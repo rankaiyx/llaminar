@@ -32,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 
 namespace llaminar2
@@ -764,6 +765,45 @@ namespace llaminar2
         size_t num_cpu_packed_ = 0;
         size_t num_gpu_packed_ = 0;
 
+    private:
+        // =========================================================================
+        // Phase 2: Per-weight/device readiness tickets and TP-safe reclaim eligibility
+        // =========================================================================
+
+        enum class WeightPrepState
+        {
+            UNKNOWN = 0,
+            LOADED_HOST,
+            PACKED_HOST,
+            UPLOADED_DEVICE,
+            READY,
+            FAILED
+        };
+
+        struct WeightPrepTicket
+        {
+            WeightPrepState state = WeightPrepState::UNKNOWN;
+            bool is_gemm = false;
+            std::string detail;
+        };
+
+        mutable std::mutex prep_ticket_mutex_;
+        std::unordered_map<std::string, std::unordered_map<std::string, WeightPrepTicket>> prep_tickets_;
+        std::unordered_map<std::string, std::unordered_set<std::string>> expected_devices_by_weight_;
+        std::unordered_set<std::string> reclaim_ready_weights_;
+        std::unordered_set<std::string> reclaim_applied_weights_;
+
+        void registerExpectedDeviceForWeight(const std::string &name, DeviceId device);
+        void markPrepState(const std::string &name,
+                           DeviceId device,
+                           WeightPrepState state,
+                           bool is_gemm,
+                           const std::string &detail = "");
+        void evaluateReclaimEligibility(const std::string &name, bool is_gemm);
+        bool tryReleaseReclaimHostRawData(const std::string &name);
+        static const char *weightPrepStateName(WeightPrepState state);
+
+    public:
         // Friend class for WeightPreloader (deprecated, will be removed)
         // WeightPreloader needs access to cache_ and private members until fully removed
         friend class WeightPreloader;

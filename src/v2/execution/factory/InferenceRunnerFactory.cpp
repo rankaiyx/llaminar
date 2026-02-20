@@ -24,6 +24,9 @@
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../utils/WeightLoadingProfiler.h"
+#include <atomic>
+#include <future>
+#include <thread>
 
 namespace llaminar2
 {
@@ -522,29 +525,42 @@ namespace llaminar2
                   << (mpi_ctx ? "valid" : "nullptr")
                   << " world_size=" << (mpi_ctx ? mpi_ctx->world_size() : -1));
 
-        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
-            graph_config, mpi_ctx, cache_config);
+        std::unique_ptr<DeviceGraphOrchestrator> orchestrator;
+        {
+            ScopedWeightLoadDetailTimer timer("graph.build.create_orchestrator");
+            orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+                graph_config, mpi_ctx, cache_config);
+        }
 
         // Initialize graph cache
-        orchestrator->initializeGraphCache(graph_config.n_layers);
+        {
+            ScopedWeightLoadDetailTimer timer("graph.build.initialize_graph_cache");
+            orchestrator->initializeGraphCache(graph_config.n_layers);
+        }
 
         // Initialize inference state (allocates buffers)
         // Pass mapped memory config for GPU zero-copy access
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
 
-        if (!orchestrator->initializeInferenceState(
-                config.batch_size, config.max_seq_len, device, init_config))
         {
-            LOG_ERROR("[InferenceRunner] Failed to initialize inference state");
-            return nullptr;
+            ScopedWeightLoadDetailTimer timer("graph.build.initialize_inference_state");
+            if (!orchestrator->initializeInferenceState(
+                    config.batch_size, config.max_seq_len, device, init_config))
+            {
+                LOG_ERROR("[InferenceRunner] Failed to initialize inference state");
+                return nullptr;
+            }
         }
 
         // Load weights and configure orchestrator
-        if (!configureOrchestratorWeightsImpl(orchestrator.get(), model_ctx, device))
         {
-            LOG_ERROR("[InferenceRunner] Failed to configure orchestrator weights");
-            return nullptr;
+            ScopedWeightLoadDetailTimer timer("graph.build.configure_weights");
+            if (!configureOrchestratorWeightsImpl(orchestrator.get(), model_ctx, device))
+            {
+                LOG_ERROR("[InferenceRunner] Failed to configure orchestrator weights");
+                return nullptr;
+            }
         }
 
         // =====================================================================
@@ -577,8 +593,10 @@ namespace llaminar2
         const bool local_tp_collectives_enabled =
             (config.local_tp_ctx != nullptr && config.local_tp_ctx->degree() > 1);
 
-        if (local_tp_collectives_enabled)
         {
+            ScopedWeightLoadDetailTimer timer("graph.build.collective_setup");
+            if (local_tp_collectives_enabled)
+            {
             // Build local cluster inventory (detects CUDA/ROCm GPUs)
             ClusterInventory cluster_inventory = buildLocalClusterInventory(mpi_ctx);
 
@@ -605,9 +623,9 @@ namespace llaminar2
             {
                 LOG_DEBUG("[InferenceRunner] No GPUs detected - using CPU MPI for collectives");
             }
-        }
-        else if (mpi_ctx && mpi_ctx->world_size() > 1)
-        {
+            }
+            else if (mpi_ctx && mpi_ctx->world_size() > 1)
+            {
             // GLOBAL TP path: use MPI-based collectives from compute stages.
             // Optional experiment path: route collective stages through
             // DeviceGraphExecutor intercept + MPI-backed CollectiveContext.
@@ -643,6 +661,7 @@ namespace llaminar2
             {
                 // Default GLOBAL TP behavior: use MPI-based collectives from compute stages.
                 LOG_DEBUG("[InferenceRunner] GLOBAL TP mode: using stage MPI collectives (CollectiveContext disabled)");
+            }
             }
         }
 
@@ -734,6 +753,10 @@ namespace llaminar2
         int n_layers = model_ctx->blockCount();
         LOG_DEBUG("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
         WeightLoadingProfiler::begin(WeightLoadPhase::TENSOR_LOAD);
+        ScopedWeightLoadDetailTimer eager_layer_timer("weights.eager_layer_cache_load");
+        std::vector<std::pair<std::string, bool>> weights_to_load;
+        weights_to_load.reserve(static_cast<size_t>(n_layers) * 12);
+
         for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
         {
             std::string prefix = "blk." + std::to_string(layer_idx) + ".";
@@ -758,8 +781,39 @@ namespace llaminar2
 
             for (const auto &weight_name : layer_weights)
             {
-                auto weight = weight_mgr->getWeightForDevice(weight_name);
                 bool is_optional = schema_factory->isWeightOptional(weight_name);
+                weights_to_load.emplace_back(weight_name, is_optional);
+            }
+        }
+
+        const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned target_workers = std::min<unsigned>(8u, hw_threads);
+        const unsigned worker_count = std::min<unsigned>(
+            target_workers,
+            std::max<unsigned>(1u, static_cast<unsigned>(weights_to_load.size())));
+
+        std::atomic<size_t> next_index{0};
+        std::atomic<bool> failed{false};
+        std::string first_error;
+        std::mutex error_mutex;
+
+        auto load_worker = [&]()
+        {
+            while (true)
+            {
+                if (failed.load(std::memory_order_relaxed))
+                {
+                    return;
+                }
+
+                const size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= weights_to_load.size())
+                {
+                    return;
+                }
+
+                const auto &[weight_name, is_optional] = weights_to_load[idx];
+                auto weight = weight_mgr->getWeightForDevice(weight_name);
 
                 if (!weight)
                 {
@@ -770,46 +824,104 @@ namespace llaminar2
                     }
                     else
                     {
-                        // Required weight missing - this is an error
-                        LOG_ERROR("[InferenceRunner] Failed to load required weight: " << weight_name);
-                        return false;
+                        std::lock_guard<std::mutex> lock(error_mutex);
+                        if (!failed.exchange(true, std::memory_order_relaxed))
+                        {
+                            first_error = weight_name;
+                        }
+                        return;
                     }
                 }
             }
+        };
+
+        if (worker_count == 1)
+        {
+            load_worker();
         }
+        else
+        {
+            LOG_DEBUG("[InferenceRunner] Parallel eager load workers=" << worker_count
+                                                                        << " weights=" << weights_to_load.size());
+            std::vector<std::future<void>> load_tasks;
+            load_tasks.reserve(worker_count);
+            for (unsigned i = 0; i < worker_count; ++i)
+            {
+                load_tasks.emplace_back(std::async(std::launch::async, load_worker));
+            }
+            for (auto &task : load_tasks)
+            {
+                task.get();
+            }
+        }
+
+        if (failed.load(std::memory_order_relaxed))
+        {
+            LOG_ERROR("[InferenceRunner] Failed to load required weight: " << first_error);
+            WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
+            return false;
+        }
+
         LOG_DEBUG("[InferenceRunner] All layer weights loaded into cache");
         WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
 
         // =====================================================================
         // NOW preload weights for target device (GPU packing/upload)
         // =====================================================================
-        // Pack GEMM weights (creates kernels and uploads to GPU for GPU targets)
+        // Phase 1 overlap: for GPU targets, run GEMM packing asynchronously while
+        // uploading non-GEMM weights on the main thread.
+        std::future<bool> gemm_pack_future;
+        const bool overlap_enabled = device.is_gpu();
+
+        if (overlap_enabled)
         {
-            ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
-            if (!weight_mgr->packGemmWeights(device))
+            gemm_pack_future = std::async(std::launch::async, [weight_mgr, device]()
             {
-                LOG_WARN("[InferenceRunner] Weight packing failed for device "
-                         << device_name << ", will use lazy kernel creation");
-                // Not fatal - kernels will be created lazily on first use
-            }
-            else
-            {
-                LOG_DEBUG("[InferenceRunner] Packed GEMM weights for " << device_name);
-            }
+                ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
+                ScopedWeightLoadDetailTimer detail_timer("weights.gemm_pack.async_work");
+                return weight_mgr->packGemmWeights(device);
+            });
         }
 
-        // Upload non-GEMM weights (norms, embeddings) to GPU
+        bool non_gemm_upload_ok = true;
         {
             ScopedWeightLoadTimer timer(WeightLoadPhase::DEVICE_UPLOAD);
-            if (!weight_mgr->uploadNonGemmWeights(device))
-            {
-                LOG_WARN("[InferenceRunner] Non-GEMM weight upload failed for device "
-                         << device_name);
-            }
-            else
-            {
-                LOG_DEBUG("[InferenceRunner] Uploaded non-GEMM weights for " << device_name);
-            }
+            ScopedWeightLoadDetailTimer detail_timer("weights.non_gemm_upload");
+            non_gemm_upload_ok = weight_mgr->uploadNonGemmWeights(device);
+        }
+
+        bool gemm_pack_ok = true;
+        if (overlap_enabled)
+        {
+            ScopedWeightLoadDetailTimer wait_timer("weights.gemm_pack.async_wait");
+            gemm_pack_ok = gemm_pack_future.get();
+        }
+        else
+        {
+            ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
+            ScopedWeightLoadDetailTimer detail_timer("weights.gemm_pack.sync_work");
+            gemm_pack_ok = weight_mgr->packGemmWeights(device);
+        }
+
+        if (!gemm_pack_ok)
+        {
+            LOG_WARN("[InferenceRunner] Weight packing failed for device "
+                     << device_name << ", will use lazy kernel creation");
+        }
+        else
+        {
+            LOG_DEBUG("[InferenceRunner] Packed GEMM weights for " << device_name
+                                                                    << (overlap_enabled ? " (overlapped)" : ""));
+        }
+
+        if (!non_gemm_upload_ok)
+        {
+            LOG_WARN("[InferenceRunner] Non-GEMM weight upload failed for device "
+                     << device_name);
+        }
+        else
+        {
+            LOG_DEBUG("[InferenceRunner] Uploaded non-GEMM weights for " << device_name);
         }
 
         // Layer weight accessor - capture weight_mgr by value (shared_ptr copy)
@@ -982,6 +1094,7 @@ namespace llaminar2
         const int last_layer = pp_config.last_layer;
         LOG_DEBUG("[PPStageRunner] Eagerly loading layers [" << first_layer << ", " << last_layer
                                                              << ") of weights...");
+        ScopedWeightLoadDetailTimer pp_eager_layer_timer("weights.pp.eager_layer_cache_load");
 
         for (int layer_idx = first_layer; layer_idx < last_layer; ++layer_idx)
         {
@@ -1029,29 +1142,57 @@ namespace llaminar2
         // =====================================================================
         // Preload weights for target device (GPU packing/upload)
         // =====================================================================
+        std::future<bool> pp_gemm_pack_future;
+        const bool pp_overlap_enabled = device.is_gpu();
+
+        if (pp_overlap_enabled)
         {
-            ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
-            if (!weight_mgr->packGemmWeights(device))
+            pp_gemm_pack_future = std::async(std::launch::async, [weight_mgr, device]()
             {
-                LOG_WARN("[PPStageRunner] Weight packing failed for device "
-                         << device_name << ", will use lazy kernel creation");
-            }
-            else
-            {
-                LOG_DEBUG("[PPStageRunner] Packed GEMM weights for " << device_name);
-            }
+                ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
+                ScopedWeightLoadDetailTimer detail_timer("weights.pp.gemm_pack.async_work");
+                return weight_mgr->packGemmWeights(device);
+            });
         }
 
+        bool pp_non_gemm_upload_ok = true;
         {
             ScopedWeightLoadTimer timer(WeightLoadPhase::DEVICE_UPLOAD);
-            if (!weight_mgr->uploadNonGemmWeights(device))
-            {
-                LOG_WARN("[PPStageRunner] Non-GEMM weight upload failed for device " << device_name);
-            }
-            else
-            {
-                LOG_DEBUG("[PPStageRunner] Uploaded non-GEMM weights for " << device_name);
-            }
+            ScopedWeightLoadDetailTimer detail_timer("weights.pp.non_gemm_upload");
+            pp_non_gemm_upload_ok = weight_mgr->uploadNonGemmWeights(device);
+        }
+
+        bool pp_gemm_pack_ok = true;
+        if (pp_overlap_enabled)
+        {
+            ScopedWeightLoadDetailTimer wait_timer("weights.pp.gemm_pack.async_wait");
+            pp_gemm_pack_ok = pp_gemm_pack_future.get();
+        }
+        else
+        {
+            ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
+            ScopedWeightLoadDetailTimer detail_timer("weights.pp.gemm_pack.sync_work");
+            pp_gemm_pack_ok = weight_mgr->packGemmWeights(device);
+        }
+
+        if (!pp_gemm_pack_ok)
+        {
+            LOG_WARN("[PPStageRunner] Weight packing failed for device "
+                     << device_name << ", will use lazy kernel creation");
+        }
+        else
+        {
+            LOG_DEBUG("[PPStageRunner] Packed GEMM weights for " << device_name
+                                                                  << (pp_overlap_enabled ? " (overlapped)" : ""));
+        }
+
+        if (!pp_non_gemm_upload_ok)
+        {
+            LOG_WARN("[PPStageRunner] Non-GEMM weight upload failed for device " << device_name);
+        }
+        else
+        {
+            LOG_DEBUG("[PPStageRunner] Uploaded non-GEMM weights for " << device_name);
         }
 
         // =====================================================================

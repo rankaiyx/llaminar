@@ -1683,22 +1683,22 @@ namespace llaminar2
      */
     struct ValidationConfig
     {
-        bool validate_buffers = false; ///< Enable buffer validation after stage execution
-        bool validate_inputs = false;  ///< Enable input validation BEFORE stage execution (Phase 1)
-        bool validate_gpu_ptrs = false; ///< Validate GPU pointer device ownership before stage execution
-        bool sync_each_stage = false; ///< Force hipDeviceSynchronize after each stage (ROCm debug)
-        bool sync_after_embedding_stage = false; ///< Force stream sync only after embedding kernel launch (targeted race debug)
-        bool sync_local_tp_allreduce = false; ///< Force device sync before/after LOCAL TP allreduce (targeted debug)
-        bool serialize_embedding_stage = false; ///< Serialize embedding stage execution across LOCAL TP device threads (targeted race debug)
-        bool serialize_rocm_gemm_stage = false; ///< Serialize ROCm CK GEMM dispatch across LOCAL TP device threads (targeted race debug)
-        bool strict_local_tp_stage_barrier = false; ///< Fail fast when LOCAL TP barrier receives mixed stage names in one generation
+        bool validate_buffers = false;                    ///< Enable buffer validation after stage execution
+        bool validate_inputs = false;                     ///< Enable input validation BEFORE stage execution (Phase 1)
+        bool validate_gpu_ptrs = false;                   ///< Validate GPU pointer device ownership before stage execution
+        bool sync_each_stage = false;                     ///< Force hipDeviceSynchronize after each stage (ROCm debug)
+        bool sync_after_embedding_stage = false;          ///< Force stream sync only after embedding kernel launch (targeted race debug)
+        bool sync_local_tp_allreduce = false;             ///< Force device sync before/after LOCAL TP allreduce (targeted debug)
+        bool serialize_embedding_stage = false;           ///< Serialize embedding stage execution across LOCAL TP device threads (targeted race debug)
+        bool serialize_rocm_gemm_stage = false;           ///< Serialize ROCm CK GEMM dispatch across LOCAL TP device threads (targeted race debug)
+        bool strict_local_tp_stage_barrier = false;       ///< Fail fast when LOCAL TP barrier receives mixed stage names in one generation
         bool serialize_local_tp_allreduce_launch = false; ///< Serialize LOCAL TP collective launch section across threads (targeted race debug)
-        bool trace_local_tp_pointer = false; ///< Enable targeted pointer watch for LOCAL TP allreduce buffers
-        uint64_t trace_local_tp_pointer_address = 0; ///< Watched address for LOCAL TP pointer tracing (env accepts hex/decimal)
-        bool fail_on_zero = false;     ///< Fail immediately when all-zero OUTPUT tensor detected (auto-enabled in Debug)
-        bool fail_on_nan = false;      ///< Fail immediately when NaN/Inf detected
-        bool dump_on_failure = true;   ///< Dump all buffers to disk when verification fails
-        int sample_rows = 8;           ///< Number of rows to sample for verification (efficiency)
+        bool trace_local_tp_pointer = false;              ///< Enable targeted pointer watch for LOCAL TP allreduce buffers
+        uint64_t trace_local_tp_pointer_address = 0;      ///< Watched address for LOCAL TP pointer tracing (env accepts hex/decimal)
+        bool fail_on_zero = false;                        ///< Fail immediately when all-zero OUTPUT tensor detected (auto-enabled in Debug)
+        bool fail_on_nan = false;                         ///< Fail immediately when NaN/Inf detected
+        bool dump_on_failure = true;                      ///< Dump all buffers to disk when verification fails
+        int sample_rows = 8;                              ///< Number of rows to sample for verification (efficiency)
 
         ValidationConfig()
         {
@@ -2173,6 +2173,24 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_TRACE_KERNELS=1` - Enable per-kernel timing breakdown
      * - `LLAMINAR_ROCM_SYNC_AFTER_KERNEL=1` - Force hipDeviceSynchronize after each kernel
      * - `LLAMINAR_ROCM_GEMV_LAYOUT=vnni` - Use VNNI-packed weights for GEMV when available
+     * - `LLAMINAR_ROCM_PACK_VNNI_ONLY=1` - Prefer VNNI-only host packed buffers (drop row-major host copy when safe)
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL=1` - Enable native prefill path routing for M>1
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR=1` - Enable INT8 prefill grid-kpar split-K variant
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_SPLITS=<n>` - Split-K slice count for grid-kpar prefill variant (`0` = auto)
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_CPT=<n>` - Outputs-per-thread for INT8 prefill kernels (`1`, `2`, or `4`)
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_KB=<n>` - Grid-kpar K-block count override (`0` = auto policy)
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_VARIANT=<id>` - Force baseline INT8 prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_VARIANT=<id>` - Force grid-kpar INT8 prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
+     * - `LLAMINAR_ROCM_RATIO_PREFILL_VARIANT=<id>` - Force ratio-prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
+     * - `LLAMINAR_ROCM_RATIO_PREFILL_KB=<n>` - Ratio-prefill split-K blocks (`0` = auto)
+     * - `LLAMINAR_ROCM_RATIO_PREFILL_LINEAR_VARIANT=<id>` - Force linear-codebook ratio prefill tile variant (`-1`=use global/auto)
+     * - `LLAMINAR_ROCM_RATIO_PREFILL_LINEAR_KB=<n>` - Force linear-codebook ratio prefill split-K blocks (`0`=use global/auto)
+     * - `LLAMINAR_ROCM_RATIO_PREFILL_IQ4_VARIANT=<id>` - Force IQ4-codebook ratio prefill tile variant (`-1`=use global/auto)
+     * - `LLAMINAR_ROCM_RATIO_PREFILL_IQ4_KB=<n>` - Force IQ4-codebook ratio prefill split-K blocks (`0`=use global/auto)
+     * - `LLAMINAR_ROCM_STARTUP_GPU_REPACK=1` - Enable startup GPU-native GEMM repack pipeline (Phase 4, flag-only in Step 1)
+     * - `LLAMINAR_ROCM_REPACK_SLOTS=<n>` - Ring-buffer slot count for startup GPU repack pipeline
+     * - `LLAMINAR_ROCM_REPACK_BUDGET_MB=<mb>` - VRAM budget cap for startup GPU repack staging buffers
+     * - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` - Stream count hint for startup GPU repack pipeline
      *
      * @code
      *   LLAMINAR_ROCM_TRACE_COHERENCE=1 \
@@ -2181,12 +2199,30 @@ namespace llaminar2
      */
     struct ROCmConfig
     {
-        bool trace_coherence = false;    ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
-        bool trace_kernels = false;      ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
-        bool sync_after_kernel = false;  ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
-        bool fused_gemv = false;         ///< Enable fused GEMV path (LLAMINAR_FUSED_GEMV)
-        std::string gemv_mode = "fp32";  ///< GEMV mode: fp32 (default), fp16, int8
-        std::string gemv_layout = "row"; ///< GEMV weight layout: row (default), vnni
+        bool trace_coherence = false;           ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
+        bool trace_kernels = false;             ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
+        bool sync_after_kernel = false;         ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
+        bool fused_gemv = false;                ///< Enable fused GEMV path (LLAMINAR_FUSED_GEMV)
+        std::string gemv_mode = "fp32";         ///< GEMV mode: fp32 (default), fp16, int8
+        std::string gemv_layout = "row";        ///< GEMV weight layout: row (default), vnni
+        bool pack_vnni_only_host = false;       ///< Prefer VNNI-only host packed buffers (LLAMINAR_ROCM_PACK_VNNI_ONLY)
+        bool vnni_prefill_experimental = false; ///< Enable scaffold branch for non-CK prefill path (LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL)
+        bool vnni_prefill_grid_kpar = false;    ///< Enable INT8 prefill grid-kpar split-K variant (LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR)
+        int vnni_prefill_grid_kpar_splits = 0;  ///< Split-K slices for grid-kpar variant (`0` = auto)
+        int vnni_prefill_cpt = 1;               ///< Outputs-per-thread for INT8 prefill kernels (1,2,4)
+        int vnni_prefill_grid_kpar_kb = 0;      ///< Grid-kpar K-block count override (0=auto)
+        int vnni_prefill_variant = -1;          ///< Baseline prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
+        int vnni_prefill_grid_variant = -1;     ///< Grid-kpar prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
+        int ratio_prefill_variant = -1;         ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
+        int ratio_prefill_kb = 0;               ///< Ratio prefill split-K blocks override (0=auto)
+        int ratio_prefill_linear_variant = -1;  ///< Linear codebook ratio prefill tile override (-1=use global/auto)
+        int ratio_prefill_linear_kb = 0;        ///< Linear codebook ratio prefill split-K override (0=use global/auto)
+        int ratio_prefill_iq4_variant = -1;     ///< IQ4 codebook ratio prefill tile override (-1=use global/auto)
+        int ratio_prefill_iq4_kb = 0;           ///< IQ4 codebook ratio prefill split-K override (0=use global/auto)
+        bool startup_gpu_repack = false;        ///< Enable startup GPU repack pipeline (LLAMINAR_ROCM_STARTUP_GPU_REPACK)
+        int repack_slots = 8;                   ///< Ring-buffer slot count for startup GPU repack pipeline
+        int repack_budget_mb = 1024;            ///< VRAM budget cap for startup GPU repack staging buffers
+        int repack_streams = 3;                 ///< Stream count hint for startup GPU repack pipeline
 
         ROCmConfig()
         {
@@ -2201,6 +2237,24 @@ namespace llaminar2
             fused_gemv = false;
             gemv_mode = "fp32";
             gemv_layout = "row";
+            pack_vnni_only_host = false;
+            vnni_prefill_experimental = false;
+            vnni_prefill_grid_kpar = false;
+            vnni_prefill_grid_kpar_splits = 0;
+            vnni_prefill_cpt = 1;
+            vnni_prefill_grid_kpar_kb = 0;
+            vnni_prefill_variant = -1;
+            vnni_prefill_grid_variant = -1;
+            ratio_prefill_variant = -1;
+            ratio_prefill_kb = 0;
+            ratio_prefill_linear_variant = -1;
+            ratio_prefill_linear_kb = 0;
+            ratio_prefill_iq4_variant = -1;
+            ratio_prefill_iq4_kb = 0;
+            startup_gpu_repack = false;
+            repack_slots = 8;
+            repack_budget_mb = 1024;
+            repack_streams = 3;
 
             const char *trace_coh_env = std::getenv("LLAMINAR_ROCM_TRACE_COHERENCE");
             if (trace_coh_env)
@@ -2242,6 +2296,118 @@ namespace llaminar2
                 std::transform(gemv_layout.begin(), gemv_layout.end(), gemv_layout.begin(),
                                [](unsigned char c)
                                { return static_cast<char>(std::tolower(c)); });
+            }
+
+            const char *pack_vnni_only_env = std::getenv("LLAMINAR_ROCM_PACK_VNNI_ONLY");
+            if (pack_vnni_only_env)
+            {
+                pack_vnni_only_host = (std::atoi(pack_vnni_only_env) != 0);
+            }
+
+            const char *vnni_prefill_experimental_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL");
+            if (vnni_prefill_experimental_env)
+            {
+                vnni_prefill_experimental = (std::atoi(vnni_prefill_experimental_env) != 0);
+            }
+
+            const char *vnni_prefill_grid_kpar_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR");
+            if (vnni_prefill_grid_kpar_env)
+            {
+                vnni_prefill_grid_kpar = (std::atoi(vnni_prefill_grid_kpar_env) != 0);
+            }
+
+            const char *vnni_prefill_grid_kpar_splits_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_SPLITS");
+            if (vnni_prefill_grid_kpar_splits_env)
+            {
+                vnni_prefill_grid_kpar_splits = std::clamp(std::atoi(vnni_prefill_grid_kpar_splits_env), 0, 32);
+            }
+
+            const char *vnni_prefill_cpt_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_CPT");
+            if (vnni_prefill_cpt_env)
+            {
+                const int requested_cpt = std::atoi(vnni_prefill_cpt_env);
+                if (requested_cpt == 1 || requested_cpt == 2 || requested_cpt == 4)
+                {
+                    vnni_prefill_cpt = requested_cpt;
+                }
+            }
+
+            const char *vnni_prefill_grid_kpar_kb_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_KB");
+            if (vnni_prefill_grid_kpar_kb_env)
+            {
+                vnni_prefill_grid_kpar_kb = std::clamp(std::atoi(vnni_prefill_grid_kpar_kb_env), 0, 128);
+            }
+
+            const char *vnni_prefill_variant_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_VARIANT");
+            if (vnni_prefill_variant_env)
+            {
+                vnni_prefill_variant = std::clamp(std::atoi(vnni_prefill_variant_env), -1, 3);
+            }
+
+            const char *vnni_prefill_grid_variant_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_GRID_VARIANT");
+            if (vnni_prefill_grid_variant_env)
+            {
+                vnni_prefill_grid_variant = std::clamp(std::atoi(vnni_prefill_grid_variant_env), -1, 3);
+            }
+
+            const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");
+            if (ratio_prefill_variant_env)
+            {
+                ratio_prefill_variant = std::clamp(std::atoi(ratio_prefill_variant_env), -1, 3);
+            }
+
+            const char *ratio_prefill_kb_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_KB");
+            if (ratio_prefill_kb_env)
+            {
+                ratio_prefill_kb = std::clamp(std::atoi(ratio_prefill_kb_env), 0, 32);
+            }
+
+            const char *ratio_prefill_linear_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_LINEAR_VARIANT");
+            if (ratio_prefill_linear_variant_env)
+            {
+                ratio_prefill_linear_variant = std::clamp(std::atoi(ratio_prefill_linear_variant_env), -1, 3);
+            }
+
+            const char *ratio_prefill_linear_kb_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_LINEAR_KB");
+            if (ratio_prefill_linear_kb_env)
+            {
+                ratio_prefill_linear_kb = std::clamp(std::atoi(ratio_prefill_linear_kb_env), 0, 32);
+            }
+
+            const char *ratio_prefill_iq4_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_IQ4_VARIANT");
+            if (ratio_prefill_iq4_variant_env)
+            {
+                ratio_prefill_iq4_variant = std::clamp(std::atoi(ratio_prefill_iq4_variant_env), -1, 3);
+            }
+
+            const char *ratio_prefill_iq4_kb_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_IQ4_KB");
+            if (ratio_prefill_iq4_kb_env)
+            {
+                ratio_prefill_iq4_kb = std::clamp(std::atoi(ratio_prefill_iq4_kb_env), 0, 32);
+            }
+
+            const char *startup_gpu_repack_env = std::getenv("LLAMINAR_ROCM_STARTUP_GPU_REPACK");
+            if (startup_gpu_repack_env)
+            {
+                startup_gpu_repack = (std::atoi(startup_gpu_repack_env) != 0);
+            }
+
+            const char *repack_slots_env = std::getenv("LLAMINAR_ROCM_REPACK_SLOTS");
+            if (repack_slots_env)
+            {
+                repack_slots = std::max(1, std::atoi(repack_slots_env));
+            }
+
+            const char *repack_budget_env = std::getenv("LLAMINAR_ROCM_REPACK_BUDGET_MB");
+            if (repack_budget_env)
+            {
+                repack_budget_mb = std::max(128, std::atoi(repack_budget_env));
+            }
+
+            const char *repack_streams_env = std::getenv("LLAMINAR_ROCM_REPACK_STREAMS");
+            if (repack_streams_env)
+            {
+                repack_streams = std::max(1, std::atoi(repack_streams_env));
             }
         }
     };

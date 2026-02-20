@@ -1139,38 +1139,15 @@ extern "C"
 
     void rocmQuantGemm_warmupKernels()
     {
-        fprintf(stderr, "[CK Warmup] Pre-initializing CK INT8 GEMM kernels...\n");
-        
-        auto start = std::chrono::high_resolution_clock::now();
-        
         // Force construction of all kernel variants for this warmup context
         ROCmCKKernelContext context{};
         (void)getCachedNoScaleKernel32x32(context);  // 32x32 for decode (M <= 32)
-        
-        auto t1 = std::chrono::high_resolution_clock::now();
-        auto d1 = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - start).count();
-        fprintf(stderr, "[CK Warmup]   32x32 kernel: %ld ms\n", d1);
-        
+
         (void)getCachedNoScaleKernel64x64(context);  // 64x64 for small batch (32 < M < 128)
-        
-        auto t2 = std::chrono::high_resolution_clock::now();
-        auto d2 = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
-        fprintf(stderr, "[CK Warmup]   64x64 kernel: %ld ms\n", d2);
-        
+
         (void)getCachedNoScaleKernel(context);       // 128x128 for prefill (M >= 128, M%128==0)
-        
-        auto t3 = std::chrono::high_resolution_clock::now();
-        auto d3 = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
-        fprintf(stderr, "[CK Warmup]   128x128 kernel: %ld ms\n", d3);
-        
+
         (void)getCachedNoScaleKernel128x128MNPadding(context);  // 128x128 MNPadding for M%128!=0
-        
-        auto t4 = std::chrono::high_resolution_clock::now();
-        auto d4 = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count();
-        auto total = std::chrono::duration_cast<std::chrono::milliseconds>(t4 - start).count();
-        
-        fprintf(stderr, "[CK Warmup]   128x128 MNPadding kernel: %ld ms\n", d4);
-        fprintf(stderr, "[CK Warmup] All CK kernels initialized in %ld ms\n", total);
     }
 
     // -------------------------------------------------------------------------

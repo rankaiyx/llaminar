@@ -6,15 +6,174 @@
 
 #include "WeightManager.h"
 #include "../utils/Logger.h"
+#include "../utils/WeightLoadingProfiler.h"
+#include "../utils/DebugEnv.h"
 #include "../tensors/TensorFactory.h"
 #include "../tensors/TensorSlice.h"
 #include "../kernels/KernelFactory.h"
+#include "../backends/BackendManager.h"
 #include <iostream>
 #include <cstring>
 #include <regex>
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <atomic>
+#include <thread>
+#include <future>
+#include <unordered_map>
+#include <vector>
 
 namespace llaminar2
 {
+
+    const char *WeightManager::weightPrepStateName(WeightPrepState state)
+    {
+        switch (state)
+        {
+        case WeightPrepState::UNKNOWN:
+            return "UNKNOWN";
+        case WeightPrepState::LOADED_HOST:
+            return "LOADED_HOST";
+        case WeightPrepState::PACKED_HOST:
+            return "PACKED_HOST";
+        case WeightPrepState::UPLOADED_DEVICE:
+            return "UPLOADED_DEVICE";
+        case WeightPrepState::READY:
+            return "READY";
+        case WeightPrepState::FAILED:
+            return "FAILED";
+        default:
+            return "INVALID";
+        }
+    }
+
+    void WeightManager::registerExpectedDeviceForWeight(const std::string &name, DeviceId device)
+    {
+        std::lock_guard<std::mutex> lock(prep_ticket_mutex_);
+        expected_devices_by_weight_[name].insert(device.to_string());
+    }
+
+    void WeightManager::markPrepState(const std::string &name,
+                                      DeviceId device,
+                                      WeightPrepState state,
+                                      bool is_gemm,
+                                      const std::string &detail)
+    {
+        std::lock_guard<std::mutex> lock(prep_ticket_mutex_);
+
+        const std::string device_key = device.to_string();
+        expected_devices_by_weight_[name].insert(device_key);
+
+        auto &ticket = prep_tickets_[name][device_key];
+        ticket.state = state;
+        ticket.is_gemm = is_gemm;
+        ticket.detail = detail;
+    }
+
+    void WeightManager::evaluateReclaimEligibility(const std::string &name, bool is_gemm)
+    {
+        if (!is_gemm)
+        {
+            return;
+        }
+
+        bool should_attempt_reclaim = false;
+
+        {
+            std::lock_guard<std::mutex> lock(prep_ticket_mutex_);
+
+            auto exp_it = expected_devices_by_weight_.find(name);
+            auto ticket_it = prep_tickets_.find(name);
+            if (exp_it == expected_devices_by_weight_.end() || ticket_it == prep_tickets_.end())
+            {
+                return;
+            }
+
+            const auto &expected = exp_it->second;
+            const auto &tickets = ticket_it->second;
+
+            if (expected.empty())
+            {
+                return;
+            }
+
+            const bool all_ready = std::all_of(expected.begin(), expected.end(), [&](const std::string &device_key)
+                                               {
+                auto it = tickets.find(device_key);
+                return it != tickets.end() && it->second.state == WeightPrepState::READY;
+            });
+
+            if (!all_ready)
+            {
+                return;
+            }
+
+            reclaim_ready_weights_.insert(name);
+            if (reclaim_applied_weights_.find(name) == reclaim_applied_weights_.end())
+            {
+                should_attempt_reclaim = true;
+            }
+        }
+
+        if (!should_attempt_reclaim)
+        {
+            return;
+        }
+
+        if (tryReleaseReclaimHostRawData(name))
+        {
+            std::lock_guard<std::mutex> lock(prep_ticket_mutex_);
+            reclaim_applied_weights_.insert(name);
+            LOG_DEBUG("[WeightManager][Phase2] Reclaimed GEMM host raw data: " << name);
+        }
+    }
+
+    bool WeightManager::tryReleaseReclaimHostRawData(const std::string &name)
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        std::unordered_set<TensorBase *> released;
+        bool found_any = false;
+
+        auto base_it = cache_.find(name);
+        if (base_it != cache_.end() && base_it->second)
+        {
+            TensorBase *ptr = base_it->second.get();
+            if (released.insert(ptr).second)
+            {
+                ptr->release_raw_data();
+                found_any = true;
+            }
+        }
+
+        const std::string suffix = ":" + name;
+        for (const auto &[key, tensor] : per_device_cache_)
+        {
+            if (!tensor)
+            {
+                continue;
+            }
+            if (key.size() >= suffix.size() &&
+                key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0)
+            {
+                TensorBase *ptr = tensor.get();
+                if (released.insert(ptr).second)
+                {
+                    ptr->release_raw_data();
+                    found_any = true;
+                }
+            }
+        }
+
+        if (!found_any)
+        {
+            LOG_WARN("[WeightManager][Phase2] Reclaim requested but no tensors found for: " << name);
+        }
+
+        return found_any;
+    }
 
     WeightManager::WeightManager(IModelLoader &loader,
                                  std::shared_ptr<MPIContext> mpi_ctx,
@@ -1059,8 +1218,19 @@ namespace llaminar2
 
     void WeightManager::clearCache()
     {
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-        cache_.clear();
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            cache_.clear();
+            per_device_cache_.clear();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(prep_ticket_mutex_);
+            prep_tickets_.clear();
+            expected_devices_by_weight_.clear();
+            reclaim_ready_weights_.clear();
+            reclaim_applied_weights_.clear();
+        }
     }
 
     size_t WeightManager::decodeCacheSize() const
@@ -1234,7 +1404,7 @@ namespace llaminar2
         DeviceId device,
         int layer_idx)
     {
-        std::lock_guard<std::mutex> lock(cache_mutex_);
+        std::unique_lock<std::mutex> lock(cache_mutex_);
 
         // For LAYER_PARTITIONED strategy, filter out weights not in our layer range
         if (strategy_ == WeightDistributionStrategy::LAYER_PARTITIONED && has_layer_range_)
@@ -1281,7 +1451,7 @@ namespace llaminar2
         }
 
         // Helper lambda to load weight if not in cache (reuses getWeight logic without re-locking)
-        auto ensureWeightLoaded = [this, &name, &device, layer_idx]() -> std::shared_ptr<TensorBase>
+        auto ensureWeightLoaded = [this, &name, &device, layer_idx, &lock]() -> std::shared_ptr<TensorBase>
         {
             auto it = cache_.find(name);
             if (it != cache_.end())
@@ -1305,6 +1475,7 @@ namespace llaminar2
 
             // Load based on strategy (same logic as getWeight)
             std::shared_ptr<TensorBase> tensor;
+            lock.unlock();
             switch (strategy_)
             {
             case WeightDistributionStrategy::REPLICATED:
@@ -1321,7 +1492,17 @@ namespace llaminar2
                 break;
             default:
                 LOG_ERROR("[WeightManager] Unknown strategy: " << static_cast<int>(strategy_));
+                lock.lock();
                 return nullptr;
+            }
+
+            lock.lock();
+
+            // Double-check cache after loading in case another thread won the race.
+            auto cached_it = cache_.find(name);
+            if (cached_it != cache_.end())
+            {
+                return cached_it->second;
             }
 
             if (tensor)
@@ -1450,11 +1631,16 @@ namespace llaminar2
                 }
 
                 auto tensor = getWeightForDevice(name, device);
+                const bool is_gemm_weight = isGemmWeight(name);
+                registerExpectedDeviceForWeight(name, device);
                 if (!tensor)
                 {
+                    markPrepState(name, device, WeightPrepState::FAILED, is_gemm_weight, "getWeightForDevice failed during preload");
                     ++load_failures;
                     continue;
                 }
+
+                markPrepState(name, device, WeightPrepState::LOADED_HOST, is_gemm_weight, "weight loaded for device");
 
                 ++loaded_tensors;
 
@@ -1462,10 +1648,16 @@ namespace llaminar2
                 {
                     if (tensor->ensureOnDevice(device))
                     {
+                        markPrepState(name, device, WeightPrepState::UPLOADED_DEVICE, is_gemm_weight, "preload ensureOnDevice completed");
+                        if (!is_gemm_weight)
+                        {
+                            markPrepState(name, device, WeightPrepState::READY, false, "preload non-GEMM ready");
+                        }
                         ++total_uploads;
                     }
                     else
                     {
+                        markPrepState(name, device, WeightPrepState::FAILED, is_gemm_weight, "preload ensureOnDevice failed");
                         ++load_failures;
                         LOG_WARN("[WeightManager] Failed to upload preloaded tensor "
                                  << name << " to " << device.to_string());
@@ -1491,16 +1683,49 @@ namespace llaminar2
         bool release_raw_data)
     {
         using namespace llaminar::v2::kernels;
+        using Clock = std::chrono::high_resolution_clock;
 
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-
-        // Collect all GEMM weight names
-        std::vector<std::string> gemm_weights;
-        for (const auto &[name, tensor] : cache_)
+        const bool detail_enabled = WeightLoadingProfiler::isEnabled();
+        auto classify_weight = [](const std::string &name) -> std::string
         {
-            if (isGemmWeight(name))
+            if (name.find("attn_q.weight") != std::string::npos)
+                return "attn_q";
+            if (name.find("attn_k.weight") != std::string::npos)
+                return "attn_k";
+            if (name.find("attn_v.weight") != std::string::npos)
+                return "attn_v";
+            if (name.find("attn_output.weight") != std::string::npos)
+                return "attn_output";
+            if (name.find("ffn_gate.weight") != std::string::npos)
+                return "ffn_gate";
+            if (name.find("ffn_up.weight") != std::string::npos)
+                return "ffn_up";
+            if (name.find("ffn_down.weight") != std::string::npos)
+                return "ffn_down";
+            if (name == "output.weight")
+                return "lm_head";
+            if (name == "token_embd.weight")
+                return "embedding";
+            return "other";
+        };
+
+        std::unordered_map<std::string, double> bucket_ms;
+        std::vector<std::pair<std::string, double>> per_weight_ms;
+        std::mutex detail_mutex;
+        auto pack_loop_start = Clock::now();
+
+        // Collect GEMM tensors under lock, then pack outside lock.
+        // This allows overlap with other preload operations (e.g., non-GEMM uploads).
+        std::vector<std::pair<std::string, std::shared_ptr<TensorBase>>> gemm_weights;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            gemm_weights.reserve(cache_.size());
+            for (const auto &[name, tensor] : cache_)
             {
-                gemm_weights.push_back(name);
+                if (isGemmWeight(name) && tensor)
+                {
+                    gemm_weights.emplace_back(name, tensor);
+                }
             }
         }
 
@@ -1513,57 +1738,314 @@ namespace llaminar2
         LOG_DEBUG("[WeightManager] Packing " << gemm_weights.size() << " GEMM weights for "
                                              << target_device.to_string());
 
-        size_t total = gemm_weights.size();
-        size_t current = 0;
-        bool all_success = true;
+        const size_t total = gemm_weights.size();
+        const unsigned hardware_threads = std::max(1u, std::thread::hardware_concurrency());
 
-        // Set up device ordinal guards for GPU packing
-        // Lambda that performs the actual packing
-        auto do_packing = [&]() -> bool
+        unsigned prepare_workers = target_device.is_gpu()
+                                       ? std::min<unsigned>(8u, hardware_threads)
+                                       : 1u;
+        unsigned upload_workers = target_device.is_gpu()
+                                      ? std::min<unsigned>(2u, hardware_threads)
+                                      : 1u;
+        size_t queue_capacity = std::max<size_t>(4, static_cast<size_t>(upload_workers) * 4);
+
+        // Phase 4 Step 2 pilot (control-plane only): historical worker/slot shaping
+        // for ROCm startup CK row-major repack pipeline.
+        //
+        // Architectural direction is now VNNI-only startup preparation. CK row-major
+        // startup repack is disabled, so we intentionally keep default producer/
+        // consumer topology to avoid injecting control-plane overhead that no longer
+        // has corresponding GPU overlap benefits.
+        if (target_device.is_rocm() && debugEnv().rocm.startup_gpu_repack)
         {
-            for (const auto &name : gemm_weights)
+            const auto &rocm_cfg = debugEnv().rocm;
+
+            const size_t requested_budget_mb = static_cast<size_t>(std::max(128, rocm_cfg.repack_budget_mb));
+            size_t effective_budget_mb = requested_budget_mb;
+            if (auto *rocm_backend = getROCmBackend())
             {
-                current++;
-                if (progress_cb)
+                const size_t free_mb = rocm_backend->deviceMemoryFree(target_device.ordinal) / (1024ull * 1024ull);
+                if (free_mb > 512)
                 {
-                    progress_cb(current, total, name);
+                    effective_budget_mb = std::min(effective_budget_mb, free_mb - 512);
+                }
+            }
+
+            LOG_INFO("[WeightManager][Phase4Pilot] ROCm startup GPU repack control enabled: "
+                     << "prepare_workers=" << prepare_workers
+                     << " upload_workers=" << upload_workers
+                     << " queue_slots=" << queue_capacity
+                     << " budget_mb=" << requested_budget_mb
+                     << " effective_budget_mb=" << effective_budget_mb);
+
+            if (detail_enabled)
+            {
+                WeightLoadingProfiler::addDetail("weights.gemm_pack.phase4.prepare_workers", static_cast<double>(prepare_workers));
+                WeightLoadingProfiler::addDetail("weights.gemm_pack.phase4.upload_workers", static_cast<double>(upload_workers));
+                WeightLoadingProfiler::addDetail("weights.gemm_pack.phase4.queue_slots", static_cast<double>(queue_capacity));
+                WeightLoadingProfiler::addDetail("weights.gemm_pack.phase4.effective_budget_mb", static_cast<double>(effective_budget_mb));
+            }
+        }
+
+        struct PreparedJob
+        {
+            std::string name;
+            std::shared_ptr<TensorBase> tensor;
+            const KernelFactory::PreparedGemmHandle *prepared = nullptr;
+            bool preparation_ok = false;
+        };
+
+        std::deque<PreparedJob> job_queue;
+        std::mutex queue_mutex;
+        std::condition_variable queue_not_empty;
+        std::condition_variable queue_not_full;
+
+        std::atomic<size_t> next_prepare_index{0};
+        std::atomic<size_t> completed_count{0};
+        std::atomic<bool> producer_done{false};
+        std::atomic<bool> all_success{true};
+        std::atomic<size_t> local_cpu_packed{0};
+        std::atomic<size_t> local_gpu_packed{0};
+
+        auto prepare_job = [&](const std::pair<std::string, std::shared_ptr<TensorBase>> &entry) -> PreparedJob
+        {
+            PreparedJob job;
+            job.name = entry.first;
+            job.tensor = entry.second;
+
+            try
+            {
+                job.prepared = KernelFactory::getOrCreatePreparedGemmWeights(job.tensor.get(), target_device);
+                job.preparation_ok = (job.prepared != nullptr);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[WeightManager] Prepared GEMM creation failed for " << job.name << ": " << e.what());
+                job.preparation_ok = false;
+            }
+
+            return job;
+        };
+
+        auto upload_job = [&](PreparedJob &job) -> bool
+        {
+            if (!job.preparation_ok || !job.prepared)
+            {
+                return false;
+            }
+
+            auto run_upload = [&]() -> bool
+            {
+                auto *kernel = KernelFactory::getOrCreateGemmEngine(job.prepared);
+                if (!kernel)
+                {
+                    return false;
+                }
+                kernel->prepareWeights();
+                return true;
+            };
+
+            try
+            {
+                if (target_device.is_rocm())
+                {
+                    KernelFactory::ROCmOrdinalGuard guard(target_device.ordinal);
+                    return run_upload();
+                }
+                if (target_device.is_cuda())
+                {
+                    KernelFactory::CUDAOrdinalGuard guard(target_device.ordinal);
+                    return run_upload();
+                }
+                return run_upload();
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[WeightManager] GEMM upload failed for " << job.name << ": " << e.what());
+                return false;
+            }
+        };
+
+        auto producer_worker = [&]()
+        {
+            while (true)
+            {
+                const size_t index = next_prepare_index.fetch_add(1, std::memory_order_relaxed);
+                if (index >= total)
+                {
+                    return;
                 }
 
-                auto &tensor = cache_[name];
-                if (!tensor)
+                const auto prep_start = Clock::now();
+                PreparedJob job = prepare_job(gemm_weights[index]);
+                const auto prep_end = Clock::now();
+
+                if (detail_enabled)
                 {
-                    LOG_WARN("[WeightManager] Weight not found in cache: " << name);
+                    const double prep_ms = std::chrono::duration<double, std::milli>(prep_end - prep_start).count();
+                    WeightLoadingProfiler::addDetail("weights.gemm_pack.stage_prepare", prep_ms);
+                }
+
+                if (!job.preparation_ok)
+                {
+                    markPrepState(job.name, target_device, WeightPrepState::FAILED, true, "prepared GEMM creation failed");
+                    all_success.store(false, std::memory_order_relaxed);
                     continue;
                 }
 
-                if (!packWeight(tensor.get(), target_device, release_raw_data))
+                std::unique_lock<std::mutex> queue_lock(queue_mutex);
+                const auto slot_wait_start = Clock::now();
+                queue_not_full.wait(queue_lock, [&]()
+                                    { return job_queue.size() < queue_capacity; });
+                if (detail_enabled)
                 {
-                    LOG_ERROR("[WeightManager] Failed to pack weight: " << name);
-                    all_success = false;
+                    const auto slot_wait_end = Clock::now();
+                    const double slot_wait_ms = std::chrono::duration<double, std::milli>(slot_wait_end - slot_wait_start).count();
+                    WeightLoadingProfiler::addDetail("weights.gemm_pack.slot_wait_time", slot_wait_ms);
                 }
+                job_queue.push_back(std::move(job));
+                queue_lock.unlock();
+                queue_not_empty.notify_one();
             }
-            return all_success;
         };
 
-        // Use ordinal guards for GPU devices
-        if (target_device.is_rocm())
+        auto consumer_worker = [&]()
         {
-            LOG_DEBUG("[WeightManager] Setting ROCm ordinal " << target_device.ordinal
-                                                              << " for weight packing");
-            KernelFactory::ROCmOrdinalGuard guard(target_device.ordinal);
-            return do_packing();
-        }
-        else if (target_device.is_cuda())
+            while (true)
+            {
+                PreparedJob job;
+                {
+                    std::unique_lock<std::mutex> queue_lock(queue_mutex);
+                    const auto bubble_wait_start = Clock::now();
+                    queue_not_empty.wait(queue_lock, [&]()
+                                         { return !job_queue.empty() || producer_done.load(std::memory_order_relaxed); });
+                    if (detail_enabled)
+                    {
+                        const auto bubble_wait_end = Clock::now();
+                        const double bubble_wait_ms = std::chrono::duration<double, std::milli>(bubble_wait_end - bubble_wait_start).count();
+                        WeightLoadingProfiler::addDetail("weights.gemm_pack.pipeline_bubble_time", bubble_wait_ms);
+                    }
+
+                    if (job_queue.empty())
+                    {
+                        return;
+                    }
+
+                    job = std::move(job_queue.front());
+                    job_queue.pop_front();
+                }
+
+                queue_not_full.notify_one();
+
+                const auto upload_start = Clock::now();
+                const bool upload_ok = upload_job(job);
+                const auto upload_end = Clock::now();
+
+                if (detail_enabled)
+                {
+                    const double upload_ms = std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+                    {
+                        std::lock_guard<std::mutex> detail_lock(detail_mutex);
+                        bucket_ms[classify_weight(job.name)] += upload_ms;
+                        per_weight_ms.emplace_back(job.name, upload_ms);
+                    }
+                    WeightLoadingProfiler::addDetail("weights.gemm_pack.stage_upload", upload_ms);
+                }
+
+                if (!upload_ok)
+                {
+                    markPrepState(job.name, target_device, WeightPrepState::FAILED, true, "prepareWeights failed");
+                    LOG_ERROR("[WeightManager] Failed to pack weight: " << job.name);
+                    all_success.store(false, std::memory_order_relaxed);
+                }
+                else
+                {
+                    if (target_device.is_gpu())
+                    {
+                        markPrepState(job.name, target_device, WeightPrepState::UPLOADED_DEVICE, true, "GEMM packed + uploaded");
+                        local_gpu_packed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    else
+                    {
+                        markPrepState(job.name, target_device, WeightPrepState::PACKED_HOST, true, "GEMM packed on CPU");
+                        local_cpu_packed.fetch_add(1, std::memory_order_relaxed);
+                        if (release_raw_data && job.tensor)
+                        {
+                            job.tensor->release_raw_data();
+                        }
+                    }
+
+                    markPrepState(job.name, target_device, WeightPrepState::READY, true, "GEMM weight ready");
+                    evaluateReclaimEligibility(job.name, true);
+                }
+
+                const size_t finished = completed_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (progress_cb)
+                {
+                    progress_cb(finished, total, job.name);
+                }
+            }
+        };
+
+        std::vector<std::future<void>> producer_futures;
+        producer_futures.reserve(prepare_workers);
+        for (unsigned i = 0; i < prepare_workers; ++i)
         {
-            LOG_DEBUG("[WeightManager] Setting CUDA ordinal " << target_device.ordinal
-                                                              << " for weight packing");
-            KernelFactory::CUDAOrdinalGuard guard(target_device.ordinal);
-            return do_packing();
+            producer_futures.emplace_back(std::async(std::launch::async, producer_worker));
         }
-        else
+
+        std::vector<std::future<void>> consumer_futures;
+        consumer_futures.reserve(upload_workers);
+        for (unsigned i = 0; i < upload_workers; ++i)
         {
-            return do_packing();
+            consumer_futures.emplace_back(std::async(std::launch::async, consumer_worker));
         }
+
+        for (auto &future : producer_futures)
+        {
+            future.get();
+        }
+
+        producer_done.store(true, std::memory_order_relaxed);
+        queue_not_empty.notify_all();
+
+        for (auto &future : consumer_futures)
+        {
+            future.get();
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            num_cpu_packed_ += local_cpu_packed.load(std::memory_order_relaxed);
+            num_gpu_packed_ += local_gpu_packed.load(std::memory_order_relaxed);
+        }
+
+        if (detail_enabled)
+        {
+            const auto pack_loop_end = Clock::now();
+            const double total_pack_ms = std::chrono::duration<double, std::milli>(pack_loop_end - pack_loop_start).count();
+            WeightLoadingProfiler::addDetail("weights.gemm_pack.loop_total", total_pack_ms);
+
+            {
+                std::lock_guard<std::mutex> detail_lock(detail_mutex);
+                for (const auto &[bucket, ms] : bucket_ms)
+                {
+                    WeightLoadingProfiler::addDetail(std::string("weights.gemm_pack.bucket.") + bucket, ms);
+                }
+
+                std::sort(per_weight_ms.begin(), per_weight_ms.end(), [](const auto &a, const auto &b)
+                          { return a.second > b.second; });
+
+                const size_t top_n = std::min<size_t>(8, per_weight_ms.size());
+                for (size_t i = 0; i < top_n; ++i)
+                {
+                    WeightLoadingProfiler::addDetail(std::string("weights.gemm_pack.weight_top.") + per_weight_ms[i].first,
+                                                     per_weight_ms[i].second);
+                }
+            }
+        }
+
+        return all_success.load(std::memory_order_relaxed);
     }
 
     bool WeightManager::packWeight(
@@ -1625,66 +2107,81 @@ namespace llaminar2
             return true;
         }
 
-        std::lock_guard<std::mutex> lock(cache_mutex_);
-
         size_t uploaded_count = 0;
 
         LOG_DEBUG("[WeightManager] Uploading non-GEMM weights to " << target_device.to_string() << "...");
 
-        for (const auto &[name, tensor] : cache_)
+        // Snapshot non-GEMM names under lock, then process each tensor with
+        // lock held only for cache access/clone bookkeeping.
+        std::vector<std::string> non_gemm_names;
         {
-            // Only process non-GEMM weights (norms, embeddings, biases)
-            if (isGemmWeight(name))
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            non_gemm_names.reserve(cache_.size());
+            for (const auto &[name, tensor] : cache_)
             {
-                continue;
-            }
-
-            if (!tensor)
-            {
-                LOG_WARN("[WeightManager] Non-GEMM weight is null: " << name);
-                continue;
-            }
-
-            // Get the device-specific tensor if multi-GPU, otherwise use original
-            TensorBase *device_tensor = nullptr;
-
-            if (first_device_.has_value() && first_device_.value() == target_device)
-            {
-                // First device uses original tensor
-                device_tensor = tensor.get();
-            }
-            else if (first_device_.has_value())
-            {
-                // Subsequent devices need clones - check per-device cache
-                std::string cache_key = target_device.to_string() + ":" + name;
-                auto it = per_device_cache_.find(cache_key);
-                if (it != per_device_cache_.end())
+                if (!isGemmWeight(name) && tensor)
                 {
-                    device_tensor = it->second.get();
+                    non_gemm_names.push_back(name);
+                }
+            }
+        }
+
+        for (const auto &name : non_gemm_names)
+        {
+            std::shared_ptr<TensorBase> tensor;
+            std::shared_ptr<TensorBase> device_tensor_holder;
+
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto base_it = cache_.find(name);
+                if (base_it == cache_.end() || !base_it->second)
+                {
+                    LOG_WARN("[WeightManager] Non-GEMM weight missing from cache: " << name);
+                    continue;
+                }
+                tensor = base_it->second;
+
+                // Get the device-specific tensor if multi-GPU, otherwise use original
+                if (first_device_.has_value() && first_device_.value() == target_device)
+                {
+                    // First device uses original tensor
+                    device_tensor_holder = tensor;
+                }
+                else if (first_device_.has_value())
+                {
+                    // Subsequent devices need clones - check per-device cache
+                    std::string cache_key = target_device.to_string() + ":" + name;
+                    auto it = per_device_cache_.find(cache_key);
+                    if (it != per_device_cache_.end())
+                    {
+                        device_tensor_holder = it->second;
+                    }
+                    else
+                    {
+                        // Create clone for this device
+                        auto clone = cloneTensorForDevice(name, tensor, target_device);
+                        if (clone)
+                        {
+                            device_tensor_holder = clone;
+                            per_device_cache_[cache_key] = clone;
+                        }
+                    }
                 }
                 else
                 {
-                    // Create clone for this device
-                    auto clone = cloneTensorForDevice(name, tensor, target_device);
-                    if (clone)
-                    {
-                        device_tensor = clone.get();
-                        per_device_cache_[cache_key] = clone;
-                    }
+                    // First device not set yet, set it now
+                    first_device_ = target_device;
+                    device_tensor_holder = tensor;
                 }
             }
-            else
-            {
-                // First device not set yet, set it now
-                first_device_ = target_device;
-                device_tensor = tensor.get();
-            }
 
-            if (!device_tensor)
+            if (!device_tensor_holder)
             {
                 LOG_WARN("[WeightManager] Failed to get device tensor for: " << name);
                 continue;
             }
+
+            TensorBase *device_tensor = device_tensor_holder.get();
 
             // Set debug name so transfers can be traced
             device_tensor->setDebugName(name);
@@ -1695,12 +2192,15 @@ namespace llaminar2
                 size_t rows = device_tensor->shape()[0];
                 size_t cols = device_tensor->shape().size() > 1 ? device_tensor->shape()[1] : 1;
                 size_t bytes = rows * cols * sizeof(float);
+                markPrepState(name, target_device, WeightPrepState::UPLOADED_DEVICE, false, "non-GEMM ensureOnDevice completed");
+                markPrepState(name, target_device, WeightPrepState::READY, false, "non-GEMM ready");
                 LOG_TRACE("[WeightManager] Uploaded non-GEMM weight: " << name
                                                                        << " [" << rows << "x" << cols << "] = " << bytes << " bytes");
                 uploaded_count++;
             }
             else
             {
+                markPrepState(name, target_device, WeightPrepState::FAILED, false, "non-GEMM ensureOnDevice failed");
                 LOG_WARN("[WeightManager] Failed to upload non-GEMM weight: " << name);
             }
         }

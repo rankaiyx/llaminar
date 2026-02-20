@@ -202,8 +202,8 @@ namespace llaminar2
      *
      * Supported formats: IQ4_NL, Q6_K, Q8_0, etc.
      *
-     * NOTE: This interface decodes to FP32. For integer GEMM kernels that want
-     * raw quantized blocks, use IQuantizedTileAccessor instead.
+        * NOTE: This interface decodes to FP32. For integer GEMM kernels that want
+        * native int-domain access, use IINT8Unpackable instead.
      */
     class ITensorGemmTileDataProvider
     {
@@ -236,53 +236,6 @@ namespace llaminar2
          */
         virtual size_t decoder_rows() const = 0;
         virtual size_t decoder_cols() const = 0;
-        virtual size_t block_size() const = 0;
-    };
-
-    /**
-     * @brief Raw quantized weight block accessor (integer GEMM path)
-     *
-     * Unlike ITensorGemmTileDataProvider (which decodes to FP32), this interface
-     * exposes raw quantized blocks + metadata for integer GEMM kernels that want
-     * to defer dequantization (e.g., AVX512-VNNI INT8×IQ4_NL GEMM).
-     *
-     * Rationale:
-     * - FP32 GEMM: Decode weights to FP32 → multiply with FP32 activations
-     * - INT8 GEMM: Keep weights as int8, decode on-the-fly in registers,
-     *              apply scaling to final output (fused dequant)
-     *
-     * This avoids materializing FP32 weight buffers for integer kernels.
-     */
-    class IQuantizedTileAccessor
-    {
-    public:
-        virtual ~IQuantizedTileAccessor() = default;
-
-        /**
-         * @brief Get raw pointer to quantized block (no decode)
-         *
-         * @param row_idx Row index in weight tensor
-         * @param k_block_idx Block index along K dimension
-         * @return Const pointer to raw quantized block structure
-         *
-         * Example: For IQ4_NL, returns IQ4_NLBlock* = {uint8_t qs[16], uint16_t d}
-         */
-        virtual const void *get_raw_block(size_t row_idx, size_t k_block_idx) const = 0;
-
-        /**
-         * @brief Get dequantization scale for block
-         *
-         * @param row_idx Row index
-         * @param k_block_idx Block index
-         * @return FP32 scale factor (converted from FP16 if needed)
-         */
-        virtual float get_block_scale(size_t row_idx, size_t k_block_idx) const = 0;
-
-        /**
-         * @brief Get tensor dimensions
-         */
-        virtual size_t rows() const = 0;
-        virtual size_t cols() const = 0;
         virtual size_t block_size() const = 0;
     };
 

@@ -49,6 +49,7 @@
 #include <atomic>
 
 #include "../../backends/rocm/HipDeviceGuard.h"
+#include "ROCmRatioVNNIAbi.h"
 
 // ============================================================================
 // Kernel: gemv_int8_fp32
@@ -95,9 +96,16 @@ __device__ __constant__ int8_t k_ratio_vnni_iq4_lut_i8[16] = {
 
 __device__ __constant__ uint32_t k_ratio_iq4_perm_lut_words[1024];
 __device__ __constant__ uint32_t k_ratio_linear_perm_lut_words[1024];
+__device__ __constant__ uint32_t k_ratio_linear_unsigned_perm_lut_words[1024];
 
 static std::array<uint32_t, 1024> build_ratio_iq4_perm_lut_table_host()
 {
+    constexpr int8_t k_ratio_vnni_iq4_lut_i8_host[16] = {
+        -127, -104, -83, -65,
+        -49, -35, -22, -10,
+        1, 13, 25, 38,
+        53, 69, 89, 113};
+
     std::array<uint32_t, 1024> table{};
     for (int rb = 0; rb < 256; ++rb)
     {
@@ -111,10 +119,10 @@ static std::array<uint32_t, 1024> build_ratio_iq4_perm_lut_table_host()
 
         for (int i = 0; i < 4; ++i)
         {
-            const int8_t wi_lo_0 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i]) + 64) >> 7);
-            const int8_t wi_lo_1 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 4]) + 64) >> 7);
-            const int8_t wi_hi_0 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 8]) + 64) >> 7);
-            const int8_t wi_hi_1 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8[i + 12]) + 64) >> 7);
+            const int8_t wi_lo_0 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8_host[i]) + 64) >> 7);
+            const int8_t wi_lo_1 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8_host[i + 4]) + 64) >> 7);
+            const int8_t wi_hi_0 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8_host[i + 8]) + 64) >> 7);
+            const int8_t wi_hi_1 = static_cast<int8_t>((static_cast<int>(ratio) * static_cast<int>(k_ratio_vnni_iq4_lut_i8_host[i + 12]) + 64) >> 7);
 
             lut0 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_0)) << (i * 8));
             lut1 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_1)) << (i * 8));
@@ -149,6 +157,40 @@ static std::array<uint32_t, 1024> build_ratio_linear_perm_lut_table_host()
             const int8_t wi_lo_1 = static_cast<int8_t>((static_cast<int>(ratio) * (i - 4) + 64) >> 7);
             const int8_t wi_hi_0 = static_cast<int8_t>((static_cast<int>(ratio) * (i + 0) + 64) >> 7);
             const int8_t wi_hi_1 = static_cast<int8_t>((static_cast<int>(ratio) * (i + 4) + 64) >> 7);
+
+            lut0 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_0)) << (i * 8));
+            lut1 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_1)) << (i * 8));
+            lut2 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_hi_0)) << (i * 8));
+            lut3 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_hi_1)) << (i * 8));
+        }
+
+        table[base + 0] = lut0;
+        table[base + 1] = lut1;
+        table[base + 2] = lut2;
+        table[base + 3] = lut3;
+    }
+    return table;
+}
+
+static std::array<uint32_t, 1024> build_ratio_linear_unsigned_perm_lut_table_host()
+{
+    std::array<uint32_t, 1024> table{};
+    for (int rb = 0; rb < 256; ++rb)
+    {
+        const int8_t ratio = static_cast<int8_t>(rb);
+        const int base = rb * 4;
+
+        uint32_t lut0 = 0;
+        uint32_t lut1 = 0;
+        uint32_t lut2 = 0;
+        uint32_t lut3 = 0;
+
+        for (int i = 0; i < 4; ++i)
+        {
+            const int8_t wi_lo_0 = static_cast<int8_t>((static_cast<int>(ratio) * (i + 0) + 64) >> 7);
+            const int8_t wi_lo_1 = static_cast<int8_t>((static_cast<int>(ratio) * (i + 4) + 64) >> 7);
+            const int8_t wi_hi_0 = static_cast<int8_t>((static_cast<int>(ratio) * (i + 8) + 64) >> 7);
+            const int8_t wi_hi_1 = static_cast<int8_t>((static_cast<int>(ratio) * (i + 12) + 64) >> 7);
 
             lut0 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_0)) << (i * 8));
             lut1 |= (static_cast<uint32_t>(static_cast<uint8_t>(wi_lo_1)) << (i * 8));
@@ -214,6 +256,35 @@ static bool ensure_ratio_linear_perm_lut_table_on_device(int device_id)
     if (err != hipSuccess)
     {
         fprintf(stderr, "[rocmGemv_ratio_vnni_int8_int32] Failed to init linear mode3 LUT table on device %d: %s\n",
+                did, hipGetErrorString(err));
+        return false;
+    }
+
+    initialized[did] = true;
+    return true;
+}
+
+static bool ensure_ratio_linear_unsigned_perm_lut_table_on_device(int device_id)
+{
+    static std::mutex init_mutex;
+    static bool initialized[16] = {false};
+    static const std::array<uint32_t, 1024> host_table = build_ratio_linear_unsigned_perm_lut_table_host();
+
+    const int did = (device_id >= 0 && device_id < 16) ? device_id : 0;
+    std::lock_guard<std::mutex> lock(init_mutex);
+    if (initialized[did])
+    {
+        return true;
+    }
+
+    hipError_t err = hipMemcpyToSymbol(HIP_SYMBOL(k_ratio_linear_unsigned_perm_lut_words),
+                                       host_table.data(),
+                                       host_table.size() * sizeof(uint32_t),
+                                       0,
+                                       hipMemcpyHostToDevice);
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_ratio_vnni_int8_int32] Failed to init linear unsigned mode3 LUT table on device %d: %s\n",
                 did, hipGetErrorString(err));
         return false;
     }
@@ -305,6 +376,59 @@ __device__ __forceinline__ int32_t decode_q4_group_to_packed_i8(
     return decode_q4_pack4_low<IQ4>(q0, q1, q2, q3, ratio);
 }
 
+template <bool HAS_MIN>
+__device__ __forceinline__ int32_t decode_q5_group_to_packed_i8_linear(
+    const uint8_t* payload20,
+    int group,
+    int8_t ratio,
+    int min_q)
+{
+    const uint8_t* qs = payload20;
+    const uint8_t* qh_bytes = payload20 + 16;
+    const uint32_t qh =
+        static_cast<uint32_t>(qh_bytes[0]) |
+        (static_cast<uint32_t>(qh_bytes[1]) << 8) |
+        (static_cast<uint32_t>(qh_bytes[2]) << 16) |
+        (static_cast<uint32_t>(qh_bytes[3]) << 24);
+
+    int8_t decoded[4];
+    #pragma unroll
+    for (int lane = 0; lane < 4; ++lane)
+    {
+        const int idx = group * 4 + lane;
+        const int j = idx & 0x0F;
+        const bool upper = (idx >= 16);
+        const uint8_t nibble = upper
+            ? static_cast<uint8_t>(qs[j] >> 4)
+            : static_cast<uint8_t>(qs[j] & 0x0F);
+        const uint8_t xh = upper
+            ? static_cast<uint8_t>((qh >> (j + 12)) & 0x10)
+            : static_cast<uint8_t>(((qh >> j) << 4) & 0x10);
+
+        int d = static_cast<int>(nibble | xh);
+        if constexpr (!HAS_MIN)
+        {
+            d -= 16;
+        }
+
+        int w = ((static_cast<int>(ratio) * d + 64) >> 7);
+        if constexpr (HAS_MIN)
+        {
+            w += min_q;
+        }
+
+        w = max(-128, min(127, w));
+        decoded[lane] = static_cast<int8_t>(w);
+    }
+
+    uint32_t packed = 0;
+    packed |= static_cast<uint32_t>(static_cast<uint8_t>(decoded[0]));
+    packed |= (static_cast<uint32_t>(static_cast<uint8_t>(decoded[1])) << 8);
+    packed |= (static_cast<uint32_t>(static_cast<uint8_t>(decoded[2])) << 16);
+    packed |= (static_cast<uint32_t>(static_cast<uint8_t>(decoded[3])) << 24);
+    return static_cast<int32_t>(packed);
+}
+
 template <bool IQ4>
 __device__ __forceinline__ void decode_q4_block8_to_packed_i8(
     const uint8_t* payload16,
@@ -342,6 +466,62 @@ __device__ __forceinline__ void decode_q4_block8_to_packed_i8(
     out[5] = decode_q4_pack4_high<IQ4>(q4, q5, q6, q7, ratio);
     out[6] = decode_q4_pack4_high<IQ4>(q8, q9, q10, q11, ratio);
     out[7] = decode_q4_pack4_high<IQ4>(q12, q13, q14, q15, ratio);
+}
+
+__device__ __forceinline__ int32_t add_min_clamp_to_packed_i8x4(
+    int32_t packed_i8x4,
+    int min_q)
+{
+    const int v0 = max(-128, min(127, static_cast<int>(static_cast<int8_t>(packed_i8x4 & 0xFF)) + min_q));
+    const int v1 = max(-128, min(127, static_cast<int>(static_cast<int8_t>((packed_i8x4 >> 8) & 0xFF)) + min_q));
+    const int v2 = max(-128, min(127, static_cast<int>(static_cast<int8_t>((packed_i8x4 >> 16) & 0xFF)) + min_q));
+    const int v3 = max(-128, min(127, static_cast<int>(static_cast<int8_t>((packed_i8x4 >> 24) & 0xFF)) + min_q));
+
+    uint32_t packed = 0;
+    packed |= static_cast<uint32_t>(static_cast<uint8_t>(v0));
+    packed |= (static_cast<uint32_t>(static_cast<uint8_t>(v1)) << 8);
+    packed |= (static_cast<uint32_t>(static_cast<uint8_t>(v2)) << 16);
+    packed |= (static_cast<uint32_t>(static_cast<uint8_t>(v3)) << 24);
+    return static_cast<int32_t>(packed);
+}
+
+__device__ __forceinline__ void decode_q4_block8_to_packed_i8_linear_with_min(
+    const uint8_t* payload16,
+    int8_t ratio,
+    int min_q,
+    int32_t out[8])
+{
+    const uint4 packed = *reinterpret_cast<const uint4*>(payload16);
+    const uint32_t p0 = packed.x;
+    const uint32_t p1 = packed.y;
+    const uint32_t p2 = packed.z;
+    const uint32_t p3 = packed.w;
+
+    const uint8_t q0 = static_cast<uint8_t>(p0 & 0xFFu);
+    const uint8_t q1 = static_cast<uint8_t>((p0 >> 8) & 0xFFu);
+    const uint8_t q2 = static_cast<uint8_t>((p0 >> 16) & 0xFFu);
+    const uint8_t q3 = static_cast<uint8_t>((p0 >> 24) & 0xFFu);
+    const uint8_t q4 = static_cast<uint8_t>(p1 & 0xFFu);
+    const uint8_t q5 = static_cast<uint8_t>((p1 >> 8) & 0xFFu);
+    const uint8_t q6 = static_cast<uint8_t>((p1 >> 16) & 0xFFu);
+    const uint8_t q7 = static_cast<uint8_t>((p1 >> 24) & 0xFFu);
+    const uint8_t q8 = static_cast<uint8_t>(p2 & 0xFFu);
+    const uint8_t q9 = static_cast<uint8_t>((p2 >> 8) & 0xFFu);
+    const uint8_t q10 = static_cast<uint8_t>((p2 >> 16) & 0xFFu);
+    const uint8_t q11 = static_cast<uint8_t>((p2 >> 24) & 0xFFu);
+    const uint8_t q12 = static_cast<uint8_t>(p3 & 0xFFu);
+    const uint8_t q13 = static_cast<uint8_t>((p3 >> 8) & 0xFFu);
+    const uint8_t q14 = static_cast<uint8_t>((p3 >> 16) & 0xFFu);
+    const uint8_t q15 = static_cast<uint8_t>((p3 >> 24) & 0xFFu);
+
+    out[0] = add_min_clamp_to_packed_i8x4(decode_q4_pack4_low<false>(q0, q1, q2, q3, ratio), min_q);
+    out[1] = add_min_clamp_to_packed_i8x4(decode_q4_pack4_low<false>(q4, q5, q6, q7, ratio), min_q);
+    out[2] = add_min_clamp_to_packed_i8x4(decode_q4_pack4_low<false>(q8, q9, q10, q11, ratio), min_q);
+    out[3] = add_min_clamp_to_packed_i8x4(decode_q4_pack4_low<false>(q12, q13, q14, q15, ratio), min_q);
+    out[4] = add_min_clamp_to_packed_i8x4(decode_q4_pack4_high<false>(q0, q1, q2, q3, ratio), min_q);
+    out[5] = add_min_clamp_to_packed_i8x4(decode_q4_pack4_high<false>(q4, q5, q6, q7, ratio), min_q);
+    out[6] = add_min_clamp_to_packed_i8x4(decode_q4_pack4_high<false>(q8, q9, q10, q11, ratio), min_q);
+    out[7] = add_min_clamp_to_packed_i8x4(decode_q4_pack4_high<false>(q12, q13, q14, q15, ratio), min_q);
 }
 
 
@@ -426,6 +606,20 @@ __device__ __forceinline__ void fetch_linear_perm_lut_words_from_ratio_table(
     lut3 = k_ratio_linear_perm_lut_words[idx + 3];
 }
 
+__device__ __forceinline__ void fetch_linear_unsigned_perm_lut_words_from_ratio_table(
+    int8_t ratio,
+    uint32_t& lut0,
+    uint32_t& lut1,
+    uint32_t& lut2,
+    uint32_t& lut3)
+{
+    const uint32_t idx = static_cast<uint32_t>(static_cast<uint8_t>(ratio)) * 4u;
+    lut0 = k_ratio_linear_unsigned_perm_lut_words[idx + 0];
+    lut1 = k_ratio_linear_unsigned_perm_lut_words[idx + 1];
+    lut2 = k_ratio_linear_unsigned_perm_lut_words[idx + 2];
+    lut3 = k_ratio_linear_unsigned_perm_lut_words[idx + 3];
+}
+
 __global__ void gemv_int8_int8_vnni_kernel(
     const int8_t* __restrict__ d_A_int8,
     const int8_t* __restrict__ d_B_int8_vnni,
@@ -451,6 +645,483 @@ __global__ void gemv_int8_int8_vnni_kernel(
     }
 
     d_C_int32[n] = acc;
+}
+
+/**
+ * @brief 2D INT8 VNNI prefill kernel (M>1): computes C[M,N] in one launch.
+ *
+ * Thread mapping:
+ * - threadIdx.y / blockIdx.y choose output row `m`
+ * - threadIdx.x / blockIdx.x choose output column `n`
+ *
+ * For each output element C[m,n], we iterate over K in groups of 4 bytes and
+ * use `v_dot4_i32_i8` (`__builtin_amdgcn_sdot4`) for efficient INT8 MAC.
+ *
+ * Layout reminder for junior developers:
+ * - A is row-major [M x K]
+ * - B is VNNI-packed [K/4 x N x 4]
+ * - C is row-major [M x N]
+ */
+template <int BLOCK_X, int BLOCK_Y, int CPT>
+__global__ void gemm_int8_int8_vnni_prefill_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K)
+{
+    const int n_base = blockIdx.x * (BLOCK_X * CPT) + threadIdx.x * CPT;
+    const int m = blockIdx.y * BLOCK_Y + threadIdx.y;
+    if (m >= M || n_base >= N)
+    {
+        return;
+    }
+
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        acc[c] = 0;
+    }
+
+    const int k_groups = K / 4;
+
+    // Compute one output element by reducing across K.
+    for (int kg = 0; kg < k_groups; ++kg)
+    {
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(
+            d_A_int8 + static_cast<int64_t>(m) * K + kg * 4);
+
+        if constexpr (CPT == 4)
+        {
+            if ((n_base + 3) < N)
+            {
+                const uint4 b_pack4 = *reinterpret_cast<const uint4*>(
+                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+        }
+        else if constexpr (CPT == 2)
+        {
+            if ((n_base + 1) < N)
+            {
+                const uint2 b_pack2 = *reinterpret_cast<const uint2*>(
+                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+        }
+        else
+        {
+            const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+        }
+    }
+
+    if constexpr (CPT == 4)
+    {
+        if ((n_base + 3) < N)
+        {
+            *reinterpret_cast<uint4*>(d_C_int32 + static_cast<int64_t>(m) * N + n_base) =
+                make_uint4(static_cast<uint32_t>(acc[0]), static_cast<uint32_t>(acc[1]), static_cast<uint32_t>(acc[2]), static_cast<uint32_t>(acc[3]));
+        }
+        else
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                const int n = n_base + c;
+                if (n < N)
+                {
+                    d_C_int32[static_cast<int64_t>(m) * N + n] = acc[c];
+                }
+            }
+        }
+    }
+    else if constexpr (CPT == 2)
+    {
+        if ((n_base + 1) < N)
+        {
+            *reinterpret_cast<uint2*>(d_C_int32 + static_cast<int64_t>(m) * N + n_base) =
+                make_uint2(static_cast<uint32_t>(acc[0]), static_cast<uint32_t>(acc[1]));
+        }
+        else
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                const int n = n_base + c;
+                if (n < N)
+                {
+                    d_C_int32[static_cast<int64_t>(m) * N + n] = acc[c];
+                }
+            }
+        }
+    }
+    else
+    {
+        d_C_int32[static_cast<int64_t>(m) * N + n_base] = acc[0];
+    }
+}
+
+/**
+ * @brief 2D INT8 VNNI prefill kernel with grid-kpar split-K accumulation.
+ *
+ * grid.z partitions K into slices. Each z-slice computes a partial sum for
+ * C[m,n] and atomically accumulates into INT32 output.
+ */
+template <int BLOCK_X, int BLOCK_Y, int CPT>
+__global__ void gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K,
+    int k_groups_per_slice)
+{
+    const int n_base = blockIdx.x * (BLOCK_X * CPT) + threadIdx.x * CPT;
+    const int m = blockIdx.y * BLOCK_Y + threadIdx.y;
+    const int split_idx = blockIdx.z;
+
+    if (m >= M || n_base >= N)
+    {
+        return;
+    }
+
+    const int total_k_groups = K / 4;
+    const int k_begin = split_idx * k_groups_per_slice;
+    if (k_begin >= total_k_groups)
+    {
+        return;
+    }
+
+    const int k_end = min(total_k_groups, k_begin + k_groups_per_slice);
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        acc[c] = 0;
+    }
+
+    for (int kg = k_begin; kg < k_end; ++kg)
+    {
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(
+            d_A_int8 + static_cast<int64_t>(m) * K + kg * 4);
+
+        if constexpr (CPT == 4)
+        {
+            if ((n_base + 3) < N)
+            {
+                const uint4 b_pack4 = *reinterpret_cast<const uint4*>(
+                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+        }
+        else if constexpr (CPT == 2)
+        {
+            if ((n_base + 1) < N)
+            {
+                const uint2 b_pack2 = *reinterpret_cast<const uint2*>(
+                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+        }
+        else
+        {
+            const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n < N && acc[c] != 0)
+        {
+            atomicAdd(&d_C_int32[static_cast<int64_t>(m) * N + n], acc[c]);
+        }
+    }
+}
+
+/**
+ * @brief 2D ratio-VNNI prefill kernel (M>1): computes C[M,N] in one launch.
+ *
+ * This kernel mirrors the INT8-VNNI prefill shape traversal but decodes the
+ * compact ratio-VNNI payload per (block, column) on the fly, avoiding a full
+ * row-major expansion buffer.
+ *
+ * Layout reminder:
+ * - A is row-major INT8 [M x K]
+ * - Payload is [K/32 x N x 16 bytes]
+ * - Ratio side metadata is [K/32 x N]
+ * - C is row-major INT32 [M x N]
+ */
+template <bool IQ4, bool BITWIDTH5>
+__global__ void gemm_ratio_vnni_prefill_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const uint8_t* __restrict__ d_payload,
+    const int8_t* __restrict__ d_ratio,
+    const int8_t* __restrict__ d_min,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K,
+    uint8_t has_min,
+    int kblocks)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m >= M || n >= N)
+    {
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const int kb = max(1, kblocks);
+    const int b_per = (blocks_per_row + kb - 1) / kb;
+    const int b0 = min(blocks_per_row, static_cast<int>(blockIdx.z) * b_per);
+    const int b1 = min(blocks_per_row, b0 + b_per);
+
+    if (b0 >= b1)
+    {
+        return;
+    }
+
+    int32_t acc = 0;
+
+    for (int b = b0; b < b1; ++b)
+    {
+        const int32_t* a4 = reinterpret_cast<const int32_t*>(
+            d_A_int8 + static_cast<int64_t>(m) * K + b * 32);
+
+        const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
+        constexpr size_t payload_stride = BITWIDTH5 ? 20u : 16u;
+        const uint8_t* payload_ptr = d_payload + linear * payload_stride;
+        const int8_t ratio = d_ratio[linear];
+
+        int32_t packed_groups[8];
+        if constexpr (BITWIDTH5)
+        {
+            if (has_min != 0)
+            {
+                const int min_q = static_cast<int>(d_min[linear]);
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                {
+                    packed_groups[g] = decode_q5_group_to_packed_i8_linear<true>(payload_ptr, g, ratio, min_q);
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                {
+                    packed_groups[g] = decode_q5_group_to_packed_i8_linear<false>(payload_ptr, g, ratio, 0);
+                }
+            }
+        }
+        else if (has_min != 0)
+        {
+            const int min_q = static_cast<int>(d_min[linear]);
+            const uint4 packed = *reinterpret_cast<const uint4*>(payload_ptr);
+            uint32_t lut0 = 0;
+            uint32_t lut1 = 0;
+            uint32_t lut2 = 0;
+            uint32_t lut3 = 0;
+            fetch_linear_unsigned_perm_lut_words_from_ratio_table(ratio, lut0, lut1, lut2, lut3);
+
+            int32_t w0_low, w0_high, w1_low, w1_high;
+            decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.x, packed.y, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
+            packed_groups[0] = add_min_clamp_to_packed_i8x4(w0_low, min_q);
+            packed_groups[4] = add_min_clamp_to_packed_i8x4(w0_high, min_q);
+            packed_groups[1] = add_min_clamp_to_packed_i8x4(w1_low, min_q);
+            packed_groups[5] = add_min_clamp_to_packed_i8x4(w1_high, min_q);
+
+            decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.z, packed.w, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
+            packed_groups[2] = add_min_clamp_to_packed_i8x4(w0_low, min_q);
+            packed_groups[6] = add_min_clamp_to_packed_i8x4(w0_high, min_q);
+            packed_groups[3] = add_min_clamp_to_packed_i8x4(w1_low, min_q);
+            packed_groups[7] = add_min_clamp_to_packed_i8x4(w1_high, min_q);
+        }
+        else
+        {
+            const uint4 packed = *reinterpret_cast<const uint4*>(payload_ptr);
+            uint32_t lut0 = 0;
+            uint32_t lut1 = 0;
+            uint32_t lut2 = 0;
+            uint32_t lut3 = 0;
+
+            if constexpr (IQ4)
+            {
+                fetch_iq4_perm_lut_words_from_ratio_table(ratio, lut0, lut1, lut2, lut3);
+            }
+            else
+            {
+                fetch_linear_perm_lut_words_from_ratio_table(ratio, lut0, lut1, lut2, lut3);
+            }
+
+            int32_t w0_low, w0_high, w1_low, w1_high;
+            decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.x, packed.y, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
+            packed_groups[0] = w0_low;
+            packed_groups[4] = w0_high;
+            packed_groups[1] = w1_low;
+            packed_groups[5] = w1_high;
+
+            decode_q4_two_pairs_to_packed_i8_with_perm_lut16(packed.z, packed.w, lut0, lut1, lut2, lut3, w0_low, w0_high, w1_low, w1_high);
+            packed_groups[2] = w0_low;
+            packed_groups[6] = w0_high;
+            packed_groups[3] = w1_low;
+            packed_groups[7] = w1_high;
+        }
+
+        #pragma unroll
+        for (int g = 0; g < 8; ++g)
+        {
+            acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc, false);
+        }
+    }
+
+    const int64_t out_idx = static_cast<int64_t>(m) * N + n;
+    if (kb == 1)
+    {
+        d_C_int32[out_idx] = acc;
+    }
+    else
+    {
+        atomicAdd(&d_C_int32[out_idx], acc);
+    }
+}
+
+/**
+ * @brief 2D payload-v2 bitwidth-8 prefill kernel (M>1): computes C[M,N].
+ *
+ * Layout:
+ * - A is row-major INT8 [M x K]
+ * - Payload is [K/32 x N x 32 bytes] where each record stores 32 signed INT8
+ *   values for one (block, output-column)
+ * - C is row-major INT32 [M x N]
+ */
+__global__ void gemm_payload_v2_i8_prefill_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const uint8_t* __restrict__ d_payload,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K,
+    int kblocks)
+{
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int m = blockIdx.y * blockDim.y + threadIdx.y;
+    if (m >= M || n >= N)
+    {
+        return;
+    }
+
+    const int blocks_per_row = K / 32;
+    const int kb = max(1, kblocks);
+    const int b_per = (blocks_per_row + kb - 1) / kb;
+    const int b0 = min(blocks_per_row, static_cast<int>(blockIdx.z) * b_per);
+    const int b1 = min(blocks_per_row, b0 + b_per);
+
+    if (b0 >= b1)
+    {
+        return;
+    }
+
+    int32_t acc = 0;
+
+    for (int b = b0; b < b1; ++b)
+    {
+        const int32_t* a4 = reinterpret_cast<const int32_t*>(
+            d_A_int8 + static_cast<int64_t>(m) * K + b * 32);
+
+        const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
+        const int32_t* payload_i32 = reinterpret_cast<const int32_t*>(d_payload + linear * 32u);
+
+        #pragma unroll
+        for (int g = 0; g < 8; ++g)
+        {
+            acc = __builtin_amdgcn_sdot4(a4[g], payload_i32[g], acc, false);
+        }
+    }
+
+    const int64_t out_idx = static_cast<int64_t>(m) * N + n;
+    if (kb == 1)
+    {
+        d_C_int32[out_idx] = acc;
+    }
+    else
+    {
+        atomicAdd(&d_C_int32[out_idx], acc);
+    }
 }
 
 template <int TILE_N, int CPT, bool VEC_PACKED_LOAD>
@@ -1048,9 +1719,11 @@ __global__ void gemv_ratio_vnni_grid_kpar_kernel_t(
 __global__ void expand_ratio_vnni_to_rowmajor_q4_kernel(
     const uint8_t* __restrict__ d_payload,
     const int8_t* __restrict__ d_ratio,
+    const int8_t* __restrict__ d_min,
     int8_t* __restrict__ d_B_rowmajor,
     int N, int K,
-    uint8_t codebook_id)
+    uint8_t codebook_id,
+    uint8_t has_min)
 {
     const int blocks_per_row = K / 32;
     const int total = N * blocks_per_row;
@@ -1064,6 +1737,24 @@ __global__ void expand_ratio_vnni_to_rowmajor_q4_kernel(
     const uint8_t* payload16 = d_payload + linear * 16;
     const int8_t ratio = d_ratio[linear];
     int8_t* row_ptr = d_B_rowmajor + static_cast<int64_t>(n) * K + b * 32;
+
+    if (has_min != 0)
+    {
+        const int min_q = static_cast<int>(d_min[linear]);
+        #pragma unroll
+        for (int i = 0; i < 16; ++i)
+        {
+            const uint8_t q = payload16[i];
+            const int low = ((static_cast<int>(ratio) * static_cast<int>(q & 0x0Fu) + 64) >> 7) + min_q;
+            const int high = ((static_cast<int>(ratio) * static_cast<int>(q >> 4) + 64) >> 7) + min_q;
+
+            const int low_clamped = max(-128, min(127, low));
+            const int high_clamped = max(-128, min(127, high));
+            row_ptr[i] = static_cast<int8_t>(low_clamped);
+            row_ptr[i + 16] = static_cast<int8_t>(high_clamped);
+        }
+        return;
+    }
 
     int32_t packed_groups[8];
     if (codebook_id == RATIO_VNNI_CODEBOOK_IQ4)
@@ -1079,6 +1770,38 @@ __global__ void expand_ratio_vnni_to_rowmajor_q4_kernel(
     for (int g = 0; g < 8; ++g)
     {
         *reinterpret_cast<int32_t*>(row_ptr + g * 4) = packed_groups[g];
+    }
+}
+
+__global__ void expand_ratio_vnni_to_rowmajor_q5_kernel(
+    const uint8_t* __restrict__ d_payload,
+    const int8_t* __restrict__ d_ratio,
+    const int8_t* __restrict__ d_min,
+    int8_t* __restrict__ d_B_rowmajor,
+    int N, int K,
+    uint8_t has_min)
+{
+    const int blocks_per_row = K / 32;
+    const int total = N * blocks_per_row;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total) return;
+
+    const int n = tid % N;
+    const int b = tid / N;
+    const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
+
+    const uint8_t* payload20 = d_payload + linear * 20;
+    const int8_t ratio = d_ratio[linear];
+    const int min_q = (has_min != 0) ? static_cast<int>(d_min[linear]) : 0;
+    int8_t* row_ptr = d_B_rowmajor + static_cast<int64_t>(n) * K + b * 32;
+
+    #pragma unroll
+    for (int g = 0; g < 8; ++g)
+    {
+        const int32_t packed = (has_min != 0)
+            ? decode_q5_group_to_packed_i8_linear<true>(payload20, g, ratio, min_q)
+            : decode_q5_group_to_packed_i8_linear<false>(payload20, g, ratio, 0);
+        *reinterpret_cast<int32_t*>(row_ptr + g * 4) = packed;
     }
 }
 
@@ -1926,6 +2649,7 @@ bool rocmGemv_ratio_vnni_int8_int32(
 bool rocmGemv_expandRatioVNNI_to_rowmajor(
     const uint8_t* d_payload,
     const int8_t* d_ratio,
+    const int8_t* d_min,
     int8_t* d_B_rowmajor,
     int N, int K,
     uint8_t bitwidth,
@@ -1937,11 +2661,33 @@ bool rocmGemv_expandRatioVNNI_to_rowmajor(
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    if (bitwidth != 4 || has_min != 0 || block_size != 32 || payload_bytes != 16)
+    const bool is_q4 = (bitwidth == 4 && block_size == 32 && payload_bytes == 16);
+    const bool is_q5 = (bitwidth == 5 && block_size == 32 && payload_bytes == 20);
+    if (!is_q4 && !is_q5)
     {
         fprintf(stderr, "[rocmGemv_expandRatioVNNI_to_rowmajor] Unsupported header (bitwidth=%u has_min=%u block=%u payload=%u)\n",
                 static_cast<unsigned>(bitwidth), static_cast<unsigned>(has_min),
                 static_cast<unsigned>(block_size), static_cast<unsigned>(payload_bytes));
+        return false;
+    }
+
+    if (has_min != 0 && !d_min)
+    {
+        fprintf(stderr, "[rocmGemv_expandRatioVNNI_to_rowmajor] has_min set but min side-channel pointer is null\n");
+        return false;
+    }
+
+    if (has_min != 0 && codebook_id != RATIO_VNNI_CODEBOOK_LINEAR)
+    {
+        fprintf(stderr, "[rocmGemv_expandRatioVNNI_to_rowmajor] has_min currently supports only linear codebook (codebook_id=%u)\n",
+                static_cast<unsigned>(codebook_id));
+        return false;
+    }
+
+    if (is_q5 && codebook_id != RATIO_VNNI_CODEBOOK_LINEAR)
+    {
+        fprintf(stderr, "[rocmGemv_expandRatioVNNI_to_rowmajor] bitwidth=5 currently supports only linear codebook (codebook_id=%u)\n",
+                static_cast<unsigned>(codebook_id));
         return false;
     }
     if ((K % 32) != 0)
@@ -1955,10 +2701,20 @@ bool rocmGemv_expandRatioVNNI_to_rowmajor(
     constexpr int BLOCK = 256;
     const int grid = (total + BLOCK - 1) / BLOCK;
 
-    hipLaunchKernelGGL(
-        expand_ratio_vnni_to_rowmajor_q4_kernel,
-        dim3(grid), dim3(BLOCK), 0, static_cast<hipStream_t>(stream),
-        d_payload, d_ratio, d_B_rowmajor, N, K, codebook_id);
+    if (is_q4)
+    {
+        hipLaunchKernelGGL(
+            expand_ratio_vnni_to_rowmajor_q4_kernel,
+            dim3(grid), dim3(BLOCK), 0, static_cast<hipStream_t>(stream),
+            d_payload, d_ratio, d_min, d_B_rowmajor, N, K, codebook_id, has_min);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            expand_ratio_vnni_to_rowmajor_q5_kernel,
+            dim3(grid), dim3(BLOCK), 0, static_cast<hipStream_t>(stream),
+            d_payload, d_ratio, d_min, d_B_rowmajor, N, K, has_min);
+    }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -2163,6 +2919,737 @@ bool rocmGemv_repackVNNI_to_rowmajor(
     }
 
     return true;
+}
+
+/**
+ * @brief Experimental scaffold entrypoint for INT8 VNNI prefill GEMM.
+ *
+ * This function exists to stabilize API wiring while the real M>1 kernel is
+ * still under active implementation. Returning false here is intentional: it
+ * instructs the caller to keep using the proven CK fallback path.
+ *
+ * Junior-dev note:
+ * - The decode path (M=1) already has specialized GEMV kernels.
+ * - Prefill path (M>1) will eventually land here with tiled GEMM kernels.
+ * - Until then, this entrypoint provides a safe hook for incremental rollout.
+ */
+enum PrefillInt8TileVariant : int
+{
+    PREFILL_TILE_16x16 = 0,
+    PREFILL_TILE_32x8 = 1,
+    PREFILL_TILE_8x32 = 2,
+    PREFILL_TILE_8x8 = 3,
+};
+
+static const char *prefillTileVariantName(int variant)
+{
+    switch (variant)
+    {
+    case PREFILL_TILE_16x16:
+        return "16x16";
+    case PREFILL_TILE_32x8:
+        return "32x8";
+    case PREFILL_TILE_8x32:
+        return "8x32";
+    case PREFILL_TILE_8x8:
+        return "8x8";
+    default:
+        return "unknown";
+    }
+}
+
+static int select_prefill_int8_tile_variant_auto(int M, int N, int K, bool grid_kpar)
+{
+    (void)K;
+    if (M <= 12 && N <= 512)
+    {
+        return PREFILL_TILE_8x8;
+    }
+
+    if (N >= 4 * M && N >= 1024)
+    {
+        return PREFILL_TILE_32x8;
+    }
+
+    if (M >= 4 * N && M >= 128)
+    {
+        return PREFILL_TILE_8x32;
+    }
+
+    if (grid_kpar && N >= 2 * M && N >= 2048)
+    {
+        return PREFILL_TILE_32x8;
+    }
+
+    return PREFILL_TILE_16x16;
+}
+
+static int resolve_prefill_int8_tile_variant(int forced_variant, int M, int N, int K, bool grid_kpar)
+{
+    if (forced_variant >= PREFILL_TILE_16x16 && forced_variant <= PREFILL_TILE_8x8)
+    {
+        return forced_variant;
+    }
+    return select_prefill_int8_tile_variant_auto(M, N, K, grid_kpar);
+}
+
+bool rocmGemm_int8_int8_int32_vnni_prefill(
+    const int8_t* d_A_int8,
+    const int8_t* d_B_int8_vnni,
+    int32_t* d_C_int32,
+    int M, int N, int K,
+    int tile_variant,
+    int cpt,
+    int device_id, void* stream)
+{
+    if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+    {
+        fprintf(stderr, "[rocmGemm_int8_int8_int32_vnni_prefill] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+        return false;
+    }
+
+    if ((K % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemm_int8_int8_int32_vnni_prefill] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    const int variant = resolve_prefill_int8_tile_variant(tile_variant, M, N, K, false);
+    const int cpt_v = (cpt == 2 || cpt == 4) ? cpt : 1;
+
+    if (variant == PREFILL_TILE_32x8)
+    {
+        constexpr int BX = 32;
+        constexpr int BY = 8;
+        const dim3 block(BX, BY, 1);
+        if (cpt_v == 4)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 4>),
+                               dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else if (cpt_v == 2)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 2>),
+                               dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 1>),
+                               dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+    }
+    else if (variant == PREFILL_TILE_8x32)
+    {
+        constexpr int BX = 8;
+        constexpr int BY = 32;
+        const dim3 block(BX, BY, 1);
+        if (cpt_v == 4)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 4>),
+                               dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else if (cpt_v == 2)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 2>),
+                               dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 1>),
+                               dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+    }
+    else if (variant == PREFILL_TILE_8x8)
+    {
+        constexpr int BX = 8;
+        constexpr int BY = 8;
+        const dim3 block(BX, BY, 1);
+        if (cpt_v == 4)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 4>),
+                               dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else if (cpt_v == 2)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 2>),
+                               dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 1>),
+                               dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+    }
+    else
+    {
+        constexpr int BX = 16;
+        constexpr int BY = 16;
+        const dim3 block(BX, BY, 1);
+        if (cpt_v == 4)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 4>),
+                               dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else if (cpt_v == 2)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 2>),
+                               dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 1>),
+                               dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+        }
+    }
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemm_int8_int8_int32_vnni_prefill] Kernel launch failed: %s (M=%d N=%d K=%d)\n",
+                hipGetErrorString(err), M, N, K);
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Experimental INT8 VNNI prefill grid-kpar split-K variant.
+ *
+ * This variant uses grid.z to split K reduction into slices with INT32
+ * atomic accumulation. It is opt-in from higher-level dispatch.
+ */
+bool rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(
+    const int8_t* d_A_int8,
+    const int8_t* d_B_int8_vnni,
+    int32_t* d_C_int32,
+    int M, int N, int K,
+    int split_k_slices,
+    int tile_variant,
+    int cpt,
+    int device_id, void* stream)
+{
+    if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+    {
+        fprintf(stderr, "[rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+        return false;
+    }
+
+    if ((K % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+        return false;
+    }
+
+    const int total_k_groups = K / 4;
+    const int slices = max(1, min(split_k_slices, total_k_groups));
+    const int k_groups_per_slice = (total_k_groups + slices - 1) / slices;
+
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    const size_t c_bytes = static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(int32_t);
+    hipError_t memset_err = hipMemsetAsync(d_C_int32, 0, c_bytes, static_cast<hipStream_t>(stream));
+    if (memset_err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar] hipMemsetAsync failed: %s\n", hipGetErrorString(memset_err));
+        return false;
+    }
+
+    const int variant = resolve_prefill_int8_tile_variant(tile_variant, M, N, K, true);
+    const int cpt_v = (cpt == 2 || cpt == 4) ? cpt : 1;
+
+    if (variant == PREFILL_TILE_32x8)
+    {
+        constexpr int BX = 32;
+        constexpr int BY = 8;
+        const dim3 block(BX, BY, 1);
+        if (cpt_v == 4)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                               dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+        else if (cpt_v == 2)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                               dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                               dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+    }
+    else if (variant == PREFILL_TILE_8x32)
+    {
+        constexpr int BX = 8;
+        constexpr int BY = 32;
+        const dim3 block(BX, BY, 1);
+        if (cpt_v == 4)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                               dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+        else if (cpt_v == 2)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                               dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                               dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+    }
+    else if (variant == PREFILL_TILE_8x8)
+    {
+        constexpr int BX = 8;
+        constexpr int BY = 8;
+        const dim3 block(BX, BY, 1);
+        if (cpt_v == 4)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                               dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+        else if (cpt_v == 2)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                               dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                               dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+    }
+    else
+    {
+        constexpr int BX = 16;
+        constexpr int BY = 16;
+        const dim3 block(BX, BY, 1);
+        if (cpt_v == 4)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                               dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+        else if (cpt_v == 2)
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                               dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+        else
+        {
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                               dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                               block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+        }
+    }
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar] Kernel launch failed: %s (M=%d N=%d K=%d slices=%d)\n",
+                hipGetErrorString(err), M, N, K, slices);
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Native ratio-VNNI prefill GEMM entrypoint (M>1), ABI v2.
+ *
+ * ABI v2 takes a versioned descriptor to allow future payload families
+ * (different block sizes / side metadata) without changing this function
+ * signature again.
+ */
+bool rocmGemm_ratio_vnni_int8_int32_prefill_v2(
+    const int8_t* d_A_int8,
+    const uint8_t* d_payload,
+    const int8_t* d_ratio,
+    const int8_t* d_min,
+    int32_t* d_C_int32,
+    int M, int N, int K,
+    const llaminar2::rocm::ROCmRatioVNNIPrefillAbiV2Desc* abi,
+    int prefill_variant,
+    int prefill_kb,
+    int device_id, void* stream)
+{
+    if (!d_A_int8 || !d_payload || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+        return false;
+    }
+
+    if (!abi)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Null ABI descriptor\n");
+        return false;
+    }
+
+    if (abi->abi_version != llaminar2::rocm::ROCM_RATIO_VNNI_PREFILL_ABI_V2)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Unsupported abi_version=%u\n",
+                static_cast<unsigned>(abi->abi_version));
+        return false;
+    }
+
+    const bool is_q4_family = (abi->bitwidth == 4 && abi->block_size == 32 && abi->payload_bytes == 16);
+    const bool is_q5_family = (abi->bitwidth == 5 && abi->block_size == 32 && abi->payload_bytes == 20);
+    const bool is_i8_payload_family = (abi->bitwidth == 8 && abi->block_size == 32 && abi->payload_bytes == 32);
+    if (!is_q4_family && !is_q5_family && !is_i8_payload_family)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Unsupported descriptor (bitwidth=%u has_min=%u block=%u payload=%u)\n",
+                static_cast<unsigned>(abi->bitwidth), static_cast<unsigned>(abi->has_min),
+                static_cast<unsigned>(abi->block_size), static_cast<unsigned>(abi->payload_bytes));
+        return false;
+    }
+
+    if ((K % 32) != 0)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] K must be multiple of 32 (M=%d N=%d K=%d)\n", M, N, K);
+        return false;
+    }
+
+    const uint32_t expected_blocks_per_row = static_cast<uint32_t>(K / 32);
+    if (abi->blocks_per_row != 0 && abi->blocks_per_row != expected_blocks_per_row)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] blocks_per_row mismatch (abi=%u expected=%u K=%d)\n",
+                static_cast<unsigned>(abi->blocks_per_row), static_cast<unsigned>(expected_blocks_per_row), K);
+        return false;
+    }
+
+    if (abi->payload_stride_bytes != abi->payload_bytes)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Unsupported payload stride (payload_stride=%u payload_bytes=%u)\n",
+                static_cast<unsigned>(abi->payload_stride_bytes),
+                static_cast<unsigned>(abi->payload_bytes));
+        return false;
+    }
+
+    if (!is_i8_payload_family)
+    {
+        if (abi->ratio_bytes != 1 || abi->ratio_stride_bytes != 1 || !d_ratio)
+        {
+            fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Unsupported or missing ratio side-channel for bitwidth=%u (ratio_bytes=%u ratio_stride=%u d_ratio=%p)\n",
+                    static_cast<unsigned>(abi->bitwidth),
+                    static_cast<unsigned>(abi->ratio_bytes),
+                    static_cast<unsigned>(abi->ratio_stride_bytes),
+                    static_cast<const void*>(d_ratio));
+            return false;
+        }
+    }
+    else
+    {
+        if (abi->has_min != 0 || abi->codebook_id != RATIO_VNNI_CODEBOOK_LINEAR)
+        {
+            fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] bitwidth=8 payload family requires has_min=0 and linear codebook (has_min=%u codebook_id=%u)\n",
+                    static_cast<unsigned>(abi->has_min),
+                    static_cast<unsigned>(abi->codebook_id));
+            return false;
+        }
+    }
+
+    if (abi->has_min != 0)
+    {
+        if (!d_min)
+        {
+            fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] has_min set but min side-channel pointer is null\n");
+            return false;
+        }
+        if (abi->codebook_id != RATIO_VNNI_CODEBOOK_LINEAR)
+        {
+            fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] has_min currently supports only linear codebook (codebook_id=%u)\n",
+                    static_cast<unsigned>(abi->codebook_id));
+            return false;
+        }
+        if (abi->min_bytes != 1 || abi->min_stride_bytes != 1)
+        {
+            fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Unsupported min side-channel config (min_bytes=%u min_stride=%u)\n",
+                    static_cast<unsigned>(abi->min_bytes),
+                    static_cast<unsigned>(abi->min_stride_bytes));
+            return false;
+        }
+    }
+
+    if (abi->codebook_id != RATIO_VNNI_CODEBOOK_IQ4 && abi->codebook_id != RATIO_VNNI_CODEBOOK_LINEAR)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Unsupported codebook_id=%u\n", static_cast<unsigned>(abi->codebook_id));
+        return false;
+    }
+
+    if (is_q5_family && abi->codebook_id != RATIO_VNNI_CODEBOOK_LINEAR)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] bitwidth=5 currently supports only linear codebook (codebook_id=%u)\n",
+                static_cast<unsigned>(abi->codebook_id));
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if (is_q4_family)
+    {
+        bool lut_ok = false;
+        if (abi->has_min != 0)
+        {
+            lut_ok = ensure_ratio_linear_unsigned_perm_lut_table_on_device(device_id);
+        }
+        else if (abi->codebook_id == RATIO_VNNI_CODEBOOK_IQ4)
+        {
+            lut_ok = ensure_ratio_iq4_perm_lut_table_on_device(device_id);
+        }
+        else
+        {
+            lut_ok = ensure_ratio_linear_perm_lut_table_on_device(device_id);
+        }
+
+        if (!lut_ok)
+        {
+            fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Failed to initialize ratio perm LUT table on device\n");
+            return false;
+        }
+    }
+
+    int block_x = 16;
+    int block_y = 16;
+    if (prefill_variant >= 0)
+    {
+        switch (prefill_variant)
+        {
+        case 0:
+            block_x = 16;
+            block_y = 16;
+            break;
+        case 1:
+            block_x = 32;
+            block_y = 8;
+            break;
+        case 2:
+            block_x = 8;
+            block_y = 32;
+            break;
+        case 3:
+            block_x = 8;
+            block_y = 8;
+            break;
+        default:
+            break;
+        }
+    }
+    else
+    {
+        if (N >= 12288 && M <= 256)
+        {
+            block_x = 32;
+            block_y = 8;
+        }
+        else if (M >= 384 && N <= 4096)
+        {
+            block_x = 8;
+            block_y = 32;
+        }
+    }
+
+    int kb = prefill_kb;
+    if (kb <= 0)
+    {
+        if (K >= 16384)
+        {
+            kb = 8;
+        }
+        else if (K >= 8192)
+        {
+            kb = 4;
+        }
+        else if (K >= 4096)
+        {
+            kb = 2;
+        }
+        else
+        {
+            kb = 1;
+        }
+    }
+    kb = max(1, min(32, kb));
+
+    if (kb > 1)
+    {
+        const hipError_t memset_err = hipMemsetAsync(
+            d_C_int32,
+            0,
+            static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(int32_t),
+            static_cast<hipStream_t>(stream));
+        if (memset_err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] hipMemsetAsync failed: %s\n",
+                    hipGetErrorString(memset_err));
+            return false;
+        }
+    }
+
+    const dim3 block(static_cast<unsigned>(block_x), static_cast<unsigned>(block_y), 1);
+    const dim3 grid(
+        static_cast<unsigned>((N + block_x - 1) / block_x),
+        static_cast<unsigned>((M + block_y - 1) / block_y),
+        static_cast<unsigned>(kb));
+
+    if (is_q4_family && abi->codebook_id == RATIO_VNNI_CODEBOOK_IQ4)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemm_ratio_vnni_prefill_kernel<true, false>),
+            grid,
+            block,
+            0,
+            static_cast<hipStream_t>(stream),
+            d_A_int8,
+            d_payload,
+            d_ratio,
+                d_min,
+            d_C_int32,
+            M,
+            N,
+            K,
+            abi->has_min,
+            kb);
+    }
+    else if (is_q4_family)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemm_ratio_vnni_prefill_kernel<false, false>),
+            grid,
+            block,
+            0,
+            static_cast<hipStream_t>(stream),
+            d_A_int8,
+            d_payload,
+            d_ratio,
+                d_min,
+            d_C_int32,
+            M,
+            N,
+            K,
+            abi->has_min,
+            kb);
+    }
+    else if (is_q5_family)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemm_ratio_vnni_prefill_kernel<false, true>),
+            grid,
+            block,
+            0,
+            static_cast<hipStream_t>(stream),
+            d_A_int8,
+            d_payload,
+            d_ratio,
+            d_min,
+            d_C_int32,
+            M,
+            N,
+            K,
+            abi->has_min,
+            kb);
+    }
+    else
+    {
+        hipLaunchKernelGGL(
+            gemm_payload_v2_i8_prefill_kernel,
+            grid,
+            block,
+            0,
+            static_cast<hipStream_t>(stream),
+            d_A_int8,
+            d_payload,
+            d_C_int32,
+            M,
+            N,
+            K,
+            kb);
+    }
+
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemm_ratio_vnni_int8_int32_prefill_v2] Kernel launch failed: %s (M=%d N=%d K=%d)\n",
+                hipGetErrorString(err), M, N, K);
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Legacy ratio-VNNI prefill ABI wrapper.
+ *
+ * Maintains existing callsites while forwarding to descriptor-based ABI v2.
+ */
+bool rocmGemm_ratio_vnni_int8_int32_prefill(
+    const int8_t* d_A_int8,
+    const uint8_t* d_payload,
+    const int8_t* d_ratio,
+    const int8_t* d_min,
+    int32_t* d_C_int32,
+    int M, int N, int K,
+    uint8_t bitwidth,
+    uint8_t codebook_id,
+    uint8_t has_min,
+    uint8_t block_size,
+    uint16_t payload_bytes,
+    int prefill_variant,
+    int prefill_kb,
+    int device_id, void* stream)
+{
+    llaminar2::rocm::ROCmRatioVNNIPrefillAbiV2Desc abi{};
+    abi.abi_version = llaminar2::rocm::ROCM_RATIO_VNNI_PREFILL_ABI_V2;
+    abi.bitwidth = bitwidth;
+    abi.codebook_id = codebook_id;
+    abi.has_min = has_min;
+    abi.block_size = block_size;
+    abi.payload_bytes = payload_bytes;
+    abi.ratio_bytes = 1;
+    abi.min_bytes = (has_min != 0) ? 1 : 0;
+    abi.flags = 0;
+    abi.blocks_per_row = (block_size > 0) ? static_cast<uint32_t>(K / static_cast<int>(block_size)) : 0;
+    abi.payload_stride_bytes = payload_bytes;
+    abi.ratio_stride_bytes = 1;
+    abi.min_stride_bytes = (has_min != 0) ? 1 : 0;
+
+    return rocmGemm_ratio_vnni_int8_int32_prefill_v2(
+        d_A_int8,
+        d_payload,
+        d_ratio,
+        d_min,
+        d_C_int32,
+        M, N, K,
+        &abi,
+        prefill_variant,
+        prefill_kb,
+        device_id,
+        stream);
 }
 
 } // extern "C"

@@ -208,7 +208,26 @@ namespace llaminar2
             {
                 for (size_t b = 0; b < blocks_per_row; ++b)
                 {
-                    decodeBlock(blocks[r * blocks_per_row + b], &dequant_cache_[r * shape_[1] + b * IQ2_XXSBlock::BLOCK_SIZE]);
+                    const size_t row_offset = r * shape_[1];
+                    const size_t col_offset = b * IQ2_XXSBlock::BLOCK_SIZE;
+                    const size_t remaining = shape_[1] > col_offset ? (shape_[1] - col_offset) : 0;
+                    const size_t valid_count = std::min(static_cast<size_t>(IQ2_XXSBlock::BLOCK_SIZE), remaining);
+
+                    if (valid_count == 0)
+                    {
+                        continue;
+                    }
+
+                    if (valid_count == IQ2_XXSBlock::BLOCK_SIZE)
+                    {
+                        decodeBlock(blocks[r * blocks_per_row + b], &dequant_cache_[row_offset + col_offset]);
+                    }
+                    else
+                    {
+                        float temp[IQ2_XXSBlock::BLOCK_SIZE];
+                        decodeBlock(blocks[r * blocks_per_row + b], temp);
+                        std::memcpy(&dequant_cache_[row_offset + col_offset], temp, valid_count * sizeof(float));
+                    }
                 }
             }
         }

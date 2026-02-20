@@ -3217,6 +3217,22 @@ add_v2_test(V2_Unit_Q8_0_PartialBlocks
     LABELS "V2;Unit;TensorOperations;Q8_0;Quantization;Regression;PartialBlocks;BufferOverflow"
 )
 
+# Test: Quantized tensor tail decode regressions (K not divisible by 256)
+add_executable(v2_test_quantized_tensor_tail_decode_regression unit/tensors/Test__QuantizedTensorTailDecodeRegression.cpp)
+target_link_libraries(v2_test_quantized_tensor_tail_decode_regression
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_test_quantized_tensor_tail_decode_regression PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_QuantizedTensorTailDecodeRegression
+    COMMAND $<TARGET_FILE:v2_test_quantized_tensor_tail_decode_regression>
+    MPI_PROCS 1
+    LABELS "V2;Unit;TensorOperations;Quantization;Regression;PartialBlocks;TailDecode;BufferOverflow"
+)
+
 # Test: Q4_0 Tensor Views
 add_executable(v2_test_q4_0_views unit/tensors/Test__Q4_0Tensor_Views.cpp)
 target_link_libraries(v2_test_q4_0_views 
@@ -7897,22 +7913,39 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm GEMV kernel performance benchmarks")
 
-    # Performance Test: ROCm Ratio-VNNI Kernel (Phase-1 Q4_0/IQ4_NL)
-    # Compares compact ratio-VNNI decode kernel against existing INT8 VNNI grid_kpar
-    add_executable(v2_perf_rocm_ratio_vnni_kernel
-        performance/kernels/rocm/Perf__ROCmRatioVNNIKernel.cpp
+    # Performance Test: ROCm Ratio-VNNI Decode Kernel (Phase-1 Q4_0/IQ4_NL)
+    # Compares compact ratio-VNNI decode GEMV kernel against existing INT8 VNNI decode path
+    add_executable(v2_perf_rocm_ratio_vnni_decode_kernel
+        performance/kernels/rocm/Perf__ROCmRatioVNNIDecodeKernel.cpp
     )
-    target_link_libraries(v2_perf_rocm_ratio_vnni_kernel
+    target_link_libraries(v2_perf_rocm_ratio_vnni_decode_kernel
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Perf_ROCmRatioVNNIKernel
-        COMMAND $<TARGET_FILE:v2_perf_rocm_ratio_vnni_kernel>
+    add_v2_test(V2_Perf_ROCmRatioVNNIDecodeKernel
+        COMMAND $<TARGET_FILE:v2_perf_rocm_ratio_vnni_decode_kernel>
         LABELS "V2;Performance;ROCm;GEMV;RatioVNNI;Q4_0;IQ4_NL;Decode;gfx906;Benchmark"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added ROCm ratio-VNNI performance benchmark")
+    message(STATUS "V2 Tests: Added ROCm ratio-VNNI decode performance benchmark")
+
+    # Performance Test: ROCm Ratio-VNNI Prefill Kernel
+    # Measures full-path prefill (M>1) ratio-native GEMM across Qwen 7B/14B Attn/FFN shapes
+    add_executable(v2_perf_rocm_ratio_vnni_prefill_kernel
+        performance/kernels/rocm/Perf__ROCmRatioVNNIPrefillKernel.cpp
+    )
+    target_link_libraries(v2_perf_rocm_ratio_vnni_prefill_kernel
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmRatioVNNIPrefillKernel
+        COMMAND $<TARGET_FILE:v2_perf_rocm_ratio_vnni_prefill_kernel>
+        LABELS "V2;Performance;ROCm;GEMM;RatioVNNI;Prefill;Q4_0;IQ4_NL;gfx906;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm ratio-VNNI prefill performance benchmark")
 
     # Performance Test: ROCm IQ4_NL Decode Microbenchmark
     # Isolates IQ4_NL decode+dot strategy costs to compare kernel approach variants.

@@ -33,6 +33,7 @@
 #include <random>
 #include <cstring>
 #include <algorithm>
+#include <array>
 
 namespace llaminar2::test
 {
@@ -1218,10 +1219,12 @@ namespace llaminar2::test
 
             for (size_t i = 0; i < total_blocks; ++i)
             {
+                float max_abs = 0.0f;
                 float values[BLOCK_SIZE];
                 for (size_t j = 0; j < BLOCK_SIZE; ++j)
                 {
                     values[j] = dist(rng);
+                    max_abs = std::max(max_abs, std::abs(values[j]));
                 }
 
                 for (size_t j = 0; j < 32; ++j)
@@ -1232,10 +1235,23 @@ namespace llaminar2::test
                 {
                     blocks[i].qh[j] = static_cast<uint8_t>(rng() & 0xFF);
                 }
-                for (size_t j = 0; j < 8; ++j)
+                std::array<uint16_t, 4> sc_words{};
+                for (size_t j = 0; j < 4; ++j)
                 {
-                    blocks[i].scales[j] = static_cast<uint8_t>(rng() & 0xFF);
+                    // Low 6 bits carry per-subgroup scale selectors (two 3-bit values).
+                    const uint16_t low6 = static_cast<uint16_t>(rng() & 0x3F);
+                    sc_words[j] = low6;
                 }
+
+                // Encode a finite FP16 global scale into the packed high-nibble layout used by IQ1_M decode.
+                const float global_scale = std::max(1e-3f, max_abs / 8.0f);
+                const uint16_t scale_u16 = fp32_to_fp16(global_scale);
+                sc_words[0] |= static_cast<uint16_t>((scale_u16 & 0x000F) << 12);
+                sc_words[1] |= static_cast<uint16_t>((scale_u16 & 0x00F0) << 8);
+                sc_words[2] |= static_cast<uint16_t>((scale_u16 & 0x0F00) << 4);
+                sc_words[3] |= static_cast<uint16_t>(scale_u16 & 0xF000);
+
+                std::memcpy(blocks[i].scales, sc_words.data(), sizeof(sc_words));
             }
 
             return std::make_unique<IQ1_MTensor>(shape, raw_data);

@@ -19,11 +19,15 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "DebugEnv.h"
 #include "fort.hpp"
@@ -84,6 +88,7 @@ namespace llaminar2
             if (!isEnabled())
                 return;
             auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
             inst.starts_[static_cast<size_t>(phase)] = Clock::now();
         }
 
@@ -92,17 +97,56 @@ namespace llaminar2
             if (!isEnabled())
                 return;
             auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
             auto idx = static_cast<size_t>(phase);
             auto elapsed = Clock::now() - inst.starts_[idx];
             inst.durations_ms_[idx] += std::chrono::duration<double, std::milli>(elapsed).count();
             inst.call_counts_[idx]++;
         }
 
+        static void beginDetail(const std::string &label)
+        {
+            if (!isEnabled())
+                return;
+            auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
+            inst.detail_starts_[label] = Clock::now();
+        }
+
+        static void endDetail(const std::string &label)
+        {
+            if (!isEnabled())
+                return;
+            auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
+            auto it = inst.detail_starts_.find(label);
+            if (it == inst.detail_starts_.end())
+                return;
+            auto elapsed = Clock::now() - it->second;
+            inst.detail_durations_ms_[label] += std::chrono::duration<double, std::milli>(elapsed).count();
+            inst.detail_call_counts_[label] += 1;
+            inst.detail_starts_.erase(it);
+        }
+
+        static void addDetail(const std::string &label, double ms)
+        {
+            if (!isEnabled())
+                return;
+            auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
+            inst.detail_durations_ms_[label] += ms;
+            inst.detail_call_counts_[label] += 1;
+        }
+
         static void reset()
         {
             auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
             inst.durations_ms_.fill(0.0);
             inst.call_counts_.fill(0);
+            inst.detail_starts_.clear();
+            inst.detail_durations_ms_.clear();
+            inst.detail_call_counts_.clear();
         }
 
         /**
@@ -111,6 +155,7 @@ namespace llaminar2
         static double getTotalTimeMs()
         {
             auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
             double total = 0.0;
             for (size_t i = 0; i < PHASE_COUNT; ++i)
             {
@@ -122,22 +167,43 @@ namespace llaminar2
         static bool hasData()
         {
             auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
             for (size_t i = 0; i < PHASE_COUNT; ++i)
             {
                 if (inst.call_counts_[i] > 0)
                     return true;
             }
+            if (!inst.detail_call_counts_.empty())
+                return true;
             return false;
         }
 
         static std::string getSummary()
         {
             auto &inst = getInstance();
+            std::lock_guard<std::mutex> lock(inst.mutex_);
 
-            if (!hasData())
+            bool has_data = false;
+            for (size_t i = 0; i < PHASE_COUNT; ++i)
+            {
+                if (inst.call_counts_[i] > 0)
+                {
+                    has_data = true;
+                    break;
+                }
+            }
+            if (!has_data && !inst.detail_call_counts_.empty())
+            {
+                has_data = true;
+            }
+            if (!has_data)
                 return "";
 
-            double total_ms = getTotalTimeMs();
+            double total_ms = 0.0;
+            for (size_t i = 0; i < PHASE_COUNT; ++i)
+            {
+                total_ms += inst.durations_ms_[i];
+            }
 
             std::ostringstream oss;
 
@@ -183,6 +249,44 @@ namespace llaminar2
             }
 
             oss << table.to_string();
+
+            if (!inst.detail_durations_ms_.empty())
+            {
+                fort::utf8_table detail_title;
+                detail_title.set_border_style(FT_DOUBLE2_STYLE);
+                detail_title << "WEIGHT LOADING DETAIL" << fort::endr;
+                detail_title[0][0].set_cell_text_align(fort::text_align::center);
+                detail_title.row(0).set_cell_row_type(fort::row_type::header);
+                oss << "\n"
+                    << detail_title.to_string();
+
+                std::vector<std::pair<std::string, double>> detail_rows;
+                detail_rows.reserve(inst.detail_durations_ms_.size());
+                for (const auto &entry : inst.detail_durations_ms_)
+                {
+                    detail_rows.emplace_back(entry.first, entry.second);
+                }
+                std::sort(detail_rows.begin(), detail_rows.end(), [](const auto &a, const auto &b)
+                          { return a.second > b.second; });
+
+                fort::utf8_table detail_table;
+                detail_table.set_border_style(FT_DOUBLE2_STYLE);
+                detail_table << fort::header << "Detail" << "Time (ms)" << "Calls" << fort::endr;
+                detail_table.column(0).set_cell_text_align(fort::text_align::left);
+                detail_table.column(1).set_cell_text_align(fort::text_align::right);
+                detail_table.column(2).set_cell_text_align(fort::text_align::right);
+
+                for (const auto &[label, ms] : detail_rows)
+                {
+                    std::ostringstream ms_ss;
+                    ms_ss << std::fixed << std::setprecision(2) << ms;
+                    const auto call_it = inst.detail_call_counts_.find(label);
+                    const uint32_t calls = (call_it == inst.detail_call_counts_.end()) ? 0u : call_it->second;
+                    detail_table << label << ms_ss.str() << std::to_string(calls) << fort::endr;
+                }
+
+                oss << detail_table.to_string();
+            }
             return oss.str();
         }
 
@@ -207,6 +311,10 @@ namespace llaminar2
         std::array<TimePoint, PHASE_COUNT> starts_{};
         std::array<double, PHASE_COUNT> durations_ms_{};
         std::array<uint32_t, PHASE_COUNT> call_counts_{};
+        std::unordered_map<std::string, TimePoint> detail_starts_{};
+        std::unordered_map<std::string, double> detail_durations_ms_{};
+        std::unordered_map<std::string, uint32_t> detail_call_counts_{};
+        mutable std::mutex mutex_;
     };
 
     /**
@@ -233,6 +341,30 @@ namespace llaminar2
 
     private:
         WeightLoadPhase phase_;
+        bool enabled_;
+    };
+
+    class ScopedWeightLoadDetailTimer
+    {
+    public:
+        explicit ScopedWeightLoadDetailTimer(std::string label)
+            : label_(std::move(label)), enabled_(WeightLoadingProfiler::isEnabled())
+        {
+            if (enabled_)
+                WeightLoadingProfiler::beginDetail(label_);
+        }
+
+        ~ScopedWeightLoadDetailTimer()
+        {
+            if (enabled_)
+                WeightLoadingProfiler::endDetail(label_);
+        }
+
+        ScopedWeightLoadDetailTimer(const ScopedWeightLoadDetailTimer &) = delete;
+        ScopedWeightLoadDetailTimer &operator=(const ScopedWeightLoadDetailTimer &) = delete;
+
+    private:
+        std::string label_;
         bool enabled_;
     };
 

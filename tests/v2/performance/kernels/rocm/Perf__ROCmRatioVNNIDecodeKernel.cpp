@@ -90,7 +90,7 @@ namespace
         double max_ms = 0.0;
     };
 
-    class ROCmRatioVNNIPerfTest : public ::testing::Test
+    class ROCmRatioVNNIDecodePerfTest : public ::testing::Test
     {
     protected:
         int device_id_ = 0;
@@ -170,7 +170,7 @@ namespace
 #endif
     };
 
-    TEST_F(ROCmRatioVNNIPerfTest, Phase1Q4AndIQ4SpeedupVsInt8VNNI)
+    TEST_F(ROCmRatioVNNIDecodePerfTest, Phase1Q4AndIQ4SpeedupVsInt8VNNI)
     {
 #ifdef HAVE_ROCM
         const std::vector<Shape> shapes = {
@@ -329,7 +329,7 @@ namespace
 #endif
     }
 
-    TEST_F(ROCmRatioVNNIPerfTest, QWoAutoSweepTnKb)
+    TEST_F(ROCmRatioVNNIDecodePerfTest, QWoAutoSweepTnKb)
     {
 #ifdef HAVE_ROCM
         const char *run_sweep = std::getenv("LLAMINAR_RUN_QWO_AUTOSWEEP");

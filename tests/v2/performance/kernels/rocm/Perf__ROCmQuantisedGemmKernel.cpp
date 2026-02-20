@@ -35,8 +35,10 @@
 #include <omp.h>
 
 #include "kernels/rocm/ROCmQuantisedGemmKernel.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 
 #ifdef HAVE_ONEDNN
@@ -67,6 +69,7 @@ struct ROCmBenchConfig
     int warmup_iters; ///< Warmup iterations (not timed)
     int bench_iters;  ///< Timed benchmark iterations
     int num_trials;   ///< Independent trials for statistics
+    bool end_to_end_timing = false; ///< If true, time full multiply_tensor path (quantize + GEMM + scaling)
 };
 
 /**
@@ -101,6 +104,44 @@ class ROCmQuantisedGemmPerf : public ::testing::Test
 protected:
     bool has_rocm_device_ = false;
     std::string device_name_;
+
+    class ScopedEnvOverride
+    {
+    public:
+        ScopedEnvOverride(const char *name, const std::string &value)
+            : name_(name)
+        {
+            const char *existing = std::getenv(name_);
+            had_original_ = (existing != nullptr);
+            if (had_original_)
+            {
+                original_value_ = existing;
+            }
+            ::setenv(name_, value.c_str(), 1);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnvOverride()
+        {
+            if (had_original_)
+            {
+                ::setenv(name_, original_value_.c_str(), 1);
+            }
+            else
+            {
+                ::unsetenv(name_);
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnvOverride(const ScopedEnvOverride &) = delete;
+        ScopedEnvOverride &operator=(const ScopedEnvOverride &) = delete;
+
+    private:
+        const char *name_;
+        bool had_original_ = false;
+        std::string original_value_;
+    };
 
     void SetUp() override
     {
@@ -180,6 +221,12 @@ protected:
         // 2. Create kernel
         ROCmQuantisedGemmKernel kernel(&packed, 0);
 
+        // 2b. Bind required workspace (needed for full multiply_tensor path)
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::rocm(0), 1024ULL * 1024ULL * 1024ULL);
+        const auto reqs = kernel.getWorkspaceRequirements(M, N, K);
+        EXPECT_TRUE(workspace->allocate(reqs));
+        kernel.bindWorkspace(workspace.get());
+
         // 3. Create random FP32 activations [M × K]
         auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
         auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
@@ -188,14 +235,26 @@ protected:
         std::vector<float> reference(M * N);
         computeReference(input->data(), weights->fp32_data(), reference.data(), M, N, K);
 
-        // 5. Warmup (use regular multiply_tensor)
+        // 5. Warmup
+        bool use_kernel_timed_path = !config.end_to_end_timing;
         for (int i = 0; i < config.warmup_iters; ++i)
         {
-            kernel.multiply_tensor(input.get(), output.get(), M, N, K);
+            if (!use_kernel_timed_path)
+            {
+                kernel.multiply_tensor(input.get(), output.get(), M, N, K);
+            }
+            else
+            {
+                if (!kernel.multiply_tensor_timed(input.get(), output.get(), M, N, K, nullptr))
+                {
+                    use_kernel_timed_path = false;
+                    kernel.multiply_tensor(input.get(), output.get(), M, N, K);
+                }
+            }
         }
         (void)hipDeviceSynchronize();
 
-        // 6. Benchmark trials using kernel-only timing
+        // 6. Benchmark trials
         std::vector<double> trial_times_ms;
         trial_times_ms.reserve(config.num_trials * config.bench_iters);
 
@@ -203,13 +262,35 @@ protected:
         {
             for (int i = 0; i < config.bench_iters; ++i)
             {
-                float kernel_time_ms = 0.0f;
-                kernel.multiply_tensor_timed(input.get(), output.get(), M, N, K, &kernel_time_ms);
-                
-                // Only record valid timings (>0 means HIP events worked)
-                if (kernel_time_ms > 0.0f)
+                if (!use_kernel_timed_path)
                 {
-                    trial_times_ms.push_back(kernel_time_ms);
+                    auto start = std::chrono::high_resolution_clock::now();
+                    kernel.multiply_tensor(input.get(), output.get(), M, N, K);
+                    (void)hipDeviceSynchronize();
+                    auto end = std::chrono::high_resolution_clock::now();
+                    const double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    trial_times_ms.push_back(elapsed_ms);
+                }
+                else
+                {
+                    float kernel_time_ms = 0.0f;
+                    if (!kernel.multiply_tensor_timed(input.get(), output.get(), M, N, K, &kernel_time_ms))
+                    {
+                        use_kernel_timed_path = false;
+                        auto start = std::chrono::high_resolution_clock::now();
+                        kernel.multiply_tensor(input.get(), output.get(), M, N, K);
+                        (void)hipDeviceSynchronize();
+                        auto end = std::chrono::high_resolution_clock::now();
+                        const double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                        trial_times_ms.push_back(elapsed_ms);
+                        continue;
+                    }
+
+                    // Only record valid timings (>0 means HIP events worked)
+                    if (kernel_time_ms > 0.0f)
+                    {
+                        trial_times_ms.push_back(kernel_time_ms);
+                    }
                 }
             }
         }
@@ -250,9 +331,21 @@ protected:
 
         stats.cosine_sim = cosine_sim;
         stats.quant_time_ms = 0.0;
-        stats.gemm_time_ms = stats.mean_ms; // Now this IS the kernel time
+        stats.gemm_time_ms = stats.mean_ms;
 
         return stats;
+    }
+
+    void printFullPathSweepRow(const std::string &mode_name, const ROCmBenchConfig &config, const ROCmBenchStats &stats)
+    {
+        std::cout << "  mode=" << std::left << std::setw(16) << mode_name
+                  << " M=" << std::setw(5) << config.M
+                  << " N=" << std::setw(6) << config.N
+                  << " K=" << std::setw(6) << config.K
+                  << " | " << std::fixed << std::setprecision(3) << std::setw(8) << stats.mean_ms << " ms"
+                  << " | " << std::setprecision(3) << std::setw(7) << stats.mean_tflops << " TFLOPS"
+                  << " | cos=" << std::setprecision(6) << stats.cosine_sim
+                  << std::endl;
     }
 
     /**
@@ -550,4 +643,233 @@ TEST_F(ROCmQuantisedGemmPerf, BatchSizeScaling)
     }
 
     printFooter();
+}
+
+/**
+ * @test Full production-path prefill sweep (quantize + prefill GEMM + scaling)
+ *
+ * Compares baseline prefill native INT8 path against grid-kpar variants while timing
+ * full `multiply_tensor` execution to preserve interaction effects across stages.
+ */
+TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_GridKParSweep)
+{
+    if (!has_rocm_device_)
+    {
+        GTEST_SKIP() << "No ROCm device available";
+    }
+
+    struct ModeCfg
+    {
+        std::string name;
+        std::string grid_kpar;
+        std::string splits;
+    };
+
+    const std::vector<ModeCfg> modes = {
+        {"baseline", "0", "0"},
+        {"grid_auto", "1", "0"},
+        {"grid_s4", "1", "4"},
+        {"grid_s8", "1", "8"},
+    };
+
+    const std::vector<int> m_buckets = {64, 256};
+
+    std::cout << "\n[Perf] ROCm prefill full-path sweep (Qwen-7B FFN Up, Mx3584 * 18944x3584^T)\n"
+              << "[Perf] Path includes: activation quantization + prefill native GEMM + scaling/epilogue\n";
+
+    for (int M : m_buckets)
+    {
+        std::cout << "\n[Perf] Shape bucket: M=" << M << " N=18944 K=3584" << std::endl;
+
+        for (const auto &mode : modes)
+        {
+            ScopedEnvOverride prefill_enabled("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "1");
+            ScopedEnvOverride grid_enabled("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", mode.grid_kpar);
+            ScopedEnvOverride grid_splits("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_SPLITS", mode.splits);
+
+            ROCmBenchConfig cfg{
+                .name = "7B FFN Up FullPath",
+                .M = M,
+                .N = 18944,
+                .K = 3584,
+                .warmup_iters = 2,
+                .bench_iters = 3,
+                .num_trials = 2,
+                .end_to_end_timing = true,
+            };
+
+            auto stats = runBenchmark(cfg);
+            printFullPathSweepRow(mode.name, cfg, stats);
+            EXPECT_GT(stats.cosine_sim, 0.99);
+        }
+    }
+}
+
+/**
+ * @test Full production-path sweep across real model shapes and aspect ratios.
+ *
+ * Evaluates runtime auto prefill tile dispatch against forced micro-variants
+ * on representative model projection matrices.
+ */
+TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_RealModelAspectSweep)
+{
+    if (!has_rocm_device_)
+    {
+        GTEST_SKIP() << "No ROCm device available";
+    }
+
+    struct ShapeCfg
+    {
+        std::string name;
+        int N;
+        int K;
+    };
+
+    const std::vector<ShapeCfg> shapes = {
+        {"0.5B AttnOut", 896, 896},
+        {"0.5B FFN Up", 4864, 896},
+        {"0.5B FFN Down", 896, 4864},
+        {"7B AttnOut", 3584, 3584},
+        {"7B FFN Up", 18944, 3584},
+        {"7B FFN Down", 3584, 18944},
+        {"14B FFN Up", 13824, 5120},
+        {"32B FFN Up", 27648, 5120},
+    };
+
+    struct VariantCfg
+    {
+        std::string name;
+        std::string variant;
+    };
+
+    const std::vector<VariantCfg> variants = {
+        {"auto", "-1"},
+        {"tile16x16", "0"},
+        {"tile32x8", "1"},
+        {"tile8x32", "2"},
+        {"tile8x8", "3"},
+    };
+
+    const std::vector<int> m_buckets = {32, 256};
+
+    std::cout << "\n[Perf] ROCm prefill full-path real-model aspect sweep\n"
+              << "[Perf] Path includes: activation quantization + prefill native GEMM + scaling/epilogue\n";
+
+    for (const auto &shape : shapes)
+    {
+        for (int M : m_buckets)
+        {
+            std::cout << "\n[Perf] Shape=" << shape.name << " M=" << M << " N=" << shape.N << " K=" << shape.K << std::endl;
+
+            for (const auto &variant : variants)
+            {
+                ScopedEnvOverride prefill_enabled("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "1");
+                ScopedEnvOverride grid_enabled("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", "0");
+                ScopedEnvOverride variant_override("LLAMINAR_ROCM_VNNI_PREFILL_VARIANT", variant.variant);
+
+                ROCmBenchConfig cfg{
+                    .name = shape.name,
+                    .M = M,
+                    .N = shape.N,
+                    .K = shape.K,
+                    .warmup_iters = 1,
+                    .bench_iters = 2,
+                    .num_trials = 1,
+                    .end_to_end_timing = true,
+                };
+
+                auto stats = runBenchmark(cfg);
+                printFullPathSweepRow(variant.name, cfg, stats);
+                EXPECT_GT(stats.cosine_sim, 0.99);
+            }
+        }
+    }
+}
+
+TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_CptAndKbSweep)
+{
+    if (!has_rocm_device_)
+    {
+        GTEST_SKIP() << "No ROCm device available";
+    }
+
+    struct ShapeCfg
+    {
+        std::string name;
+        int M;
+        int N;
+        int K;
+    };
+
+    const std::vector<ShapeCfg> shapes = {
+        {"7B AttnOut", 128, 3584, 3584},
+        {"7B FFN Up", 128, 18944, 3584},
+        {"7B FFN Gate", 128, 18944, 3584},
+        {"7B FFN Down", 128, 3584, 18944},
+        {"14B AttnOut", 128, 5120, 5120},
+        {"14B FFN Up", 128, 13824, 5120},
+        {"14B FFN Gate", 128, 13824, 5120},
+        {"14B FFN Down", 128, 5120, 13824},
+    };
+
+    const std::vector<std::string> cpts = {"1"};
+    const std::vector<std::string> kbs = {"0", "4", "8", "16"};
+
+    std::cout << "\n[Perf] ROCm prefill full-path KB sweep (CPT fixed to 1)\n"
+              << "[Perf] Path includes: activation quantization + prefill native GEMM + scaling/epilogue\n";
+
+    for (const auto &shape : shapes)
+    {
+        std::cout << "\n[Perf] Shape=" << shape.name << " M=" << shape.M << " N=" << shape.N << " K=" << shape.K << std::endl;
+
+        for (const auto &cpt : cpts)
+        {
+            // Baseline (grid off) for this CPT
+            {
+                ScopedEnvOverride prefill_enabled("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "1");
+                ScopedEnvOverride grid_enabled("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", "0");
+                ScopedEnvOverride prefill_cpt("LLAMINAR_ROCM_VNNI_PREFILL_CPT", cpt);
+
+                ROCmBenchConfig cfg{
+                    .name = shape.name + " baseline cpt=" + cpt,
+                    .M = shape.M,
+                    .N = shape.N,
+                    .K = shape.K,
+                    .warmup_iters = 1,
+                    .bench_iters = 2,
+                    .num_trials = 1,
+                    .end_to_end_timing = true,
+                };
+
+                auto stats = runBenchmark(cfg);
+                printFullPathSweepRow("baseline_cpt" + cpt, cfg, stats);
+                EXPECT_GT(stats.cosine_sim, 0.99);
+            }
+
+            // Grid-kpar with KB sweep for this CPT
+            for (const auto &kb : kbs)
+            {
+                ScopedEnvOverride prefill_enabled("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "1");
+                ScopedEnvOverride grid_enabled("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", "1");
+                ScopedEnvOverride prefill_cpt("LLAMINAR_ROCM_VNNI_PREFILL_CPT", cpt);
+                ScopedEnvOverride grid_kb("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_KB", kb);
+                ScopedEnvOverride grid_splits_auto("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_SPLITS", "0");
+
+                ROCmBenchConfig cfg{
+                    .name = shape.name + " grid cpt=" + cpt + " kb=" + kb,
+                    .M = shape.M,
+                    .N = shape.N,
+                    .K = shape.K,
+                    .warmup_iters = 1,
+                    .bench_iters = 2,
+                    .num_trials = 1,
+                    .end_to_end_timing = true,
+                };
+
+                auto stats = runBenchmark(cfg);
+                printFullPathSweepRow("grid_cpt" + cpt + "_kb" + kb, cfg, stats);
+                EXPECT_GT(stats.cosine_sim, 0.99);
+            }
+        }
+    }
 }
