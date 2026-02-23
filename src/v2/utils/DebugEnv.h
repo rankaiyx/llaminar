@@ -2186,7 +2186,7 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_SPLITS=<n>` - FFN override split-K slices (`0` policy default)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_CPT=<n>` - FFN override outputs-per-thread (`0` policy default, `1`,`2`,`4` valid)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_VARIANT=<id>` - FFN override tile variant (`-1` policy default, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
-     * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_KERNEL_BODY=<id>` - FFN override kernel-body variant (`0` baseline loop, `1` software-pipelined loop)
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_KERNEL_BODY=<id>` - FFN override kernel-body variant (`0` baseline loop, `1` software-pipelined loop, `2` LDS B-tile + pipelined loop)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_SWIZZLE=<id>` - Global grid-kpar swizzle variant (`-1` policy default, `0` unswizzled, `1` swizzled)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_GRID_SWIZZLE=<id>` - FFN override grid-kpar swizzle variant (`-1` policy default, `0` unswizzled, `1` swizzled)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_VARIANT=<id>` - Force ratio-prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
@@ -2226,8 +2226,8 @@ namespace llaminar2
         int vnni_prefill_ffn_override_splits = 0;
         int vnni_prefill_ffn_override_cpt = 0;
         int vnni_prefill_ffn_override_variant = -1;
-        int vnni_prefill_ffn_override_kernel_body = 1;
-        int vnni_prefill_grid_swizzle = 1;
+        int vnni_prefill_ffn_override_kernel_body = 2;
+        int vnni_prefill_grid_swizzle = -1;
         int vnni_prefill_ffn_override_grid_swizzle = 1;
         int ratio_prefill_variant = -1;        ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;              ///< Ratio prefill split-K blocks override (0=auto)
@@ -2266,8 +2266,8 @@ namespace llaminar2
             vnni_prefill_ffn_override_splits = 0;
             vnni_prefill_ffn_override_cpt = 0;
             vnni_prefill_ffn_override_variant = -1;
-            vnni_prefill_ffn_override_kernel_body = 1;
-            vnni_prefill_grid_swizzle = 1;
+            vnni_prefill_ffn_override_kernel_body = 2;
+            vnni_prefill_grid_swizzle = -1;
             vnni_prefill_ffn_override_grid_swizzle = 1;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
@@ -2411,7 +2411,7 @@ namespace llaminar2
             const char *vnni_prefill_ffn_override_kernel_body_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_KERNEL_BODY");
             if (vnni_prefill_ffn_override_kernel_body_env)
             {
-                vnni_prefill_ffn_override_kernel_body = std::clamp(std::atoi(vnni_prefill_ffn_override_kernel_body_env), 0, 1);
+                vnni_prefill_ffn_override_kernel_body = std::clamp(std::atoi(vnni_prefill_ffn_override_kernel_body_env), 0, 2);
             }
 
             const char *vnni_prefill_grid_swizzle_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_GRID_SWIZZLE");

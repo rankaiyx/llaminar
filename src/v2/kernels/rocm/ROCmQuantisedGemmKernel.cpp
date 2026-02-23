@@ -378,6 +378,14 @@ namespace llaminar2
                 int grid_swizzle_variant,
                 int device_id, void *stream);
 
+            // INT8 VNNI wide-tile prefill GEMM for extreme-wide shapes (M≤128, N>>K).
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                int32_t *d_C_int32,
+                int M, int N, int K,
+                int device_id, void *stream);
+
             // ratio-VNNI native prefill GEMM scaffold: payload + ratio side-channel
             bool rocmGemm_ratio_vnni_int8_int32_prefill(
                 const int8_t *d_A_int8,   // [M x K] row-major INT8 activations
@@ -2089,6 +2097,7 @@ namespace llaminar2
                     int kernel_body_variant = 0;
                     int grid_swizzle_variant = 0;
                     const char *profile = "default";
+                    bool use_wide_tile = false; // Wide-tile kernel for extreme-wide shapes (M≤128, N>>K)
                 };
 
                 const auto &rocm_env = debugEnv().rocm;
@@ -2132,8 +2141,17 @@ namespace llaminar2
                     // Shape classes (ratio-first, then work-size split).
                     if (aspect_n_over_k >= 32.0)
                     {
-                        // LM-head/extreme-wide: keep atomics lower and favor stable baseline path.
-                        return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, 0, "extreme_wide_baseline_32x8_cpt1"};
+                        // LM-head/extreme-wide: Wide-tile kernel covers ALL M-rows (up to 128)
+                        // in a single block via cooperative A+B LDS loading.  B is read from HBM
+                        // exactly once (no M-tile re-read amplification).
+                        // Geometry: 256 threads, M_TILE=128, N_TILE=64, KT=8, 32 accumulators/thread.
+                        // Grid: (ceil(N/64), 1) — single M-pass, ~4 waves/SIMD occupancy.
+                        if (M <= 128)
+                        {
+                            return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, 0, "extreme_wide_tile_128", true};
+                        }
+                        // Fallback for M > 128: use grid-kpar with LDS + swizzle
+                        return VnniPrefillLaunchConfig{true, 1, 1, 4, 2, 1, "extreme_wide_gridkpar_32x8_cpt4"};
                     }
 
                     if (aspect_n_over_k >= 2.0)
@@ -2145,7 +2163,7 @@ namespace llaminar2
                         }
 
                         const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
-                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 1, 1, "wide_gridkpar_32x8_cpt4"};
+                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 2, 1, "wide_gridkpar_32x8_cpt4"};
                     }
 
                     if (aspect_n_over_k < 0.75)
@@ -2157,13 +2175,13 @@ namespace llaminar2
                         }
 
                         const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
-                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 1, 1, "tall_gridkpar_32x8_cpt4"};
+                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 2, 1, "tall_gridkpar_32x8_cpt4"};
                     }
 
                     // Attention-ish / near-square.
                     {
                         const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
-                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 1, 1, "balanced_gridkpar_32x8_cpt4"};
+                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 2, 1, "balanced_gridkpar_32x8_cpt4"};
                     }
                 };
 
@@ -2243,7 +2261,24 @@ namespace llaminar2
                                                   << ")"); });
                 }
 
-                if (use_grid_kpar)
+                // Wide-tile path: covers all M-rows in one block (extreme-wide shapes)
+                if (!has_manual_override && policy_cfg.use_wide_tile)
+                {
+                    native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile(
+                        d_A_int8,
+                        impl_->d_weights_int8_vnni,
+                        impl_->d_C_int32,
+                        m, n, k,
+                        rocm_device_id_, gpu_stream_);
+                    if (!native_ok)
+                    {
+                        static std::once_flag wide_tile_fallback_once;
+                        std::call_once(wide_tile_fallback_once, [&]()
+                                       { LOG_WARN("[" << callsite << "] Wide-tile kernel failed; falling back to grid-kpar/baseline"); });
+                    }
+                }
+
+                if (!native_ok && use_grid_kpar)
                 {
                     const int requested_slices_env = rocm_env.vnni_prefill_grid_kpar_splits;
                     const int requested_slices = [&]()

@@ -186,7 +186,7 @@ __global__ void gridkpar_32x8_cpt4_kernel(
     const int8_t *a_ptr0 = d_A_int8 + static_cast<int64_t>(m) * K + static_cast<int64_t>(k_begin) * 4;
     const int8_t *b_ptr0 = d_B_int8_vnni + (static_cast<int64_t>(k_begin) * N + n_base) * 4;
 
-    int32_t acc[4] = {0, 0, 0, 0};
+    int32_t acc[CPT] = {};
 
     // ---------------------------------------------------------------------
     // GEMINI TUNING ZONE START
@@ -196,48 +196,81 @@ __global__ void gridkpar_32x8_cpt4_kernel(
     // ---------------------------------------------------------------------
     if constexpr (IsCandidate)
     {
-        // V7: Software-pipelined loop. No tail path (N%128==0 for targets).
-        // Issue next iteration's loads before computing current iteration,
-        // increasing the load-to-use distance for better latency hiding.
-        // Uses ≤24 VGPRs to maintain 10 waves/SIMD occupancy on gfx906.
-        const int8_t *a_ptr = a_ptr0;
-        const int32_t *b_ptr = reinterpret_cast<const int32_t *>(b_ptr0);
-        const int b_stride = N;
-        const int k_len = k_end - k_begin;
+        // V10: LDS B-tile caching — cooperatively load B into shared
+        // memory to eliminate redundant B global loads across the 8
+        // m-rows per block.  Combined with grid swizzle (V8) for L2.
+        //
+        // KT=8 k-groups per tile: divides evenly for both 0.5B
+        // (56/8=7) and 3B (128/8=16).  4KB LDS per block.
+        //
+        // NOTE: Shapes are exact multiples of tile dimensions, so the
+        // early-return guard above never triggers (i.e., all 256
+        // threads in every launched block participate in __syncthreads).
+        constexpr int KT = 8;
+        __shared__ int32_t b_lds[KT * 128]; // 8 × 128 = 4KB
 
-        if (k_len > 0)
+        const int tid = threadIdx.y * BLOCK_X + threadIdx.x; // 0..255
+
+        // Block-level N-base (first N-column for this block)
+        const int n_block_base = CandidateSwizzle
+            ? (static_cast<int>(blockIdx.y) * (BLOCK_X * CPT))
+            : (static_cast<int>(blockIdx.x) * (BLOCK_X * CPT));
+
+        // Thread's N-offset within the 128-wide tile
+        const int n_local = threadIdx.x * CPT; // 0, 4, 8, ..., 124
+
+        // Pointer to A for this thread's m-row
+        const int32_t *a_row = reinterpret_cast<const int32_t *>(
+            d_A_int8 + static_cast<int64_t>(m) * K);
+
+        // Pointer to B base for this block's N-columns
+        const int32_t *b_global_base = reinterpret_cast<const int32_t *>(
+            d_B_int8_vnni + static_cast<int64_t>(n_block_base) * 4);
+
+        for (int kt = k_begin; kt < k_end; kt += KT)
         {
-            // Pre-load first iteration
-            int32_t a_cur = *reinterpret_cast<const int32_t *>(a_ptr);
-            int32_t b0 = b_ptr[0], b1 = b_ptr[1], b2 = b_ptr[2], b3 = b_ptr[3];
-            a_ptr += 4;
-            b_ptr += b_stride;
-
-            for (int i = 1; i < k_len; ++i)
+            // Phase 1: Cooperative B load into LDS
+            // 128 × 8 = 1024 int32 / 256 threads = 4 per thread.
+            // Consecutive threads load consecutive N-columns for
+            // perfect coalescing (1 cache line per sub-wave).
+            #pragma unroll
+            for (int i = 0; i < 4; ++i)
             {
-                // Issue next iteration's loads (in flight during compute below)
-                const int32_t a_nxt = *reinterpret_cast<const int32_t *>(a_ptr);
-                const int32_t bn0 = b_ptr[0], bn1 = b_ptr[1];
-                const int32_t bn2 = b_ptr[2], bn3 = b_ptr[3];
-
-                // Compute with current iteration's data
-                acc[0] = __builtin_amdgcn_sdot4(a_cur, b0, acc[0], false);
-                acc[1] = __builtin_amdgcn_sdot4(a_cur, b1, acc[1], false);
-                acc[2] = __builtin_amdgcn_sdot4(a_cur, b2, acc[2], false);
-                acc[3] = __builtin_amdgcn_sdot4(a_cur, b3, acc[3], false);
-
-                // Rotate
-                a_cur = a_nxt;
-                b0 = bn0; b1 = bn1; b2 = bn2; b3 = bn3;
-                a_ptr += 4;
-                b_ptr += b_stride;
+                const int flat = i * 256 + tid;
+                const int kg_l = flat >> 7;   // / 128
+                const int n_l  = flat & 127;  // % 128
+                b_lds[kg_l * 128 + n_l] =
+                    b_global_base[static_cast<int64_t>(kt + kg_l) * N + n_l];
             }
+            __syncthreads();
 
-            // Last iteration
-            acc[0] = __builtin_amdgcn_sdot4(a_cur, b0, acc[0], false);
-            acc[1] = __builtin_amdgcn_sdot4(a_cur, b1, acc[1], false);
-            acc[2] = __builtin_amdgcn_sdot4(a_cur, b2, acc[2], false);
-            acc[3] = __builtin_amdgcn_sdot4(a_cur, b3, acc[3], false);
+            // Phase 2: Compute from LDS (B) + global memory (A).
+            // A loads are software-pipelined: prefetch next k-group's
+            // A value while computing current.
+            // NOT unrolled — lets compiler use fewer VGPRs (target ≤25
+            // for 10 waves/SIMD on gfx906, but the 62% VMEM_RD
+            // reduction far outweighs the occupancy loss.
+            int32_t a_packed = a_row[kt];
+            #pragma unroll
+            for (int kg_l = 0; kg_l < KT - 1; ++kg_l)
+            {
+                const int32_t a_next = a_row[kt + kg_l + 1];
+                const int off = kg_l * 128 + n_local;
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 0], acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 1], acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 2], acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 3], acc[3], false);
+                a_packed = a_next;
+            }
+            // Last k-group in tile (no prefetch)
+            {
+                const int off = (KT - 1) * 128 + n_local;
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 0], acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 1], acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 2], acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, b_lds[off + 3], acc[3], false);
+            }
+            __syncthreads(); // Ensure all done before next tile overwrites LDS
         }
     }
     else
@@ -292,7 +325,7 @@ __global__ void gridkpar_32x8_cpt4_kernel(
     // ---------------------------------------------------------------------
 
     #pragma unroll
-    for (int c = 0; c < 4; ++c)
+    for (int c = 0; c < CPT; ++c)
     {
         const int n = n_base + c;
         if (n < N)
