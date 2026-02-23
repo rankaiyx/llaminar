@@ -2181,11 +2181,12 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_KB=<n>` - Grid-kpar K-block count override (`0` = auto policy)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_VARIANT=<id>` - Force baseline INT8 prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_VARIANT=<id>` - Force grid-kpar INT8 prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
-    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE=1` - Enable FFN-wide policy override for production dispatch path
-    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_GRID_KPAR=<n>` - FFN override grid-kpar mode (`-1` policy default, `0` baseline, `1` grid-kpar)
-    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_SPLITS=<n>` - FFN override split-K slices (`0` policy default)
-    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_CPT=<n>` - FFN override outputs-per-thread (`0` policy default, `1`,`2`,`4` valid)
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE=1` - Enable FFN-wide policy override for production dispatch path
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_GRID_KPAR=<n>` - FFN override grid-kpar mode (`-1` policy default, `0` baseline, `1` grid-kpar)
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_SPLITS=<n>` - FFN override split-K slices (`0` policy default)
+     * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_CPT=<n>` - FFN override outputs-per-thread (`0` policy default, `1`,`2`,`4` valid)
     * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_VARIANT=<id>` - FFN override tile variant (`-1` policy default, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
+    * - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_KERNEL_BODY=<id>` - FFN override kernel-body variant (`0` baseline loop, `1` software-pipelined loop)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_VARIANT=<id>` - Force ratio-prefill tile variant (`-1` auto, `0` 16x16, `1` 32x8, `2` 8x32, `3` 8x8)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_KB=<n>` - Ratio-prefill split-K blocks (`0` = auto)
      * - `LLAMINAR_ROCM_RATIO_PREFILL_LINEAR_VARIANT=<id>` - Force linear-codebook ratio prefill tile variant (`-1`=use global/auto)
@@ -2223,16 +2224,17 @@ namespace llaminar2
         int vnni_prefill_ffn_override_splits = 0;
         int vnni_prefill_ffn_override_cpt = 0;
         int vnni_prefill_ffn_override_variant = -1;
-        int ratio_prefill_variant = -1;         ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
-        int ratio_prefill_kb = 0;               ///< Ratio prefill split-K blocks override (0=auto)
-        int ratio_prefill_linear_variant = -1;  ///< Linear codebook ratio prefill tile override (-1=use global/auto)
-        int ratio_prefill_linear_kb = 0;        ///< Linear codebook ratio prefill split-K override (0=use global/auto)
-        int ratio_prefill_iq4_variant = -1;     ///< IQ4 codebook ratio prefill tile override (-1=use global/auto)
-        int ratio_prefill_iq4_kb = 0;           ///< IQ4 codebook ratio prefill split-K override (0=use global/auto)
-        bool startup_gpu_repack = false;        ///< Enable startup GPU repack pipeline (LLAMINAR_ROCM_STARTUP_GPU_REPACK)
-        int repack_slots = 8;                   ///< Ring-buffer slot count for startup GPU repack pipeline
-        int repack_budget_mb = 1024;            ///< VRAM budget cap for startup GPU repack staging buffers
-        int repack_streams = 3;                 ///< Stream count hint for startup GPU repack pipeline
+        int vnni_prefill_ffn_override_kernel_body = 1;
+        int ratio_prefill_variant = -1;        ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
+        int ratio_prefill_kb = 0;              ///< Ratio prefill split-K blocks override (0=auto)
+        int ratio_prefill_linear_variant = -1; ///< Linear codebook ratio prefill tile override (-1=use global/auto)
+        int ratio_prefill_linear_kb = 0;       ///< Linear codebook ratio prefill split-K override (0=use global/auto)
+        int ratio_prefill_iq4_variant = -1;    ///< IQ4 codebook ratio prefill tile override (-1=use global/auto)
+        int ratio_prefill_iq4_kb = 0;          ///< IQ4 codebook ratio prefill split-K override (0=use global/auto)
+        bool startup_gpu_repack = false;       ///< Enable startup GPU repack pipeline (LLAMINAR_ROCM_STARTUP_GPU_REPACK)
+        int repack_slots = 8;                  ///< Ring-buffer slot count for startup GPU repack pipeline
+        int repack_budget_mb = 1024;           ///< VRAM budget cap for startup GPU repack staging buffers
+        int repack_streams = 3;                ///< Stream count hint for startup GPU repack pipeline
 
         ROCmConfig()
         {
@@ -2260,6 +2262,7 @@ namespace llaminar2
             vnni_prefill_ffn_override_splits = 0;
             vnni_prefill_ffn_override_cpt = 0;
             vnni_prefill_ffn_override_variant = -1;
+            vnni_prefill_ffn_override_kernel_body = 1;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -2397,6 +2400,12 @@ namespace llaminar2
             if (vnni_prefill_ffn_override_variant_env)
             {
                 vnni_prefill_ffn_override_variant = std::clamp(std::atoi(vnni_prefill_ffn_override_variant_env), -1, 3);
+            }
+
+            const char *vnni_prefill_ffn_override_kernel_body_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_KERNEL_BODY");
+            if (vnni_prefill_ffn_override_kernel_body_env)
+            {
+                vnni_prefill_ffn_override_kernel_body = std::clamp(std::atoi(vnni_prefill_ffn_override_kernel_body_env), 0, 1);
             }
 
             const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");
