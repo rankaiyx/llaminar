@@ -68,6 +68,7 @@ struct RunConfig
     int split_k_slices = 4;
     int seed = 1337;
     bool check = true;
+    bool candidate_swizzle = true;
 };
 
 struct TimingResult
@@ -107,9 +108,13 @@ RunConfig parseArgs(int argc, char **argv)
         {
             cfg.check = false;
         }
+        else if (arg == "--candidate-swizzle" && (i + 1) < argc)
+        {
+            cfg.candidate_swizzle = (std::atoi(argv[++i]) != 0);
+        }
         else if (arg == "--help")
         {
-            std::printf("Usage: %s [--warmup N] [--iters N] [--split-k N] [--seed N] [--no-check]\n", argv[0]);
+            std::printf("Usage: %s [--warmup N] [--iters N] [--split-k N] [--seed N] [--no-check] [--candidate-swizzle 0|1]\n", argv[0]);
             std::exit(0);
         }
     }
@@ -138,7 +143,7 @@ void makeRandomBVNNI(std::vector<int8_t> &b_vnni, int N, int K, int seed)
     (void)N;
 }
 
-template <bool IsCandidate>
+template <bool IsCandidate, bool CandidateSwizzle>
 __global__ void gridkpar_32x8_cpt4_kernel(
     const int8_t *__restrict__ d_A_int8,
     const int8_t *__restrict__ d_B_int8_vnni,
@@ -152,8 +157,15 @@ __global__ void gridkpar_32x8_cpt4_kernel(
     constexpr int BLOCK_Y = 8;
     constexpr int CPT = 4;
 
-    const int n_base = blockIdx.x * (BLOCK_X * CPT) + threadIdx.x * CPT;
-    const int m = blockIdx.y * BLOCK_Y + threadIdx.y;
+    // Candidate uses swizzled grid: x=M-tiles (fast), y=N-tiles (slow)
+    // so consecutive CUs share the same B N-tile columns in L2.
+    // Baseline uses original layout: x=N-tiles (fast), y=M-tiles.
+    const int n_base = (IsCandidate && CandidateSwizzle)
+        ? (blockIdx.y * (BLOCK_X * CPT) + threadIdx.x * CPT)
+        : (blockIdx.x * (BLOCK_X * CPT) + threadIdx.x * CPT);
+    const int m = (IsCandidate && CandidateSwizzle)
+        ? (blockIdx.x * BLOCK_Y + threadIdx.y)
+        : (blockIdx.y * BLOCK_Y + threadIdx.y);
     const int split_idx = blockIdx.z;
 
     if (m >= M || n_base >= N)
@@ -290,7 +302,7 @@ __global__ void gridkpar_32x8_cpt4_kernel(
     }
 }
 
-template <bool IsCandidate>
+template <bool IsCandidate, bool CandidateSwizzle>
 TimingResult runKernelCase(
     const ShapeCase &shape,
     const RunConfig &cfg,
@@ -306,9 +318,16 @@ TimingResult runKernelCase(
     constexpr int BY = 8;
     constexpr int CPT = 4;
     const dim3 block(BX, BY, 1);
+
+    const unsigned n_tiles = static_cast<unsigned>((shape.N + BX * CPT - 1) / (BX * CPT));
+    const unsigned m_tiles = static_cast<unsigned>((shape.M + BY - 1) / BY);
+
+    // Candidate uses swizzled grid: x=M-tiles (fast), y=N-tiles (slow)
+    // so hardware block scheduler dispatches M-tile groups contiguously,
+    // giving consecutive CUs the same B N-tile for L2 reuse.
     const dim3 grid(
-        static_cast<unsigned>((shape.N + BX * CPT - 1) / (BX * CPT)),
-        static_cast<unsigned>((shape.M + BY - 1) / BY),
+        (IsCandidate && CandidateSwizzle) ? m_tiles : n_tiles,
+        (IsCandidate && CandidateSwizzle) ? n_tiles : m_tiles,
         static_cast<unsigned>(slices));
 
     hipEvent_t start_evt = nullptr;
@@ -322,7 +341,7 @@ TimingResult runKernelCase(
     {
         HIP_CHECK(hipMemset(d_C, 0, c_bytes));
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gridkpar_32x8_cpt4_kernel<IsCandidate>),
+            HIP_KERNEL_NAME(gridkpar_32x8_cpt4_kernel<IsCandidate, CandidateSwizzle>),
             grid,
             block,
             0,
@@ -344,7 +363,7 @@ TimingResult runKernelCase(
         HIP_CHECK(hipMemset(d_C, 0, c_bytes));
         HIP_CHECK(hipEventRecord(start_evt));
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gridkpar_32x8_cpt4_kernel<IsCandidate>),
+            HIP_KERNEL_NAME(gridkpar_32x8_cpt4_kernel<IsCandidate, CandidateSwizzle>),
             grid,
             block,
             0,
@@ -456,8 +475,10 @@ void runOneShape(const ShapeCase &shape, const RunConfig &cfg)
     HIP_CHECK(hipMemcpy(d_A, h_A.data(), a_elems * sizeof(int8_t), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_B, h_B_vnni.data(), b_elems * sizeof(int8_t), hipMemcpyHostToDevice));
 
-    const TimingResult baseline = runKernelCase<false>(shape, cfg, d_A, d_B, d_C_baseline);
-    const TimingResult candidate = runKernelCase<true>(shape, cfg, d_A, d_B, d_C_candidate);
+    const TimingResult baseline = runKernelCase<false, false>(shape, cfg, d_A, d_B, d_C_baseline);
+    const TimingResult candidate = cfg.candidate_swizzle
+                                       ? runKernelCase<true, true>(shape, cfg, d_A, d_B, d_C_candidate)
+                                       : runKernelCase<true, false>(shape, cfg, d_A, d_B, d_C_candidate);
 
     int64_t max_abs_diff_base_vs_ref = -1;
     int64_t max_abs_diff_cand_vs_ref = -1;
@@ -516,11 +537,12 @@ int main(int argc, char **argv)
     std::printf("============================================================\n");
     std::printf("Gemini FFN Kernel Playground (ROCm HIP)\n");
     std::printf("Device: %s\n", prop.name);
-    std::printf("Config: warmup=%d iters=%d split_k=%d check=%s omp_threads=%d\n",
+    std::printf("Config: warmup=%d iters=%d split_k=%d check=%s candidate_swizzle=%s omp_threads=%d\n",
                 cfg.warmup,
                 cfg.iters,
                 cfg.split_k_slices,
                 cfg.check ? "on" : "off",
+                cfg.candidate_swizzle ? "on" : "off",
                 getOpenMpThreadCount());
     std::printf("============================================================\n");
 

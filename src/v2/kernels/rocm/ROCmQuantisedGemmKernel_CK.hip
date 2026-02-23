@@ -1336,10 +1336,13 @@ __global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
     int N,
     int K,
     int k_groups_per_slice,
-    int slice_index_base)
+    int slice_index_base,
+    int grid_swizzle_variant)
 {
-    const int n_base = blockIdx.x * (BLOCK_X * CPT) + threadIdx.x * CPT;
-    const int m = blockIdx.y * BLOCK_Y + threadIdx.y;
+    const int n_tile_idx = (grid_swizzle_variant != 0) ? static_cast<int>(blockIdx.y) : static_cast<int>(blockIdx.x);
+    const int m_tile_idx = (grid_swizzle_variant != 0) ? static_cast<int>(blockIdx.x) : static_cast<int>(blockIdx.y);
+    const int n_base = n_tile_idx * (BLOCK_X * CPT) + threadIdx.x * CPT;
+    const int m = m_tile_idx * BLOCK_Y + threadIdx.y;
     const int split_idx = blockIdx.z;
 
     if (m >= M || n_base >= N)
@@ -3151,6 +3154,7 @@ extern "C"
         int tile_variant,
         int cpt,
         int kernel_body_variant,
+        int grid_swizzle_variant,
         int rocm_device_id, void* stream)
     {
         if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
@@ -3177,6 +3181,7 @@ extern "C"
         const int variant = resolve_prefill_int8_tile_variant(tile_variant, M, N, K, true);
         const int cpt_v = (cpt == 2 || cpt == 4) ? cpt : 1;
         const bool use_software_pipelined = (kernel_body_variant == 1);
+        const bool use_grid_swizzled = (grid_swizzle_variant == 1);
 
         {
             const size_t c_bytes = static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(int32_t);
@@ -3195,30 +3200,39 @@ extern "C"
             const dim3 block(BX, BY, 1);
             if (cpt_v == 4)
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4));
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 if (use_software_pipelined)
                 {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true, true>),
-                                       dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                       grid,
+                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
                 }
                 else
                 {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true, false>),
-                                       dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                       grid,
+                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
                 }
             }
             else if (cpt_v == 2)
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2));
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2, false, true, false>),
-                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                   grid,
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
             }
             else
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX - 1) / BX);
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1, false, true, false>),
-                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                   grid,
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
             }
         }
         else if (variant == PREFILL_TILE_8x32)
@@ -3228,30 +3242,39 @@ extern "C"
             const dim3 block(BX, BY, 1);
             if (cpt_v == 4)
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4));
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 if (use_software_pipelined)
                 {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true, true>),
-                                       dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                       grid,
+                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
                 }
                 else
                 {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true, false>),
-                                       dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                       grid,
+                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
                 }
             }
             else if (cpt_v == 2)
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2));
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2, false, true, false>),
-                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                   grid,
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
             }
             else
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX - 1) / BX);
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1, false, true, false>),
-                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                   grid,
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
             }
         }
         else if (variant == PREFILL_TILE_8x8)
@@ -3261,30 +3284,39 @@ extern "C"
             const dim3 block(BX, BY, 1);
             if (cpt_v == 4)
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4));
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 if (use_software_pipelined)
                 {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true, true>),
-                                       dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                       grid,
+                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
                 }
                 else
                 {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true, false>),
-                                       dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                       grid,
+                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
                 }
             }
             else if (cpt_v == 2)
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2));
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2, false, true, false>),
-                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                   grid,
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
             }
             else
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX - 1) / BX);
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1, false, true, false>),
-                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                   grid,
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
             }
         }
         else
@@ -3294,30 +3326,39 @@ extern "C"
             const dim3 block(BX, BY, 1);
             if (cpt_v == 4)
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4));
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 if (use_software_pipelined)
                 {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true, true>),
-                                       dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                       grid,
+                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
                 }
                 else
                 {
                     hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4, false, true, false>),
-                                       dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                       grid,
+                                       block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
                 }
             }
             else if (cpt_v == 2)
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2));
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2, false, true, false>),
-                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                   grid,
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
             }
             else
             {
+                const unsigned n_tiles = static_cast<unsigned>((N + BX - 1) / BX);
+                const unsigned m_tiles = static_cast<unsigned>((M + BY - 1) / BY);
+                const dim3 grid(use_grid_swizzled ? m_tiles : n_tiles, use_grid_swizzled ? n_tiles : m_tiles, static_cast<unsigned>(slices));
                 hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1, false, true, false>),
-                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
-                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0);
+                                   grid,
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice, 0, use_grid_swizzled ? 1 : 0);
             }
         }
 

@@ -375,6 +375,7 @@ namespace llaminar2
                 int tile_variant,
                 int cpt,
                 int kernel_body_variant,
+                int grid_swizzle_variant,
                 int device_id, void *stream);
 
             // ratio-VNNI native prefill GEMM scaffold: payload + ratio side-channel
@@ -2086,6 +2087,7 @@ namespace llaminar2
                     int tile_variant = -1; // -1 => HIP-side auto tile select
                     int cpt = 1;
                     int kernel_body_variant = 0;
+                    int grid_swizzle_variant = 0;
                     const char *profile = "default";
                 };
 
@@ -2116,19 +2118,22 @@ namespace llaminar2
                                             ? rocm_env.vnni_prefill_ffn_override_cpt
                                             : 4;
                         const int kernel_body_variant = rocm_env.vnni_prefill_ffn_override_kernel_body;
+                        const int grid_swizzle_variant = (rocm_env.vnni_prefill_ffn_override_grid_swizzle >= 0)
+                                                             ? rocm_env.vnni_prefill_ffn_override_grid_swizzle
+                                                             : 1;
 
                         if (use_grid_kpar)
                         {
-                            return VnniPrefillLaunchConfig{true, split_k_slices, tile_variant, cpt, kernel_body_variant, "ffn_override_env_gridkpar"};
+                            return VnniPrefillLaunchConfig{true, split_k_slices, tile_variant, cpt, kernel_body_variant, grid_swizzle_variant, "ffn_override_env_gridkpar"};
                         }
-                        return VnniPrefillLaunchConfig{false, split_k_slices, tile_variant, cpt, kernel_body_variant, "ffn_override_env_baseline"};
+                        return VnniPrefillLaunchConfig{false, split_k_slices, tile_variant, cpt, kernel_body_variant, grid_swizzle_variant, "ffn_override_env_baseline"};
                     }
 
                     // Shape classes (ratio-first, then work-size split).
                     if (aspect_n_over_k >= 32.0)
                     {
                         // LM-head/extreme-wide: keep atomics lower and favor stable baseline path.
-                        return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, "extreme_wide_baseline_32x8_cpt1"};
+                        return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, 0, "extreme_wide_baseline_32x8_cpt1"};
                     }
 
                     if (aspect_n_over_k >= 2.0)
@@ -2136,11 +2141,11 @@ namespace llaminar2
                         // FFN up/gate (wide): strategy-lab favored split-k style behavior.
                         if (work < kGridKparMinWork || M < 16 || k_groups < 64)
                         {
-                            return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, "wide_guardrail_baseline_32x8_cpt1"};
+                            return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, 0, "wide_guardrail_baseline_32x8_cpt1"};
                         }
 
                         const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
-                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 1, "wide_gridkpar_32x8_cpt4"};
+                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 1, 1, "wide_gridkpar_32x8_cpt4"};
                     }
 
                     if (aspect_n_over_k < 0.75)
@@ -2148,17 +2153,17 @@ namespace llaminar2
                         // FFN down (tall): keep grid-kpar with moderate split count.
                         if (work < kGridKparMinWork || M < 16 || k_groups < 64)
                         {
-                            return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, "tall_guardrail_baseline_32x8_cpt1"};
+                            return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, 0, "tall_guardrail_baseline_32x8_cpt1"};
                         }
 
                         const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
-                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 1, "tall_gridkpar_32x8_cpt4"};
+                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 1, 1, "tall_gridkpar_32x8_cpt4"};
                     }
 
                     // Attention-ish / near-square.
                     {
                         const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
-                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 1, "balanced_gridkpar_32x8_cpt4"};
+                        return VnniPrefillLaunchConfig{true, slices, 1, 4, 1, 1, "balanced_gridkpar_32x8_cpt4"};
                     }
                 };
 
@@ -2176,6 +2181,7 @@ namespace llaminar2
                     (rocm_env.vnni_prefill_grid_variant >= 0) ||
                     (rocm_env.vnni_prefill_grid_kpar_splits > 0) ||
                     (rocm_env.vnni_prefill_grid_kpar_kb > 0) ||
+                    (rocm_env.vnni_prefill_grid_swizzle >= 0) ||
                     (rocm_env.vnni_prefill_cpt != 1) ||
                     rocm_env.vnni_prefill_grid_kpar;
 
@@ -2187,6 +2193,9 @@ namespace llaminar2
                 const int grid_variant = has_manual_override ? rocm_env.vnni_prefill_grid_variant : policy_cfg.tile_variant;
                 const int cpt = has_manual_override ? rocm_env.vnni_prefill_cpt : policy_cfg.cpt;
                 const int kernel_body_variant = policy_cfg.kernel_body_variant;
+                const int grid_swizzle_variant = (rocm_env.vnni_prefill_grid_swizzle >= 0)
+                                                     ? rocm_env.vnni_prefill_grid_swizzle
+                                                     : policy_cfg.grid_swizzle_variant;
 
                 const int resolved_variant = [&]()
                 {
@@ -2302,6 +2311,7 @@ namespace llaminar2
                         grid_variant,
                         cpt,
                         kernel_body_variant,
+                        grid_swizzle_variant,
                         rocm_device_id_, gpu_stream_);
 
                     if (!native_ok)
