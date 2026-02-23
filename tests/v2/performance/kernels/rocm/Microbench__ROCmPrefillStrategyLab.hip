@@ -78,6 +78,7 @@ struct Options
     int iters = 8;
     std::vector<Shape> shapes;
     std::vector<std::string> strategies;
+    bool user_strategy_override = false;
     std::vector<int> splitk_values;
     bool check_correctness = true;
     bool full_lm_head = false;
@@ -988,6 +989,159 @@ __launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt4_gridstride_aligne
 }
 
 template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt4_gridstride_aligned_mr8_abcast_lane0_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 4;
+    constexpr int MR = 8;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+    const int m4 = row_group * MR + 4;
+    const int m5 = row_group * MR + 5;
+    const int m6 = row_group * MR + 6;
+    const int m7 = row_group * MR + 7;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0;
+        int32_t acc40 = 0, acc41 = 0, acc42 = 0, acc43 = 0;
+        int32_t acc50 = 0, acc51 = 0, acc52 = 0, acc53 = 0;
+        int32_t acc60 = 0, acc61 = 0, acc62 = 0, acc63 = 0;
+        int32_t acc70 = 0, acc71 = 0, acc72 = 0, acc73 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *a4_ptr = d_A + static_cast<int64_t>(m4) * K;
+        const int8_t *a5_ptr = d_A + static_cast<int64_t>(m5) * K;
+        const int8_t *a6_ptr = d_A + static_cast<int64_t>(m6) * K;
+        const int8_t *a7_ptr = d_A + static_cast<int64_t>(m7) * K;
+
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base) * 4;
+
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            int32_t a0_lane = 0, a1_lane = 0, a2_lane = 0, a3_lane = 0;
+            int32_t a4_lane = 0, a5_lane = 0, a6_lane = 0, a7_lane = 0;
+
+            if (lane == 0)
+            {
+                a0_lane = *reinterpret_cast<const int32_t *>(a0_ptr);
+                a1_lane = *reinterpret_cast<const int32_t *>(a1_ptr);
+                a2_lane = *reinterpret_cast<const int32_t *>(a2_ptr);
+                a3_lane = *reinterpret_cast<const int32_t *>(a3_ptr);
+                a4_lane = *reinterpret_cast<const int32_t *>(a4_ptr);
+                a5_lane = *reinterpret_cast<const int32_t *>(a5_ptr);
+                a6_lane = *reinterpret_cast<const int32_t *>(a6_ptr);
+                a7_lane = *reinterpret_cast<const int32_t *>(a7_ptr);
+            }
+
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+            const int32_t a4_cur = __builtin_amdgcn_readlane(a4_lane, 0);
+            const int32_t a5_cur = __builtin_amdgcn_readlane(a5_lane, 0);
+            const int32_t a6_cur = __builtin_amdgcn_readlane(a6_lane, 0);
+            const int32_t a7_cur = __builtin_amdgcn_readlane(a7_lane, 0);
+
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+
+            acc40 = __builtin_amdgcn_sdot4(a4_cur, b0_cur.x, acc40, false);
+            acc41 = __builtin_amdgcn_sdot4(a4_cur, b0_cur.y, acc41, false);
+            acc42 = __builtin_amdgcn_sdot4(a4_cur, b0_cur.z, acc42, false);
+            acc43 = __builtin_amdgcn_sdot4(a4_cur, b0_cur.w, acc43, false);
+
+            acc50 = __builtin_amdgcn_sdot4(a5_cur, b0_cur.x, acc50, false);
+            acc51 = __builtin_amdgcn_sdot4(a5_cur, b0_cur.y, acc51, false);
+            acc52 = __builtin_amdgcn_sdot4(a5_cur, b0_cur.z, acc52, false);
+            acc53 = __builtin_amdgcn_sdot4(a5_cur, b0_cur.w, acc53, false);
+
+            acc60 = __builtin_amdgcn_sdot4(a6_cur, b0_cur.x, acc60, false);
+            acc61 = __builtin_amdgcn_sdot4(a6_cur, b0_cur.y, acc61, false);
+            acc62 = __builtin_amdgcn_sdot4(a6_cur, b0_cur.z, acc62, false);
+            acc63 = __builtin_amdgcn_sdot4(a6_cur, b0_cur.w, acc63, false);
+
+            acc70 = __builtin_amdgcn_sdot4(a7_cur, b0_cur.x, acc70, false);
+            acc71 = __builtin_amdgcn_sdot4(a7_cur, b0_cur.y, acc71, false);
+            acc72 = __builtin_amdgcn_sdot4(a7_cur, b0_cur.z, acc72, false);
+            acc73 = __builtin_amdgcn_sdot4(a7_cur, b0_cur.w, acc73, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            a4_ptr += 4;
+            a5_ptr += 4;
+            a6_ptr += 4;
+            a7_ptr += 4;
+            b0_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        const int64_t c4_base = static_cast<int64_t>(m4) * N + n_base;
+        const int64_t c5_base = static_cast<int64_t>(m5) * N + n_base;
+        const int64_t c6_base = static_cast<int64_t>(m6) * N + n_base;
+        const int64_t c7_base = static_cast<int64_t>(m7) * N + n_base;
+
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c4_base), acc40, acc41, acc42, acc43);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c5_base), acc50, acc51, acc52, acc53);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c6_base), acc60, acc61, acc62, acc63);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c7_base), acc70, acc71, acc72, acc73);
+    }
+}
+
+template <int BY>
 __launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_prefill_kernel(
     const int8_t *__restrict__ d_A,
     const int8_t *__restrict__ d_B_vnni,
@@ -1123,6 +1277,2535 @@ __launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligne
         acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
         acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
         acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4;
+
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            int32_t a0_lane = 0;
+            int32_t a1_lane = 0;
+            int32_t a2_lane = 0;
+            int32_t a3_lane = 0;
+            if (lane == 0)
+            {
+                a0_lane = *reinterpret_cast<const int32_t *>(a0_ptr);
+                a1_lane = *reinterpret_cast<const int32_t *>(a1_ptr);
+                a2_lane = *reinterpret_cast<const int32_t *>(a2_ptr);
+                a3_lane = *reinterpret_cast<const int32_t *>(a3_ptr);
+            }
+
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+            b1_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * 4;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + BX * 4) * 4;
+
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            int32_t a0_lane = 0;
+            int32_t a1_lane = 0;
+            int32_t a2_lane = 0;
+            int32_t a3_lane = 0;
+            if (lane == 0)
+            {
+                a0_lane = *reinterpret_cast<const int32_t *>(a0_ptr);
+                a1_lane = *reinterpret_cast<const int32_t *>(a1_ptr);
+                a2_lane = *reinterpret_cast<const int32_t *>(a2_ptr);
+                a3_lane = *reinterpret_cast<const int32_t *>(a3_ptr);
+            }
+
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+            b1_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + (BX * 4)), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + (BX * 4)), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + (BX * 4)), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + (BX * 4)), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_i32addr_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * 4;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+
+    const int32_t *a0_row = reinterpret_cast<const int32_t *>(d_A + static_cast<int64_t>(m0) * K);
+    const int32_t *a1_row = reinterpret_cast<const int32_t *>(d_A + static_cast<int64_t>(m1) * K);
+    const int32_t *a2_row = reinterpret_cast<const int32_t *>(d_A + static_cast<int64_t>(m2) * K);
+    const int32_t *a3_row = reinterpret_cast<const int32_t *>(d_A + static_cast<int64_t>(m3) * K);
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int32_t *a0_ptr = a0_row;
+        const int32_t *a1_ptr = a1_row;
+        const int32_t *a2_ptr = a2_row;
+        const int32_t *a3_ptr = a3_row;
+
+        const int32_t *b0_i32 = reinterpret_cast<const int32_t *>(d_B_vnni + static_cast<int64_t>(n_base) * 4);
+        const int32_t *b1_i32 = b0_i32 + BX * 4;
+
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            int32_t a0_lane = 0;
+            int32_t a1_lane = 0;
+            int32_t a2_lane = 0;
+            int32_t a3_lane = 0;
+            if (lane == 0)
+            {
+                a0_lane = *a0_ptr;
+                a1_lane = *a1_ptr;
+                a2_lane = *a2_ptr;
+                a3_lane = *a3_ptr;
+            }
+
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_i32);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_i32);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            ++a0_ptr;
+            ++a1_ptr;
+            ++a2_ptr;
+            ++a3_ptr;
+            b0_i32 += N;
+            b1_i32 += N;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + (BX * 4)), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + (BX * 4)), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + (BX * 4)), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + (BX * 4)), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__device__ __forceinline__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_body(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * 4;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        const int8_t *a0_row = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_row = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_row = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_row = d_A + static_cast<int64_t>(m3) * K;
+
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0;
+
+        const int8_t *a0_ptr = a0_row;
+        const int8_t *a1_ptr = a1_row;
+        const int8_t *a2_ptr = a2_row;
+        const int8_t *a3_ptr = a3_row;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base) * 4;
+
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            int32_t a0_lane = 0;
+            int32_t a1_lane = 0;
+            int32_t a2_lane = 0;
+            int32_t a3_lane = 0;
+            if (lane == 0)
+            {
+                a0_lane = *reinterpret_cast<const int32_t *>(a0_ptr);
+                a1_lane = *reinterpret_cast<const int32_t *>(a1_ptr);
+                a2_lane = *reinterpret_cast<const int32_t *>(a2_ptr);
+                a3_lane = *reinterpret_cast<const int32_t *>(a3_ptr);
+            }
+
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+        }
+
+        int32_t acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        a0_ptr = a0_row;
+        a1_ptr = a1_row;
+        a2_ptr = a2_row;
+        a3_ptr = a3_row;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + BX * 4) * 4;
+
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            int32_t a0_lane = 0;
+            int32_t a1_lane = 0;
+            int32_t a2_lane = 0;
+            int32_t a3_lane = 0;
+            if (lane == 0)
+            {
+                a0_lane = *reinterpret_cast<const int32_t *>(a0_ptr);
+                a1_lane = *reinterpret_cast<const int32_t *>(a1_ptr);
+                a2_lane = *reinterpret_cast<const int32_t *>(a2_ptr);
+                a3_lane = *reinterpret_cast<const int32_t *>(a3_ptr);
+            }
+
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b1_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + (BX * 4)), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + (BX * 4)), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + (BX * 4)), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + (BX * 4)), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_body<BY>(d_A, d_B_vnni, d_C, M, N, K);
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 3) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_lb3_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_body<BY>(d_A, d_B_vnni, d_C, M, N, K);
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 4) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_lb4_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_body<BY>(d_A, d_B_vnni, d_C, M, N, K);
+}
+
+template <int BY, int KGT>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_ldsB_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    __shared__ int4 s_b0[KGT][BX];
+    __shared__ int4 s_b1[KGT][BX];
+
+    const int lane = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int row_group = blockIdx.y * BY + ty;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_row = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_row = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_row = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_row = d_A + static_cast<int64_t>(m3) * K;
+
+        for (int kg0 = 0; kg0 < k_groups; kg0 += KGT)
+        {
+            const int tile = min(KGT, k_groups - kg0);
+
+            if (ty == 0)
+            {
+                const int8_t *b0_tile = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4 + static_cast<int64_t>(kg0) * b_group_stride;
+                const int8_t *b1_tile = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4 + static_cast<int64_t>(kg0) * b_group_stride;
+                #pragma unroll
+                for (int t = 0; t < KGT; ++t)
+                {
+                    if (t < tile)
+                    {
+                        s_b0[t][lane] = *reinterpret_cast<const int4 *>(b0_tile + static_cast<int64_t>(t) * b_group_stride);
+                        s_b1[t][lane] = *reinterpret_cast<const int4 *>(b1_tile + static_cast<int64_t>(t) * b_group_stride);
+                    }
+                }
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int t = 0; t < KGT; ++t)
+            {
+                if (t >= tile)
+                {
+                    continue;
+                }
+
+                const int kg = kg0 + t;
+                int32_t a0_lane = 0;
+                int32_t a1_lane = 0;
+                int32_t a2_lane = 0;
+                int32_t a3_lane = 0;
+                if (lane == 0)
+                {
+                    a0_lane = *reinterpret_cast<const int32_t *>(a0_row + static_cast<int64_t>(kg) * 4);
+                    a1_lane = *reinterpret_cast<const int32_t *>(a1_row + static_cast<int64_t>(kg) * 4);
+                    a2_lane = *reinterpret_cast<const int32_t *>(a2_row + static_cast<int64_t>(kg) * 4);
+                    a3_lane = *reinterpret_cast<const int32_t *>(a3_row + static_cast<int64_t>(kg) * 4);
+                }
+
+                const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+                const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+                const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+                const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+                const int4 b0_cur = s_b0[t][lane];
+                const int4 b1_cur = s_b1[t][lane];
+
+                acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+                acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+                acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+                acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+                acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+                acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+                acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+                acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+                acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+                acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+                acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+                acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+                acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+                acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+                acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+                acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+                acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+                acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+                acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+                acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+                acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+                acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+                acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+                acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+                acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+                acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+                acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+                acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+                acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+                acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+                acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+                acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+            }
+            __syncthreads();
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_avec4_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4;
+
+        for (int kg = 0; kg < k_groups; kg += 4)
+        {
+            int4 a0_pack = make_int4(0, 0, 0, 0);
+            int4 a1_pack = make_int4(0, 0, 0, 0);
+            int4 a2_pack = make_int4(0, 0, 0, 0);
+            int4 a3_pack = make_int4(0, 0, 0, 0);
+            if (lane == 0)
+            {
+                a0_pack = *reinterpret_cast<const int4 *>(a0_ptr);
+                a1_pack = *reinterpret_cast<const int4 *>(a1_ptr);
+                a2_pack = *reinterpret_cast<const int4 *>(a2_ptr);
+                a3_pack = *reinterpret_cast<const int4 *>(a3_ptr);
+            }
+
+            #pragma unroll
+            for (int s = 0; s < 4; ++s)
+            {
+                if (kg + s >= k_groups)
+                {
+                    continue;
+                }
+
+                int32_t a0_lane = 0;
+                int32_t a1_lane = 0;
+                int32_t a2_lane = 0;
+                int32_t a3_lane = 0;
+                if (s == 0)
+                {
+                    a0_lane = a0_pack.x;
+                    a1_lane = a1_pack.x;
+                    a2_lane = a2_pack.x;
+                    a3_lane = a3_pack.x;
+                }
+                else if (s == 1)
+                {
+                    a0_lane = a0_pack.y;
+                    a1_lane = a1_pack.y;
+                    a2_lane = a2_pack.y;
+                    a3_lane = a3_pack.y;
+                }
+                else if (s == 2)
+                {
+                    a0_lane = a0_pack.z;
+                    a1_lane = a1_pack.z;
+                    a2_lane = a2_pack.z;
+                    a3_lane = a3_pack.z;
+                }
+                else
+                {
+                    a0_lane = a0_pack.w;
+                    a1_lane = a1_pack.w;
+                    a2_lane = a2_pack.w;
+                    a3_lane = a3_pack.w;
+                }
+
+                const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+                const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+                const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+                const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+
+                const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr + static_cast<int64_t>(s) * b_group_stride);
+                const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr + static_cast<int64_t>(s) * b_group_stride);
+
+                acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+                acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+                acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+                acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+                acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+                acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+                acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+                acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+                acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+                acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+                acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+                acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+                acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+                acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+                acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+                acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+                acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+                acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+                acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+                acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+                acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+                acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+                acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+                acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+                acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+                acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+                acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+                acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+                acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+                acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+                acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+                acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+            }
+
+            a0_ptr += 16;
+            a1_ptr += 16;
+            a2_ptr += 16;
+            a3_ptr += 16;
+            b0_ptr += static_cast<int64_t>(4) * b_group_stride;
+            b1_ptr += static_cast<int64_t>(4) * b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 1) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_lb1_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4;
+
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            int32_t a0_lane = 0;
+            int32_t a1_lane = 0;
+            int32_t a2_lane = 0;
+            int32_t a3_lane = 0;
+            if (lane == 0)
+            {
+                a0_lane = *reinterpret_cast<const int32_t *>(a0_ptr);
+                a1_lane = *reinterpret_cast<const int32_t *>(a1_ptr);
+                a2_lane = *reinterpret_cast<const int32_t *>(a2_ptr);
+                a3_lane = *reinterpret_cast<const int32_t *>(a3_ptr);
+            }
+
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+            b1_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coal_pipe_u4_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * 4;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + BX * 4) * 4;
+
+        int32_t a0_lane_next = 0;
+        int32_t a1_lane_next = 0;
+        int32_t a2_lane_next = 0;
+        int32_t a3_lane_next = 0;
+        if (lane == 0)
+        {
+            a0_lane_next = *reinterpret_cast<const int32_t *>(a0_ptr);
+            a1_lane_next = *reinterpret_cast<const int32_t *>(a1_ptr);
+            a2_lane_next = *reinterpret_cast<const int32_t *>(a2_ptr);
+            a3_lane_next = *reinterpret_cast<const int32_t *>(a3_ptr);
+        }
+        int4 b0_next = *reinterpret_cast<const int4 *>(b0_ptr);
+        int4 b1_next = *reinterpret_cast<const int4 *>(b1_ptr);
+
+        #pragma unroll 4
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane_next, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane_next, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane_next, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane_next, 0);
+            const int4 b0_cur = b0_next;
+            const int4 b1_cur = b1_next;
+
+            if (kg + 1 < k_groups)
+            {
+                if (lane == 0)
+                {
+                    a0_lane_next = *reinterpret_cast<const int32_t *>(a0_ptr + 4);
+                    a1_lane_next = *reinterpret_cast<const int32_t *>(a1_ptr + 4);
+                    a2_lane_next = *reinterpret_cast<const int32_t *>(a2_ptr + 4);
+                    a3_lane_next = *reinterpret_cast<const int32_t *>(a3_ptr + 4);
+                }
+                b0_next = *reinterpret_cast<const int4 *>(b0_ptr + b_group_stride);
+                b1_next = *reinterpret_cast<const int4 *>(b1_ptr + b_group_stride);
+            }
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+            b1_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + (BX * 4)), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + (BX * 4)), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + (BX * 4)), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + (BX * 4)), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_pf1_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4;
+
+        int32_t a0_lane = 0;
+        int32_t a1_lane = 0;
+        int32_t a2_lane = 0;
+        int32_t a3_lane = 0;
+        if (lane == 0)
+        {
+            a0_lane = *reinterpret_cast<const int32_t *>(a0_ptr);
+            a1_lane = *reinterpret_cast<const int32_t *>(a1_ptr);
+            a2_lane = *reinterpret_cast<const int32_t *>(a2_ptr);
+            a3_lane = *reinterpret_cast<const int32_t *>(a3_ptr);
+        }
+
+        int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+        int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+        int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+        int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+        int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+        int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+
+        #pragma unroll 2
+        for (int kg = 1; kg < k_groups; ++kg)
+        {
+            const int8_t *a0_next_ptr = a0_ptr + 4;
+            const int8_t *a1_next_ptr = a1_ptr + 4;
+            const int8_t *a2_next_ptr = a2_ptr + 4;
+            const int8_t *a3_next_ptr = a3_ptr + 4;
+            const int8_t *b0_next_ptr = b0_ptr + b_group_stride;
+            const int8_t *b1_next_ptr = b1_ptr + b_group_stride;
+
+            __builtin_prefetch(b0_next_ptr + b_group_stride, 0, 1);
+            __builtin_prefetch(b1_next_ptr + b_group_stride, 0, 1);
+
+            int32_t a0_next_lane = 0;
+            int32_t a1_next_lane = 0;
+            int32_t a2_next_lane = 0;
+            int32_t a3_next_lane = 0;
+            if (lane == 0)
+            {
+                a0_next_lane = *reinterpret_cast<const int32_t *>(a0_next_ptr);
+                a1_next_lane = *reinterpret_cast<const int32_t *>(a1_next_ptr);
+                a2_next_lane = *reinterpret_cast<const int32_t *>(a2_next_ptr);
+                a3_next_lane = *reinterpret_cast<const int32_t *>(a3_next_ptr);
+            }
+            const int4 b0_next = *reinterpret_cast<const int4 *>(b0_next_ptr);
+            const int4 b1_next = *reinterpret_cast<const int4 *>(b1_next_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr = a0_next_ptr;
+            a1_ptr = a1_next_ptr;
+            a2_ptr = a2_next_ptr;
+            a3_ptr = a3_next_ptr;
+            b0_ptr = b0_next_ptr;
+            b1_ptr = b1_next_ptr;
+
+            a0_cur = __builtin_amdgcn_readlane(a0_next_lane, 0);
+            a1_cur = __builtin_amdgcn_readlane(a1_next_lane, 0);
+            a2_cur = __builtin_amdgcn_readlane(a2_next_lane, 0);
+            a3_cur = __builtin_amdgcn_readlane(a3_next_lane, 0);
+            b0_cur = b0_next;
+            b1_cur = b1_next;
+        }
+
+        acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+        acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+        acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+        acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+        acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+        acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+        acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+        acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+        acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+        acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+        acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+        acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+        acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+        acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+        acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+        acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+        acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+        acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+        acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+        acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+        acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+        acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+        acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+        acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+        acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+        acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+        acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+        acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+        acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+        acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+        acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+        acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_k2_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4;
+
+        const int k_groups2 = (k_groups / 2) * 2;
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups2; kg += 2)
+        {
+            int2 a0_lane2 = make_int2(0, 0);
+            int2 a1_lane2 = make_int2(0, 0);
+            int2 a2_lane2 = make_int2(0, 0);
+            int2 a3_lane2 = make_int2(0, 0);
+            if (lane == 0)
+            {
+                a0_lane2 = *reinterpret_cast<const int2 *>(a0_ptr);
+                a1_lane2 = *reinterpret_cast<const int2 *>(a1_ptr);
+                a2_lane2 = *reinterpret_cast<const int2 *>(a2_ptr);
+                a3_lane2 = *reinterpret_cast<const int2 *>(a3_ptr);
+            }
+
+            const int32_t a00 = __builtin_amdgcn_readlane(a0_lane2.x, 0);
+            const int32_t a01 = __builtin_amdgcn_readlane(a0_lane2.y, 0);
+            const int32_t a10 = __builtin_amdgcn_readlane(a1_lane2.x, 0);
+            const int32_t a11 = __builtin_amdgcn_readlane(a1_lane2.y, 0);
+            const int32_t a20 = __builtin_amdgcn_readlane(a2_lane2.x, 0);
+            const int32_t a21 = __builtin_amdgcn_readlane(a2_lane2.y, 0);
+            const int32_t a30 = __builtin_amdgcn_readlane(a3_lane2.x, 0);
+            const int32_t a31 = __builtin_amdgcn_readlane(a3_lane2.y, 0);
+
+            const int4 b0_0 = *reinterpret_cast<const int4 *>(b0_ptr + 0 * b_group_stride);
+            const int4 b1_0 = *reinterpret_cast<const int4 *>(b1_ptr + 0 * b_group_stride);
+            const int4 b0_1 = *reinterpret_cast<const int4 *>(b0_ptr + 1 * b_group_stride);
+            const int4 b1_1 = *reinterpret_cast<const int4 *>(b1_ptr + 1 * b_group_stride);
+
+            acc00 = __builtin_amdgcn_sdot4(a00, b0_0.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a00, b0_0.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a00, b0_0.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a00, b0_0.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a00, b1_0.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a00, b1_0.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a00, b1_0.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a00, b1_0.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a10, b0_0.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a10, b0_0.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a10, b0_0.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a10, b0_0.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a10, b1_0.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a10, b1_0.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a10, b1_0.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a10, b1_0.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a20, b0_0.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a20, b0_0.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a20, b0_0.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a20, b0_0.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a20, b1_0.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a20, b1_0.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a20, b1_0.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a20, b1_0.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a30, b0_0.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a30, b0_0.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a30, b0_0.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a30, b0_0.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a30, b1_0.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a30, b1_0.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a30, b1_0.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a30, b1_0.w, acc37, false);
+
+            acc00 = __builtin_amdgcn_sdot4(a01, b0_1.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a01, b0_1.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a01, b0_1.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a01, b0_1.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a01, b1_1.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a01, b1_1.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a01, b1_1.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a01, b1_1.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a11, b0_1.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a11, b0_1.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a11, b0_1.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a11, b0_1.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a11, b1_1.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a11, b1_1.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a11, b1_1.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a11, b1_1.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a21, b0_1.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a21, b0_1.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a21, b0_1.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a21, b0_1.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a21, b1_1.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a21, b1_1.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a21, b1_1.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a21, b1_1.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a31, b0_1.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a31, b0_1.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a31, b0_1.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a31, b0_1.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a31, b1_1.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a31, b1_1.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a31, b1_1.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a31, b1_1.w, acc37, false);
+
+            a0_ptr += 8;
+            a1_ptr += 8;
+            a2_ptr += 8;
+            a3_ptr += 8;
+            b0_ptr += 2 * b_group_stride;
+            b1_ptr += 2 * b_group_stride;
+        }
+
+        for (int kg = k_groups2; kg < k_groups; ++kg)
+        {
+            int32_t a0_lane = 0;
+            int32_t a1_lane = 0;
+            int32_t a2_lane = 0;
+            int32_t a3_lane = 0;
+            if (lane == 0)
+            {
+                a0_lane = *reinterpret_cast<const int32_t *>(a0_ptr);
+                a1_lane = *reinterpret_cast<const int32_t *>(a1_ptr);
+                a2_lane = *reinterpret_cast<const int32_t *>(a2_ptr);
+                a3_lane = *reinterpret_cast<const int32_t *>(a3_ptr);
+            }
+
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+            b1_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_cpt16split_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 16;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc08 = 0, acc09 = 0, acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0;
+        int32_t acc16 = 0, acc17 = 0, acc18 = 0, acc19 = 0, acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0;
+        int32_t acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0, acc28 = 0, acc29 = 0, acc30 = 0, acc31 = 0;
+        int32_t acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0, acc38 = 0, acc39 = 0;
+        int32_t acc40 = 0, acc41 = 0, acc42 = 0, acc43 = 0, acc44 = 0, acc45 = 0, acc46 = 0, acc47 = 0;
+        int32_t acc48 = 0, acc49 = 0, acc50 = 0, acc51 = 0, acc52 = 0, acc53 = 0, acc54 = 0, acc55 = 0;
+        int32_t acc56 = 0, acc57 = 0, acc58 = 0, acc59 = 0, acc60 = 0, acc61 = 0, acc62 = 0, acc63 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4;
+        const int8_t *b2_ptr = d_B_vnni + static_cast<int64_t>(n_base + 8) * 4;
+        const int8_t *b3_ptr = d_B_vnni + static_cast<int64_t>(n_base + 12) * 4;
+
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            int32_t a0_lane = 0;
+            int32_t a1_lane = 0;
+            int32_t a2_lane = 0;
+            int32_t a3_lane = 0;
+            if (lane == 0)
+            {
+                a0_lane = *reinterpret_cast<const int32_t *>(a0_ptr);
+                a1_lane = *reinterpret_cast<const int32_t *>(a1_ptr);
+                a2_lane = *reinterpret_cast<const int32_t *>(a2_ptr);
+                a3_lane = *reinterpret_cast<const int32_t *>(a3_ptr);
+            }
+
+            const int32_t a0_cur = __builtin_amdgcn_readlane(a0_lane, 0);
+            const int32_t a1_cur = __builtin_amdgcn_readlane(a1_lane, 0);
+            const int32_t a2_cur = __builtin_amdgcn_readlane(a2_lane, 0);
+            const int32_t a3_cur = __builtin_amdgcn_readlane(a3_lane, 0);
+
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+            const int4 b2_cur = *reinterpret_cast<const int4 *>(b2_ptr);
+            const int4 b3_cur = *reinterpret_cast<const int4 *>(b3_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false); acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false); acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false); acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false); acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false); acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false); acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+            acc08 = __builtin_amdgcn_sdot4(a0_cur, b2_cur.x, acc08, false); acc09 = __builtin_amdgcn_sdot4(a0_cur, b2_cur.y, acc09, false); acc10 = __builtin_amdgcn_sdot4(a0_cur, b2_cur.z, acc10, false); acc11 = __builtin_amdgcn_sdot4(a0_cur, b2_cur.w, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a0_cur, b3_cur.x, acc12, false); acc13 = __builtin_amdgcn_sdot4(a0_cur, b3_cur.y, acc13, false); acc14 = __builtin_amdgcn_sdot4(a0_cur, b3_cur.z, acc14, false); acc15 = __builtin_amdgcn_sdot4(a0_cur, b3_cur.w, acc15, false);
+
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc16, false); acc17 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc17, false); acc18 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc18, false); acc19 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc19, false);
+            acc20 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc20, false); acc21 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc21, false); acc22 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc22, false); acc23 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a1_cur, b2_cur.x, acc24, false); acc25 = __builtin_amdgcn_sdot4(a1_cur, b2_cur.y, acc25, false); acc26 = __builtin_amdgcn_sdot4(a1_cur, b2_cur.z, acc26, false); acc27 = __builtin_amdgcn_sdot4(a1_cur, b2_cur.w, acc27, false);
+            acc28 = __builtin_amdgcn_sdot4(a1_cur, b3_cur.x, acc28, false); acc29 = __builtin_amdgcn_sdot4(a1_cur, b3_cur.y, acc29, false); acc30 = __builtin_amdgcn_sdot4(a1_cur, b3_cur.z, acc30, false); acc31 = __builtin_amdgcn_sdot4(a1_cur, b3_cur.w, acc31, false);
+
+            acc32 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc32, false); acc33 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc33, false); acc34 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc34, false); acc35 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc36, false); acc37 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc37, false); acc38 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc38, false); acc39 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc39, false);
+            acc40 = __builtin_amdgcn_sdot4(a2_cur, b2_cur.x, acc40, false); acc41 = __builtin_amdgcn_sdot4(a2_cur, b2_cur.y, acc41, false); acc42 = __builtin_amdgcn_sdot4(a2_cur, b2_cur.z, acc42, false); acc43 = __builtin_amdgcn_sdot4(a2_cur, b2_cur.w, acc43, false);
+            acc44 = __builtin_amdgcn_sdot4(a2_cur, b3_cur.x, acc44, false); acc45 = __builtin_amdgcn_sdot4(a2_cur, b3_cur.y, acc45, false); acc46 = __builtin_amdgcn_sdot4(a2_cur, b3_cur.z, acc46, false); acc47 = __builtin_amdgcn_sdot4(a2_cur, b3_cur.w, acc47, false);
+
+            acc48 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc48, false); acc49 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc49, false); acc50 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc50, false); acc51 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc51, false);
+            acc52 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc52, false); acc53 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc53, false); acc54 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc54, false); acc55 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc55, false);
+            acc56 = __builtin_amdgcn_sdot4(a3_cur, b2_cur.x, acc56, false); acc57 = __builtin_amdgcn_sdot4(a3_cur, b2_cur.y, acc57, false); acc58 = __builtin_amdgcn_sdot4(a3_cur, b2_cur.z, acc58, false); acc59 = __builtin_amdgcn_sdot4(a3_cur, b2_cur.w, acc59, false);
+            acc60 = __builtin_amdgcn_sdot4(a3_cur, b3_cur.x, acc60, false); acc61 = __builtin_amdgcn_sdot4(a3_cur, b3_cur.y, acc61, false); acc62 = __builtin_amdgcn_sdot4(a3_cur, b3_cur.z, acc62, false); acc63 = __builtin_amdgcn_sdot4(a3_cur, b3_cur.w, acc63, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+            b1_ptr += b_group_stride;
+            b2_ptr += b_group_stride;
+            b3_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 8), acc08, acc09, acc10, acc11);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 12), acc12, acc13, acc14, acc15);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc16, acc17, acc18, acc19);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 8), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 12), acc28, acc29, acc30, acc31);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc32, acc33, acc34, acc35);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc36, acc37, acc38, acc39);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 8), acc40, acc41, acc42, acc43);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 12), acc44, acc45, acc46, acc47);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc48, acc49, acc50, acc51);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc52, acc53, acc54, acc55);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 8), acc56, acc57, acc58, acc59);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 12), acc60, acc61, acc62, acc63);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_veca2_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4;
+
+        const int k_groups2 = (k_groups / 2) * 2;
+        #pragma unroll 2
+        for (int kg = 0; kg < k_groups2; kg += 2)
+        {
+            const int2 a0_vec = *reinterpret_cast<const int2 *>(a0_ptr);
+            const int2 a1_vec = *reinterpret_cast<const int2 *>(a1_ptr);
+            const int2 a2_vec = *reinterpret_cast<const int2 *>(a2_ptr);
+            const int2 a3_vec = *reinterpret_cast<const int2 *>(a3_ptr);
+
+            const int4 b0_0 = *reinterpret_cast<const int4 *>(b0_ptr + 0 * b_group_stride);
+            const int4 b1_0 = *reinterpret_cast<const int4 *>(b1_ptr + 0 * b_group_stride);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_vec.x, b0_0.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_vec.x, b0_0.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_vec.x, b0_0.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_vec.x, b0_0.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_vec.x, b1_0.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_vec.x, b1_0.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_vec.x, b1_0.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_vec.x, b1_0.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_vec.x, b0_0.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_vec.x, b0_0.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_vec.x, b0_0.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_vec.x, b0_0.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_vec.x, b1_0.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_vec.x, b1_0.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_vec.x, b1_0.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_vec.x, b1_0.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_vec.x, b0_0.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_vec.x, b0_0.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_vec.x, b0_0.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_vec.x, b0_0.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_vec.x, b1_0.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_vec.x, b1_0.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_vec.x, b1_0.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_vec.x, b1_0.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_vec.x, b0_0.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_vec.x, b0_0.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_vec.x, b0_0.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_vec.x, b0_0.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_vec.x, b1_0.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_vec.x, b1_0.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_vec.x, b1_0.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_vec.x, b1_0.w, acc37, false);
+
+            const int4 b0_1 = *reinterpret_cast<const int4 *>(b0_ptr + 1 * b_group_stride);
+            const int4 b1_1 = *reinterpret_cast<const int4 *>(b1_ptr + 1 * b_group_stride);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_vec.y, b0_1.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_vec.y, b0_1.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_vec.y, b0_1.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_vec.y, b0_1.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_vec.y, b1_1.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_vec.y, b1_1.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_vec.y, b1_1.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_vec.y, b1_1.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_vec.y, b0_1.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_vec.y, b0_1.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_vec.y, b0_1.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_vec.y, b0_1.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_vec.y, b1_1.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_vec.y, b1_1.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_vec.y, b1_1.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_vec.y, b1_1.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_vec.y, b0_1.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_vec.y, b0_1.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_vec.y, b0_1.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_vec.y, b0_1.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_vec.y, b1_1.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_vec.y, b1_1.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_vec.y, b1_1.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_vec.y, b1_1.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_vec.y, b0_1.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_vec.y, b0_1.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_vec.y, b0_1.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_vec.y, b0_1.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_vec.y, b1_1.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_vec.y, b1_1.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_vec.y, b1_1.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_vec.y, b1_1.w, acc37, false);
+
+            a0_ptr += 8;
+            a1_ptr += 8;
+            a2_ptr += 8;
+            a3_ptr += 8;
+            b0_ptr += 2 * b_group_stride;
+            b1_ptr += 2 * b_group_stride;
+        }
+
+        for (int kg = k_groups2; kg < k_groups; ++kg)
+        {
+            const int32_t a0_cur = *reinterpret_cast<const int32_t *>(a0_ptr);
+            const int32_t a1_cur = *reinterpret_cast<const int32_t *>(a1_ptr);
+            const int32_t a2_cur = *reinterpret_cast<const int32_t *>(a2_ptr);
+            const int32_t a3_cur = *reinterpret_cast<const int32_t *>(a3_ptr);
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+            b1_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_veca4_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4;
+
+        const int k_groups4 = (k_groups / 4) * 4;
+        for (int kg = 0; kg < k_groups4; kg += 4)
+        {
+            const int4 a0_vec = *reinterpret_cast<const int4 *>(a0_ptr);
+            const int4 a1_vec = *reinterpret_cast<const int4 *>(a1_ptr);
+            const int4 a2_vec = *reinterpret_cast<const int4 *>(a2_ptr);
+            const int4 a3_vec = *reinterpret_cast<const int4 *>(a3_ptr);
+
+            const int4 b0_0 = *reinterpret_cast<const int4 *>(b0_ptr + 0 * b_group_stride);
+            const int4 b1_0 = *reinterpret_cast<const int4 *>(b1_ptr + 0 * b_group_stride);
+            const int4 b0_1 = *reinterpret_cast<const int4 *>(b0_ptr + 1 * b_group_stride);
+            const int4 b1_1 = *reinterpret_cast<const int4 *>(b1_ptr + 1 * b_group_stride);
+            const int4 b0_2 = *reinterpret_cast<const int4 *>(b0_ptr + 2 * b_group_stride);
+            const int4 b1_2 = *reinterpret_cast<const int4 *>(b1_ptr + 2 * b_group_stride);
+            const int4 b0_3 = *reinterpret_cast<const int4 *>(b0_ptr + 3 * b_group_stride);
+            const int4 b1_3 = *reinterpret_cast<const int4 *>(b1_ptr + 3 * b_group_stride);
+
+            const int32_t a00 = a0_vec.x;
+            const int32_t a01 = a0_vec.y;
+            const int32_t a02 = a0_vec.z;
+            const int32_t a03 = a0_vec.w;
+            const int32_t a10 = a1_vec.x;
+            const int32_t a11 = a1_vec.y;
+            const int32_t a12 = a1_vec.z;
+            const int32_t a13 = a1_vec.w;
+            const int32_t a20 = a2_vec.x;
+            const int32_t a21 = a2_vec.y;
+            const int32_t a22 = a2_vec.z;
+            const int32_t a23 = a2_vec.w;
+            const int32_t a30 = a3_vec.x;
+            const int32_t a31 = a3_vec.y;
+            const int32_t a32 = a3_vec.z;
+            const int32_t a33 = a3_vec.w;
+
+            acc00 = __builtin_amdgcn_sdot4(a00, b0_0.x, acc00, false); acc01 = __builtin_amdgcn_sdot4(a00, b0_0.y, acc01, false); acc02 = __builtin_amdgcn_sdot4(a00, b0_0.z, acc02, false); acc03 = __builtin_amdgcn_sdot4(a00, b0_0.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a00, b1_0.x, acc04, false); acc05 = __builtin_amdgcn_sdot4(a00, b1_0.y, acc05, false); acc06 = __builtin_amdgcn_sdot4(a00, b1_0.z, acc06, false); acc07 = __builtin_amdgcn_sdot4(a00, b1_0.w, acc07, false);
+            acc10 = __builtin_amdgcn_sdot4(a10, b0_0.x, acc10, false); acc11 = __builtin_amdgcn_sdot4(a10, b0_0.y, acc11, false); acc12 = __builtin_amdgcn_sdot4(a10, b0_0.z, acc12, false); acc13 = __builtin_amdgcn_sdot4(a10, b0_0.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a10, b1_0.x, acc14, false); acc15 = __builtin_amdgcn_sdot4(a10, b1_0.y, acc15, false); acc16 = __builtin_amdgcn_sdot4(a10, b1_0.z, acc16, false); acc17 = __builtin_amdgcn_sdot4(a10, b1_0.w, acc17, false);
+            acc20 = __builtin_amdgcn_sdot4(a20, b0_0.x, acc20, false); acc21 = __builtin_amdgcn_sdot4(a20, b0_0.y, acc21, false); acc22 = __builtin_amdgcn_sdot4(a20, b0_0.z, acc22, false); acc23 = __builtin_amdgcn_sdot4(a20, b0_0.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a20, b1_0.x, acc24, false); acc25 = __builtin_amdgcn_sdot4(a20, b1_0.y, acc25, false); acc26 = __builtin_amdgcn_sdot4(a20, b1_0.z, acc26, false); acc27 = __builtin_amdgcn_sdot4(a20, b1_0.w, acc27, false);
+            acc30 = __builtin_amdgcn_sdot4(a30, b0_0.x, acc30, false); acc31 = __builtin_amdgcn_sdot4(a30, b0_0.y, acc31, false); acc32 = __builtin_amdgcn_sdot4(a30, b0_0.z, acc32, false); acc33 = __builtin_amdgcn_sdot4(a30, b0_0.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a30, b1_0.x, acc34, false); acc35 = __builtin_amdgcn_sdot4(a30, b1_0.y, acc35, false); acc36 = __builtin_amdgcn_sdot4(a30, b1_0.z, acc36, false); acc37 = __builtin_amdgcn_sdot4(a30, b1_0.w, acc37, false);
+
+            acc00 = __builtin_amdgcn_sdot4(a01, b0_1.x, acc00, false); acc01 = __builtin_amdgcn_sdot4(a01, b0_1.y, acc01, false); acc02 = __builtin_amdgcn_sdot4(a01, b0_1.z, acc02, false); acc03 = __builtin_amdgcn_sdot4(a01, b0_1.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a01, b1_1.x, acc04, false); acc05 = __builtin_amdgcn_sdot4(a01, b1_1.y, acc05, false); acc06 = __builtin_amdgcn_sdot4(a01, b1_1.z, acc06, false); acc07 = __builtin_amdgcn_sdot4(a01, b1_1.w, acc07, false);
+            acc10 = __builtin_amdgcn_sdot4(a11, b0_1.x, acc10, false); acc11 = __builtin_amdgcn_sdot4(a11, b0_1.y, acc11, false); acc12 = __builtin_amdgcn_sdot4(a11, b0_1.z, acc12, false); acc13 = __builtin_amdgcn_sdot4(a11, b0_1.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a11, b1_1.x, acc14, false); acc15 = __builtin_amdgcn_sdot4(a11, b1_1.y, acc15, false); acc16 = __builtin_amdgcn_sdot4(a11, b1_1.z, acc16, false); acc17 = __builtin_amdgcn_sdot4(a11, b1_1.w, acc17, false);
+            acc20 = __builtin_amdgcn_sdot4(a21, b0_1.x, acc20, false); acc21 = __builtin_amdgcn_sdot4(a21, b0_1.y, acc21, false); acc22 = __builtin_amdgcn_sdot4(a21, b0_1.z, acc22, false); acc23 = __builtin_amdgcn_sdot4(a21, b0_1.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a21, b1_1.x, acc24, false); acc25 = __builtin_amdgcn_sdot4(a21, b1_1.y, acc25, false); acc26 = __builtin_amdgcn_sdot4(a21, b1_1.z, acc26, false); acc27 = __builtin_amdgcn_sdot4(a21, b1_1.w, acc27, false);
+            acc30 = __builtin_amdgcn_sdot4(a31, b0_1.x, acc30, false); acc31 = __builtin_amdgcn_sdot4(a31, b0_1.y, acc31, false); acc32 = __builtin_amdgcn_sdot4(a31, b0_1.z, acc32, false); acc33 = __builtin_amdgcn_sdot4(a31, b0_1.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a31, b1_1.x, acc34, false); acc35 = __builtin_amdgcn_sdot4(a31, b1_1.y, acc35, false); acc36 = __builtin_amdgcn_sdot4(a31, b1_1.z, acc36, false); acc37 = __builtin_amdgcn_sdot4(a31, b1_1.w, acc37, false);
+
+            acc00 = __builtin_amdgcn_sdot4(a02, b0_2.x, acc00, false); acc01 = __builtin_amdgcn_sdot4(a02, b0_2.y, acc01, false); acc02 = __builtin_amdgcn_sdot4(a02, b0_2.z, acc02, false); acc03 = __builtin_amdgcn_sdot4(a02, b0_2.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a02, b1_2.x, acc04, false); acc05 = __builtin_amdgcn_sdot4(a02, b1_2.y, acc05, false); acc06 = __builtin_amdgcn_sdot4(a02, b1_2.z, acc06, false); acc07 = __builtin_amdgcn_sdot4(a02, b1_2.w, acc07, false);
+            acc10 = __builtin_amdgcn_sdot4(a12, b0_2.x, acc10, false); acc11 = __builtin_amdgcn_sdot4(a12, b0_2.y, acc11, false); acc12 = __builtin_amdgcn_sdot4(a12, b0_2.z, acc12, false); acc13 = __builtin_amdgcn_sdot4(a12, b0_2.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a12, b1_2.x, acc14, false); acc15 = __builtin_amdgcn_sdot4(a12, b1_2.y, acc15, false); acc16 = __builtin_amdgcn_sdot4(a12, b1_2.z, acc16, false); acc17 = __builtin_amdgcn_sdot4(a12, b1_2.w, acc17, false);
+            acc20 = __builtin_amdgcn_sdot4(a22, b0_2.x, acc20, false); acc21 = __builtin_amdgcn_sdot4(a22, b0_2.y, acc21, false); acc22 = __builtin_amdgcn_sdot4(a22, b0_2.z, acc22, false); acc23 = __builtin_amdgcn_sdot4(a22, b0_2.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a22, b1_2.x, acc24, false); acc25 = __builtin_amdgcn_sdot4(a22, b1_2.y, acc25, false); acc26 = __builtin_amdgcn_sdot4(a22, b1_2.z, acc26, false); acc27 = __builtin_amdgcn_sdot4(a22, b1_2.w, acc27, false);
+            acc30 = __builtin_amdgcn_sdot4(a32, b0_2.x, acc30, false); acc31 = __builtin_amdgcn_sdot4(a32, b0_2.y, acc31, false); acc32 = __builtin_amdgcn_sdot4(a32, b0_2.z, acc32, false); acc33 = __builtin_amdgcn_sdot4(a32, b0_2.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a32, b1_2.x, acc34, false); acc35 = __builtin_amdgcn_sdot4(a32, b1_2.y, acc35, false); acc36 = __builtin_amdgcn_sdot4(a32, b1_2.z, acc36, false); acc37 = __builtin_amdgcn_sdot4(a32, b1_2.w, acc37, false);
+
+            acc00 = __builtin_amdgcn_sdot4(a03, b0_3.x, acc00, false); acc01 = __builtin_amdgcn_sdot4(a03, b0_3.y, acc01, false); acc02 = __builtin_amdgcn_sdot4(a03, b0_3.z, acc02, false); acc03 = __builtin_amdgcn_sdot4(a03, b0_3.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a03, b1_3.x, acc04, false); acc05 = __builtin_amdgcn_sdot4(a03, b1_3.y, acc05, false); acc06 = __builtin_amdgcn_sdot4(a03, b1_3.z, acc06, false); acc07 = __builtin_amdgcn_sdot4(a03, b1_3.w, acc07, false);
+            acc10 = __builtin_amdgcn_sdot4(a13, b0_3.x, acc10, false); acc11 = __builtin_amdgcn_sdot4(a13, b0_3.y, acc11, false); acc12 = __builtin_amdgcn_sdot4(a13, b0_3.z, acc12, false); acc13 = __builtin_amdgcn_sdot4(a13, b0_3.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a13, b1_3.x, acc14, false); acc15 = __builtin_amdgcn_sdot4(a13, b1_3.y, acc15, false); acc16 = __builtin_amdgcn_sdot4(a13, b1_3.z, acc16, false); acc17 = __builtin_amdgcn_sdot4(a13, b1_3.w, acc17, false);
+            acc20 = __builtin_amdgcn_sdot4(a23, b0_3.x, acc20, false); acc21 = __builtin_amdgcn_sdot4(a23, b0_3.y, acc21, false); acc22 = __builtin_amdgcn_sdot4(a23, b0_3.z, acc22, false); acc23 = __builtin_amdgcn_sdot4(a23, b0_3.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a23, b1_3.x, acc24, false); acc25 = __builtin_amdgcn_sdot4(a23, b1_3.y, acc25, false); acc26 = __builtin_amdgcn_sdot4(a23, b1_3.z, acc26, false); acc27 = __builtin_amdgcn_sdot4(a23, b1_3.w, acc27, false);
+            acc30 = __builtin_amdgcn_sdot4(a33, b0_3.x, acc30, false); acc31 = __builtin_amdgcn_sdot4(a33, b0_3.y, acc31, false); acc32 = __builtin_amdgcn_sdot4(a33, b0_3.z, acc32, false); acc33 = __builtin_amdgcn_sdot4(a33, b0_3.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a33, b1_3.x, acc34, false); acc35 = __builtin_amdgcn_sdot4(a33, b1_3.y, acc35, false); acc36 = __builtin_amdgcn_sdot4(a33, b1_3.z, acc36, false); acc37 = __builtin_amdgcn_sdot4(a33, b1_3.w, acc37, false);
+
+            a0_ptr += 16;
+            a1_ptr += 16;
+            a2_ptr += 16;
+            a3_ptr += 16;
+            b0_ptr += 4 * b_group_stride;
+            b1_ptr += 4 * b_group_stride;
+        }
+
+        for (int kg = k_groups4; kg < k_groups; ++kg)
+        {
+            const int32_t a0_cur = *reinterpret_cast<const int32_t *>(a0_ptr);
+            const int32_t a1_cur = *reinterpret_cast<const int32_t *>(a1_ptr);
+            const int32_t a2_cur = *reinterpret_cast<const int32_t *>(a2_ptr);
+            const int32_t a3_cur = *reinterpret_cast<const int32_t *>(a3_ptr);
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+            b1_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_veca4_rfl_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int row_group = blockIdx.y * BY + threadIdx.y;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int64_t b_group_stride = static_cast<int64_t>(N) * 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int8_t *a0_ptr = d_A + static_cast<int64_t>(m0) * K;
+        const int8_t *a1_ptr = d_A + static_cast<int64_t>(m1) * K;
+        const int8_t *a2_ptr = d_A + static_cast<int64_t>(m2) * K;
+        const int8_t *a3_ptr = d_A + static_cast<int64_t>(m3) * K;
+        const int8_t *b0_ptr = d_B_vnni + static_cast<int64_t>(n_base + 0) * 4;
+        const int8_t *b1_ptr = d_B_vnni + static_cast<int64_t>(n_base + 4) * 4;
+
+        const int k_groups4 = (k_groups / 4) * 4;
+        for (int kg = 0; kg < k_groups4; kg += 4)
+        {
+            const int4 a0_vec = *reinterpret_cast<const int4 *>(a0_ptr);
+            const int4 a1_vec = *reinterpret_cast<const int4 *>(a1_ptr);
+            const int4 a2_vec = *reinterpret_cast<const int4 *>(a2_ptr);
+            const int4 a3_vec = *reinterpret_cast<const int4 *>(a3_ptr);
+
+            const int32_t a00 = __builtin_amdgcn_readfirstlane(a0_vec.x);
+            const int32_t a01 = __builtin_amdgcn_readfirstlane(a0_vec.y);
+            const int32_t a02 = __builtin_amdgcn_readfirstlane(a0_vec.z);
+            const int32_t a03 = __builtin_amdgcn_readfirstlane(a0_vec.w);
+            const int32_t a10 = __builtin_amdgcn_readfirstlane(a1_vec.x);
+            const int32_t a11 = __builtin_amdgcn_readfirstlane(a1_vec.y);
+            const int32_t a12 = __builtin_amdgcn_readfirstlane(a1_vec.z);
+            const int32_t a13 = __builtin_amdgcn_readfirstlane(a1_vec.w);
+            const int32_t a20 = __builtin_amdgcn_readfirstlane(a2_vec.x);
+            const int32_t a21 = __builtin_amdgcn_readfirstlane(a2_vec.y);
+            const int32_t a22 = __builtin_amdgcn_readfirstlane(a2_vec.z);
+            const int32_t a23 = __builtin_amdgcn_readfirstlane(a2_vec.w);
+            const int32_t a30 = __builtin_amdgcn_readfirstlane(a3_vec.x);
+            const int32_t a31 = __builtin_amdgcn_readfirstlane(a3_vec.y);
+            const int32_t a32 = __builtin_amdgcn_readfirstlane(a3_vec.z);
+            const int32_t a33 = __builtin_amdgcn_readfirstlane(a3_vec.w);
+
+            const int4 b0_0 = *reinterpret_cast<const int4 *>(b0_ptr + 0 * b_group_stride);
+            const int4 b1_0 = *reinterpret_cast<const int4 *>(b1_ptr + 0 * b_group_stride);
+            const int4 b0_1 = *reinterpret_cast<const int4 *>(b0_ptr + 1 * b_group_stride);
+            const int4 b1_1 = *reinterpret_cast<const int4 *>(b1_ptr + 1 * b_group_stride);
+            const int4 b0_2 = *reinterpret_cast<const int4 *>(b0_ptr + 2 * b_group_stride);
+            const int4 b1_2 = *reinterpret_cast<const int4 *>(b1_ptr + 2 * b_group_stride);
+            const int4 b0_3 = *reinterpret_cast<const int4 *>(b0_ptr + 3 * b_group_stride);
+            const int4 b1_3 = *reinterpret_cast<const int4 *>(b1_ptr + 3 * b_group_stride);
+
+            acc00 = __builtin_amdgcn_sdot4(a00, b0_0.x, acc00, false); acc01 = __builtin_amdgcn_sdot4(a00, b0_0.y, acc01, false); acc02 = __builtin_amdgcn_sdot4(a00, b0_0.z, acc02, false); acc03 = __builtin_amdgcn_sdot4(a00, b0_0.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a00, b1_0.x, acc04, false); acc05 = __builtin_amdgcn_sdot4(a00, b1_0.y, acc05, false); acc06 = __builtin_amdgcn_sdot4(a00, b1_0.z, acc06, false); acc07 = __builtin_amdgcn_sdot4(a00, b1_0.w, acc07, false);
+            acc10 = __builtin_amdgcn_sdot4(a10, b0_0.x, acc10, false); acc11 = __builtin_amdgcn_sdot4(a10, b0_0.y, acc11, false); acc12 = __builtin_amdgcn_sdot4(a10, b0_0.z, acc12, false); acc13 = __builtin_amdgcn_sdot4(a10, b0_0.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a10, b1_0.x, acc14, false); acc15 = __builtin_amdgcn_sdot4(a10, b1_0.y, acc15, false); acc16 = __builtin_amdgcn_sdot4(a10, b1_0.z, acc16, false); acc17 = __builtin_amdgcn_sdot4(a10, b1_0.w, acc17, false);
+            acc20 = __builtin_amdgcn_sdot4(a20, b0_0.x, acc20, false); acc21 = __builtin_amdgcn_sdot4(a20, b0_0.y, acc21, false); acc22 = __builtin_amdgcn_sdot4(a20, b0_0.z, acc22, false); acc23 = __builtin_amdgcn_sdot4(a20, b0_0.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a20, b1_0.x, acc24, false); acc25 = __builtin_amdgcn_sdot4(a20, b1_0.y, acc25, false); acc26 = __builtin_amdgcn_sdot4(a20, b1_0.z, acc26, false); acc27 = __builtin_amdgcn_sdot4(a20, b1_0.w, acc27, false);
+            acc30 = __builtin_amdgcn_sdot4(a30, b0_0.x, acc30, false); acc31 = __builtin_amdgcn_sdot4(a30, b0_0.y, acc31, false); acc32 = __builtin_amdgcn_sdot4(a30, b0_0.z, acc32, false); acc33 = __builtin_amdgcn_sdot4(a30, b0_0.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a30, b1_0.x, acc34, false); acc35 = __builtin_amdgcn_sdot4(a30, b1_0.y, acc35, false); acc36 = __builtin_amdgcn_sdot4(a30, b1_0.z, acc36, false); acc37 = __builtin_amdgcn_sdot4(a30, b1_0.w, acc37, false);
+
+            acc00 = __builtin_amdgcn_sdot4(a01, b0_1.x, acc00, false); acc01 = __builtin_amdgcn_sdot4(a01, b0_1.y, acc01, false); acc02 = __builtin_amdgcn_sdot4(a01, b0_1.z, acc02, false); acc03 = __builtin_amdgcn_sdot4(a01, b0_1.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a01, b1_1.x, acc04, false); acc05 = __builtin_amdgcn_sdot4(a01, b1_1.y, acc05, false); acc06 = __builtin_amdgcn_sdot4(a01, b1_1.z, acc06, false); acc07 = __builtin_amdgcn_sdot4(a01, b1_1.w, acc07, false);
+            acc10 = __builtin_amdgcn_sdot4(a11, b0_1.x, acc10, false); acc11 = __builtin_amdgcn_sdot4(a11, b0_1.y, acc11, false); acc12 = __builtin_amdgcn_sdot4(a11, b0_1.z, acc12, false); acc13 = __builtin_amdgcn_sdot4(a11, b0_1.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a11, b1_1.x, acc14, false); acc15 = __builtin_amdgcn_sdot4(a11, b1_1.y, acc15, false); acc16 = __builtin_amdgcn_sdot4(a11, b1_1.z, acc16, false); acc17 = __builtin_amdgcn_sdot4(a11, b1_1.w, acc17, false);
+            acc20 = __builtin_amdgcn_sdot4(a21, b0_1.x, acc20, false); acc21 = __builtin_amdgcn_sdot4(a21, b0_1.y, acc21, false); acc22 = __builtin_amdgcn_sdot4(a21, b0_1.z, acc22, false); acc23 = __builtin_amdgcn_sdot4(a21, b0_1.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a21, b1_1.x, acc24, false); acc25 = __builtin_amdgcn_sdot4(a21, b1_1.y, acc25, false); acc26 = __builtin_amdgcn_sdot4(a21, b1_1.z, acc26, false); acc27 = __builtin_amdgcn_sdot4(a21, b1_1.w, acc27, false);
+            acc30 = __builtin_amdgcn_sdot4(a31, b0_1.x, acc30, false); acc31 = __builtin_amdgcn_sdot4(a31, b0_1.y, acc31, false); acc32 = __builtin_amdgcn_sdot4(a31, b0_1.z, acc32, false); acc33 = __builtin_amdgcn_sdot4(a31, b0_1.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a31, b1_1.x, acc34, false); acc35 = __builtin_amdgcn_sdot4(a31, b1_1.y, acc35, false); acc36 = __builtin_amdgcn_sdot4(a31, b1_1.z, acc36, false); acc37 = __builtin_amdgcn_sdot4(a31, b1_1.w, acc37, false);
+
+            acc00 = __builtin_amdgcn_sdot4(a02, b0_2.x, acc00, false); acc01 = __builtin_amdgcn_sdot4(a02, b0_2.y, acc01, false); acc02 = __builtin_amdgcn_sdot4(a02, b0_2.z, acc02, false); acc03 = __builtin_amdgcn_sdot4(a02, b0_2.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a02, b1_2.x, acc04, false); acc05 = __builtin_amdgcn_sdot4(a02, b1_2.y, acc05, false); acc06 = __builtin_amdgcn_sdot4(a02, b1_2.z, acc06, false); acc07 = __builtin_amdgcn_sdot4(a02, b1_2.w, acc07, false);
+            acc10 = __builtin_amdgcn_sdot4(a12, b0_2.x, acc10, false); acc11 = __builtin_amdgcn_sdot4(a12, b0_2.y, acc11, false); acc12 = __builtin_amdgcn_sdot4(a12, b0_2.z, acc12, false); acc13 = __builtin_amdgcn_sdot4(a12, b0_2.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a12, b1_2.x, acc14, false); acc15 = __builtin_amdgcn_sdot4(a12, b1_2.y, acc15, false); acc16 = __builtin_amdgcn_sdot4(a12, b1_2.z, acc16, false); acc17 = __builtin_amdgcn_sdot4(a12, b1_2.w, acc17, false);
+            acc20 = __builtin_amdgcn_sdot4(a22, b0_2.x, acc20, false); acc21 = __builtin_amdgcn_sdot4(a22, b0_2.y, acc21, false); acc22 = __builtin_amdgcn_sdot4(a22, b0_2.z, acc22, false); acc23 = __builtin_amdgcn_sdot4(a22, b0_2.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a22, b1_2.x, acc24, false); acc25 = __builtin_amdgcn_sdot4(a22, b1_2.y, acc25, false); acc26 = __builtin_amdgcn_sdot4(a22, b1_2.z, acc26, false); acc27 = __builtin_amdgcn_sdot4(a22, b1_2.w, acc27, false);
+            acc30 = __builtin_amdgcn_sdot4(a32, b0_2.x, acc30, false); acc31 = __builtin_amdgcn_sdot4(a32, b0_2.y, acc31, false); acc32 = __builtin_amdgcn_sdot4(a32, b0_2.z, acc32, false); acc33 = __builtin_amdgcn_sdot4(a32, b0_2.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a32, b1_2.x, acc34, false); acc35 = __builtin_amdgcn_sdot4(a32, b1_2.y, acc35, false); acc36 = __builtin_amdgcn_sdot4(a32, b1_2.z, acc36, false); acc37 = __builtin_amdgcn_sdot4(a32, b1_2.w, acc37, false);
+
+            acc00 = __builtin_amdgcn_sdot4(a03, b0_3.x, acc00, false); acc01 = __builtin_amdgcn_sdot4(a03, b0_3.y, acc01, false); acc02 = __builtin_amdgcn_sdot4(a03, b0_3.z, acc02, false); acc03 = __builtin_amdgcn_sdot4(a03, b0_3.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a03, b1_3.x, acc04, false); acc05 = __builtin_amdgcn_sdot4(a03, b1_3.y, acc05, false); acc06 = __builtin_amdgcn_sdot4(a03, b1_3.z, acc06, false); acc07 = __builtin_amdgcn_sdot4(a03, b1_3.w, acc07, false);
+            acc10 = __builtin_amdgcn_sdot4(a13, b0_3.x, acc10, false); acc11 = __builtin_amdgcn_sdot4(a13, b0_3.y, acc11, false); acc12 = __builtin_amdgcn_sdot4(a13, b0_3.z, acc12, false); acc13 = __builtin_amdgcn_sdot4(a13, b0_3.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a13, b1_3.x, acc14, false); acc15 = __builtin_amdgcn_sdot4(a13, b1_3.y, acc15, false); acc16 = __builtin_amdgcn_sdot4(a13, b1_3.z, acc16, false); acc17 = __builtin_amdgcn_sdot4(a13, b1_3.w, acc17, false);
+            acc20 = __builtin_amdgcn_sdot4(a23, b0_3.x, acc20, false); acc21 = __builtin_amdgcn_sdot4(a23, b0_3.y, acc21, false); acc22 = __builtin_amdgcn_sdot4(a23, b0_3.z, acc22, false); acc23 = __builtin_amdgcn_sdot4(a23, b0_3.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a23, b1_3.x, acc24, false); acc25 = __builtin_amdgcn_sdot4(a23, b1_3.y, acc25, false); acc26 = __builtin_amdgcn_sdot4(a23, b1_3.z, acc26, false); acc27 = __builtin_amdgcn_sdot4(a23, b1_3.w, acc27, false);
+            acc30 = __builtin_amdgcn_sdot4(a33, b0_3.x, acc30, false); acc31 = __builtin_amdgcn_sdot4(a33, b0_3.y, acc31, false); acc32 = __builtin_amdgcn_sdot4(a33, b0_3.z, acc32, false); acc33 = __builtin_amdgcn_sdot4(a33, b0_3.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a33, b1_3.x, acc34, false); acc35 = __builtin_amdgcn_sdot4(a33, b1_3.y, acc35, false); acc36 = __builtin_amdgcn_sdot4(a33, b1_3.z, acc36, false); acc37 = __builtin_amdgcn_sdot4(a33, b1_3.w, acc37, false);
+
+            a0_ptr += 16;
+            a1_ptr += 16;
+            a2_ptr += 16;
+            a3_ptr += 16;
+            b0_ptr += 4 * b_group_stride;
+            b1_ptr += 4 * b_group_stride;
+        }
+
+        for (int kg = k_groups4; kg < k_groups; ++kg)
+        {
+            const int32_t a0_cur = __builtin_amdgcn_readfirstlane(*reinterpret_cast<const int32_t *>(a0_ptr));
+            const int32_t a1_cur = __builtin_amdgcn_readfirstlane(*reinterpret_cast<const int32_t *>(a1_ptr));
+            const int32_t a2_cur = __builtin_amdgcn_readfirstlane(*reinterpret_cast<const int32_t *>(a2_ptr));
+            const int32_t a3_cur = __builtin_amdgcn_readfirstlane(*reinterpret_cast<const int32_t *>(a3_ptr));
+            const int4 b0_cur = *reinterpret_cast<const int4 *>(b0_ptr);
+            const int4 b1_cur = *reinterpret_cast<const int4 *>(b1_ptr);
+
+            acc00 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.x, acc00, false);
+            acc01 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.y, acc01, false);
+            acc02 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.z, acc02, false);
+            acc03 = __builtin_amdgcn_sdot4(a0_cur, b0_cur.w, acc03, false);
+            acc04 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.x, acc04, false);
+            acc05 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.y, acc05, false);
+            acc06 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.z, acc06, false);
+            acc07 = __builtin_amdgcn_sdot4(a0_cur, b1_cur.w, acc07, false);
+
+            acc10 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.x, acc10, false);
+            acc11 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.y, acc11, false);
+            acc12 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.z, acc12, false);
+            acc13 = __builtin_amdgcn_sdot4(a1_cur, b0_cur.w, acc13, false);
+            acc14 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.x, acc14, false);
+            acc15 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.y, acc15, false);
+            acc16 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.z, acc16, false);
+            acc17 = __builtin_amdgcn_sdot4(a1_cur, b1_cur.w, acc17, false);
+
+            acc20 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.x, acc20, false);
+            acc21 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.y, acc21, false);
+            acc22 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.z, acc22, false);
+            acc23 = __builtin_amdgcn_sdot4(a2_cur, b0_cur.w, acc23, false);
+            acc24 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.x, acc24, false);
+            acc25 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.y, acc25, false);
+            acc26 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.z, acc26, false);
+            acc27 = __builtin_amdgcn_sdot4(a2_cur, b1_cur.w, acc27, false);
+
+            acc30 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.x, acc30, false);
+            acc31 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.y, acc31, false);
+            acc32 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.z, acc32, false);
+            acc33 = __builtin_amdgcn_sdot4(a3_cur, b0_cur.w, acc33, false);
+            acc34 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.x, acc34, false);
+            acc35 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.y, acc35, false);
+            acc36 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.z, acc36, false);
+            acc37 = __builtin_amdgcn_sdot4(a3_cur, b1_cur.w, acc37, false);
+
+            a0_ptr += 4;
+            a1_ptr += 4;
+            a2_ptr += 4;
+            a3_ptr += 4;
+            b0_ptr += b_group_stride;
+            b1_ptr += b_group_stride;
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY, int KG_TILE>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_ldsdb_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int row_group = blockIdx.y * BY + ty;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    __shared__ int4 sB0[2][KG_TILE][BX];
+    __shared__ int4 sB1[2][KG_TILE][BX];
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+    const int n_tile_base = blockIdx.x * (BX * CPT);
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        const int64_t a0_row = static_cast<int64_t>(m0) * K;
+        const int64_t a1_row = static_cast<int64_t>(m1) * K;
+        const int64_t a2_row = static_cast<int64_t>(m2) * K;
+        const int64_t a3_row = static_cast<int64_t>(m3) * K;
+
+        int ping = 0;
+        int pong = 1;
+        const int total_threads = BX * BY;
+        const int linear_tid = ty * BX + lane;
+
+        {
+            const int tile_kg = min(KG_TILE, k_groups);
+            const int loads = tile_kg * BX;
+            for (int idx = linear_tid; idx < loads; idx += total_threads)
+            {
+                const int kt = idx / BX;
+                const int ln = idx % BX;
+                const int64_t b_off = (static_cast<int64_t>(kt) * N + (n_tile_base + ln * CPT)) * 4;
+                sB0[ping][kt][ln] = *reinterpret_cast<const int4 *>(d_B_vnni + b_off);
+                sB1[ping][kt][ln] = *reinterpret_cast<const int4 *>(d_B_vnni + b_off + 16);
+            }
+            __syncthreads();
+        }
+
+        for (int kg_base = 0; kg_base < k_groups; kg_base += KG_TILE)
+        {
+            const int tile_kg = min(KG_TILE, k_groups - kg_base);
+
+            for (int kt = 0; kt < tile_kg; ++kt)
+            {
+                const int64_t kg = static_cast<int64_t>(kg_base + kt) * 4;
+                const int32_t a0 = *reinterpret_cast<const int32_t *>(d_A + a0_row + kg);
+                const int32_t a1 = *reinterpret_cast<const int32_t *>(d_A + a1_row + kg);
+                const int32_t a2 = *reinterpret_cast<const int32_t *>(d_A + a2_row + kg);
+                const int32_t a3 = *reinterpret_cast<const int32_t *>(d_A + a3_row + kg);
+                const int4 b0 = sB0[ping][kt][lane];
+                const int4 b1 = sB1[ping][kt][lane];
+
+                acc00 = __builtin_amdgcn_sdot4(a0, b0.x, acc00, false);
+                acc01 = __builtin_amdgcn_sdot4(a0, b0.y, acc01, false);
+                acc02 = __builtin_amdgcn_sdot4(a0, b0.z, acc02, false);
+                acc03 = __builtin_amdgcn_sdot4(a0, b0.w, acc03, false);
+                acc04 = __builtin_amdgcn_sdot4(a0, b1.x, acc04, false);
+                acc05 = __builtin_amdgcn_sdot4(a0, b1.y, acc05, false);
+                acc06 = __builtin_amdgcn_sdot4(a0, b1.z, acc06, false);
+                acc07 = __builtin_amdgcn_sdot4(a0, b1.w, acc07, false);
+
+                acc10 = __builtin_amdgcn_sdot4(a1, b0.x, acc10, false);
+                acc11 = __builtin_amdgcn_sdot4(a1, b0.y, acc11, false);
+                acc12 = __builtin_amdgcn_sdot4(a1, b0.z, acc12, false);
+                acc13 = __builtin_amdgcn_sdot4(a1, b0.w, acc13, false);
+                acc14 = __builtin_amdgcn_sdot4(a1, b1.x, acc14, false);
+                acc15 = __builtin_amdgcn_sdot4(a1, b1.y, acc15, false);
+                acc16 = __builtin_amdgcn_sdot4(a1, b1.z, acc16, false);
+                acc17 = __builtin_amdgcn_sdot4(a1, b1.w, acc17, false);
+
+                acc20 = __builtin_amdgcn_sdot4(a2, b0.x, acc20, false);
+                acc21 = __builtin_amdgcn_sdot4(a2, b0.y, acc21, false);
+                acc22 = __builtin_amdgcn_sdot4(a2, b0.z, acc22, false);
+                acc23 = __builtin_amdgcn_sdot4(a2, b0.w, acc23, false);
+                acc24 = __builtin_amdgcn_sdot4(a2, b1.x, acc24, false);
+                acc25 = __builtin_amdgcn_sdot4(a2, b1.y, acc25, false);
+                acc26 = __builtin_amdgcn_sdot4(a2, b1.z, acc26, false);
+                acc27 = __builtin_amdgcn_sdot4(a2, b1.w, acc27, false);
+
+                acc30 = __builtin_amdgcn_sdot4(a3, b0.x, acc30, false);
+                acc31 = __builtin_amdgcn_sdot4(a3, b0.y, acc31, false);
+                acc32 = __builtin_amdgcn_sdot4(a3, b0.z, acc32, false);
+                acc33 = __builtin_amdgcn_sdot4(a3, b0.w, acc33, false);
+                acc34 = __builtin_amdgcn_sdot4(a3, b1.x, acc34, false);
+                acc35 = __builtin_amdgcn_sdot4(a3, b1.y, acc35, false);
+                acc36 = __builtin_amdgcn_sdot4(a3, b1.z, acc36, false);
+                acc37 = __builtin_amdgcn_sdot4(a3, b1.w, acc37, false);
+            }
+
+            const int next_kg_base = kg_base + KG_TILE;
+            if (next_kg_base < k_groups)
+            {
+                const int next_tile_kg = min(KG_TILE, k_groups - next_kg_base);
+                const int loads = next_tile_kg * BX;
+                for (int idx = linear_tid; idx < loads; idx += total_threads)
+                {
+                    const int kt = idx / BX;
+                    const int ln = idx % BX;
+                    const int64_t b_off = (static_cast<int64_t>(next_kg_base + kt) * N + (n_tile_base + ln * CPT)) * 4;
+                    sB0[pong][kt][ln] = *reinterpret_cast<const int4 *>(d_B_vnni + b_off);
+                    sB1[pong][kt][ln] = *reinterpret_cast<const int4 *>(d_B_vnni + b_off + 16);
+                }
+                __syncthreads();
+                const int tmp = ping;
+                ping = pong;
+                pong = tmp;
+            }
+        }
+
+        const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
+        const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
+        const int64_t c2_base = static_cast<int64_t>(m2) * N + n_base;
+        const int64_t c3_base = static_cast<int64_t>(m3) * N + n_base;
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 0), acc00, acc01, acc02, acc03);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c0_base + 4), acc04, acc05, acc06, acc07);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 0), acc10, acc11, acc12, acc13);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c1_base + 4), acc14, acc15, acc16, acc17);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 0), acc20, acc21, acc22, acc23);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c2_base + 4), acc24, acc25, acc26, acc27);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 0), acc30, acc31, acc32, acc33);
+        store_i32x4(reinterpret_cast<uint32_t *>(d_C + c3_base + 4), acc34, acc35, acc36, acc37);
+    }
+}
+
+template <int BY, int KG_TILE>
+__launch_bounds__(64 * BY, 2) __global__ void gemm_wave64_cpt8_gridstride_aligned_mr4_lds_prefill_kernel(
+    const int8_t *__restrict__ d_A,
+    const int8_t *__restrict__ d_B_vnni,
+    int32_t *__restrict__ d_C,
+    int M,
+    int N,
+    int K)
+{
+    (void)M;
+    constexpr int BX = 64;
+    constexpr int CPT = 8;
+    constexpr int MR = 4;
+
+    const int lane = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int row_group = blockIdx.y * BY + ty;
+    const int m0 = row_group * MR + 0;
+    const int m1 = row_group * MR + 1;
+    const int m2 = row_group * MR + 2;
+    const int m3 = row_group * MR + 3;
+
+    __shared__ int4 sB0[KG_TILE][BX];
+    __shared__ int4 sB1[KG_TILE][BX];
+    __shared__ int32_t sA[BY][MR][KG_TILE];
+
+    int n_base = blockIdx.x * (BX * CPT) + lane * CPT;
+    const int n_stride = static_cast<int>(gridDim.x) * BX * CPT;
+    const int k_groups = K / 4;
+
+    for (; n_base < N; n_base += n_stride)
+    {
+        int32_t acc00 = 0, acc01 = 0, acc02 = 0, acc03 = 0, acc04 = 0, acc05 = 0, acc06 = 0, acc07 = 0;
+        int32_t acc10 = 0, acc11 = 0, acc12 = 0, acc13 = 0, acc14 = 0, acc15 = 0, acc16 = 0, acc17 = 0;
+        int32_t acc20 = 0, acc21 = 0, acc22 = 0, acc23 = 0, acc24 = 0, acc25 = 0, acc26 = 0, acc27 = 0;
+        int32_t acc30 = 0, acc31 = 0, acc32 = 0, acc33 = 0, acc34 = 0, acc35 = 0, acc36 = 0, acc37 = 0;
+
+        for (int kg_base = 0; kg_base < k_groups; kg_base += KG_TILE)
+        {
+            const int tile_kg = min(KG_TILE, k_groups - kg_base);
+
+            if (ty == 0)
+            {
+                for (int kt = 0; kt < tile_kg; ++kt)
+                {
+                    const int64_t b_off = (static_cast<int64_t>(kg_base + kt) * N + n_base) * 4;
+                    sB0[kt][lane] = *reinterpret_cast<const int4 *>(d_B_vnni + b_off);
+                    sB1[kt][lane] = *reinterpret_cast<const int4 *>(d_B_vnni + b_off + 16);
+                }
+            }
+
+            if (lane < tile_kg)
+            {
+                const int64_t kg = static_cast<int64_t>(kg_base + lane) * 4;
+                sA[ty][0][lane] = *reinterpret_cast<const int32_t *>(d_A + static_cast<int64_t>(m0) * K + kg);
+                sA[ty][1][lane] = *reinterpret_cast<const int32_t *>(d_A + static_cast<int64_t>(m1) * K + kg);
+                sA[ty][2][lane] = *reinterpret_cast<const int32_t *>(d_A + static_cast<int64_t>(m2) * K + kg);
+                sA[ty][3][lane] = *reinterpret_cast<const int32_t *>(d_A + static_cast<int64_t>(m3) * K + kg);
+            }
+
+            __syncthreads();
+
+            for (int kt = 0; kt < tile_kg; ++kt)
+            {
+                const int4 b0 = sB0[kt][lane];
+                const int4 b1 = sB1[kt][lane];
+                const int32_t a0 = sA[ty][0][kt];
+                const int32_t a1 = sA[ty][1][kt];
+                const int32_t a2 = sA[ty][2][kt];
+                const int32_t a3 = sA[ty][3][kt];
+
+                acc00 = __builtin_amdgcn_sdot4(a0, b0.x, acc00, false);
+                acc01 = __builtin_amdgcn_sdot4(a0, b0.y, acc01, false);
+                acc02 = __builtin_amdgcn_sdot4(a0, b0.z, acc02, false);
+                acc03 = __builtin_amdgcn_sdot4(a0, b0.w, acc03, false);
+                acc04 = __builtin_amdgcn_sdot4(a0, b1.x, acc04, false);
+                acc05 = __builtin_amdgcn_sdot4(a0, b1.y, acc05, false);
+                acc06 = __builtin_amdgcn_sdot4(a0, b1.z, acc06, false);
+                acc07 = __builtin_amdgcn_sdot4(a0, b1.w, acc07, false);
+
+                acc10 = __builtin_amdgcn_sdot4(a1, b0.x, acc10, false);
+                acc11 = __builtin_amdgcn_sdot4(a1, b0.y, acc11, false);
+                acc12 = __builtin_amdgcn_sdot4(a1, b0.z, acc12, false);
+                acc13 = __builtin_amdgcn_sdot4(a1, b0.w, acc13, false);
+                acc14 = __builtin_amdgcn_sdot4(a1, b1.x, acc14, false);
+                acc15 = __builtin_amdgcn_sdot4(a1, b1.y, acc15, false);
+                acc16 = __builtin_amdgcn_sdot4(a1, b1.z, acc16, false);
+                acc17 = __builtin_amdgcn_sdot4(a1, b1.w, acc17, false);
+
+                acc20 = __builtin_amdgcn_sdot4(a2, b0.x, acc20, false);
+                acc21 = __builtin_amdgcn_sdot4(a2, b0.y, acc21, false);
+                acc22 = __builtin_amdgcn_sdot4(a2, b0.z, acc22, false);
+                acc23 = __builtin_amdgcn_sdot4(a2, b0.w, acc23, false);
+                acc24 = __builtin_amdgcn_sdot4(a2, b1.x, acc24, false);
+                acc25 = __builtin_amdgcn_sdot4(a2, b1.y, acc25, false);
+                acc26 = __builtin_amdgcn_sdot4(a2, b1.z, acc26, false);
+                acc27 = __builtin_amdgcn_sdot4(a2, b1.w, acc27, false);
+
+                acc30 = __builtin_amdgcn_sdot4(a3, b0.x, acc30, false);
+                acc31 = __builtin_amdgcn_sdot4(a3, b0.y, acc31, false);
+                acc32 = __builtin_amdgcn_sdot4(a3, b0.z, acc32, false);
+                acc33 = __builtin_amdgcn_sdot4(a3, b0.w, acc33, false);
+                acc34 = __builtin_amdgcn_sdot4(a3, b1.x, acc34, false);
+                acc35 = __builtin_amdgcn_sdot4(a3, b1.y, acc35, false);
+                acc36 = __builtin_amdgcn_sdot4(a3, b1.z, acc36, false);
+                acc37 = __builtin_amdgcn_sdot4(a3, b1.w, acc37, false);
+            }
+
+            __syncthreads();
+        }
 
         const int64_t c0_base = static_cast<int64_t>(m0) * N + n_base;
         const int64_t c1_base = static_cast<int64_t>(m1) * N + n_base;
@@ -2344,8 +5027,8 @@ void printHelp(const char *argv0)
         << "Correctness / speed:\n"
         << "  --no-check                  Disable correctness checks for faster sweeps\n"
         << "                              (skips CPU reference GEMM and CK layout-validation path)\n"
-        << "  --int8-vnni-repack          Include INT8 VNNI repack timing in E2E (experimental)\n"
-        << "                              (default assumes model-loader-prepacked INT8 VNNI)\n\n"
+        << "  --int8-vnni-repack          Deprecated (ignored): CK baseline repack is always accounted\n"
+        << "                              from INT8-VNNI->CK format; non-CK repack remains excluded\n\n"
         << "Help:\n"
         << "  -h, --help                  Show this help and exit\n";
 }
@@ -2353,6 +5036,7 @@ void printHelp(const char *argv0)
 Options parseOptions(int argc, char **argv)
 {
     Options opt;
+    bool saw_deprecated_int8_vnni_repack = false;
     opt.shapes = defaultShapes();
     opt.strategies = {
         "cpt2",
@@ -2435,6 +5119,7 @@ Options parseOptions(int argc, char **argv)
         if (arg.rfind("--strategies=", 0) == 0)
         {
             opt.strategies = splitCSV(arg.substr(std::strlen("--strategies=")));
+            opt.user_strategy_override = true;
             continue;
         }
         if (arg.rfind("--splitk=", 0) == 0)
@@ -2449,7 +5134,7 @@ Options parseOptions(int argc, char **argv)
         }
         if (arg == "--int8-vnni-repack")
         {
-            opt.int8_vnni_prepacked = false;
+            saw_deprecated_int8_vnni_repack = true;
             continue;
         }
         if (arg == "--no-disk-leaderboard")
@@ -2467,6 +5152,12 @@ Options parseOptions(int argc, char **argv)
     if (m > 0 && n > 0 && k > 0)
     {
         opt.shapes = {{"custom", m, n, k}};
+    }
+
+    if (saw_deprecated_int8_vnni_repack)
+    {
+        std::cout << "[prefill-lab] note: --int8-vnni-repack is deprecated and ignored; "
+                  << "CK baseline repack is always included; non-CK weight repack remains excluded" << std::endl;
     }
 
     return opt;
@@ -2519,6 +5210,28 @@ void packRowMajorToVNNIInplace(const std::vector<int8_t> &b_rowmajor, int N, int
             b_vnni[base + 1] = b_rowmajor[static_cast<size_t>(kg * 4 + 1) * static_cast<size_t>(N) + static_cast<size_t>(n)];
             b_vnni[base + 2] = b_rowmajor[static_cast<size_t>(kg * 4 + 2) * static_cast<size_t>(N) + static_cast<size_t>(n)];
             b_vnni[base + 3] = b_rowmajor[static_cast<size_t>(kg * 4 + 3) * static_cast<size_t>(N) + static_cast<size_t>(n)];
+        }
+    }
+}
+
+void unpackVNNIToRowMajorInplace(const std::vector<int8_t> &b_vnni, int N, int K, std::vector<int8_t> &b_rowmajor)
+{
+    const int k_groups = K / 4;
+    const size_t expected = static_cast<size_t>(K) * static_cast<size_t>(N);
+    if (b_rowmajor.size() != expected)
+    {
+        b_rowmajor.resize(expected);
+    }
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int kg = 0; kg < k_groups; ++kg)
+    {
+        for (int n = 0; n < N; ++n)
+        {
+            const size_t base = (static_cast<size_t>(kg) * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4u;
+            b_rowmajor[static_cast<size_t>(kg * 4 + 0) * static_cast<size_t>(N) + static_cast<size_t>(n)] = b_vnni[base + 0];
+            b_rowmajor[static_cast<size_t>(kg * 4 + 1) * static_cast<size_t>(N) + static_cast<size_t>(n)] = b_vnni[base + 1];
+            b_rowmajor[static_cast<size_t>(kg * 4 + 2) * static_cast<size_t>(N) + static_cast<size_t>(n)] = b_vnni[base + 2];
+            b_rowmajor[static_cast<size_t>(kg * 4 + 3) * static_cast<size_t>(N) + static_cast<size_t>(n)] = b_vnni[base + 3];
         }
     }
 }
@@ -3218,11 +5931,427 @@ Result benchmarkStrategy(
                 launch_failed = true;
             }
         }
+        else if (strategy == "wave64_cpt4_aligned_mr8_abcast_lane0_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 4;
+            constexpr int MR = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * MR)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * MR) - 1) / (BY * MR)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt4_gridstride_aligned_mr8_abcast_lane0_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
         else if (strategy == "wave64_cpt8_aligned_mr4_cap128")
         {
             constexpr int BX = 64;
             constexpr int BY = 4;
             constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            int cap = 128;
+            if (const char *cap_env = std::getenv("LLAMINAR_PREFILL_CPT8_CAP"))
+            {
+                const int parsed = std::atoi(cap_env);
+                if (parsed > 0)
+                {
+                    cap = parsed;
+                }
+            }
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_cap64" ||
+                 strategy == "wave64_cpt8_aligned_mr4_cap96" ||
+                 strategy == "wave64_cpt8_aligned_mr4_cap192" ||
+                 strategy == "wave64_cpt8_aligned_mr4_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+
+            int cap = 128;
+            if (strategy == "wave64_cpt8_aligned_mr4_cap64")
+            {
+                cap = 64;
+            }
+            else if (strategy == "wave64_cpt8_aligned_mr4_cap96")
+            {
+                cap = 96;
+            }
+            else if (strategy == "wave64_cpt8_aligned_mr4_cap192")
+            {
+                cap = 192;
+            }
+            else if (strategy == "wave64_cpt8_aligned_mr4_cap256")
+            {
+                cap = 256;
+            }
+
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cap64" ||
+                 strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cap96" ||
+                 strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cap128" ||
+                 strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cap192" ||
+                 strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+
+            int cap = 256;
+            if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cap64")
+            {
+                cap = 64;
+            }
+            else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cap96")
+            {
+                cap = 96;
+            }
+            else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cap128")
+            {
+                cap = 128;
+            }
+            else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cap192")
+            {
+                cap = 192;
+            }
+
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_coal_pipe_u4_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coal_pipe_u4_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_i32addr_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_i32addr_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_splitacc_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_splitacc_lb3_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_lb3_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_splitacc_lb4_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_coalonly_splitacc_lb4_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_ldsB_kgt8_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_ldsB_prefill_kernel<BY, 8>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_avec4_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 16) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_avec4_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_by8_cap256" ||
+                 strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_by8_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 8;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const int cap = (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_by8_cap128") ? 128 : 256;
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_by8_lb1_cap256" ||
+                 strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_by8_lb1_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 8;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const int cap = (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_by8_lb1_cap128") ? 128 : 256;
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_lb1_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_pf1_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_pf1_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_k2_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_k2_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_k2_by8_cap256")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 8;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 256))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_k2_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_abcast_lane0_cpt16split_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 16;
             const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
             const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
             const dim3 block(BX, BY, 1);
@@ -3232,7 +6361,203 @@ Result benchmarkStrategy(
                 1);
             if (aligned)
             {
-                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_abcast_lane0_cpt16split_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_veca2_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            int cap = 128;
+            if (const char *cap_env = std::getenv("LLAMINAR_PREFILL_CPT8_CAP"))
+            {
+                const int parsed = std::atoi(cap_env);
+                if (parsed > 0)
+                {
+                    cap = parsed;
+                }
+            }
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_veca2_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_veca4_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            int cap = 128;
+            if (const char *cap_env = std::getenv("LLAMINAR_PREFILL_CPT8_CAP"))
+            {
+                const int parsed = std::atoi(cap_env);
+                if (parsed > 0)
+                {
+                    cap = parsed;
+                }
+            }
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_veca4_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_veca4_rfl_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            int cap = 128;
+            if (const char *cap_env = std::getenv("LLAMINAR_PREFILL_CPT8_CAP"))
+            {
+                const int parsed = std::atoi(cap_env);
+                if (parsed > 0)
+                {
+                    cap = parsed;
+                }
+            }
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_veca4_rfl_prefill_kernel<BY>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_ldsbdb_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            constexpr int KG_TILE = 16;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            int cap = 128;
+            if (const char *cap_env = std::getenv("LLAMINAR_PREFILL_CPT8_CAP"))
+            {
+                const int parsed = std::atoi(cap_env);
+                if (parsed > 0)
+                {
+                    cap = parsed;
+                }
+            }
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_ldsdb_prefill_kernel<BY, KG_TILE>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_ldsbdb_kgt8_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            constexpr int KG_TILE = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            int cap = 128;
+            if (const char *cap_env = std::getenv("LLAMINAR_PREFILL_CPT8_CAP"))
+            {
+                const int parsed = std::atoi(cap_env);
+                if (parsed > 0)
+                {
+                    cap = parsed;
+                }
+            }
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, cap))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_ldsdb_prefill_kernel<BY, KG_TILE>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_lds_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            constexpr int KG_TILE = 8;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 128))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_lds_prefill_kernel<BY, KG_TILE>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
+            }
+            else
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "wave64_cpt8_aligned_mr4_lds_kgt16_cap128")
+        {
+            constexpr int BX = 64;
+            constexpr int BY = 4;
+            constexpr int CPT = 8;
+            constexpr int KG_TILE = 16;
+            const bool aligned = ((N % (BX * CPT)) == 0) && ((K % 4) == 0) && ((M % (BY * 4)) == 0);
+            const int full_tiles = (N + BX * CPT - 1) / (BX * CPT);
+            const dim3 block(BX, BY, 1);
+            const dim3 grid(
+                static_cast<unsigned>(max(1, min(full_tiles, 128))),
+                static_cast<unsigned>((M + (BY * 4) - 1) / (BY * 4)),
+                1);
+            if (aligned)
+            {
+                hipLaunchKernelGGL((gemm_wave64_cpt8_gridstride_aligned_mr4_lds_prefill_kernel<BY, KG_TILE>), grid, block, 0, stream, d_A, d_B_vnni, d_C, M, N, K);
             }
             else
             {
@@ -3534,6 +6859,104 @@ Result benchmarkStrategy(
                 launch_failed = true;
             }
         }
+        else if (strategy == "native_prefill_gridkpar_s4")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  4,
+                                                                  1,
+                                                                  4,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "native_prefill_gridkpar_s6")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  6,
+                                                                  1,
+                                                                  4,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "native_prefill_gridkpar_s5")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  5,
+                                                                  1,
+                                                                  4,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "native_prefill_gridkpar_s7")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  7,
+                                                                  1,
+                                                                  4,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "native_prefill_gridkpar_s6_gv2")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  6,
+                                                                  2,
+                                                                  4,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "native_prefill_gridkpar_s6_gv3")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  6,
+                                                                  3,
+                                                                  4,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "native_prefill_gridkpar_s10")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  10,
+                                                                  1,
+                                                                  4,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
         else if (strategy == "native_prefill_gridkpar_auto_cpt1")
         {
             int device_id = opt.device;
@@ -3551,49 +6974,77 @@ Result benchmarkStrategy(
                 launch_failed = true;
             }
         }
-        else if (strategy == "native_prefill_prod_policy")
+        else if (strategy == "native_prefill_gridkpar_auto_cpt4")
         {
             int device_id = opt.device;
             hipGetDevice(&device_id);
-
-            const double k_over_m = static_cast<double>(K) / static_cast<double>(std::max(M, 1));
-            const bool reduction_pressure =
-                (K >= 1024) ||
-                ((K >= 512) && (k_over_m >= 16.0));
-            const bool try_grid_kpar =
-                (N >= 128) &&
-                (M >= 8) &&
-                reduction_pressure;
-
-            bool ok = false;
-            if (try_grid_kpar)
-            {
-                const int cpt = 1;
-                const int grid_variant = -1;
-                const int slices = computeProdPrefillGridSlices(M, N, K, grid_variant, cpt);
-                ok = rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(
-                    d_A, d_B_vnni, d_C, M, N, K,
-                    slices,
-                    grid_variant,
-                    cpt,
-                    device_id,
-                    stream);
-            }
-
-            if (!ok)
-            {
-                ok = rocmGemm_int8_int8_int32_vnni_prefill(
-                    d_A, d_B_vnni, d_C, M, N, K,
-                    -1,
-                    1,
-                    device_id,
-                    stream);
-            }
-
-            if (!ok)
+            const int cpt = 4;
+            const int grid_variant = -1;
+            const int slices = computeProdPrefillGridSlices(M, N, K, grid_variant, cpt);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  slices,
+                                                                  grid_variant,
+                                                                  cpt,
+                                                                  device_id,
+                                                                  stream))
             {
                 launch_failed = true;
             }
+        }
+        else if (strategy == "native_prefill_gridkpar_auto_cpt4_gv1")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            const int cpt = 4;
+            const int grid_variant = 1;
+            const int slices = computeProdPrefillGridSlices(M, N, K, grid_variant, cpt);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  slices,
+                                                                  grid_variant,
+                                                                  cpt,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "native_prefill_gridkpar_auto_cpt4_gv2")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            const int cpt = 4;
+            const int grid_variant = 2;
+            const int slices = computeProdPrefillGridSlices(M, N, K, grid_variant, cpt);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  slices,
+                                                                  grid_variant,
+                                                                  cpt,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
+        else if (strategy == "native_prefill_gridkpar_auto_cpt4_gv3")
+        {
+            int device_id = opt.device;
+            hipGetDevice(&device_id);
+            const int cpt = 4;
+            const int grid_variant = 3;
+            const int slices = computeProdPrefillGridSlices(M, N, K, grid_variant, cpt);
+            if (!rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(d_A, d_B_vnni, d_C, M, N, K,
+                                                                  slices,
+                                                                  grid_variant,
+                                                                  cpt,
+                                                                  device_id,
+                                                                  stream))
+            {
+                launch_failed = true;
+            }
+        }
+        else
+        {
+            launch_failed = true;
         }
     };
 
@@ -3629,6 +7080,12 @@ Result benchmarkStrategy(
 
 void printTable(const std::vector<Result> &results)
 {
+    std::cout << "[prefill-lab] table note: RepackMS reports host-side repack overhead. "
+              << "vsCK(E2E) uses harvested canonical CK E2E when available (otherwise measured CK E2E). "
+              << "Only CK baseline reports simulated INT8-VNNI->CK repack; non-CK strategies keep repack excluded. "
+              << "Activation quantization stays inside KernelMS."
+              << std::endl;
+
     fort::utf8_table table;
     table.set_border_style(FT_DOUBLE2_STYLE);
     table << fort::header << "Shape" << "Strategy" << "SplitK" << "KernelMS" << "RepackMS" << "E2EMS" << "TFLOPS" << "vsCK(K)" << "vsCK(E2E)" << "vsCanon(K)" << "vsCanon(E2E)" << "MaxAbsDiff" << "OK" << fort::endr;
@@ -4082,6 +7539,12 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
         return false;
     }
 
+    std::cout << "[prefill-lab] device=" << device
+              << " accounting policy: vsCK(E2E) uses canonical harvested CK E2E when available (fallback: measured CK E2E); "
+              << "CK row still reports simulated INT8-VNNI->CK repack, non-CK weight repack remains excluded; "
+              << "activation-quantization remains in kernel timing"
+              << std::endl;
+
     for (const auto &shape : shapes)
     {
         const CanonicalCKBaseline *canonical_ck = findCanonicalCKBaseline(shape.name);
@@ -4121,9 +7584,6 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
         }
         std::vector<int8_t> h_B_vnni = packRowMajorToVNNI(h_B_rowmajor, shape.N, shape.K);
         std::vector<uint8_t> h_B_q4_vnni = packRowMajorToQ4VNNI(h_B_rowmajor_q4, shape.N, shape.K);
-        std::vector<int8_t> h_B_nxk_work(h_B_nxk.size());
-        std::vector<int8_t> h_B_vnni_work(h_B_vnni.size());
-        std::vector<uint8_t> h_B_q4_vnni_work(h_B_q4_vnni.size());
         std::vector<int32_t> cpu_ref;
         std::vector<int32_t> cpu_ref_q4;
         if (opt.check_correctness)
@@ -4191,7 +7651,10 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
 
                 const int8_t *d_ck_weights = d_B_rowmajor;
                 int ck_best_diff = 0;
-                double ck_repack_ms = 0.0;
+                std::vector<int8_t> h_B_ck_rowmajor;
+                const double ck_repack_ms = runTimedHostPrepLoop(opt.warmup, opt.iters, [&]() {
+                    unpackVNNIToRowMajorInplace(h_B_vnni, shape.N, shape.K, h_B_ck_rowmajor);
+                });
                 if (opt.check_correctness)
                 {
                         hipMemsetAsync(d_C, 0, c_elems * sizeof(int32_t), stream);
@@ -4211,19 +7674,14 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                         d_ck_weights = (diff_nxk < diff_rowmajor) ? d_B_nxk : d_B_rowmajor;
                         ck_best_diff = std::min(diff_rowmajor, diff_nxk);
 
-                        ck_repack_ms = (d_ck_weights == d_B_nxk)
-                                                             ? runTimedHostPrepLoop(opt.warmup, opt.iters, [&]() {
-                                                                         transposeKxNToNxKInplace(h_B_rowmajor, shape.N, shape.K, h_B_nxk_work);
-                                                                         hipMemcpyAsync(d_B_nxk, h_B_nxk_work.data(), b_elems * sizeof(int8_t), hipMemcpyHostToDevice, stream);
-                                                                         hipStreamSynchronize(stream);
-                                                                 })
-                                                             : 0.0;
+                        (void)d_ck_weights;
                 }
 
         const double ck_ms = runTimedLoop(opt.warmup, opt.iters, [&]() {
             run_ck(d_ck_weights);
         }, stream);
         const double ck_e2e_ms = ck_ms + ck_repack_ms;
+        const double ck_e2e_compare_ms = canonical_ck ? canonical_ck->mean_ms : ck_e2e_ms;
 
         const double ck_tflops = tflopsFor(shape.M, shape.N, shape.K, ck_ms);
         Result ck_row;
@@ -4235,7 +7693,7 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
         ck_row.e2e_ms = ck_e2e_ms;
         ck_row.tflops = ck_tflops;
         ck_row.speedup_vs_ck = 1.0;
-        ck_row.speedup_vs_ck_e2e = 1.0;
+        ck_row.speedup_vs_ck_e2e = ck_e2e_compare_ms / std::max(ck_row.e2e_ms, 1e-9);
         if (canonical_ck)
         {
             ck_row.speedup_vs_ck_canonical_k = canonical_ck->mean_ms / std::max(ck_row.ms, 1e-9);
@@ -4245,25 +7703,16 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
         ck_row.ok = (ck_best_diff == 0);
         results_out.push_back(ck_row);
 
-        const double custom_int8_repack_ms = opt.int8_vnni_prepacked
-                                                 ? 0.0
-                                                 : runTimedHostPrepLoop(opt.warmup, opt.iters, [&]() {
-                                                       packRowMajorToVNNIInplace(h_B_rowmajor, shape.N, shape.K, h_B_vnni_work);
-                                                       hipMemcpyAsync(d_B_vnni, h_B_vnni_work.data(), h_B_vnni_work.size() * sizeof(int8_t), hipMemcpyHostToDevice, stream);
-                                                       hipStreamSynchronize(stream);
-                                                   });
-        const double custom_q4_repack_ms = runTimedHostPrepLoop(opt.warmup, opt.iters, [&]() {
-            packRowMajorToQ4VNNIInplace(h_B_rowmajor_q4, shape.N, shape.K, h_B_q4_vnni_work);
-            hipMemcpyAsync(d_B_q4_vnni, h_B_q4_vnni_work.data(), h_B_q4_vnni_work.size() * sizeof(uint8_t), hipMemcpyHostToDevice, stream);
-            hipStreamSynchronize(stream);
-        });
+        const double custom_int8_repack_ms = 0.0;
+        const double custom_q4_repack_ms = 0.0;
 
         std::vector<std::string> shape_strategies = opt.strategies;
+        const bool user_strategy_override = opt.user_strategy_override && !shape_strategies.empty();
         const double n_over_k = static_cast<double>(shape.N) / static_cast<double>(std::max(shape.K, 1));
         const bool is_lm_head = (shape.N >= 65536) && (n_over_k >= 32.0);
         const bool is_wide_or_extrawide = (n_over_k >= 2.0);
 
-        if (is_wide_or_extrawide && opt.prefer_ck_wide)
+        if (is_wide_or_extrawide && opt.prefer_ck_wide && !user_strategy_override)
         {
             shape_strategies.clear();
             std::cout << "[prefill-lab] device=" << device
@@ -4272,7 +7721,7 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                       << "; pass --no-prefer-ck-wide to benchmark custom variants"
                       << std::endl;
         }
-        else if (is_wide_or_extrawide && !shape_strategies.empty())
+        else if (is_wide_or_extrawide && !shape_strategies.empty() && !user_strategy_override)
         {
             // S5 promotion: CK-style skinny/wide shortlist for wide/extrawide classes.
             // Focuses on rectangular/grid-cap variants that have shown better behavior
@@ -4280,7 +7729,6 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
             shape_strategies = {
                 "lmhead_vec_mr4_pad_cpt8",
                 "lmhead_vec_mr4_pad_cpt4",
-                "native_prefill_prod_policy",
                 "native_prefill_auto_cpt1",
                 "native_prefill_32x8_cpt1",
                 "native_prefill_gridkpar_auto_cpt1",
@@ -4300,14 +7748,13 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                       << std::endl;
         }
 
-        if (is_lm_head && !opt.full_lm_head)
+        if (is_lm_head && !opt.full_lm_head && !user_strategy_override)
         {
             if (!shape_strategies.empty())
             {
                 shape_strategies = {
                     "lmhead_vec_mr4_pad_cpt8",
                     "lmhead_vec_mr4_pad_cpt4",
-                    "native_prefill_prod_policy",
                     "native_prefill_auto_cpt1",
                     "native_prefill_32x8_cpt1",
                     "native_prefill_gridkpar_auto_cpt1",
@@ -4322,6 +7769,13 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                 std::cout << "[prefill-lab] device=" << device
                           << " using fast LM-head subset (" << shape_strategies.size() << " strategies); pass --full-lm-head for exhaustive" << std::endl;
             }
+        }
+
+        if (user_strategy_override)
+        {
+            std::cout << "[prefill-lab] device=" << device
+                      << " honoring explicit --strategies override (" << shape_strategies.size()
+                      << " strategies)" << std::endl;
         }
 
         for (const auto &strategy : shape_strategies)
@@ -4402,14 +7856,7 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                 hipMemcpyAsync(d_B_q4_vnni_padded, h_B_q4_vnni_padded.data(), h_B_q4_vnni_padded.size() * sizeof(uint8_t), hipMemcpyHostToDevice, stream);
                 hipStreamSynchronize(stream);
 
-                std::vector<int8_t> h_B_vnni_padded_work(h_B_vnni_padded.size());
-                const double vecpad_repack_ms = opt.int8_vnni_prepacked
-                                                    ? 0.0
-                                                    : runTimedHostPrepLoop(opt.warmup, opt.iters, [&]() {
-                                                          packRowMajorToVNNIInplace(h_B_rowmajor_padded, n_padded, shape.K, h_B_vnni_padded_work);
-                                                          hipMemcpyAsync(d_B_vnni_padded, h_B_vnni_padded_work.data(), h_B_vnni_padded_work.size() * sizeof(int8_t), hipMemcpyHostToDevice, stream);
-                                                          hipStreamSynchronize(stream);
-                                                      });
+                const double vecpad_repack_ms = 0.0;
 
                 Shape padded_shape{shape.name + "_vecpad_mr4", m_padded, n_padded, shape.K};
                 Result r = benchmarkStrategy(
@@ -4433,7 +7880,7 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                 r.speedup_vs_ck = ck_ms / std::max(r.ms, 1e-9);
                 r.repack_ms = vecpad_repack_ms;
                 r.e2e_ms = r.ms + r.repack_ms;
-                r.speedup_vs_ck_e2e = ck_e2e_ms / std::max(r.e2e_ms, 1e-9);
+                r.speedup_vs_ck_e2e = ck_e2e_compare_ms / std::max(r.e2e_ms, 1e-9);
                 if (canonical_ck)
                 {
                     r.speedup_vs_ck_canonical_k = canonical_ck->mean_ms / std::max(r.ms, 1e-9);
@@ -4452,10 +7899,215 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                 continue;
             }
 
-            if (strategy == "lmhead_vec_mr4_pad_cpt8")
+            if (strategy == "lmhead_vec_mr4_pad_cpt8" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_cap64" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_cap96" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_cap192" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_cap256" ||
+                strategy == "lmhead_vec_mr8_pad_cpt4_abcast_lane0_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap64" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap96" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap128" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap192" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_i32addr_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_splitacc_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_splitacc_lb3_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_splitacc_lb4_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_ldsB_kgt8_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_avec4_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coal_pipe_u4_cap256" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_pf1" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_by8" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_by8_cap128" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_by8_lb1" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_by8_lb1_cap128" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_k2" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_k2_by8" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cpt16split" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_veca2" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_veca4" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_veca4_rfl" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_ldsbdb" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_lds_kgt16" ||
+                strategy == "lmhead_vec_mr4_pad_cpt8_ldsbdb_kgt8")
             {
-                constexpr int kVectorCols = 512; // 64 lanes * CPT8
-                constexpr int kVectorRows = 16;  // BY(4) * MR(4)
+                const int kVectorRows =
+                    (strategy == "lmhead_vec_mr8_pad_cpt4_abcast_lane0_cap256") ? 32 : 16; // BY(4) * MR(8|4)
+
+                int kVectorCols =
+                    (strategy == "lmhead_vec_mr8_pad_cpt4_abcast_lane0_cap256") ? 256 : 512; // 64 lanes * CPT(4|8)
+
+                std::string padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_cap256";
+                std::string padded_suffix = "_vecpad_mr4cpt8";
+                if (strategy == "lmhead_vec_mr4_pad_cpt8_veca2")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_veca2_cap128";
+                    padded_suffix = "_vecpad_mr4cpt8_veca2";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_cap64")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_cap64";
+                    padded_suffix = "_vecpad_mr4cpt8_cap64";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_cap96")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_cap96";
+                    padded_suffix = "_vecpad_mr4cpt8_cap96";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_cap192")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_cap192";
+                    padded_suffix = "_vecpad_mr4cpt8_cap192";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap64")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_cap64";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_cap64";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap96")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_cap96";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_cap96";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap128")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_cap128";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_cap128";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap192")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_cap192";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_cap192";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr8_pad_cpt4_abcast_lane0_cap256")
+                {
+                    padded_strategy = "wave64_cpt4_aligned_mr8_abcast_lane0_cap256";
+                    padded_suffix = "_vecpad_mr8cpt4_abcast_lane0_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_coalonly_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_i32addr_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_i32addr_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_coalonly_i32addr_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_splitacc_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_splitacc_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_coalonly_splitacc_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_splitacc_lb3_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_splitacc_lb3_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_coalonly_splitacc_lb3_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coalonly_splitacc_lb4_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_coalonly_splitacc_lb4_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_coalonly_splitacc_lb4_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_ldsB_kgt8_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_ldsB_kgt8_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_ldsB_kgt8_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_avec4_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_avec4_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_avec4_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_pf1")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_pf1_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_pf1";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_coal_pipe_u4_cap256")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_coal_pipe_u4_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_coal_pipe_u4_cap256";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_by8")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_by8_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_by8";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_by8_cap128")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_by8_cap128";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_by8_cap128";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_by8_lb1")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_by8_lb1_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_by8_lb1";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_by8_lb1_cap128")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_by8_lb1_cap128";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_by8_lb1_cap128";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_k2")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_k2_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_k2";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_k2_by8")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_k2_by8_cap256";
+                    padded_suffix = "_vecpad_mr4cpt8_abcast_lane0_k2_by8";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_abcast_lane0_cpt16split")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_abcast_lane0_cpt16split_cap128";
+                    padded_suffix = "_vecpad_mr4cpt16_abcast_lane0_split";
+                    kVectorCols = 1024; // 64 lanes * CPT16
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_veca4")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_veca4_cap128";
+                    padded_suffix = "_vecpad_mr4cpt8_veca4";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_veca4_rfl")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_veca4_rfl_cap128";
+                    padded_suffix = "_vecpad_mr4cpt8_veca4rfl";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_ldsbdb")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_ldsbdb_cap128";
+                    padded_suffix = "_vecpad_mr4cpt8_ldsbdb";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_lds_kgt16")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_lds_kgt16_cap128";
+                    padded_suffix = "_vecpad_mr4cpt8_lds_kgt16";
+                }
+                else if (strategy == "lmhead_vec_mr4_pad_cpt8_ldsbdb_kgt8")
+                {
+                    padded_strategy = "wave64_cpt8_aligned_mr4_ldsbdb_kgt8_cap128";
+                    padded_suffix = "_vecpad_mr4cpt8_ldsbdb_kgt8";
+                }
 
                 const int n_padded = roundUpToMultiple(shape.N, kVectorCols);
                 const int m_padded = roundUpToMultiple(shape.M, kVectorRows);
@@ -4523,19 +8175,12 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                 hipMemcpyAsync(d_B_q4_vnni_padded, h_B_q4_vnni_padded.data(), h_B_q4_vnni_padded.size() * sizeof(uint8_t), hipMemcpyHostToDevice, stream);
                 hipStreamSynchronize(stream);
 
-                std::vector<int8_t> h_B_vnni_padded_work(h_B_vnni_padded.size());
-                const double vecpad_repack_ms = opt.int8_vnni_prepacked
-                                                    ? 0.0
-                                                    : runTimedHostPrepLoop(opt.warmup, opt.iters, [&]() {
-                                                          packRowMajorToVNNIInplace(h_B_rowmajor_padded, n_padded, shape.K, h_B_vnni_padded_work);
-                                                          hipMemcpyAsync(d_B_vnni_padded, h_B_vnni_padded_work.data(), h_B_vnni_padded_work.size() * sizeof(int8_t), hipMemcpyHostToDevice, stream);
-                                                          hipStreamSynchronize(stream);
-                                                      });
+                const double vecpad_repack_ms = 0.0;
 
-                Shape padded_shape{shape.name + "_vecpad_mr4cpt8", m_padded, n_padded, shape.K};
+                Shape padded_shape{shape.name + padded_suffix, m_padded, n_padded, shape.K};
                 Result r = benchmarkStrategy(
                     padded_shape,
-                    "wave64_cpt8_aligned_mr4_cap128",
+                    padded_strategy,
                     1,
                     opt,
                     d_A_padded,
@@ -4548,13 +8193,13 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                     cpu_ref_q4_padded);
 
                 r.shape = shape.name;
-                r.strategy = "lmhead_vec_mr4_pad_cpt8";
+                r.strategy = strategy;
                 r.splitk = 1;
                 r.tflops = tflopsFor(shape.M, shape.N, shape.K, r.ms);
                 r.speedup_vs_ck = ck_ms / std::max(r.ms, 1e-9);
                 r.repack_ms = vecpad_repack_ms;
                 r.e2e_ms = r.ms + r.repack_ms;
-                r.speedup_vs_ck_e2e = ck_e2e_ms / std::max(r.e2e_ms, 1e-9);
+                r.speedup_vs_ck_e2e = ck_e2e_compare_ms / std::max(r.e2e_ms, 1e-9);
                 if (canonical_ck)
                 {
                     r.speedup_vs_ck_canonical_k = canonical_ck->mean_ms / std::max(r.ms, 1e-9);
@@ -4590,7 +8235,7 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                          strategy == "q4nib_perm_wave64_cpt4" || strategy == "q4nib_perm_wave64_cpt4_grid");
                     r.repack_ms = is_q4nib ? custom_q4_repack_ms : custom_int8_repack_ms;
                     r.e2e_ms = r.ms + r.repack_ms;
-                    r.speedup_vs_ck_e2e = ck_e2e_ms / r.e2e_ms;
+                    r.speedup_vs_ck_e2e = ck_e2e_compare_ms / std::max(r.e2e_ms, 1e-9);
                     if (canonical_ck)
                     {
                         r.speedup_vs_ck_canonical_k = canonical_ck->mean_ms / std::max(r.ms, 1e-9);
@@ -4609,7 +8254,7 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                      strategy == "q4nib_perm_wave64_cpt4" || strategy == "q4nib_perm_wave64_cpt4_grid");
                 r.repack_ms = is_q4nib ? custom_q4_repack_ms : custom_int8_repack_ms;
                 r.e2e_ms = r.ms + r.repack_ms;
-                r.speedup_vs_ck_e2e = ck_e2e_ms / r.e2e_ms;
+                r.speedup_vs_ck_e2e = ck_e2e_compare_ms / std::max(r.e2e_ms, 1e-9);
                 if (canonical_ck)
                 {
                     r.speedup_vs_ck_canonical_k = canonical_ck->mean_ms / std::max(r.ms, 1e-9);
@@ -4661,7 +8306,7 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                               << std::endl;
 
                     double chunk_kernel_ms = 0.0;
-                    double chunk_repack_ms = 0.0;
+                    const double chunk_repack_ms = 0.0;
                     int chunk_max_abs_diff = 0;
                     bool chunk_ok = true;
 
@@ -4733,13 +8378,6 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                         chunk_max_abs_diff = std::max(chunk_max_abs_diff, chunk_result.max_abs_diff);
                         chunk_ok = chunk_ok && chunk_result.ok;
 
-                        std::vector<int8_t> h_B_vnni_chunk_work(h_B_vnni_chunk.size());
-                        chunk_repack_ms += runTimedHostPrepLoop(opt.warmup, opt.iters, [&]() {
-                            packRowMajorToVNNIInplace(h_B_rowmajor_chunk, chunk_cols_padded, shape.K, h_B_vnni_chunk_work);
-                            hipMemcpyAsync(d_B_vnni_chunk, h_B_vnni_chunk_work.data(), h_B_vnni_chunk_work.size() * sizeof(int8_t), hipMemcpyHostToDevice, stream);
-                            hipStreamSynchronize(stream);
-                        });
-
                         hipFree(d_B_rowmajor_chunk);
                         hipFree(d_B_vnni_chunk);
                         hipFree(d_B_q4_vnni_chunk);
@@ -4761,7 +8399,7 @@ bool runShapesOnDevice(const Options &opt, int device, const std::vector<Shape> 
                     chunk_row.e2e_ms = chunk_row.ms + chunk_row.repack_ms;
                     chunk_row.tflops = tflopsFor(shape.M, shape.N, shape.K, std::max(chunk_row.ms, 1e-9));
                     chunk_row.speedup_vs_ck = ck_ms / std::max(chunk_row.ms, 1e-9);
-                    chunk_row.speedup_vs_ck_e2e = ck_e2e_ms / std::max(chunk_row.e2e_ms, 1e-9);
+                    chunk_row.speedup_vs_ck_e2e = ck_e2e_compare_ms / std::max(chunk_row.e2e_ms, 1e-9);
                     if (canonical_ck)
                     {
                         chunk_row.speedup_vs_ck_canonical_k = canonical_ck->mean_ms / std::max(chunk_row.ms, 1e-9);
@@ -4884,7 +8522,7 @@ int main(int argc, char **argv)
               << " | warmup=" << opt.warmup
               << " | iters=" << opt.iters
               << " | correctness=" << (opt.check_correctness ? "on" : "off")
-              << " | int8_vnni=" << (opt.int8_vnni_prepacked ? "prepacked" : "repack_timed")
+              << " | weight_repack_accounting=ck_only"
 #ifdef _OPENMP
               << " | openmp=on"
               << " | omp_max_threads=" << omp_get_max_threads()

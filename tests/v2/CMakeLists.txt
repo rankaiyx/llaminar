@@ -7992,6 +7992,21 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added standalone ROCm prefill strategy lab microbenchmark")
 
+    add_executable(v2_perf_rocm_prefill_dispatch_comparison
+        performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp
+    )
+    target_link_libraries(v2_perf_rocm_prefill_dispatch_comparison
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmPrefillDispatchComparison
+        COMMAND $<TARGET_FILE:v2_perf_rocm_prefill_dispatch_comparison>
+        LABELS "V2;Performance;ROCm;GEMM;INT8;Prefill;Dispatch;Comparison;gfx906;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm prefill dispatch comparison performance benchmark")
+
     # NOTE: FP16 vs INT8 benchmark removed (January 2026) - INT8 proven faster for all sizes.
     # Results documented in changelog/2026-01-10-rocm-int8-gemm-optimization.md
 

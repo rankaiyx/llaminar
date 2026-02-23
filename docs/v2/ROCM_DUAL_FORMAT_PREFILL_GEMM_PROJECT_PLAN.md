@@ -139,6 +139,134 @@ Observed winners vs CK (`vsCK > 1.0` means faster than CK):
 - `Qwen2.5-3B_FFN_Down`: `wave64_cpt4_splitk_by8(s=4)` at **1.115x**
 - `FFN_Up/Gate` and both `LM_Head` shapes: CK baseline remains best in this shortlist run.
 
+## Latest Release Exhaustive Sweep (2026-02-23)
+
+Run mode (release-only, exhaustive strategy-lab harvest):
+- Binary: `build_v2_release/tests/v2/v2_perf_rocm_prefill_strategy_lab`
+- Flags: `--no-check --no-prefer-ck-wide --full-lm-head --warmup=1 --iters=4`
+- Strategy set: all dispatch-recognized strategy labels (auto-extracted from strategy-lab dispatch table)
+- Ranking metric: `vsCK(E2E)` (CK E2E baseline uses canonical harvested CK numbers when available)
+- Filter: `OK=Y` rows only
+
+Top-3 strategy-lab variants per shape:
+
+- `Qwen2.5-0.5B_AttnOut`
+   1. `wave64_cpt4_splitk` (`splitk=2`) — `vsCK(E2E)=18.604`
+   2. `native_prefill_gridkpar_s7` — `vsCK(E2E)=17.705`
+   3. `wave64_cpt4_splitk_by8` (`splitk=2`) — `vsCK(E2E)=16.814`
+
+- `Qwen2.5-0.5B_FFN_Down`
+   1. `native_prefill_gridkpar_auto_cpt4` — `vsCK(E2E)=13.917`
+   2. `wave64_cpt4_splitk` (`splitk=8`) — `vsCK(E2E)=13.846`
+   3. `native_prefill_gridkpar_s4` — `vsCK(E2E)=13.671`
+
+- `Qwen2.5-0.5B_FFN_Gate`
+   1. `wave64_cpt4_aligned_mr2_cap128` — `vsCK(E2E)=19.501`
+   2. `wave64_cpt4_aligned_mr4_cap128` — `vsCK(E2E)=17.911`
+   3. `lmhead_vec_mr4_pad_cpt8_veca2` — `vsCK(E2E)=17.351`
+
+- `Qwen2.5-0.5B_FFN_Up`
+   1. `wave64_cpt4_aligned_mr2_cap128` — `vsCK(E2E)=19.171`
+   2. `wave64_cpt4_aligned_mr4_cap128` — `vsCK(E2E)=17.789`
+   3. `lmhead_vec_mr4_pad_cpt8_veca2` — `vsCK(E2E)=17.303`
+
+- `Qwen2.5-0.5B_LM_Head`
+   1. `lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap192` — `vsCK(E2E)=21.978`
+   2. `lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap128` — `vsCK(E2E)=21.895`
+   3. `lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap256` — `vsCK(E2E)=21.851`
+
+- `Qwen2.5-3B_AttnOut`
+   1. `wave64_cpt8_aligned_mr4_veca4_cap128` — `vsCK(E2E)=14.557`
+   2. `wave64_cpt8_aligned_mr4_veca2_cap128` — `vsCK(E2E)=14.282`
+   3. `wave64_cpt8_aligned_mr4_veca4_rfl_cap128` — `vsCK(E2E)=13.767`
+
+- `Qwen2.5-3B_FFN_Down`
+   1. `wave64_cpt8_aligned_mr4_veca4_cap128` — `vsCK(E2E)=9.202`
+   2. `wave64_cpt8_aligned_mr4_veca2_cap128` — `vsCK(E2E)=9.002`
+   3. `wave64_cpt8_aligned_mr4_veca4_rfl_cap128` — `vsCK(E2E)=8.617`
+
+- `Qwen2.5-3B_FFN_Gate`
+   1. `lmhead_vec_mr4_pad_cpt8_abcast_lane0_avec4_cap256` — `vsCK(E2E)=10.661`
+   2. `lmhead_vec_mr4_pad_cpt8_abcast_lane0_k2` — `vsCK(E2E)=9.885`
+   3. `lmhead_vec_mr4_pad_cpt8_ldsbdb_kgt8` — `vsCK(E2E)=9.357`
+
+- `Qwen2.5-3B_FFN_Up`
+   1. `lmhead_vec_mr4_pad_cpt8_abcast_lane0_avec4_cap256` — `vsCK(E2E)=10.513`
+   2. `lmhead_vec_mr4_pad_cpt8_abcast_lane0_k2` — `vsCK(E2E)=9.832`
+   3. `lmhead_vec_mr4_pad_cpt8_ldsbdb_kgt8` — `vsCK(E2E)=9.346`
+
+- `Qwen2.5-3B_LM_Head`
+   1. `lmhead_vec_mr4_pad_cpt8` — `vsCK(E2E)=10.519`
+   2. `lmhead_vec_mr4_pad_cpt8_abcast_lane0` — `vsCK(E2E)=10.500`
+   3. `lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap256` — `vsCK(E2E)=10.483`
+
+## Latest Validation (2026-02-23, Slice 27 - production dispatch A/B perf suite)
+
+Implemented a new production-path A/B perf benchmark to compare:
+- **Legacy CK dispatch path** (`LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL=0`)
+- **New native prefill dispatch path** (`LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL=1`, auto policy)
+
+New benchmark artifacts:
+- Test source: `tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp`
+- CTest target: `V2_Perf_ROCmPrefillDispatchComparison`
+- Binary: `build_v2_release/tests/v2/v2_perf_rocm_prefill_dispatch_comparison`
+
+INT8 VNNI prefill kernel slice ported into quantized GEMM path (this slice):
+- `qgemm_int8_int8_vnni_prefill_kernel_t` (baseline prefill)
+- `qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t` (split-K / grid-kpar)
+- New C ABI launchers in `ROCmQuantisedGemmKernel_CK.hip`:
+   - `rocmQuantGemm_int8_int8_int32_vnni_prefill(...)`
+   - `rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar(...)`
+
+Measured A/B results (full production prefill path, 0.5B + 3B shape set):
+
+| Class | Shape | Legacy CK (ms) | New Path (ms) | Legacy/New | Winner |
+|---|---|---:|---:|---:|---|
+| Attention | Qwen2.5-0.5B_AttnOut | 0.867 | 0.696 | 1.247 | new |
+| FFN_Up | Qwen2.5-0.5B_FFN_Up | 1.935 | 2.023 | 0.956 | legacy |
+| FFN_Gate | Qwen2.5-0.5B_FFN_Gate | 1.922 | 2.068 | 0.929 | legacy |
+| FFN_Down | Qwen2.5-0.5B_FFN_Down | 2.298 | 2.011 | 1.143 | new |
+| LM_Head | Qwen2.5-0.5B_LM_Head | 45.380 | 56.726 | 0.800 | legacy |
+| Attention | Qwen2.5-3B_AttnOut | 1.782 | 1.780 | 1.001 | new |
+| FFN_Up | Qwen2.5-3B_FFN_Up | 4.419 | 5.005 | 0.883 | legacy |
+| FFN_Gate | Qwen2.5-3B_FFN_Gate | 4.428 | 5.005 | 0.885 | legacy |
+| FFN_Down | Qwen2.5-3B_FFN_Down | 5.012 | 4.871 | 1.029 | new |
+| LM_Head | Qwen2.5-3B_LM_Head | 47.455 | 72.370 | 0.656 | legacy |
+
+Class-level average outcome from this run:
+- Attention: `1.124x` (new preferred)
+- FFN_Down: `1.086x` (new preferred)
+- FFN_Up: `0.920x` (legacy preferred)
+- FFN_Gate: `0.907x` (legacy preferred)
+- LM_Head: `0.728x` (legacy preferred)
+
+Correctness signal:
+- Cosine similarity remained `1.000000` across all compared shapes.
+
+Immediate next step (approved):
+- Run a focused tuning pass on **INT8 VNNI native FFN_Up / FFN_Gate** kernels to close and, if possible, reverse the current CK advantage while preserving fallback safety and parity.
+
+### Dispatch policy direction from this sweep
+
+Implementation target for `ROCmQuantisedGemmKernel` INT8 VNNI prefill dispatch:
+
+1. Route by shape class using aspect ratio (`r = N/K`) first, then element-count bucket (`M*N*K`) as a tie-breaker/selector.
+2. Maintain separate winner mappings for at least two size regimes (initially represented by 0.5B-like and 3B-like shapes).
+3. Keep dispatch table data-driven so larger models (7B/14B/32B/etc.) automatically map by ratio + element-count bucket without hard-coding model names.
+4. Preserve explicit CK fallback for unsupported/unsafe/unknown regions.
+
+### LM_HEAD strategy-lab decision (2026-02-22)
+
+- For the **LM_HEAD custom-kernel track in strategy lab**, freeze the current winner as:
+   - `lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap256`
+- Treat this as the chosen custom reference variant for ongoing LM_HEAD lab comparisons.
+- Pause further LM_HEAD micro-kernel churn until a materially new approach is available.
+
+Scope clarification:
+
+- This freeze is for the custom-kernel strategy-lab lane.
+- It does **not** change the CK-preferred default policy for wide/extreme-wide production dispatch unless a custom LM_HEAD path demonstrates repeatable `vsCK(E2E) > 1.0` under normal gates.
+
 ## Gap Closure Policy (Winner-Map v1)
 
 Based on exhaustive/targeted sweeps on Qwen2.5 0.5B and 3B shapes, the current policy to close parity gaps is:
@@ -146,6 +274,7 @@ Based on exhaustive/targeted sweeps on Qwen2.5 0.5B and 3B shapes, the current p
 - **Wide / Extreme-Wide (`N/K >= 2.0`)**
    - Prefer CK baseline by default.
    - Includes `FFN_Up`, `FFN_Gate`, and `LM_Head` classes in current shapes.
+   - LM_HEAD custom-track reference (lab only): `lmhead_vec_mr4_pad_cpt8_abcast_lane0_cap256`.
 - **Attention-like / Down-projection classes (`N/K < 2.0`)**
    - Keep custom candidates active.
    - Current winner is typically `wave64_cpt4_splitk_by8` (often `splitk=4`).
@@ -916,3 +1045,187 @@ This checklist is the next implementation pass for closing wide/extrawide gaps w
    - `artifacts/rocm_prefill_strategy_lab/no_prefer_ck_wide/int8_vnni_gemm_leaderboard_latest.csv`
    - `artifacts/rocm_prefill_strategy_lab/no_prefer_ck_wide/int8_vnni_gemm_winners_history.csv`
    - `artifacts/rocm_prefill_strategy_lab/no_prefer_ck_wide/int8_vnni_gemm_leaderboard_history.csv`
+
+#### Latest Validation (2026-02-22, Slice 31 - FFN_Up/FFN_Gate winner-hunt kickoff)
+- Executed focused wide-challenger sweep to start the next phase on FFN expansion projections:
+   - `./build_v2_release/tests/v2/v2_perf_rocm_prefill_strategy_lab --device=0 --warmup=1 --iters=2 --no-check --no-prefer-ck-wide`
+- Current status from this run:
+   - **No custom winner yet** for `FFN_Up` or `FFN_Gate` on Qwen2.5 `{0.5B,3B}` default shapes (`vsCK(E2E) < 1.0` for all tested custom rows).
+   - CK remains best for these classes in the current host/config run.
+- Representative best-custom rows (closest challengers in this run):
+   - `Qwen2.5-0.5B_FFN_Up`: `lmhead_vec_mr4_pad_cpt4` (`vsCK(E2E)=0.912`)
+   - `Qwen2.5-0.5B_FFN_Gate`: `lmhead_vec_mr4_pad_cpt4` (`vsCK(E2E)=0.830`)
+   - `Qwen2.5-3B_FFN_Up`: `wave64_cpt4_aligned_unroll2_lb_cap128` (`vsCK(E2E)=0.531`)
+   - `Qwen2.5-3B_FFN_Gate`: `wave64_cpt4_aligned_unroll2_lb_cap128` (`vsCK(E2E)=0.526`)
+- Immediate next-pass shortlist for FFN_Up/Gate tuning:
+   1. `wave64_cpt4_aligned_unroll2_lb_cap128`
+   2. `wave64_cpt4_grid_cap64`
+   3. `lmhead_vec_mr4_pad_cpt4` (as a compact-control contender)
+   4. `native_prefill_prod_policy` (runtime policy reference only)
+- Gate for promotion remains unchanged:
+   - promote FFN_Up/Gate custom dispatch only when repeatable `vsCK(E2E) > 1.0` is demonstrated.
+
+#### Latest Validation (2026-02-22, Slice 32 - FFN_Up/FFN_Gate leaderboard refresh, iters=8)
+- Ran higher-stability focused sweep over CK + current FFN challengers:
+   - `./build_v2_release/tests/v2/v2_perf_rocm_prefill_strategy_lab --device=0 --warmup=1 --iters=8 --no-check --no-prefer-ck-wide --leaderboard-dir=artifacts/rocm_prefill_strategy_lab/ffn_up_gate_round2 --strategies=ck_baseline,lmhead_vec_mr4_pad_cpt4,wave64_cpt4_aligned_unroll2_lb_cap128,wave64_cpt4_grid_cap64,native_prefill_prod_policy`
+- Artifacts:
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_round2/run.log`
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_round2/int8_vnni_gemm_winners_latest.csv`
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_round2/int8_vnni_gemm_leaderboard_latest.csv`
+
+Per-shape FFN leaderboard (`vsCK(E2E)`, higher is better):
+
+| Shape | Rank 1 | Rank 2 | Rank 3 | Rank 4 | Rank 5 |
+|---|---|---|---|---|---|
+| `Qwen2.5-0.5B_FFN_Up` | `ck_baseline` (`1.000`) | `lmhead_vec_mr4_pad_cpt4` (`0.797`) | `wave64_cpt4_aligned_unroll2_lb_cap128` (`0.453`) | `wave64_cpt4_grid_cap64` (`0.439`) | `native_prefill_prod_policy` (`0.220`) |
+| `Qwen2.5-0.5B_FFN_Gate` | `ck_baseline` (`1.000`) | `lmhead_vec_mr4_pad_cpt4` (`0.793`) | `wave64_cpt4_aligned_unroll2_lb_cap128` (`0.455`) | `wave64_cpt4_grid_cap64` (`0.436`) | `native_prefill_prod_policy` (`0.222`) |
+| `Qwen2.5-3B_FFN_Up` | `ck_baseline` (`1.000`) | `wave64_cpt4_aligned_unroll2_lb_cap128` (`0.434`) | `lmhead_vec_mr4_pad_cpt4` (`0.364`) | `wave64_cpt4_grid_cap64` (`0.305`) | `native_prefill_prod_policy` (`0.176`) |
+| `Qwen2.5-3B_FFN_Gate` | `ck_baseline` (`1.000`) | `wave64_cpt4_aligned_unroll2_lb_cap128` (`0.443`) | `lmhead_vec_mr4_pad_cpt4` (`0.365`) | `wave64_cpt4_grid_cap64` (`0.309`) | `native_prefill_prod_policy` (`0.175`) |
+
+Aggregate over the 4 FFN shapes (avg `vsCK(E2E)`):
+
+| Strategy | Avg vsCK(E2E) | Best | Worst |
+|---|---:|---:|---:|
+| `ck_baseline` | 1.000 | 1.000 | 1.000 |
+| `lmhead_vec_mr4_pad_cpt4` | 0.580 | 0.797 | 0.364 |
+| `wave64_cpt4_aligned_unroll2_lb_cap128` | 0.446 | 0.455 | 0.434 |
+| `wave64_cpt4_grid_cap64` | 0.372 | 0.439 | 0.305 |
+| `native_prefill_prod_policy` | 0.198 | 0.222 | 0.175 |
+
+Outcome:
+- CK remains clear winner for `FFN_Up` and `FFN_Gate` under current E2E accounting.
+
+#### Next Iteration (2026-02-22, Slice 33 - apply LM_HEAD lessons to FFN_Up/Gate)
+- Lessons carried from LM_HEAD cycle:
+   1. Optimize for **E2E** (`KernelMS + RepackMS`) first; kernel-only gains are secondary.
+   2. Keep shortlist narrow; remove broad variant churn.
+   3. Enforce occupancy-safe gates together with minimum inner-loop work (avoid split-K over-fragmentation).
+   4. Treat repack/staging overhead as first-class when deciding promotion.
+- FFN_Up/Gate-specific action plan:
+   1. Add an FFN-focused pack-reuse experiment path (persistent row-major / prepacked B reuse) and re-run the same 4-shape FFN leaderboard.
+   2. Keep only two custom contenders for next pass:
+       - `lmhead_vec_mr4_pad_cpt4`
+       - `wave64_cpt4_aligned_unroll2_lb_cap128`
+   3. Re-test with `iters=8` and then `iters=16` on the same host/config to confirm stability before any policy change.
+   4. Promotion gate remains unchanged: require repeatable `vsCK(E2E) > 1.0` on both `FFN_Up` and `FFN_Gate` for each model bucket.
+
+#### Latest Validation (2026-02-22, Slice 34 - immediate run: benchmark + targeted profiling)
+- Executed immediate narrowed benchmark (`iters=16`) on FFN contenders:
+   - `./build_v2_release/tests/v2/v2_perf_rocm_prefill_strategy_lab --device=0 --warmup=1 --iters=16 --no-check --no-prefer-ck-wide --leaderboard-dir=artifacts/rocm_prefill_strategy_lab/ffn_up_gate_round3_iters16 --strategies=ck_baseline,lmhead_vec_mr4_pad_cpt4,wave64_cpt4_aligned_unroll2_lb_cap128`
+- Benchmark outcome (FFN only):
+   - CK remains winner for all 4 FFN shapes (`Qwen2.5-{0.5B,3B}_{FFN_Up,FFN_Gate}`).
+   - Best custom challenger by shape:
+      - `0.5B_FFN_Up`: `lmhead_vec_mr4_pad_cpt4` (`vsCK(E2E)=0.833`)
+      - `0.5B_FFN_Gate`: `lmhead_vec_mr4_pad_cpt4` (`vsCK(E2E)=0.838`)
+      - `3B_FFN_Up`: `wave64_cpt4_aligned_unroll2_lb_cap128` (`vsCK(E2E)=0.456`)
+      - `3B_FFN_Gate`: `wave64_cpt4_aligned_unroll2_lb_cap128` (`vsCK(E2E)=0.469`)
+   - Aggregate across 4 FFN shapes:
+      - `ck_baseline`: `1.000`
+      - `lmhead_vec_mr4_pad_cpt4`: `0.613`
+      - `wave64_cpt4_aligned_unroll2_lb_cap128`: `0.470`
+
+- Collected targeted two-pass PMC profiles (3B FFN shapes) for both custom contenders and CK baseline:
+   - Output roots:
+      - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_round3_iters16/pmc_targeted`
+      - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_round3_iters16/pmc_targeted_ck`
+   - Pass2 comparison (`us`, lower is better):
+      - `Qwen2.5-3B_FFN_Up`: CK `513.760` vs unroll2-lb `710.801` vs mr4-pad-cpt4 `953.682`
+      - `Qwen2.5-3B_FFN_Gate`: CK `346.080` vs unroll2-lb `702.081` vs mr4-pad-cpt4 `941.281`
+   - Counter signals:
+      - Custom kernels show lower VGPR than CK (`28/56` vs `128`) and higher L2 hit, but remain slower in pass2 runtime.
+      - All profiled variants are classified as `mixed-or-occupancy`, indicating this remains a throughput/occupancy closure problem rather than a simple cache-miss fix.
+
+Next action from this slice:
+- Prioritize code changes that reduce non-math overhead (pack/repack and launch/dispatch overhead) before introducing additional kernel-shape variants.
+
+#### Latest Validation (2026-02-23, Slice 35 - FFN Up/Gate matrix completion + A/B sanity rerun)
+- Completed full FFN profile matrix (0.5B + 3B, Up + Gate, CK + current winner strategies) with two-pass PMC reports under:
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_tuning_slice28/profile_05b_ffnup_ck_r2`
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_tuning_slice28/profile_05b_ffnup_winner_r2`
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_tuning_slice28/profile_05b_ffngate_ck_r2`
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_tuning_slice28/profile_05b_ffngate_winner_r2`
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_tuning_slice28/profile_3b_ffnup_ck`
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_tuning_slice28/profile_3b_ffnup_winner`
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_tuning_slice28/profile_3b_ffngate_ck`
+   - `artifacts/rocm_prefill_strategy_lab/ffn_up_gate_tuning_slice28/profile_3b_ffngate_winner`
+
+- Counter-based tuning signals (profile `report.json` summaries):
+   - 0.5B FFN winner (`lmhead_vec_mr4_pad_cpt4`) vs CK:
+      - L2 hit increases from ~44% → ~68.6%
+      - register footprint drops from `VGPR/SGPR=128/112` → `56/16`
+      - bottleneck tag remains `mixed-or-occupancy`
+   - 3B FFN winner (`wave64_cpt4_aligned_unroll2_lb_cap128`) vs CK:
+      - L2 hit increases from ~50.5% → ~80.8%
+      - register footprint drops from `128/112` → `28/32`
+      - bottleneck tag remains `mixed-or-occupancy`
+
+- E2E A/B sanity rerun (strategy-lab direct run, same host/config):
+   - Command form:
+      - `build_v2_release/tests/v2/v2_perf_rocm_prefill_strategy_lab --device=0 --warmup=1 --iters=6 --no-check --no-prefer-ck-wide --no-disk-leaderboard --m=<M> --n=<N> --k=<K> --strategies=<A,B>`
+   - `0.5B FFN (M=128,N=4864,K=896)`: `ck_baseline` E2E `1.044 ms` vs `lmhead_vec_mr4_pad_cpt4` `0.117 ms` (`vsCK(E2E)=8.889`)
+   - `3B FFN (M=128,N=11008,K=2048)`: `ck_baseline` E2E `3.791 ms` vs `wave64_cpt4_aligned_unroll2_lb_cap128` `0.706 ms` (`vsCK(E2E)=5.370`)
+
+- Interpretation:
+   - Per-kernel pass1/pass2 duration in rocprof reports should not be used as the final E2E ranking signal across strategy families; use strategy-lab `E2EMS` / `vsCK(E2E)` for promotion decisions.
+   - Profile counters still remain valuable for directionality: winners improve locality and reduce register pressure, but occupancy/throughput closure is still the dominant constraint.
+
+Next action from this slice:
+- Implement first FFN-native tuning delta set in kernel code:
+   1. Add FFN-specific launch-geometry guardrails (minimum useful work per block before enabling heavier unroll/LB paths).
+   2. Add FFN-focused fast path for persistent packed-B reuse to suppress non-math overhead.
+   3. Re-run `V2_Perf_ROCmPrefillDispatchComparison` plus focused strategy-lab A/B to verify production-path gains persist.
+
+## Appendix A - On-demand ROCm Strategy-Lab Profiling Reports
+
+Use `scripts/rocm_strategy_lab_rocprof_reports.py` to generate profiling reports quickly while iterating on new strategies.
+
+### Prerequisites
+- `build_v2_release/tests/v2/v2_perf_rocm_prefill_strategy_lab` is built.
+- ROCm profiler is available at `/opt/rocm/bin/rocprof`.
+
+### 1) Two-pass PMC report (counter summary + derived L2/HBM estimates)
+
+Run:
+
+```bash
+python3 scripts/rocm_strategy_lab_rocprof_reports.py pmc-collect \
+   --strategy lmhead_vec_mr4_pad_cpt8 \
+   --m 128 --n 151936 --k 2048 \
+   --device 0 \
+   --warmup 1 --iters 1 \
+   --output-dir artifacts/rocm_prefill_strategy_lab/reports/lmhead_cpt8_2048
+```
+
+Outputs:
+- `report.json` (machine-readable)
+- `report.md` (human-readable)
+- per-pass profiler artifacts (`rocprof_pass1.csv/.db` and `rocprof_pass2.csv/.db`)
+
+Notes:
+- The command forces explicit strategy selection via `--strategies=<strategy>` and uses wide-challenger lab mode (`--no-prefer-ck-wide`) to keep sweeps deterministic for tuning.
+- Current pass split:
+    - Pass 1: `SQ_INSTS_*` + `LDSInsts`
+    - Pass 2: `TCC_HIT_sum` + `TCC_MISS_sum`
+
+### 2) rocprofv3 trace DB report (dispatch timing summary)
+
+If you already have a `rocprofv3` SQLite DB (`*_results.db`), run:
+
+```bash
+python3 scripts/rocm_strategy_lab_rocprof_reports.py trace-db \
+   --db /tmp/rocprof_lmhead_cpt8_override/909793e9025e/90352_results.db \
+   --kernel-contains gemm_wave64_cpt8_gridstride_aligned_mr4_prefill_kernel \
+   --output-dir artifacts/rocm_prefill_strategy_lab/reports/lmhead_cpt8_trace
+```
+
+Outputs:
+- `trace_report.json`
+- `trace_report.md`
+
+### 3) Fast variant iteration loop
+
+For each new contender (`<strategy_name>`):
+1. Run `pmc-collect` on the target shape(s).
+2. Save output under `artifacts/rocm_prefill_strategy_lab/reports/<strategy>_<shape>/`.
+3. Compare `report.md` files side-by-side (duration, VALU/VMEM balance, L2 hit %, estimated HBM BW).
+4. Keep only variants that improve both stability and repack-aware end-to-end outcome vs CK policy.

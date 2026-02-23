@@ -1102,6 +1102,291 @@ __global__ void fillConstantFloat_kernel(float* __restrict__ dst, int count, flo
     }
 }
 
+enum PrefillInt8TileVariant
+{
+    PREFILL_TILE_16x16 = 0,
+    PREFILL_TILE_32x8 = 1,
+    PREFILL_TILE_8x32 = 2,
+    PREFILL_TILE_8x8 = 3,
+};
+
+static int select_prefill_int8_tile_variant_auto(int M, int N, int K, bool grid_kpar)
+{
+    (void)K;
+    if (M <= 12 && N <= 512)
+    {
+        return PREFILL_TILE_8x8;
+    }
+
+    if (N >= 4 * M && N >= 1024)
+    {
+        return PREFILL_TILE_32x8;
+    }
+
+    if (M >= 4 * N && M >= 128)
+    {
+        return PREFILL_TILE_8x32;
+    }
+
+    if (grid_kpar && N >= 2 * M && N >= 2048)
+    {
+        return PREFILL_TILE_32x8;
+    }
+
+    return PREFILL_TILE_16x16;
+}
+
+static int resolve_prefill_int8_tile_variant(int forced_variant, int M, int N, int K, bool grid_kpar)
+{
+    if (forced_variant >= PREFILL_TILE_16x16 && forced_variant <= PREFILL_TILE_8x8)
+    {
+        return forced_variant;
+    }
+    return select_prefill_int8_tile_variant_auto(M, N, K, grid_kpar);
+}
+
+template <int BLOCK_X, int BLOCK_Y, int CPT>
+__global__ void qgemm_int8_int8_vnni_prefill_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K)
+{
+    const int n_base = blockIdx.x * (BLOCK_X * CPT) + threadIdx.x * CPT;
+    const int m = blockIdx.y * BLOCK_Y + threadIdx.y;
+
+    if (m >= M || n_base >= N)
+    {
+        return;
+    }
+
+    const int k_groups = K / 4;
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        acc[c] = 0;
+    }
+
+    for (int kg = 0; kg < k_groups; ++kg)
+    {
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(
+            d_A_int8 + static_cast<int64_t>(m) * K + kg * 4);
+
+        if constexpr (CPT == 4)
+        {
+            if ((n_base + 3) < N)
+            {
+                const uint4 b_pack4 = *reinterpret_cast<const uint4*>(
+                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+        }
+        else if constexpr (CPT == 2)
+        {
+            if ((n_base + 1) < N)
+            {
+                const uint2 b_pack2 = *reinterpret_cast<const uint2*>(
+                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+        }
+        else
+        {
+            const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+        }
+    }
+
+    if constexpr (CPT == 4)
+    {
+        if ((n_base + 3) < N)
+        {
+            *reinterpret_cast<uint4*>(d_C_int32 + static_cast<int64_t>(m) * N + n_base) =
+                make_uint4(static_cast<uint32_t>(acc[0]), static_cast<uint32_t>(acc[1]), static_cast<uint32_t>(acc[2]), static_cast<uint32_t>(acc[3]));
+        }
+        else
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                const int n = n_base + c;
+                if (n < N)
+                {
+                    d_C_int32[static_cast<int64_t>(m) * N + n] = acc[c];
+                }
+            }
+        }
+    }
+    else if constexpr (CPT == 2)
+    {
+        if ((n_base + 1) < N)
+        {
+            *reinterpret_cast<uint2*>(d_C_int32 + static_cast<int64_t>(m) * N + n_base) =
+                make_uint2(static_cast<uint32_t>(acc[0]), static_cast<uint32_t>(acc[1]));
+        }
+        else
+        {
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+            {
+                const int n = n_base + c;
+                if (n < N)
+                {
+                    d_C_int32[static_cast<int64_t>(m) * N + n] = acc[c];
+                }
+            }
+        }
+    }
+    else
+    {
+        d_C_int32[static_cast<int64_t>(m) * N + n_base] = acc[0];
+    }
+}
+
+template <int BLOCK_X, int BLOCK_Y, int CPT>
+__global__ void qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    int32_t* __restrict__ d_C_int32,
+    int M,
+    int N,
+    int K,
+    int k_groups_per_slice)
+{
+    const int n_base = blockIdx.x * (BLOCK_X * CPT) + threadIdx.x * CPT;
+    const int m = blockIdx.y * BLOCK_Y + threadIdx.y;
+    const int split_idx = blockIdx.z;
+
+    if (m >= M || n_base >= N)
+    {
+        return;
+    }
+
+    const int total_k_groups = K / 4;
+    const int k_begin = split_idx * k_groups_per_slice;
+    if (k_begin >= total_k_groups)
+    {
+        return;
+    }
+
+    const int k_end = min(total_k_groups, k_begin + k_groups_per_slice);
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        acc[c] = 0;
+    }
+
+    for (int kg = k_begin; kg < k_end; ++kg)
+    {
+        const int32_t a_packed = *reinterpret_cast<const int32_t*>(
+            d_A_int8 + static_cast<int64_t>(m) * K + kg * 4);
+
+        if constexpr (CPT == 4)
+        {
+            if ((n_base + 3) < N)
+            {
+                const uint4 b_pack4 = *reinterpret_cast<const uint4*>(
+                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.x), acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.y), acc[1], false);
+                acc[2] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.z), acc[2], false);
+                acc[3] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack4.w), acc[3], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+        }
+        else if constexpr (CPT == 2)
+        {
+            if ((n_base + 1) < N)
+            {
+                const uint2 b_pack2 = *reinterpret_cast<const uint2*>(
+                    d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.x), acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, static_cast<int32_t>(b_pack2.y), acc[1], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int n = n_base + c;
+                    if (n < N)
+                    {
+                        const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                            d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n) * 4);
+                        acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                    }
+                }
+            }
+        }
+        else
+        {
+            const int32_t b_packed = *reinterpret_cast<const int32_t*>(
+                d_B_int8_vnni + (static_cast<int64_t>(kg) * N + n_base) * 4);
+            acc[0] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[0], false);
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n < N && acc[c] != 0)
+        {
+            atomicAdd(&d_C_int32[static_cast<int64_t>(m) * N + n], acc[c]);
+        }
+    }
+}
+
 // ============================================================================
 // STUBS: Phase 4 functions return success but log "not yet implemented"
 // ============================================================================
@@ -2441,6 +2726,293 @@ extern "C"
         // Cleanup events
         hipEventDestroy(start);
         hipEventDestroy(stop);
+
+        return true;
+    }
+
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int tile_variant,
+        int cpt,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 4) != 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        {
+            return false;
+        }
+
+        const int variant = resolve_prefill_int8_tile_variant(tile_variant, M, N, K, false);
+        const int cpt_v = (cpt == 2 || cpt == 4) ? cpt : 1;
+
+        if (variant == PREFILL_TILE_32x8)
+        {
+            constexpr int BX = 32;
+            constexpr int BY = 8;
+            const dim3 block(BX, BY, 1);
+            if (cpt_v == 4)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 4>),
+                                   dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+            else if (cpt_v == 2)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 2>),
+                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+            else
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 1>),
+                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+        }
+        else if (variant == PREFILL_TILE_8x32)
+        {
+            constexpr int BX = 8;
+            constexpr int BY = 32;
+            const dim3 block(BX, BY, 1);
+            if (cpt_v == 4)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 4>),
+                                   dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+            else if (cpt_v == 2)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 2>),
+                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+            else
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 1>),
+                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+        }
+        else if (variant == PREFILL_TILE_8x8)
+        {
+            constexpr int BX = 8;
+            constexpr int BY = 8;
+            const dim3 block(BX, BY, 1);
+            if (cpt_v == 4)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 4>),
+                                   dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+            else if (cpt_v == 2)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 2>),
+                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+            else
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 1>),
+                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+        }
+        else
+        {
+            constexpr int BX = 16;
+            constexpr int BY = 16;
+            const dim3 block(BX, BY, 1);
+            if (cpt_v == 4)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 4>),
+                                   dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+            else if (cpt_v == 2)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 2>),
+                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+            else
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_kernel_t<BX, BY, 1>),
+                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), 1),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K);
+            }
+        }
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill] Kernel launch failed: %s (M=%d N=%d K=%d)\n",
+                    hipGetErrorString(err), M, N, K);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        int32_t* d_C_int32,
+        int M, int N, int K,
+        int split_k_slices,
+        int tile_variant,
+        int cpt,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_int32 || M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 4) != 0)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar] K must be multiple of 4 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        const int total_k_groups = K / 4;
+        const int slices = max(1, min(split_k_slices, total_k_groups));
+        const int k_groups_per_slice = (total_k_groups + slices - 1) / slices;
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+        {
+            return false;
+        }
+
+        const size_t c_bytes = static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(int32_t);
+        hipError_t memset_err = hipMemsetAsync(d_C_int32, 0, c_bytes, static_cast<hipStream_t>(stream));
+        if (memset_err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar] hipMemsetAsync failed: %s\n", hipGetErrorString(memset_err));
+            return false;
+        }
+
+        const int variant = resolve_prefill_int8_tile_variant(tile_variant, M, N, K, true);
+        const int cpt_v = (cpt == 2 || cpt == 4) ? cpt : 1;
+
+        if (variant == PREFILL_TILE_32x8)
+        {
+            constexpr int BX = 32;
+            constexpr int BY = 8;
+            const dim3 block(BX, BY, 1);
+            if (cpt_v == 4)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                                   dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+            else if (cpt_v == 2)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+            else
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+        }
+        else if (variant == PREFILL_TILE_8x32)
+        {
+            constexpr int BX = 8;
+            constexpr int BY = 32;
+            const dim3 block(BX, BY, 1);
+            if (cpt_v == 4)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                                   dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+            else if (cpt_v == 2)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+            else
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+        }
+        else if (variant == PREFILL_TILE_8x8)
+        {
+            constexpr int BX = 8;
+            constexpr int BY = 8;
+            const dim3 block(BX, BY, 1);
+            if (cpt_v == 4)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                                   dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+            else if (cpt_v == 2)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+            else
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+        }
+        else
+        {
+            constexpr int BX = 16;
+            constexpr int BY = 16;
+            const dim3 block(BX, BY, 1);
+            if (cpt_v == 4)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 4>),
+                                   dim3(static_cast<unsigned>((N + BX * 4 - 1) / (BX * 4)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+            else if (cpt_v == 2)
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 2>),
+                                   dim3(static_cast<unsigned>((N + BX * 2 - 1) / (BX * 2)), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+            else
+            {
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_int8_vnni_prefill_grid_kpar_kernel_t<BX, BY, 1>),
+                                   dim3(static_cast<unsigned>((N + BX - 1) / BX), static_cast<unsigned>((M + BY - 1) / BY), static_cast<unsigned>(slices)),
+                                   block, 0, static_cast<hipStream_t>(stream), d_A_int8, d_B_int8_vnni, d_C_int32, M, N, K, k_groups_per_slice);
+            }
+        }
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar] Kernel launch failed: %s (M=%d N=%d K=%d slices=%d)\n",
+                    hipGetErrorString(err), M, N, K, slices);
+            return false;
+        }
 
         return true;
     }

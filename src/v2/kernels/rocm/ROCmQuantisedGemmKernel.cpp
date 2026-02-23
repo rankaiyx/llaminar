@@ -355,7 +355,8 @@ namespace llaminar2
             // =========================================================================
 
             // INT8 VNNI native prefill GEMM scaffold: INT8 x INT8 -> INT32
-            bool rocmGemm_int8_int8_int32_vnni_prefill(
+            // Quantized-GEMM local entrypoints (ported from ROCmGemvKernel path).
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill(
                 const int8_t *d_A_int8,      // [M x K] row-major INT8 activations
                 const int8_t *d_B_int8_vnni, // [K/4 x N x 4] VNNI-packed INT8 weights
                 int32_t *d_C_int32,          // [M x N] row-major INT32 accumulators
@@ -365,7 +366,7 @@ namespace llaminar2
                 int device_id, void *stream);
 
             // INT8 VNNI native prefill GEMM split-K/grid-kpar variant.
-            bool rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(
+            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar(
                 const int8_t *d_A_int8,
                 const int8_t *d_B_int8_vnni,
                 int32_t *d_C_int32,
@@ -2077,30 +2078,91 @@ namespace llaminar2
             {
                 LOG_TRACE("[" << callsite << "] Trying INT8 VNNI native prefill scaffold (M=" << m
                               << " N=" << n << " K=" << k << ")");
-                const double k_over_m = static_cast<double>(k) / static_cast<double>(std::max(m, 1));
-                const bool reduction_pressure =
-                    (k >= 1024) ||
-                    ((k >= 512) && (k_over_m >= 16.0));
-                const bool try_grid_kpar =
-                    debugEnv().rocm.vnni_prefill_grid_kpar &&
-                    n >= 128 &&
-                    m >= 8 &&
-                    reduction_pressure;
-
-                if (debugEnv().rocm.vnni_prefill_grid_kpar && !try_grid_kpar)
+                struct VnniPrefillLaunchConfig
                 {
-                    static std::once_flag grid_kpar_gate_once;
-                    std::call_once(grid_kpar_gate_once, [&]()
-                                   { LOG_INFO("[" << callsite << "] INT8 prefill grid-kpar gated off for low reduction-pressure shapes"
-                                                 << " (M=" << m << ", N=" << n << ", K=" << k
-                                                 << ", K/M=" << std::fixed << std::setprecision(2) << k_over_m << ")"); });
+                    bool use_grid_kpar = false;
+                    int split_k_slices = 1;
+                    int tile_variant = -1; // -1 => HIP-side auto tile select
+                    int cpt = 1;
+                    const char *profile = "default";
+                };
+
+                auto select_vnni_prefill_launch = [](int M, int N, int K) -> VnniPrefillLaunchConfig
+                {
+                    const double safe_k = static_cast<double>(std::max(K, 1));
+                    const double aspect_n_over_k = static_cast<double>(N) / safe_k;
+                    const int64_t work = static_cast<int64_t>(M) * static_cast<int64_t>(N) * static_cast<int64_t>(K);
+
+                    constexpr int64_t kSmallWorkThreshold = 1200000000LL; // 0.5B-like vs 3B-like split
+
+                    // Shape classes (ratio-first, then work-size split).
+                    if (aspect_n_over_k >= 32.0)
+                    {
+                        // LM-head/extreme-wide: keep atomics lower and favor stable baseline path.
+                        return VnniPrefillLaunchConfig{false, 1, 1, 1, "extreme_wide_baseline_32x8_cpt1"};
+                    }
+
+                    if (aspect_n_over_k >= 2.0)
+                    {
+                        // FFN up/gate (wide): strategy-lab favored split-k style behavior.
+                        const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
+                        return VnniPrefillLaunchConfig{true, slices, 1, 4, "wide_gridkpar_32x8_cpt4"};
+                    }
+
+                    if (aspect_n_over_k < 0.75)
+                    {
+                        // FFN down (tall): keep grid-kpar with moderate split count.
+                        const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
+                        return VnniPrefillLaunchConfig{true, slices, 1, 4, "tall_gridkpar_32x8_cpt4"};
+                    }
+
+                    // Attention-ish / near-square.
+                    {
+                        const int slices = (work <= kSmallWorkThreshold) ? 4 : 6;
+                        return VnniPrefillLaunchConfig{true, slices, 1, 4, "balanced_gridkpar_32x8_cpt4"};
+                    }
+                };
+
+                const auto &rocm_env = debugEnv().rocm;
+                const VnniPrefillLaunchConfig policy_cfg = select_vnni_prefill_launch(m, n, k);
+                WeightLoadingProfiler::addDetail(
+                    std::string("prefill_gemm.int8_policy.") + policy_cfg.profile,
+                    1.0);
+
+                const bool has_manual_override =
+                    (rocm_env.vnni_prefill_variant >= 0) ||
+                    (rocm_env.vnni_prefill_grid_variant >= 0) ||
+                    (rocm_env.vnni_prefill_grid_kpar_splits > 0) ||
+                    (rocm_env.vnni_prefill_grid_kpar_kb > 0) ||
+                    (rocm_env.vnni_prefill_cpt != 1) ||
+                    rocm_env.vnni_prefill_grid_kpar;
+
+                const bool try_grid_kpar = has_manual_override
+                                               ? rocm_env.vnni_prefill_grid_kpar
+                                               : policy_cfg.use_grid_kpar;
+
+                const int baseline_variant = has_manual_override ? rocm_env.vnni_prefill_variant : policy_cfg.tile_variant;
+                const int grid_variant = has_manual_override ? rocm_env.vnni_prefill_grid_variant : policy_cfg.tile_variant;
+                const int cpt = has_manual_override ? rocm_env.vnni_prefill_cpt : policy_cfg.cpt;
+
+                if (!has_manual_override)
+                {
+                    static std::once_flag vnni_prefill_policy_once;
+                    std::call_once(vnni_prefill_policy_once, [&]()
+                                   { LOG_INFO("[" << callsite << "] INT8 prefill policy enabled (ratio+work map): "
+                                                  << policy_cfg.profile
+                                                  << ", M=" << m << ", N=" << n << ", K=" << k
+                                                  << ", N/K=" << std::fixed << std::setprecision(2)
+                                                  << (static_cast<double>(n) / static_cast<double>(std::max(k, 1)))
+                                                  << ")"); });
                 }
+
                 if (try_grid_kpar)
                 {
-                    const int requested_slices_env = debugEnv().rocm.vnni_prefill_grid_kpar_splits;
+                    const int requested_slices_env = rocm_env.vnni_prefill_grid_kpar_splits;
                     const int requested_slices = [&]()
                     {
-                        const int kb_override = debugEnv().rocm.vnni_prefill_grid_kpar_kb;
+                        const int kb_override = rocm_env.vnni_prefill_grid_kpar_kb;
                         if (kb_override > 0)
                         {
                             return kb_override;
@@ -2109,6 +2171,11 @@ namespace llaminar2
                         if (requested_slices_env > 0)
                         {
                             return requested_slices_env;
+                        }
+
+                        if (!has_manual_override)
+                        {
+                            return policy_cfg.split_k_slices;
                         }
 
                         // Auto heuristic (Phase 4+): target enough K-groups per split
@@ -2120,16 +2187,16 @@ namespace llaminar2
 
                         int auto_slices = std::max(1, k_groups / target_groups_per_slice);
 
-                        const int cpt = std::max(1, debugEnv().rocm.vnni_prefill_cpt);
+                        const int cpt_auto = std::max(1, cpt);
                         int tile_x = 16;
-                        const int variant = debugEnv().rocm.vnni_prefill_grid_variant;
+                        const int variant = grid_variant;
                         if (variant == 1)
                             tile_x = 32;
                         else if (variant == 2 || variant == 3)
                             tile_x = 8;
 
                         const int threads_x = std::max(1, tile_x);
-                        const int logical_tile_n = std::max(1, threads_x * cpt);
+                        const int logical_tile_n = std::max(1, threads_x * cpt_auto);
                         const int grid_n = std::max(1, (n + logical_tile_n - 1) / logical_tile_n);
                         const int min_slices_for_waves = std::max(1, (target_min_waves_per_cu * num_cus + grid_n - 1) / grid_n);
                         auto_slices = std::max(auto_slices, min_slices_for_waves);
@@ -2149,14 +2216,14 @@ namespace llaminar2
                         const int hard_cap = std::min(8, std::max(1, n_tiles * 2));
                         return std::clamp(auto_slices, 1, hard_cap);
                     }();
-                    native_ok = rocmGemm_int8_int8_int32_vnni_prefill_grid_kpar(
+                    native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar(
                         d_A_int8,
                         impl_->d_weights_int8_vnni,
                         impl_->d_C_int32,
                         m, n, k,
                         requested_slices,
-                        debugEnv().rocm.vnni_prefill_grid_variant,
-                        debugEnv().rocm.vnni_prefill_cpt,
+                        grid_variant,
+                        cpt,
                         rocm_device_id_, gpu_stream_);
 
                     if (!native_ok)
@@ -2169,13 +2236,13 @@ namespace llaminar2
 
                 if (!native_ok)
                 {
-                    native_ok = rocmGemm_int8_int8_int32_vnni_prefill(
+                    native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill(
                         d_A_int8,
                         impl_->d_weights_int8_vnni,
                         impl_->d_C_int32,
                         m, n, k,
-                        debugEnv().rocm.vnni_prefill_variant,
-                        debugEnv().rocm.vnni_prefill_cpt,
+                        baseline_variant,
+                        cpt,
                         rocm_device_id_, gpu_stream_);
                 }
                 kernel_end = std::chrono::high_resolution_clock::now();
@@ -4417,9 +4484,9 @@ namespace llaminar2
                     }
 
                     LOG_DEBUG("[ROCmQuantisedGemmKernel] Uploaded pre-packed weights to ROCm:" << rocm_device_id_
-                                                                                                 << " " << packed_->N << "x" << packed_->K
-                                                                                                 << " vnni=" << (packed_->int8_data_vnni.size() / 1024) << " KB"
-                                                                                                 << " rowmajor=" << (packed_->int8_data.size() / 1024) << " KB");
+                                                                                               << " " << packed_->N << "x" << packed_->K
+                                                                                               << " vnni=" << (packed_->int8_data_vnni.size() / 1024) << " KB"
+                                                                                               << " rowmajor=" << (packed_->int8_data.size() / 1024) << " KB");
                 }
 
                 {
