@@ -773,7 +773,6 @@ cmake -B build_v2_release -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_R
 cmake --build build_v2_release --target v2_perf_rocm_prefill_dispatch_comparison --parallel
 
 # Run all wide-tile variant comparison benchmarks
-LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL=1 \
   ./build_v2_release/tests/v2/v2_perf_rocm_prefill_dispatch_comparison \
   --gtest_filter="*WideTileVariantComparison*"
 
@@ -813,7 +812,7 @@ grep -n '<_Z' /tmp/ck_disasm.txt | head -40
 | `LLAMINAR_ROCM_WIDE_TILE_V4=1` | Force V4 kernel |
 | `LLAMINAR_ROCM_WIDE_TILE_V3=1` | Force V3 kernel |
 | `LLAMINAR_ROCM_WIDE_TILE_V2=1` | Force V2 kernel |
-| `LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL=1` | Enable wide-tile dispatch |
+
 
 ### rocprof Profiling
 

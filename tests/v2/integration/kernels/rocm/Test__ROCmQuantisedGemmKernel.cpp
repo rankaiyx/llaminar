@@ -601,7 +601,6 @@ namespace llaminar2
                     {8, 128, 128},
                 };
 
-                const bool saved_prefill_flag = mutableDebugEnv().rocm.vnni_prefill_experimental;
                 const bool saved_grid_kpar_flag = mutableDebugEnv().rocm.vnni_prefill_grid_kpar;
                 const int saved_grid_kpar_splits = mutableDebugEnv().rocm.vnni_prefill_grid_kpar_splits;
 
@@ -624,13 +623,11 @@ namespace llaminar2
 
                         auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(shape.M), static_cast<size_t>(shape.K)});
                         auto out_ck = TestTensorFactory::createFP32({static_cast<size_t>(shape.M), static_cast<size_t>(shape.N)});
-                        mutableDebugEnv().rocm.vnni_prefill_experimental = false;
                         ASSERT_TRUE(kernel.multiply_tensor(input.get(), out_ck.get(), shape.M, shape.N, shape.K));
 
                         for (const bool use_grid_kpar : {false, true})
                         {
                             auto out_native = TestTensorFactory::createFP32({static_cast<size_t>(shape.M), static_cast<size_t>(shape.N)});
-                            mutableDebugEnv().rocm.vnni_prefill_experimental = true;
                             mutableDebugEnv().rocm.vnni_prefill_grid_kpar = use_grid_kpar;
                             mutableDebugEnv().rocm.vnni_prefill_grid_kpar_splits = 4;
                             ASSERT_TRUE(kernel.multiply_tensor(input.get(), out_native.get(), shape.M, shape.N, shape.K));
@@ -664,7 +661,6 @@ namespace llaminar2
                         return TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
                     });
 
-                mutableDebugEnv().rocm.vnni_prefill_experimental = saved_prefill_flag;
                 mutableDebugEnv().rocm.vnni_prefill_grid_kpar = saved_grid_kpar_flag;
                 mutableDebugEnv().rocm.vnni_prefill_grid_kpar_splits = saved_grid_kpar_splits;
             }
@@ -710,14 +706,12 @@ namespace llaminar2
                 };
 
                 const std::vector<ShapeCase> shapes = {
-                    {4, 128, 128},   // small-M
-                    {12, 160, 128},  // medium-M
-                    {20, 192, 128},  // medium-M
-                    {28, 256, 256},  // larger-M/K
-                    {16, 192, 512},  // wider-K bucket
+                    {4, 128, 128},  // small-M
+                    {12, 160, 128}, // medium-M
+                    {20, 192, 128}, // medium-M
+                    {28, 256, 256}, // larger-M/K
+                    {16, 192, 512}, // wider-K bucket
                 };
-
-                const bool saved_prefill_flag = mutableDebugEnv().rocm.vnni_prefill_experimental;
 
                 auto run_ratio_matrix = [&](const std::string &tag, auto make_weights)
                 {
@@ -730,10 +724,10 @@ namespace llaminar2
                         if (packed.ratio_vnni_payload.empty() || packed.ratio_vnni_ratio.empty())
                         {
                             LOG_WARN("[Integration] Skipping ratio-native prefill parity [" << tag
-                                                                                               << "] M=" << shape.M
-                                                                                               << " N=" << shape.N
-                                                                                               << " K=" << shape.K
-                                                                                               << " (ratio payload unavailable on current build)");
+                                                                                            << "] M=" << shape.M
+                                                                                            << " N=" << shape.N
+                                                                                            << " K=" << shape.K
+                                                                                            << " (ratio payload unavailable on current build)");
                             continue;
                         }
 
@@ -768,10 +762,8 @@ namespace llaminar2
                         auto out_ck = TestTensorFactory::createFP32({static_cast<size_t>(shape.M), static_cast<size_t>(shape.N)});
                         auto out_native = TestTensorFactory::createFP32({static_cast<size_t>(shape.M), static_cast<size_t>(shape.N)});
 
-                        mutableDebugEnv().rocm.vnni_prefill_experimental = false;
                         ASSERT_TRUE(kernel.multiply_tensor(input.get(), out_ck.get(), shape.M, shape.N, shape.K));
 
-                        mutableDebugEnv().rocm.vnni_prefill_experimental = true;
                         ASSERT_TRUE(kernel.multiply_tensor(input.get(), out_native.get(), shape.M, shape.N, shape.K));
 
                         std::vector<float> ck(out_ck->data(), out_ck->data() + static_cast<size_t>(shape.M) * shape.N);
@@ -921,16 +913,14 @@ namespace llaminar2
                     {
                         return TestTensorFactory::createIQ3_SRandom({static_cast<size_t>(N), static_cast<size_t>(K)});
                     });
-
-                mutableDebugEnv().rocm.vnni_prefill_experimental = saved_prefill_flag;
             }
 
             /**
              * @test Ratio-only CK repack matches VNNI-assisted CK fallback
              *
-             * Forces CK prefill fallback (`vnni_prefill_experimental=0`) and removes
-             * VNNI host weights to validate ratio->rowmajor repack parity against the
-             * VNNI-assisted baseline across currently supported ratio families.
+             * Removes VNNI host weights to validate ratio->rowmajor repack parity
+             * against the VNNI-assisted baseline across currently supported ratio
+             * families. The native path handles both configurations.
              */
             TEST_F(ROCmQuantisedGemmIntegrationTest, PrefillCKFallback_RatioOnlyRepack_MatchesBaseline)
             {
@@ -942,8 +932,6 @@ namespace llaminar2
                 const int M = 16;
                 const int N = 192;
                 const int K = 128;
-                const bool saved_prefill_flag = mutableDebugEnv().rocm.vnni_prefill_experimental;
-                mutableDebugEnv().rocm.vnni_prefill_experimental = false;
 
                 auto run_case = [&](const std::string &tag, auto make_weights)
                 {
@@ -988,7 +976,7 @@ namespace llaminar2
 
                     const float cos = cosineSimilarity(baseline, ratio_only);
                     LOG_INFO("[Integration] Ratio-only CK repack parity [" << tag << "] M=" << M << " N=" << N << " K=" << K
-                                                                              << " cosine=" << cos);
+                                                                           << " cosine=" << cos);
                     EXPECT_GT(cos, 0.999f);
 
                     float max_abs_diff = 0.0f;
@@ -1005,8 +993,6 @@ namespace llaminar2
                     {
                         return TestTensorFactory::createQ4_1Random({static_cast<size_t>(rows), static_cast<size_t>(cols)});
                     });
-
-                mutableDebugEnv().rocm.vnni_prefill_experimental = saved_prefill_flag;
             }
 
             // =====================================================================

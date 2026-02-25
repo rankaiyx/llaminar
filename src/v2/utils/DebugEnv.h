@@ -2174,7 +2174,6 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_SYNC_AFTER_KERNEL=1` - Force hipDeviceSynchronize after each kernel
      * - `LLAMINAR_ROCM_GEMV_LAYOUT=vnni` - Use VNNI-packed weights for GEMV when available
      * - `LLAMINAR_ROCM_PACK_VNNI_ONLY=1` - Prefer VNNI-only host packed buffers (drop row-major host copy when safe)
-     * - `LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL=1` - Enable native prefill path routing for M>1
      * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR=1` - Enable INT8 prefill grid-kpar split-K variant
      * - `LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_SPLITS=<n>` - Split-K slice count for grid-kpar prefill variant (`0` = auto)
      * - `LLAMINAR_ROCM_VNNI_PREFILL_CPT=<n>` - Outputs-per-thread for INT8 prefill kernels (`1`, `2`, or `4`)
@@ -2214,7 +2213,6 @@ namespace llaminar2
         std::string gemv_mode = "fp32";         ///< GEMV mode: fp32 (default), fp16, int8
         std::string gemv_layout = "row";        ///< GEMV weight layout: row (default), vnni
         bool pack_vnni_only_host = false;       ///< Prefer VNNI-only host packed buffers (LLAMINAR_ROCM_PACK_VNNI_ONLY)
-        bool vnni_prefill_experimental = false; ///< Enable scaffold branch for non-CK prefill path (LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL)
         bool vnni_prefill_grid_kpar = false;    ///< Enable INT8 prefill grid-kpar split-K variant (LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR)
         int vnni_prefill_grid_kpar_splits = 0;  ///< Split-K slices for grid-kpar variant (`0` = auto)
         int vnni_prefill_cpt = 1;               ///< Outputs-per-thread for INT8 prefill kernels (1,2,4)
@@ -2229,14 +2227,9 @@ namespace llaminar2
         int vnni_prefill_ffn_override_kernel_body = 2;
         int vnni_prefill_grid_swizzle = -1;
         int vnni_prefill_ffn_override_grid_swizzle = 1;
-        bool wide_tile_v2 = false;             ///< Use V2 wide-tile kernel (A from L2) instead of V1 (LLAMINAR_ROCM_WIDE_TILE_V2)
-        bool wide_tile_v3 = false;             ///< Use V3 wide-tile kernel (LDS double-buffered pipeline) (LLAMINAR_ROCM_WIDE_TILE_V3)
-        bool wide_tile_v4 = false;             ///< Use V4 wide-tile kernel (N128 double-buffered) (LLAMINAR_ROCM_WIDE_TILE_V4)
-        bool wide_tile_v5 = false;             ///< Use V5 wide-tile kernel (N128 ABBA pipeline, 2 waves/SIMD) (LLAMINAR_ROCM_WIDE_TILE_V5)
-        bool wide_tile_v6 = false;             ///< Use V6 wide-tile kernel (partial-unroll cross-iteration overlap) (LLAMINAR_ROCM_WIDE_TILE_V6)
-        bool wide_tile_v7 = false;             ///< Use V7 wide-tile kernel (safe-tile split, branchless interior) (LLAMINAR_ROCM_WIDE_TILE_V7)
-        int wide_tile_kt = 8;                  ///< KT parameter for wide-tile kernels (8 or 16) (LLAMINAR_ROCM_WIDE_TILE_KT)
-        int wide_tile_ntile = 64;              ///< N-tile for wide-tile V1 kernel (64 or 128) (LLAMINAR_ROCM_WIDE_TILE_NTILE)
+        bool wide_tile_v3 = false;             ///< Use V3 wide-tile kernel (LDS double-buffered, N64) (LLAMINAR_ROCM_WIDE_TILE_V3)
+        bool wide_tile_v7 = false;             ///< Use V7 wide-tile kernel (safe-tile split, N128) (LLAMINAR_ROCM_WIDE_TILE_V7)
+        int wide_tile_kt = 16;                 ///< KT parameter for wide-tile kernels (4, 8, or 16) (LLAMINAR_ROCM_WIDE_TILE_KT)
         int ratio_prefill_variant = -1;        ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;              ///< Ratio prefill split-K blocks override (0=auto)
         int ratio_prefill_linear_variant = -1; ///< Linear codebook ratio prefill tile override (-1=use global/auto)
@@ -2262,7 +2255,6 @@ namespace llaminar2
             gemv_mode = "fp32";
             gemv_layout = "row";
             pack_vnni_only_host = false;
-            vnni_prefill_experimental = false;
             vnni_prefill_grid_kpar = false;
             vnni_prefill_grid_kpar_splits = 0;
             vnni_prefill_cpt = 1;
@@ -2277,14 +2269,9 @@ namespace llaminar2
             vnni_prefill_ffn_override_kernel_body = 2;
             vnni_prefill_grid_swizzle = -1;
             vnni_prefill_ffn_override_grid_swizzle = 1;
-            wide_tile_v2 = false;
             wide_tile_v3 = false;
-            wide_tile_v4 = false;
-            wide_tile_v5 = false;
-            wide_tile_v6 = false;
             wide_tile_v7 = false;
-            wide_tile_kt = 8;
-            wide_tile_ntile = 64;
+            wide_tile_kt = 16;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -2342,12 +2329,6 @@ namespace llaminar2
             if (pack_vnni_only_env)
             {
                 pack_vnni_only_host = (std::atoi(pack_vnni_only_env) != 0);
-            }
-
-            const char *vnni_prefill_experimental_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL");
-            if (vnni_prefill_experimental_env)
-            {
-                vnni_prefill_experimental = (std::atoi(vnni_prefill_experimental_env) != 0);
             }
 
             const char *vnni_prefill_grid_kpar_env = std::getenv("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR");
@@ -2442,34 +2423,10 @@ namespace llaminar2
                 vnni_prefill_ffn_override_grid_swizzle = std::clamp(std::atoi(vnni_prefill_ffn_override_grid_swizzle_env), -1, 1);
             }
 
-            const char *wide_tile_v2_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_V2");
-            if (wide_tile_v2_env)
-            {
-                wide_tile_v2 = (std::atoi(wide_tile_v2_env) != 0);
-            }
-
             const char *wide_tile_v3_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_V3");
             if (wide_tile_v3_env)
             {
                 wide_tile_v3 = (std::atoi(wide_tile_v3_env) != 0);
-            }
-
-            const char *wide_tile_v4_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_V4");
-            if (wide_tile_v4_env)
-            {
-                wide_tile_v4 = (std::atoi(wide_tile_v4_env) != 0);
-            }
-
-            const char *wide_tile_v5_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_V5");
-            if (wide_tile_v5_env)
-            {
-                wide_tile_v5 = (std::atoi(wide_tile_v5_env) != 0);
-            }
-
-            const char *wide_tile_v6_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_V6");
-            if (wide_tile_v6_env)
-            {
-                wide_tile_v6 = (std::atoi(wide_tile_v6_env) != 0);
             }
 
             const char *wide_tile_v7_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_V7");
@@ -2482,19 +2439,9 @@ namespace llaminar2
             if (wide_tile_kt_env)
             {
                 const int kt = std::atoi(wide_tile_kt_env);
-                if (kt == 8 || kt == 16)
+                if (kt == 4 || kt == 8 || kt == 16)
                 {
                     wide_tile_kt = kt;
-                }
-            }
-
-            const char *wide_tile_ntile_env = std::getenv("LLAMINAR_ROCM_WIDE_TILE_NTILE");
-            if (wide_tile_ntile_env)
-            {
-                const int nt = std::atoi(wide_tile_ntile_env);
-                if (nt == 64 || nt == 128)
-                {
-                    wide_tile_ntile = nt;
                 }
             }
 

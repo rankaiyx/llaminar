@@ -251,9 +251,8 @@ namespace
                                                RatioFormat format,
                                                bool enable_native_prefill)
         {
-            ScopedEnvOverride prefill_enabled(
-                "LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL",
-                enable_native_prefill ? "1" : "0");
+            // Native prefill is always enabled; the env var override is no longer needed.
+            (void)enable_native_prefill;
 
             ROCmPackedWeights packed;
             EXPECT_TRUE(packWeightsToROCm(weights, packed));

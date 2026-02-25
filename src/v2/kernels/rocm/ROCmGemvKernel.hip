@@ -3280,16 +3280,14 @@ bool rocmGemv_repackVNNI_to_rowmajor(
 }
 
 /**
- * @brief Experimental scaffold entrypoint for INT8 VNNI prefill GEMM.
+ * @brief Entrypoint for INT8 VNNI prefill GEMM.
  *
- * This function exists to stabilize API wiring while the real M>1 kernel is
- * still under active implementation. Returning false here is intentional: it
- * instructs the caller to keep using the proven CK fallback path.
+ * This function dispatches to tiled INT8-x-INT8 GEMM kernels for M>1 prefill.
+ * Returning false instructs the caller to keep using the CK fallback path.
  *
  * Junior-dev note:
  * - The decode path (M=1) already has specialized GEMV kernels.
- * - Prefill path (M>1) will eventually land here with tiled GEMM kernels.
- * - Until then, this entrypoint provides a safe hook for incremental rollout.
+ * - Prefill path (M>1) uses tiled INT8 VNNI GEMM kernels dispatched here.
  */
 enum PrefillInt8TileVariant : int
 {
@@ -3486,7 +3484,7 @@ bool rocmGemm_int8_int8_int32_vnni_prefill(
 }
 
 /**
- * @brief Experimental INT8 VNNI prefill grid-kpar split-K variant.
+ * @brief INT8 VNNI prefill grid-kpar split-K variant.
  *
  * This variant uses grid.z to split K reduction into slices with INT32
  * atomic accumulation. It is opt-in from higher-level dispatch.

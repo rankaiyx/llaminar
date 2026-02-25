@@ -118,7 +118,8 @@ namespace llaminar2
                 const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override;
+                DeviceWorkspaceManager *workspace = nullptr,
+                int activation_row_offset = 0) override;
 
             /**
              * @brief Tensor-based GEMM with explicit dimensions
@@ -131,7 +132,8 @@ namespace llaminar2
                 const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override;
+                DeviceWorkspaceManager *workspace = nullptr,
+                int activation_row_offset = 0) override;
 
             /**
              * @brief Raw FP32 pointer GEMM

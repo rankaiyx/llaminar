@@ -486,7 +486,9 @@ if(HAVE_ROCM)
     
     # ROCm kernels compiled with hipcc
     set(ROCM_KERNEL_SOURCES
-        kernels/rocm/ROCmQuantisedGemmKernel_CK.hip  # ComposableKernel INT8 GEMM implementation
+        kernels/rocm/ROCmQuantisedGemmKernel.hip           # Common INT8 GEMM utilities (quantization, scaling, memory)
+        kernels/rocm/ROCmQuantisedGemmKernel_CK.hip        # ComposableKernel INT8×INT8→INT32 GEMM dispatch
+        kernels/rocm/ROCmQuantisedGemmKernel_INT8_VNNI.hip # INT8 VNNI wide-tile V3+V7 kernels (gfx906)
         kernels/rocm/ROCmGemvKernel.hip               # Bandwidth-optimized INT8 GEMV for decode (M=1)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels

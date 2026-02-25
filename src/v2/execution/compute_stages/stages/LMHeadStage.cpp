@@ -29,10 +29,10 @@ namespace llaminar2
 
         // Validate inputs
         if (!ensureRequiredPointers("LMHeadStage", {
-                                                   {"hidden_states", params_.hidden_states},
-                                                   {"lm_head_weight", params_.lm_head_weight},
-                                                   {"logits", params_.logits},
-                                               }))
+                                                       {"hidden_states", params_.hidden_states},
+                                                       {"lm_head_weight", params_.lm_head_weight},
+                                                       {"logits", params_.logits},
+                                                   }))
         {
             return false;
         }
@@ -74,18 +74,31 @@ namespace llaminar2
         // LM head: logits = hidden @ lm_head^T + bias
         // hidden: [seq_len, d_model], lm_head: [vocab_size, d_model]
         // output: [seq_len, vocab_size]
+        //
+        // OPTIMIZATION: During prefill (seq_len > 1), only compute the last token's
+        // logits. The sampler only reads vocab_size elements from the last token, so
+        // computing all seq_len rows is wasted. This reduces:
+        //   - GEMM compute by seq_len× (e.g., 596× for typical prompts)
+        //   - D2H copy from seq_len × vocab_size × 4 bytes to 1 × vocab_size × 4 bytes
+        //     (e.g., 345 MB → 608 KB for Qwen2.5-7B with vocab_size=152064)
+        // The result is written to row 0 of the logits tensor.
+        const int lm_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
+        const int lm_activation_offset = (params_.seq_len > 1) ? (params_.seq_len - 1) : 0;
+
         // Bias is passed directly to GEMM kernel for fused application
         bool success = lm_gemm->multiply_tensor(
             hidden_states,
             logits,
-            params_.seq_len,
+            lm_m,
             params_.vocab_size,
             params_.d_model,
             true, // transpose_B (lm_head is [vocab_size, d_model])
             1.0f, 0.0f,
             params_.bias_tensor, // Bias fused into GEMM
             params_.mpi_ctx,
-            params_.device_id.toKernelDeviceIndex());
+            params_.device_id.toKernelDeviceIndex(),
+            nullptr, // workspace
+            lm_activation_offset);
 
         if (!success)
         {
@@ -98,17 +111,21 @@ namespace llaminar2
 
     size_t LMHeadStage::estimatedFlops() const
     {
-        // GEMM: 2 * seq_len * vocab_size * d_model
-        return 2ULL * params_.seq_len * params_.vocab_size * params_.d_model;
+        // During prefill (seq_len > 1), only 1 row is computed
+        const int effective_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
+        // GEMM: 2 * m * vocab_size * d_model
+        return 2ULL * effective_m * params_.vocab_size * params_.d_model;
     }
 
     size_t LMHeadStage::estimatedMemoryBytes() const
     {
-        // Read: hidden [seq_len, d_model], lm_head [vocab_size, d_model]
-        // Write: logits [seq_len, vocab_size]
-        size_t hidden_bytes = params_.seq_len * params_.d_model * sizeof(float);
+        // During prefill (seq_len > 1), only 1 row of hidden states and logits
+        const int effective_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
+        // Read: hidden [m, d_model], lm_head [vocab_size, d_model]
+        // Write: logits [m, vocab_size]
+        size_t hidden_bytes = effective_m * params_.d_model * sizeof(float);
         size_t weight_bytes = params_.vocab_size * params_.d_model * sizeof(float); // Approximation for quantized
-        size_t output_bytes = params_.seq_len * params_.vocab_size * sizeof(float);
+        size_t output_bytes = effective_m * params_.vocab_size * sizeof(float);
         return hidden_bytes + weight_bytes + output_bytes;
     }
 
@@ -143,8 +160,10 @@ namespace llaminar2
 
         if (params_.logits)
         {
+            // During prefill, only 1 row of logits is computed (at row 0)
+            const int effective_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
             info.addOutput("logits", params_.logits,
-                           params_.seq_len, params_.vocab_size);
+                           effective_m, params_.vocab_size);
         }
 
         info.addScalarInt("seq_len", params_.seq_len);

@@ -109,17 +109,23 @@ namespace llaminar2
     namespace rocm
     {
         // =====================================================================
-        // Forward declarations for HIP implementation (defined in .hip file)
+        // Forward declarations for HIP implementation
         // =====================================================================
+        //
+        // Functions are defined across three .hip files:
+        //   - ROCmQuantisedGemmKernel.hip      : Common kernels + utilities (quantization, scaling, memory)
+        //   - ROCmQuantisedGemmKernel_CK.hip   : CK INT8 GEMM dispatch + kernel context
+        //   - ROCmQuantisedGemmKernel_INT8_VNNI.hip : VNNI prefill/decode kernels
+        //
 
         // These functions are implemented in ROCmQuantisedGemmKernel_CK.hip
         extern "C"
         {
             // Create/destroy per-instance CK kernel context (eliminates global/static cache state)
-            void *rocmQuantGemm_createKernelContext(int rocm_device_id);
-            void rocmQuantGemm_destroyKernelContext(void *kernel_ctx, int rocm_device_id);
+            void *rocmQuantGemm_createKernelContext(int rocm_device_id);                   // CK.hip
+            void rocmQuantGemm_destroyKernelContext(void *kernel_ctx, int rocm_device_id); // CK.hip
 
-            // Upload converted INT8 weights to device
+            // Upload converted INT8 weights to device (common .hip)
             bool rocmQuantGemm_uploadWeights(
                 const int8_t *h_weights_int8, // [K x N] ColumnMajor
                 const float *h_scales_B,      // [N] per-column scales
@@ -128,7 +134,7 @@ namespace llaminar2
                 int K, int N,
                 int rocm_device_id);
 
-            // Upload work buffers for activation quantization
+            // Upload work buffers for activation quantization (common .hip)
             bool rocmQuantGemm_ensureWorkBuffers(
                 int8_t **d_A_int8,   // [M x K] quantized activations
                 float **d_scales_A,  // [M] per-row scales
@@ -137,7 +143,7 @@ namespace llaminar2
                 int M, int K, int N,
                 int rocm_device_id);
 
-            // Quantize FP32 activations to INT8
+            // Quantize FP32 activations to INT8 (common .hip)
             bool rocmQuantGemm_quantizeActivations(
                 const float *d_A_fp32, // [M x K]
                 int8_t *d_A_int8,      // [M x K] output
@@ -146,7 +152,7 @@ namespace llaminar2
                 int rocm_device_id, void *stream);
 
             // Execute INT8 GEMM using CK with SEPARATE scaling (two-kernel approach)
-            // This runs CK for INT8→INT32 GEMM, then a separate kernel for scaling.
+            // This runs CK for INT8→INT32 GEMM, then a separate kernel for scaling. (common .hip)
             bool rocmQuantGemm_executeTwoKernel(
                 const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
                 const int8_t *d_B_int8, // [K x N] RowMajor transposed weights
@@ -157,7 +163,7 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 void *kernel_ctx);
 
-            // Execute INT8 GEMM without scaling (INT8→INT32 only)
+            // Execute INT8 GEMM without scaling (INT8→INT32 only, CK.hip)
             // Used when you want to apply custom scaling/bias separately.
             bool rocmQuantGemm_executeNoScale(
                 const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
@@ -167,7 +173,7 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 void *kernel_ctx);
 
-            // Execute INT8 GEMM using CK two-kernel with PRE-ALLOCATED buffer (allocation-free)
+            // Execute INT8 GEMM using CK two-kernel with PRE-ALLOCATED buffer (common .hip)
             // This is the preferred variant for hot-path execution.
             bool rocmQuantGemm_executeTwoKernel_cached(
                 const int8_t *d_A_int8, // [M x K] RowMajor quantized activations
@@ -180,7 +186,7 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 void *kernel_ctx);
 
-            // Execute INT8 GEMM using CK two-kernel with M-PADDING for decode (M < 8)
+            // Execute INT8 GEMM using CK two-kernel with M-PADDING for decode (M < 8, common .hip)
             // Pads activations to padded_m, runs CK, extracts first M rows of output.
             // Note: With the 32×32 kernel, only M < 8 needs explicit padding.
             bool rocmQuantGemm_executeTwoKernel_padded(
@@ -196,7 +202,7 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 void *kernel_ctx);
 
-            // Execute INT8 GEMM using CK two-kernel with M-PADDING and PRE-ALLOCATED buffers (allocation-free)
+            // Execute INT8 GEMM using CK two-kernel with M-PADDING and PRE-ALLOCATED buffers (common .hip)
             // This is the preferred variant for hot-path decode execution.
             bool rocmQuantGemm_executeTwoKernel_padded_cached(
                 const int8_t *d_A_int8,  // [M x K] RowMajor quantized activations
@@ -214,7 +220,7 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 void *kernel_ctx);
 
-            // Execute INT8 GEMM using CK two-kernel with HIP event timing (for benchmarking)
+            // Execute INT8 GEMM using CK two-kernel with HIP event timing (common .hip)
             // Same as _cached but returns kernel time via kernel_time_ms parameter.
             bool rocmQuantGemm_executeTwoKernel_timed(
                 const int8_t *d_A_int8, // [M × K] INT8 activations
@@ -228,18 +234,18 @@ namespace llaminar2
                 float *kernel_time_ms, void *stream,
                 void *kernel_ctx);
 
-            // Allocate INT8 buffer
+            // Allocate INT8 buffer (common .hip)
             bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id);
 
-            // Get CK minimum dimension requirements
+            // Get CK minimum dimension requirements (CK.hip)
             int rocmQuantGemm_getMinM();
             int rocmQuantGemm_getMinN();
             int rocmQuantGemm_getMinK();
 
-            // Free device memory (must set device before freeing)
+            // Free device memory (common .hip)
             void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id);
 
-            // Memory management helpers
+            // Memory management helpers (all common .hip)
             bool rocmQuantGemm_allocFloat(float **d_ptr, size_t count, int rocm_device_id);
             bool rocmQuantGemm_allocInt32(int32_t **d_ptr, size_t count, int rocm_device_id);
             bool rocmQuantGemm_copyHostToDevice(float *d_dst, const float *h_src, size_t count, int rocm_device_id);
@@ -247,7 +253,7 @@ namespace llaminar2
             bool rocmQuantGemm_copyInt32DeviceToHost(int32_t *h_dst, const int32_t *d_src, size_t count, int rocm_device_id);
             bool rocmQuantGemm_setDevice(int rocm_device_id);
 
-            // Apply scaling with full epilogue (alpha, beta, bias) - matches CUDA's cudaQuantGemm_applyScaling
+            // Apply scaling with full epilogue (common .hip) - matches CUDA's cudaQuantGemm_applyScaling
             bool rocmQuantGemm_applyScaling(
                 const int32_t *d_C_int32, // [M×N] INT32 GEMM output
                 float *d_C_fp32,          // [M×N] FP32 output
@@ -259,7 +265,7 @@ namespace llaminar2
                 const float *d_bias,       // [N] optional bias (nullable)
                 int rocm_device_id, void *stream);
 
-            // In-place bias addition: output[m,n] += bias[n]
+            // In-place bias addition: output[m,n] += bias[n] (common .hip)
             bool rocmQuantGemm_biasAdd(
                 float *d_output,     // [M × N] FP32 output (modified in-place)
                 const float *d_bias, // [N] bias vector
@@ -355,7 +361,7 @@ namespace llaminar2
             // =========================================================================
 
             // INT8 VNNI native prefill GEMM scaffold: INT8 x INT8 -> INT32
-            // Quantized-GEMM local entrypoints (ported from ROCmGemvKernel path).
+            // Defined in ROCmQuantisedGemmKernel_INT8_VNNI.hip.
             bool rocmQuantGemm_int8_int8_int32_vnni_prefill(
                 const int8_t *d_A_int8,      // [M x K] row-major INT8 activations
                 const int8_t *d_B_int8_vnni, // [K/4 x N x 4] VNNI-packed INT8 weights
@@ -366,6 +372,7 @@ namespace llaminar2
                 int device_id, void *stream);
 
             // INT8 VNNI native prefill GEMM split-K/grid-kpar variant.
+            // Defined in ROCmQuantisedGemmKernel_INT8_VNNI.hip.
             bool rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar(
                 const int8_t *d_A_int8,
                 const int8_t *d_B_int8_vnni,
@@ -378,35 +385,9 @@ namespace llaminar2
                 int grid_swizzle_variant,
                 int device_id, void *stream);
 
-            // INT8 VNNI wide-tile prefill GEMM for extreme-wide shapes (M≤128, N>>K).
-            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8_vnni,
-                int32_t *d_C_int32,
-                int M, int N, int K,
-                int device_id, void *stream);
-
-            // INT8 VNNI wide-tile prefill GEMM with N-tile selection (64 or 128).
-            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_ntile(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8_vnni,
-                int32_t *d_C_int32,
-                int M, int N, int K,
-                int n_tile_select,
-                int device_id, void *stream);
-
-            // INT8 VNNI wide-tile V2 prefill GEMM (A from L2, only B in LDS).
-            // kt_select: 8 or 16.
-            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v2(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8_vnni,
-                int32_t *d_C_int32,
-                int M, int N, int K,
-                int kt_select,
-                int device_id, void *stream);
-
             // INT8 VNNI wide-tile V3 prefill GEMM (LDS double-buffered pipeline).
-            // kt_select: 8 or 16.
+            // kt_select: 8 or 16.  Auto-dispatched for K-heavy shapes (k >= n).
+            // Defined in ROCmQuantisedGemmKernel_INT8_VNNI.hip.
             bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v3(
                 const int8_t *d_A_int8,
                 const int8_t *d_B_int8_vnni,
@@ -415,38 +396,9 @@ namespace llaminar2
                 int kt_select,
                 int device_id, void *stream);
 
-            // INT8 VNNI wide-tile V4 prefill GEMM (N128 double-buffered pipeline).
-            // kt_select: 8 or 16.
-            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v4(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8_vnni,
-                int32_t *d_C_int32,
-                int M, int N, int K,
-                int kt_select,
-                int device_id, void *stream);
-
-            // INT8 VNNI wide-tile V5 prefill GEMM (N128 ABBA software-pipelined, 2 waves/SIMD).
-            // kt_select: 8 or 16.
-            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v5(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8_vnni,
-                int32_t *d_C_int32,
-                int M, int N, int K,
-                int kt_select,
-                int device_id, void *stream);
-
-            // INT8 VNNI wide-tile V6 prefill GEMM (N128 cross-iteration overlap, 2 waves/SIMD).
-            // kt_select: 8 or 16.
-            bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v6(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8_vnni,
-                int32_t *d_C_int32,
-                int M, int N, int K,
-                int kt_select,
-                int device_id, void *stream);
-
             // INT8 VNNI wide-tile V7 prefill GEMM (N128 safe-tile split, branchless interior).
-            // kt_select: 8 or 16.
+            // kt_select: 8 or 16.  Auto-dispatched for N-heavy shapes (n > k).
+            // Defined in ROCmQuantisedGemmKernel_INT8_VNNI.hip.
             bool rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v7(
                 const int8_t *d_A_int8,
                 const int8_t *d_B_int8_vnni,
@@ -1992,7 +1944,7 @@ namespace llaminar2
 
             // This helper is intentionally strict and conservative: if anything is
             // unclear, we keep the existing CK path as the safety net.
-            if (!debugEnv().rocm.vnni_prefill_experimental || m <= 1 || k <= 0 || (k % 4) != 0)
+            if (m <= 1 || k <= 0 || (k % 4) != 0)
             {
                 return PrefillDispatchPath::CK_FALLBACK;
             }
@@ -2043,7 +1995,7 @@ namespace llaminar2
          * contract. A false return means the caller should continue with existing CK
          * logic; it does not represent a fatal error by itself.
          */
-        bool ROCmQuantisedGemmKernel::tryExperimentalPrefillNativeGemm(
+        bool ROCmQuantisedGemmKernel::tryPrefillNativeGemm(
             const int8_t *d_A_int8,
             float *d_output,
             const float *d_scales_A,
@@ -2069,6 +2021,8 @@ namespace llaminar2
 
             const auto record_path_selected = [&](PrefillDispatchPath p)
             {
+                if (!WeightLoadingProfiler::isEnabled())
+                    return;
                 WeightLoadingProfiler::addDetail(
                     std::string("prefill_gemm.path_selected.") + path_label(p),
                     1.0);
@@ -2076,6 +2030,8 @@ namespace llaminar2
 
             const auto record_fallback_reason = [&](const char *reason)
             {
+                if (!WeightLoadingProfiler::isEnabled())
+                    return;
                 WeightLoadingProfiler::addDetail(
                     std::string("prefill_gemm.fallback_reason.") + reason,
                     1.0);
@@ -2083,6 +2039,8 @@ namespace llaminar2
 
             const auto record_kernel_ms = [&](PrefillDispatchPath p, double ms)
             {
+                if (!WeightLoadingProfiler::isEnabled())
+                    return;
                 WeightLoadingProfiler::addDetail(
                     std::string("prefill_gemm.kernel_ms.") + path_label(p),
                     ms);
@@ -2090,21 +2048,14 @@ namespace llaminar2
 
             const auto record_epilogue_ms = [&](PrefillDispatchPath p, double ms)
             {
+                if (!WeightLoadingProfiler::isEnabled())
+                    return;
                 WeightLoadingProfiler::addDetail(
                     std::string("prefill_gemm.epilogue_ms.") + path_label(p),
                     ms);
             };
 
-            // Early-out when the feature is disabled. We keep this silent to avoid
-            // log spam in normal runs where CK is still the default prefill path.
-            if (!debugEnv().rocm.vnni_prefill_experimental)
-            {
-                record_path_selected(PrefillDispatchPath::CK_FALLBACK);
-                record_fallback_reason("flag_disabled");
-                return false;
-            }
-
-            // This experimental helper is for prefill only. Decode (M=1) is handled
+            // This helper is for prefill only. Decode (M=1) is handled
             // by the dedicated GEMV fast path and should never come through here.
             if (m <= 1)
             {
@@ -2131,7 +2082,7 @@ namespace llaminar2
                 record_fallback_reason(reason);
 
                 std::call_once(*selected_once, [&]()
-                               { LOG_INFO("[" << callsite << "] Experimental prefill native path falling back to CK (reason="
+                               { LOG_INFO("[" << callsite << "] Native prefill path falling back to CK (reason="
                                               << reason << ")"); });
             };
 
@@ -2150,12 +2101,15 @@ namespace llaminar2
             const PrefillDispatchPath path = selectPrefillDispatchPath(m, n, k);
             record_path_selected(path);
             bool native_ok = false;
-            auto kernel_start = std::chrono::high_resolution_clock::now();
-            auto kernel_end = kernel_start;
+            const bool profiling_enabled = debugEnv().profile.enabled;
+            std::chrono::high_resolution_clock::time_point kernel_start{};
+            std::chrono::high_resolution_clock::time_point kernel_end{};
+            if (profiling_enabled)
+                kernel_start = std::chrono::high_resolution_clock::now();
 
             if (path == PrefillDispatchPath::INT8_VNNI_NATIVE)
             {
-                LOG_TRACE("[" << callsite << "] Trying INT8 VNNI native prefill scaffold (M=" << m
+                LOG_TRACE("[" << callsite << "] Trying INT8 VNNI native prefill (M=" << m
                               << " N=" << n << " K=" << k << ")");
                 struct VnniPrefillLaunchConfig
                 {
@@ -2209,29 +2163,24 @@ namespace llaminar2
 
                     // Shape classes (ratio-first, then work-size split).
 
-                    // ── Wide-tile kernel for ALL prefill shapes with M ≤ 128 ──
-                    // Covers all M-rows in a single block (M_TILE=128, N_TILE=64, KT=8).
-                    // Key advantage: B matrix read exactly once from HBM (no M-tile re-read
-                    // amplification). Grid = ceil(N/64) blocks — sufficient for shapes with
-                    // N ≥ ~8K to saturate 60 CUs × 3 wg/CU.
-                    // Also avoids hipMemsetAsync + atomicAdd overhead of grid-kpar.
-                    if (M <= 128)
+                    // ── Wide-tile kernel for ALL prefill shapes ──
+                    // V3/V7 kernels use a 2D grid: (ceil(N/N_TILE), ceil(M/128)).
+                    // Each workgroup covers up to 128 M-rows × N_TILE N-cols.
+                    // Key advantages over grid-kpar:
+                    //   - No hipMemsetAsync (no output zeroing needed)
+                    //   - No atomicAdd (each output element written by exactly one WG)
+                    //   - No extra applyScaling kernel launch
+                    // V3/V7 selection (K-heavy vs N-heavy) happens in the dispatch code.
                     {
-                        return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, 0, "wide_tile_128", true};
+                        return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, 0, "wide_tile", true};
                     }
+
+                    // ── Legacy grid-kpar paths below are unreachable in default policy ──
+                    // Kept for env-var override compatibility (vnni_prefill_ffn_override, etc.)
 
                     if (aspect_n_over_k >= 32.0)
                     {
-                        // LM-head/extreme-wide: Wide-tile kernel covers ALL M-rows (up to 128)
-                        // in a single block via cooperative A+B LDS loading.  B is read from HBM
-                        // exactly once (no M-tile re-read amplification).
-                        // Geometry: 256 threads, M_TILE=128, N_TILE=64, KT=8, 32 accumulators/thread.
-                        // Grid: (ceil(N/64), 1) — single M-pass, ~4 waves/SIMD occupancy.
-                        if (M <= 128)
-                        {
-                            return VnniPrefillLaunchConfig{false, 1, 1, 1, 0, 0, "extreme_wide_tile_128", true};
-                        }
-                        // Fallback for M > 128: use grid-kpar with LDS + swizzle
+                        // LM-head/extreme-wide: fallback grid-kpar (unreachable in default path)
                         return VnniPrefillLaunchConfig{true, 1, 1, 4, 2, 1, "extreme_wide_gridkpar_32x8_cpt4"};
                     }
 
@@ -2267,14 +2216,21 @@ namespace llaminar2
                 };
 
                 const VnniPrefillLaunchConfig policy_cfg = select_vnni_prefill_launch(m, n, k);
-                WeightLoadingProfiler::addDetail(
-                    std::string("prefill_gemm.int8_policy.") + policy_cfg.profile,
-                    1.0);
-                if (std::strncmp(policy_cfg.profile, "ffn_override_env_", 17) == 0)
+                if (WeightLoadingProfiler::isEnabled())
                 {
-                    WeightLoadingProfiler::addDetail("prefill_gemm.int8_policy.ffn_up_override_applied", 1.0);
+                    WeightLoadingProfiler::addDetail(
+                        std::string("prefill_gemm.int8_policy.") + policy_cfg.profile,
+                        1.0);
+                    if (std::strncmp(policy_cfg.profile, "ffn_override_env_", 17) == 0)
+                    {
+                        WeightLoadingProfiler::addDetail("prefill_gemm.int8_policy.ffn_up_override_applied", 1.0);
+                    }
                 }
 
+                // ── Fast path: wide-tile (default policy, no env overrides) ──
+                // Check wide-tile eligibility BEFORE computing grid-kpar variables.
+                // In the default path (no manual overrides), policy always returns
+                // use_wide_tile=true, so we skip ~100ns of dead grid-kpar arithmetic.
                 const bool has_manual_override =
                     (rocm_env.vnni_prefill_variant >= 0) ||
                     (rocm_env.vnni_prefill_grid_variant >= 0) ||
@@ -2283,52 +2239,6 @@ namespace llaminar2
                     (rocm_env.vnni_prefill_grid_swizzle >= 0) ||
                     (rocm_env.vnni_prefill_cpt != 1) ||
                     rocm_env.vnni_prefill_grid_kpar;
-
-                const bool try_grid_kpar = has_manual_override
-                                               ? rocm_env.vnni_prefill_grid_kpar
-                                               : policy_cfg.use_grid_kpar;
-
-                const int baseline_variant = has_manual_override ? rocm_env.vnni_prefill_variant : policy_cfg.tile_variant;
-                const int grid_variant = has_manual_override ? rocm_env.vnni_prefill_grid_variant : policy_cfg.tile_variant;
-                const int cpt = has_manual_override ? rocm_env.vnni_prefill_cpt : policy_cfg.cpt;
-                const int kernel_body_variant = policy_cfg.kernel_body_variant;
-                const int grid_swizzle_variant = (rocm_env.vnni_prefill_grid_swizzle >= 0)
-                                                     ? rocm_env.vnni_prefill_grid_swizzle
-                                                     : policy_cfg.grid_swizzle_variant;
-
-                const int resolved_variant = [&]()
-                {
-                    if (try_grid_kpar)
-                    {
-                        return grid_variant;
-                    }
-                    return baseline_variant;
-                }();
-
-                const int tile_x = [&]()
-                {
-                    if (resolved_variant == 1)
-                        return 32;
-                    if (resolved_variant == 2 || resolved_variant == 3)
-                        return 8;
-                    return 16;
-                }();
-
-                const int logical_tile_n = std::max(1, tile_x * std::max(1, cpt));
-                const int grid_n = std::max(1, (n + logical_tile_n - 1) / logical_tile_n);
-                const int64_t logical_tiles = static_cast<int64_t>(m) * static_cast<int64_t>(grid_n);
-                const int k_groups = std::max(1, k / 4);
-                const bool low_parallelism_guardrail = (!has_manual_override) && try_grid_kpar &&
-                                                       (logical_tiles < 512 || m < 16 || k_groups < 64);
-
-                const bool use_grid_kpar = low_parallelism_guardrail ? false : try_grid_kpar;
-
-                if (low_parallelism_guardrail)
-                {
-                    WeightLoadingProfiler::addDetail(
-                        "prefill_gemm.int8_policy.guardrail_disable_grid_kpar",
-                        1.0);
-                }
 
                 if (!has_manual_override)
                 {
@@ -2356,54 +2266,10 @@ namespace llaminar2
                             rocm_env.wide_tile_kt,
                             rocm_device_id_, gpu_stream_);
                     }
-                    else if (rocm_env.wide_tile_v6)
-                    {
-                        // V6 forced via env var: partial-unroll cross-iteration read-compute overlap
-                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v6(
-                            d_A_int8,
-                            impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
-                            m, n, k,
-                            rocm_env.wide_tile_kt,
-                            rocm_device_id_, gpu_stream_);
-                    }
-                    else if (rocm_env.wide_tile_v5)
-                    {
-                        // V5 forced via env var: N128 ABBA software-pipelined, 2 waves/SIMD
-                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v5(
-                            d_A_int8,
-                            impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
-                            m, n, k,
-                            rocm_env.wide_tile_kt,
-                            rocm_device_id_, gpu_stream_);
-                    }
-                    else if (rocm_env.wide_tile_v4)
-                    {
-                        // V4 forced via env var: N128 double-buffered pipeline
-                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v4(
-                            d_A_int8,
-                            impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
-                            m, n, k,
-                            rocm_env.wide_tile_kt,
-                            rocm_device_id_, gpu_stream_);
-                    }
                     else if (rocm_env.wide_tile_v3)
                     {
-                        // V3 forced via env var for all wide-tile shapes
+                        // V3 forced via env var: LDS double-buffered, N64
                         native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v3(
-                            d_A_int8,
-                            impl_->d_weights_int8_vnni,
-                            impl_->d_C_int32,
-                            m, n, k,
-                            rocm_env.wide_tile_kt,
-                            rocm_device_id_, gpu_stream_);
-                    }
-                    else if (rocm_env.wide_tile_v2)
-                    {
-                        // V2 forced via env var for all wide-tile shapes
-                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_wide_tile_v2(
                             d_A_int8,
                             impl_->d_weights_int8_vnni,
                             impl_->d_C_int32,
@@ -2422,7 +2288,7 @@ namespace llaminar2
                             impl_->d_weights_int8_vnni,
                             impl_->d_C_int32,
                             m, n, k,
-                            8, // KT=8: best occupancy for V3 auto-dispatch
+                            16, // KT=16: best throughput for V3 auto-dispatch (perf sweep shows KT=16 wins 10/12 shapes)
                             rocm_device_id_, gpu_stream_);
                     }
                     else
@@ -2450,101 +2316,157 @@ namespace llaminar2
                     }
                 }
 
-                if (!native_ok && use_grid_kpar)
+                // Grid-kpar / baseline variables — only computed when wide-tile
+                // didn't fire or didn't succeed, avoiding ~100ns of dead arithmetic
+                // on the hot path.
+                if (!native_ok)
                 {
-                    const int requested_slices_env = rocm_env.vnni_prefill_grid_kpar_splits;
-                    const int requested_slices = [&]()
+                    const bool try_grid_kpar = has_manual_override
+                                                   ? rocm_env.vnni_prefill_grid_kpar
+                                                   : policy_cfg.use_grid_kpar;
+
+                    const int baseline_variant = has_manual_override ? rocm_env.vnni_prefill_variant : policy_cfg.tile_variant;
+                    const int grid_variant = has_manual_override ? rocm_env.vnni_prefill_grid_variant : policy_cfg.tile_variant;
+                    const int cpt = has_manual_override ? rocm_env.vnni_prefill_cpt : policy_cfg.cpt;
+                    const int kernel_body_variant = policy_cfg.kernel_body_variant;
+                    const int grid_swizzle_variant = (rocm_env.vnni_prefill_grid_swizzle >= 0)
+                                                         ? rocm_env.vnni_prefill_grid_swizzle
+                                                         : policy_cfg.grid_swizzle_variant;
+
+                    const int resolved_variant = [&]()
                     {
-                        const int kb_override = rocm_env.vnni_prefill_grid_kpar_kb;
-                        if (kb_override > 0)
+                        if (try_grid_kpar)
                         {
-                            return kb_override;
+                            return grid_variant;
                         }
-
-                        if (requested_slices_env > 0)
-                        {
-                            return requested_slices_env;
-                        }
-
-                        if (!has_manual_override)
-                        {
-                            return policy_cfg.split_k_slices;
-                        }
-
-                        // Auto heuristic (Phase 4+): target enough K-groups per split
-                        // while keeping a minimum level of wavefront availability.
-                        const int k_groups = std::max(1, k / 4);
-                        constexpr int target_groups_per_slice = 64;
-                        constexpr int target_min_waves_per_cu = 8;
-                        constexpr int num_cus = 60;
-
-                        int auto_slices = std::max(1, k_groups / target_groups_per_slice);
-
-                        const int cpt_auto = std::max(1, cpt);
-                        int tile_x = 16;
-                        const int variant = grid_variant;
-                        if (variant == 1)
-                            tile_x = 32;
-                        else if (variant == 2 || variant == 3)
-                            tile_x = 8;
-
-                        const int threads_x = std::max(1, tile_x);
-                        const int logical_tile_n = std::max(1, threads_x * cpt_auto);
-                        const int grid_n = std::max(1, (n + logical_tile_n - 1) / logical_tile_n);
-                        const int min_slices_for_waves = std::max(1, (target_min_waves_per_cu * num_cus + grid_n - 1) / grid_n);
-                        auto_slices = std::max(auto_slices, min_slices_for_waves);
-
-                        // Prefer fewer atomics for very small M while still enabling
-                        // parallel K reduction for wider prefill cases.
-                        if (m < 8)
-                        {
-                            auto_slices = std::min(auto_slices, 2);
-                        }
-                        else if (m >= 24 && k >= 1024)
-                        {
-                            auto_slices = std::max(auto_slices, 4);
-                        }
-
-                        const int n_tiles = std::max(1, (n + 127) / 128);
-                        const int hard_cap = std::min(8, std::max(1, n_tiles * 2));
-                        return std::clamp(auto_slices, 1, hard_cap);
+                        return baseline_variant;
                     }();
-                    native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar(
-                        d_A_int8,
-                        impl_->d_weights_int8_vnni,
-                        impl_->d_C_int32,
-                        m, n, k,
-                        requested_slices,
-                        grid_variant,
-                        cpt,
-                        kernel_body_variant,
-                        grid_swizzle_variant,
-                        rocm_device_id_, gpu_stream_);
+
+                    const int tile_x = [&]()
+                    {
+                        if (resolved_variant == 1)
+                            return 32;
+                        if (resolved_variant == 2 || resolved_variant == 3)
+                            return 8;
+                        return 16;
+                    }();
+
+                    const int logical_tile_n = std::max(1, tile_x * std::max(1, cpt));
+                    const int grid_n = std::max(1, (n + logical_tile_n - 1) / logical_tile_n);
+                    const int64_t logical_tiles = static_cast<int64_t>(m) * static_cast<int64_t>(grid_n);
+                    const int k_groups = std::max(1, k / 4);
+                    const bool low_parallelism_guardrail = (!has_manual_override) && try_grid_kpar &&
+                                                           (logical_tiles < 512 || m < 16 || k_groups < 64);
+
+                    const bool use_grid_kpar = low_parallelism_guardrail ? false : try_grid_kpar;
+
+                    if (low_parallelism_guardrail)
+                    {
+                        if (WeightLoadingProfiler::isEnabled())
+                        {
+                            WeightLoadingProfiler::addDetail(
+                                "prefill_gemm.int8_policy.guardrail_disable_grid_kpar",
+                                1.0);
+                        }
+                    }
+
+                    if (use_grid_kpar)
+                    {
+                        const int requested_slices_env = rocm_env.vnni_prefill_grid_kpar_splits;
+                        const int requested_slices = [&]()
+                        {
+                            const int kb_override = rocm_env.vnni_prefill_grid_kpar_kb;
+                            if (kb_override > 0)
+                            {
+                                return kb_override;
+                            }
+
+                            if (requested_slices_env > 0)
+                            {
+                                return requested_slices_env;
+                            }
+
+                            if (!has_manual_override)
+                            {
+                                return policy_cfg.split_k_slices;
+                            }
+
+                            // Auto heuristic (Phase 4+): target enough K-groups per split
+                            // while keeping a minimum level of wavefront availability.
+                            const int k_groups = std::max(1, k / 4);
+                            constexpr int target_groups_per_slice = 64;
+                            constexpr int target_min_waves_per_cu = 8;
+                            constexpr int num_cus = 60;
+
+                            int auto_slices = std::max(1, k_groups / target_groups_per_slice);
+
+                            const int cpt_auto = std::max(1, cpt);
+                            int tile_x = 16;
+                            const int variant = grid_variant;
+                            if (variant == 1)
+                                tile_x = 32;
+                            else if (variant == 2 || variant == 3)
+                                tile_x = 8;
+
+                            const int threads_x = std::max(1, tile_x);
+                            const int logical_tile_n = std::max(1, threads_x * cpt_auto);
+                            const int grid_n = std::max(1, (n + logical_tile_n - 1) / logical_tile_n);
+                            const int min_slices_for_waves = std::max(1, (target_min_waves_per_cu * num_cus + grid_n - 1) / grid_n);
+                            auto_slices = std::max(auto_slices, min_slices_for_waves);
+
+                            // Prefer fewer atomics for very small M while still enabling
+                            // parallel K reduction for wider prefill cases.
+                            if (m < 8)
+                            {
+                                auto_slices = std::min(auto_slices, 2);
+                            }
+                            else if (m >= 24 && k >= 1024)
+                            {
+                                auto_slices = std::max(auto_slices, 4);
+                            }
+
+                            const int n_tiles = std::max(1, (n + 127) / 128);
+                            const int hard_cap = std::min(8, std::max(1, n_tiles * 2));
+                            return std::clamp(auto_slices, 1, hard_cap);
+                        }();
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill_grid_kpar(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            requested_slices,
+                            grid_variant,
+                            cpt,
+                            kernel_body_variant,
+                            grid_swizzle_variant,
+                            rocm_device_id_, gpu_stream_);
+
+                        if (!native_ok)
+                        {
+                            static std::once_flag grid_kpar_fallback_once;
+                            std::call_once(grid_kpar_fallback_once, [&]()
+                                           { LOG_WARN("[" << callsite << "] INT8 prefill grid-kpar launch failed once; falling back to baseline prefill kernel"); });
+                        }
+                    }
 
                     if (!native_ok)
                     {
-                        static std::once_flag grid_kpar_fallback_once;
-                        std::call_once(grid_kpar_fallback_once, [&]()
-                                       { LOG_WARN("[" << callsite << "] INT8 prefill grid-kpar launch failed once; falling back to baseline prefill kernel"); });
+                        native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            impl_->d_C_int32,
+                            m, n, k,
+                            baseline_variant,
+                            cpt,
+                            rocm_device_id_, gpu_stream_);
                     }
-                }
-
-                if (!native_ok)
-                {
-                    native_ok = rocmQuantGemm_int8_int8_int32_vnni_prefill(
-                        d_A_int8,
-                        impl_->d_weights_int8_vnni,
-                        impl_->d_C_int32,
-                        m, n, k,
-                        baseline_variant,
-                        cpt,
-                        rocm_device_id_, gpu_stream_);
-                }
-                kernel_end = std::chrono::high_resolution_clock::now();
+                } // end if (!native_ok) — grid-kpar / baseline fallback scope
+                if (profiling_enabled)
+                    kernel_end = std::chrono::high_resolution_clock::now();
             }
             else if (path == PrefillDispatchPath::RATIO_VNNI_NATIVE)
             {
-                LOG_TRACE("[" << callsite << "] Trying ratio-VNNI native prefill scaffold (M=" << m
+                LOG_TRACE("[" << callsite << "] Trying ratio-VNNI native prefill (M=" << m
                               << " N=" << n << " K=" << k << ")");
                 const bool is_iq4_codebook = (impl_->ratio_vnni_codebook_id == RATIO_VNNI_CODEBOOK_IQ4);
                 const int ratio_prefill_variant_effective = is_iq4_codebook
@@ -2606,7 +2528,8 @@ namespace llaminar2
                         ratio_prefill_kb_effective,
                         rocm_device_id_, gpu_stream_);
                 }
-                kernel_end = std::chrono::high_resolution_clock::now();
+                if (profiling_enabled)
+                    kernel_end = std::chrono::high_resolution_clock::now();
             }
             else
             {
@@ -2614,9 +2537,12 @@ namespace llaminar2
                 return false;
             }
 
-            record_kernel_ms(
-                path,
-                std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count());
+            if (profiling_enabled)
+            {
+                record_kernel_ms(
+                    path,
+                    std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count());
+            }
 
             if (!native_ok)
             {
@@ -2627,7 +2553,10 @@ namespace llaminar2
             // Phase-1 scaffold reuses the existing epilogue implementation so alpha,
             // beta, and optional bias semantics exactly match the CK fallback path.
             const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
-            const auto epilogue_start = std::chrono::high_resolution_clock::now();
+
+            std::chrono::high_resolution_clock::time_point epilogue_start{};
+            if (profiling_enabled)
+                epilogue_start = std::chrono::high_resolution_clock::now();
             if (!rocmQuantGemm_applyScaling(
                     impl_->d_C_int32,
                     d_output,
@@ -2642,10 +2571,13 @@ namespace llaminar2
                 logFallback("launch_error");
                 return false;
             }
-            const auto epilogue_end = std::chrono::high_resolution_clock::now();
-            record_epilogue_ms(
-                path,
-                std::chrono::duration<double, std::milli>(epilogue_end - epilogue_start).count());
+            if (profiling_enabled)
+            {
+                const auto epilogue_end = std::chrono::high_resolution_clock::now();
+                record_epilogue_ms(
+                    path,
+                    std::chrono::duration<double, std::milli>(epilogue_end - epilogue_start).count());
+            }
 
             return true;
         }
@@ -2661,7 +2593,8 @@ namespace llaminar2
             const TensorBase *bias,
             const MPIContext *mpi_ctx,
             int device_idx,
-            DeviceWorkspaceManager *workspace)
+            DeviceWorkspaceManager *workspace,
+            int activation_row_offset)
         {
             (void)mpi_ctx;
             (void)device_idx;
@@ -2684,7 +2617,7 @@ namespace llaminar2
                 return false;
             }
 
-            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, mpi_ctx, device_idx, workspace);
+            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, mpi_ctx, device_idx, workspace, activation_row_offset);
         }
 
         bool ROCmQuantisedGemmKernel::multiply_tensor(
@@ -2695,7 +2628,8 @@ namespace llaminar2
             const TensorBase *bias,
             const MPIContext *mpi_ctx,
             int device_idx,
-            DeviceWorkspaceManager *workspace)
+            DeviceWorkspaceManager *workspace,
+            int activation_row_offset)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_CK, static_cast<hipStream_t>(gpu_stream_));
             (void)mpi_ctx;
@@ -2778,10 +2712,21 @@ namespace llaminar2
                 d_output = static_cast<float *>(C_fp32->gpu_data_ptr());
             }
 
+            // Apply activation row offset (used by LMHeadStage to process only last token)
+            if (activation_row_offset > 0 && d_input != nullptr)
+            {
+                d_input += static_cast<size_t>(activation_row_offset) * k;
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Applied activation_row_offset="
+                          << activation_row_offset << " (offset " << (static_cast<size_t>(activation_row_offset) * k) << " floats)");
+            }
+
             const bool use_gpu_path = (d_input != nullptr) && (d_output != nullptr);
 
-            auto phase_start = std::chrono::high_resolution_clock::now();
-            auto phase_end = phase_start;
+            // Gate all phase timing behind LLAMINAR_PROFILING to eliminate ~18 chrono
+            // calls per GEMM (~630ns × 140 GEMMs/token = ~88μs/token).
+            const bool phase_timing = debugEnv().profile.enabled;
+            std::chrono::high_resolution_clock::time_point phase_start{};
+            std::chrono::high_resolution_clock::time_point phase_end{};
 
             if (use_gpu_path)
             {
@@ -2967,7 +2912,7 @@ namespace llaminar2
             }
 
             // =========================================================================
-            // PREFILL EXPERIMENTAL ROUTE (M>1)
+            // NATIVE VNNI PREFILL ROUTE (M>1)
             //
             // We defer actual native dispatch until after activation quantization,
             // because both native prefill formats consume INT8 activations.
@@ -3001,12 +2946,16 @@ namespace llaminar2
             }
 
             // Ensure weights are uploaded to device
-            phase_start = std::chrono::high_resolution_clock::now();
+            if (phase_timing)
+                phase_start = std::chrono::high_resolution_clock::now();
             ensureWeightsConverted();
-            phase_end = std::chrono::high_resolution_clock::now();
-            double weights_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-            if (weights_ms > 1.0)
-                LOG_TRACE("[ROCmGEMM::PHASES] ensureWeightsConverted: " << weights_ms << "ms");
+            if (phase_timing)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                double weights_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (weights_ms > 1.0)
+                    LOG_TRACE("[ROCmGEMM::PHASES] ensureWeightsConverted: " << weights_ms << "ms");
+            }
 
             // Get weight device pointers
             // Option B: weights are stored as VNNI only. For CK GEMM (needs row-major),
@@ -3035,14 +2984,25 @@ namespace llaminar2
             }
 
             // Validate and populate workspace pointers (includes d_B_rowmajor_scratch)
-            phase_start = std::chrono::high_resolution_clock::now();
+            if (phase_timing)
+                phase_start = std::chrono::high_resolution_clock::now();
             validateWorkspace();
-            phase_end = std::chrono::high_resolution_clock::now();
-            double workbuf_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-            if (workbuf_ms > 1.0)
-                LOG_TRACE("[ROCmGEMM::PHASES] validateWorkspace: " << workbuf_ms << "ms");
+            if (phase_timing)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                double workbuf_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (workbuf_ms > 1.0)
+                    LOG_TRACE("[ROCmGEMM::PHASES] validateWorkspace: " << workbuf_ms << "ms");
+            }
 
-            // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM
+            // Option B: Repack VNNI→row-major into workspace scratch for CK GEMM.
+            // Skip CK row-major materialization entirely when native VNNI prefill will
+            // be attempted (M>1 and VNNI/ratio-VNNI weights exist). The native path
+            // uses d_weights_int8_vnni directly and never touches d_weights_int8.
+            // This avoids ~150ns/GEMM of cache checks + potential GPU alloc/repack on
+            // first call for qualifying FFN shapes.
+            const bool native_prefill_likely = (m > 1) &&
+                                               selectPrefillDispatchPath(m, n, k) != PrefillDispatchPath::CK_FALLBACK;
             int8_t *d_weights_int8 = nullptr;
 
             const auto should_materialize_persistent_rowmajor = [&](int mm, int nn, int kk) -> bool
@@ -3156,58 +3116,81 @@ namespace llaminar2
                     packed_->d_int8_data_rowmajor = *rowmajor_target;
                 }
 
-                WeightLoadingProfiler::addDetail("prefill_gemm.ck_rowmajor_persistent.materialized", 1.0);
+                if (WeightLoadingProfiler::isEnabled())
+                    WeightLoadingProfiler::addDetail("prefill_gemm.ck_rowmajor_persistent.materialized", 1.0);
                 return true;
             };
 
-            if (impl_->d_weights_int8_rowmajor)
+            // CK row-major resolve — skip entirely when native VNNI prefill will be
+            // attempted. This avoids per-GEMM overhead of persistent-rowmajor cache
+            // checks, waitForStartupRepackIfNeeded, and ensureRepackedWeightsForCK.
+            // On first call for qualifying FFN shapes, also avoids a GPU alloc + repack
+            // kernel launch that would be immediately wasted.
+            const auto resolve_ck_rowmajor_weights = [&]() -> bool
             {
-                if (!waitForStartupRepackIfNeeded(
-                        impl_.get(),
-                        rocm_device_id_,
-                        gpu_stream_,
-                        "ROCmQuantisedGemmKernel::multiply_tensor"))
-                {
-                    return false;
-                }
-                d_weights_int8 = impl_->d_weights_int8_rowmajor;
-            }
-
-            if (!d_weights_int8)
-            {
-                (void)try_materialize_persistent_rowmajor(n, k);
                 if (impl_->d_weights_int8_rowmajor)
                 {
+                    if (!waitForStartupRepackIfNeeded(
+                            impl_.get(),
+                            rocm_device_id_,
+                            gpu_stream_,
+                            "ROCmQuantisedGemmKernel::multiply_tensor"))
+                    {
+                        return false;
+                    }
                     d_weights_int8 = impl_->d_weights_int8_rowmajor;
-                    WeightLoadingProfiler::addDetail("prefill_gemm.ck_rowmajor_persistent.reuse", 1.0);
                 }
-            }
 
-            if (!d_weights_int8 && impl_->d_B_rowmajor_scratch)
-            {
-                phase_start = std::chrono::high_resolution_clock::now();
-                if (!ensureRepackedWeightsForCK(
-                        impl_.get(), n, k, rocm_device_id_, gpu_stream_,
-                        "ROCmQuantisedGemmKernel::multiply_tensor"))
+                if (!d_weights_int8)
+                {
+                    (void)try_materialize_persistent_rowmajor(n, k);
+                    if (impl_->d_weights_int8_rowmajor)
+                    {
+                        d_weights_int8 = impl_->d_weights_int8_rowmajor;
+                        if (WeightLoadingProfiler::isEnabled())
+                            WeightLoadingProfiler::addDetail("prefill_gemm.ck_rowmajor_persistent.reuse", 1.0);
+                    }
+                }
+
+                if (!d_weights_int8 && impl_->d_B_rowmajor_scratch)
+                {
+                    if (phase_timing)
+                        phase_start = std::chrono::high_resolution_clock::now();
+                    if (!ensureRepackedWeightsForCK(
+                            impl_.get(), n, k, rocm_device_id_, gpu_stream_,
+                            "ROCmQuantisedGemmKernel::multiply_tensor"))
+                    {
+                        return false;
+                    }
+                    d_weights_int8 = impl_->d_B_rowmajor_scratch;
+                    if (phase_timing)
+                    {
+                        phase_end = std::chrono::high_resolution_clock::now();
+                        double repack_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                        LOG_TRACE("[ROCmGEMM::PHASES] VNNI→rowmajor repack: " << repack_ms << "ms");
+                    }
+                }
+
+                if (!d_weights_int8)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] No VNNI weights for CK GEMM repack");
+                    return false;
+                }
+
+                if (!validatePointerDeviceOrLog(
+                        d_weights_int8, rocm_device_id_, "workspace::ROCM_B_REPACK", "ROCmQuantisedGemmKernel::multiply_tensor"))
                 {
                     return false;
                 }
-                d_weights_int8 = impl_->d_B_rowmajor_scratch;
-                phase_end = std::chrono::high_resolution_clock::now();
-                double repack_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                LOG_TRACE("[ROCmGEMM::PHASES] VNNI→rowmajor repack: " << repack_ms << "ms");
-            }
+                return true;
+            };
 
-            if (!d_weights_int8)
+            // Only resolve CK weights eagerly when native prefill won't be tried.
+            // Otherwise we defer to after the native attempt (if it falls through).
+            if (!native_prefill_likely)
             {
-                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] No VNNI weights for CK GEMM repack");
-                return false;
-            }
-
-            if (!validatePointerDeviceOrLog(
-                    d_weights_int8, rocm_device_id_, "workspace::ROCM_B_REPACK", "ROCmQuantisedGemmKernel::multiply_tensor"))
-            {
-                return false;
+                if (!resolve_ck_rowmajor_weights())
+                    return false;
             }
 
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Weight ptrs: int8(scratch)=" << (void *)d_weights_int8 << " scales=" << (void *)d_scales_B);
@@ -3241,49 +3224,76 @@ namespace llaminar2
             else
             {
                 // CPU path: Copy from host to device
-                phase_start = std::chrono::high_resolution_clock::now();
 
                 // Workspace is required - d_A_fp32 buffer is pre-allocated
                 d_A_fp32_src = impl_->d_A_fp32;
-                phase_end = std::chrono::high_resolution_clock::now();
-                double alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                if (alloc_ms > 1.0)
-                    LOG_TRACE("[ROCmGEMM::PHASES] d_A_fp32 setup: " << alloc_ms << "ms");
 
                 LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Using workspace d_A_fp32=" << (void *)d_A_fp32_src);
 
-                phase_start = std::chrono::high_resolution_clock::now();
-                if (!rocmQuantGemm_copyHostToDevice(d_A_fp32_src, A_fp32->data(), a_fp32_size, rocm_device_id_))
+                if (phase_timing)
+                    phase_start = std::chrono::high_resolution_clock::now();
+                const float *h_A_src = A_fp32->data() + static_cast<size_t>(activation_row_offset) * k;
+                if (!rocmQuantGemm_copyHostToDevice(d_A_fp32_src, h_A_src, a_fp32_size, rocm_device_id_))
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to copy activations to device");
                     return false;
                 }
-                phase_end = std::chrono::high_resolution_clock::now();
-                double h2d_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                if (h2d_ms > 1.0)
-                    LOG_TRACE("[ROCmGEMM::PHASES] H2D copy (A_fp32): " << h2d_ms << "ms");
+                if (phase_timing)
+                {
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    double h2d_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                    if (h2d_ms > 1.0)
+                        LOG_TRACE("[ROCmGEMM::PHASES] H2D copy (A_fp32): " << h2d_ms << "ms");
+                }
                 LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Copied activations to device");
             }
 
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Now quantizing activations");
 
             // Quantize activations FP32 → INT8
-            phase_start = std::chrono::high_resolution_clock::now();
+            if (phase_timing)
+                phase_start = std::chrono::high_resolution_clock::now();
             if (!rocmQuantGemm_quantizeActivations(d_A_fp32_src, d_A_int8, d_scales_A, m, k, rocm_device_id_, gpu_stream_))
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to quantize activations");
                 return false;
             }
-            phase_end = std::chrono::high_resolution_clock::now();
-            double quant_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-            if (quant_ms > 1.0)
-                LOG_TRACE("[ROCmGEMM::PHASES] quantizeActivations: " << quant_ms << "ms");
+            if (phase_timing)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                double quant_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                if (quant_ms > 1.0)
+                    LOG_TRACE("[ROCmGEMM::PHASES] quantizeActivations: " << quant_ms << "ms");
+            }
 
             // Attempt native dual-format prefill path first (INT8 VNNI or ratio-VNNI).
-            // If this returns false, we continue to the proven CK path below.
+            // If this returns false, we continue to the CK path below.
             if (m > 1)
             {
-                float *d_prefill_output = use_gpu_path ? d_output : impl_->d_C_fp32;
+                // CRITICAL OPTIMIZATION: Detect mapped (host-pinned) output memory.
+                // Mapped memory is used for logits (CPU sampling needs host-side access).
+                // GPU writes to mapped memory go over PCIe (~1.6 GB/s) instead of HBM
+                // (~1024 GB/s). For LM_Head (M=596, N=152064 → 362MB), this causes
+                // 226ms of PCIe writes vs. 0.35ms HBM + 30ms streaming D2H = 30ms.
+                //
+                // Fix: redirect scaling output to device workspace (d_C_fp32), then
+                // do a bulk hipMemcpyAsync to the mapped output.
+                const bool output_is_mapped = use_gpu_path && C_fp32->isMapped();
+                float *d_prefill_output = (use_gpu_path && !output_is_mapped) ? d_output : impl_->d_C_fp32;
+
+                // One-time diagnostic for mapped output redirect
+                if (output_is_mapped && n > 100000)
+                {
+                    static std::once_flag mapped_redirect_once;
+                    std::call_once(mapped_redirect_once, [&]()
+                                   { LOG_WARN("[multiply_tensor] MAPPED OUTPUT REDIRECT: LM_Head M=" << m << " N=" << n
+                                                                                                     << " gpu_ptr=" << d_output
+                                                                                                     << " host_ptr=" << static_cast<void *>(C_fp32->mutable_data())
+                                                                                                     << " -> d_C_fp32=" << impl_->d_C_fp32
+                                                                                                     << " (" << (static_cast<size_t>(m) * n * 4 / (1024 * 1024)) << " MB)"
+                                                                                                     << " ptrs_same=" << (static_cast<void *>(C_fp32->mutable_data()) == static_cast<void *>(d_output) ? "YES" : "NO")); });
+                }
+
                 const float *d_prefill_bias = nullptr;
                 if (bias && use_gpu_path)
                 {
@@ -3292,7 +3302,7 @@ namespace llaminar2
                                          : static_cast<const float *>(bias->gpu_data_ptr());
                 }
 
-                if (tryExperimentalPrefillNativeGemm(
+                if (tryPrefillNativeGemm(
                         d_A_int8,
                         d_prefill_output,
                         d_scales_A,
@@ -3302,18 +3312,62 @@ namespace llaminar2
                         alpha, beta,
                         "ROCmQuantisedGemmKernel::multiply_tensor"))
                 {
-                    // CPU path still requires D2H copy because output was written to
-                    // workspace device memory, exactly like the CK flow.
-                    if (!use_gpu_path)
+                    // Copy from device workspace to final destination when scaling
+                    // was redirected away from d_output.
+                    if (!use_gpu_path || output_is_mapped)
                     {
                         const size_t prefill_c_size = static_cast<size_t>(m) * n;
-                        if (!rocmQuantGemm_copyDeviceToHost(C_fp32->mutable_data(), impl_->d_C_fp32, prefill_c_size, rocm_device_id_))
+                        if (output_is_mapped)
                         {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native prefill path succeeded but D2H copy failed");
-                            return false;
+                            // Mapped output: copy from device workspace to mapped host.
+                            // First sync the stream to ensure scaling kernel is done,
+                            // then use synchronous hipMemcpy which should use the SDMA engine.
+                            float *host_dst = C_fp32->mutable_data();
+                            const size_t copy_bytes = prefill_c_size * sizeof(float);
+
+                            hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+
+                            auto copy_start = std::chrono::high_resolution_clock::now();
+                            hipError_t err = hipMemcpy(
+                                host_dst, impl_->d_C_fp32,
+                                copy_bytes,
+                                hipMemcpyDeviceToHost);
+                            auto copy_end = std::chrono::high_resolution_clock::now();
+
+                            static std::once_flag copy_timing_once;
+                            std::call_once(copy_timing_once, [&]()
+                                           {
+                                double copy_ms = std::chrono::duration<double, std::milli>(copy_end - copy_start).count();
+                                double bw_gbs = (copy_bytes / 1e9) / (copy_ms / 1e3);
+                                LOG_WARN("[multiply_tensor] D2H COPY TIMING: " << (copy_bytes / (1024*1024)) << " MB in "
+                                         << copy_ms << " ms = " << bw_gbs << " GB/s"); });
+
+                            if (err != hipSuccess)
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Mapped output D2H copy failed: "
+                                          << hipGetErrorString(err));
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            // CPU path: copy from workspace to host tensor
+                            if (!rocmQuantGemm_copyDeviceToHost(C_fp32->mutable_data(), impl_->d_C_fp32, prefill_c_size, rocm_device_id_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native prefill path succeeded but D2H copy failed");
+                                return false;
+                            }
                         }
                     }
                     return true;
+                }
+
+                // Native prefill path failed — lazily resolve CK row-major weights
+                // now (was deferred because we expected native to succeed).
+                if (native_prefill_likely && !d_weights_int8)
+                {
+                    if (!resolve_ck_rowmajor_weights())
+                        return false;
                 }
             }
 
@@ -3381,10 +3435,13 @@ namespace llaminar2
 #endif
 
             // Determine output buffer based on GPU vs CPU path
+            // CRITICAL: For mapped (host-pinned) output, redirect to device workspace
+            // to avoid catastrophic PCIe write bandwidth (~1.6 GB/s vs 1024 GB/s HBM).
+            const bool ck_output_is_mapped = use_gpu_path && C_fp32->isMapped();
             const size_t c_fp32_size = static_cast<size_t>(m) * n;
             float *d_C_fp32_dst = nullptr;
 
-            if (use_gpu_path)
+            if (use_gpu_path && !ck_output_is_mapped)
             {
                 // GPU path: Write directly to output tensor's GPU buffer
                 d_C_fp32_dst = d_output;
@@ -3392,7 +3449,7 @@ namespace llaminar2
             }
             else
             {
-                // CPU path: Use temp buffer from workspace, will copy to host later
+                // CPU path or mapped output: Use temp buffer from workspace
                 d_C_fp32_dst = impl_->d_C_fp32;
             }
 
@@ -3502,18 +3559,39 @@ namespace llaminar2
                 return false;
             }
 
-            // Copy result back to host (only if not in GPU path)
-            if (!use_gpu_path)
+            // Copy result back to host (only if not in GPU path, or mapped output)
+            if (!use_gpu_path || ck_output_is_mapped)
             {
                 phase_start = std::chrono::high_resolution_clock::now();
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] CPU path: copying to host"
-                          << " d_C_fp32_dst=" << d_C_fp32_dst
-                          << " h_dst=" << (void *)C_fp32->mutable_data()
-                          << " c_fp32_size=" << c_fp32_size);
-                if (!rocmQuantGemm_copyDeviceToHost(C_fp32->mutable_data(), d_C_fp32_dst, c_fp32_size, rocm_device_id_))
+                if (ck_output_is_mapped)
                 {
-                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to copy output to host");
-                    return false;
+                    // Mapped output: streaming D2H from device workspace to mapped host.
+                    // Use HOST pointer, not device-visible mapped pointer.
+                    float *host_dst = C_fp32->mutable_data();
+                    hipError_t err = hipMemcpyAsync(
+                        host_dst, d_C_fp32_dst,
+                        c_fp32_size * sizeof(float),
+                        hipMemcpyDeviceToHost,
+                        static_cast<hipStream_t>(gpu_stream_));
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] CK mapped output D2H copy failed: "
+                                  << hipGetErrorString(err));
+                        return false;
+                    }
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] CK path: copied to mapped output");
+                }
+                else
+                {
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] CPU path: copying to host"
+                              << " d_C_fp32_dst=" << d_C_fp32_dst
+                              << " h_dst=" << (void *)C_fp32->mutable_data()
+                              << " c_fp32_size=" << c_fp32_size);
+                    if (!rocmQuantGemm_copyDeviceToHost(C_fp32->mutable_data(), d_C_fp32_dst, c_fp32_size, rocm_device_id_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to copy output to host");
+                        return false;
+                    }
                 }
                 phase_end = std::chrono::high_resolution_clock::now();
                 double d2h_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
@@ -4135,7 +4213,7 @@ namespace llaminar2
                 // PREFILL PATH: M>1 CK GEMM
                 // =========================================================================
 
-                if (rocm_kernel->tryExperimentalPrefillNativeGemm(
+                if (rocm_kernel->tryPrefillNativeGemm(
                         impl_->d_A_int8,
                         d_output,
                         impl_->d_scales_A,
@@ -4146,7 +4224,7 @@ namespace llaminar2
                         "ROCmQuantisedGemmKernel::multiply_fused_tensor"))
                 {
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                                                                             << " native prefill scaffold complete");
+                                                                                             << " native prefill complete");
                     continue;
                 }
 
@@ -5372,7 +5450,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (m > 1 && tryExperimentalPrefillNativeGemm(
+            if (m > 1 && tryPrefillNativeGemm(
                              impl_->d_A_int8,
                              d_C,
                              impl_->d_scales_A,
@@ -5544,7 +5622,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (m > 1 && tryExperimentalPrefillNativeGemm(
+            if (m > 1 && tryPrefillNativeGemm(
                              impl_->d_A_int8,
                              d_C,
                              impl_->d_scales_A,

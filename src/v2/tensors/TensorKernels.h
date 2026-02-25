@@ -202,8 +202,8 @@ namespace llaminar2
      *
      * Supported formats: IQ4_NL, Q6_K, Q8_0, etc.
      *
-        * NOTE: This interface decodes to FP32. For integer GEMM kernels that want
-        * native int-domain access, use IINT8Unpackable instead.
+     * NOTE: This interface decodes to FP32. For integer GEMM kernels that want
+     * native int-domain access, use IINT8Unpackable instead.
      */
     class ITensorGemmTileDataProvider
     {
@@ -350,6 +350,9 @@ namespace llaminar2
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index for execution
          * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
+         * @param activation_row_offset Row offset into A to start reading from (default 0).
+         *        Used by LMHeadStage to compute only the last token's logits during prefill,
+         *        avoiding seq_len× redundant GEMM compute and D2H copy.
          *
          * @return true on success, false if format combination not supported
          *
@@ -363,7 +366,8 @@ namespace llaminar2
             const TensorBase *bias = nullptr,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            DeviceWorkspaceManager *workspace = nullptr)
+            DeviceWorkspaceManager *workspace = nullptr,
+            int activation_row_offset = 0)
         {
             // Default: not supported (TensorBase is only forward-declared here)
             // Subclasses that include Tensors.h can override with real implementation
@@ -376,6 +380,7 @@ namespace llaminar2
             (void)mpi_ctx;
             (void)device_idx;
             (void)workspace;
+            (void)activation_row_offset;
             return false;
         }
 
@@ -399,6 +404,8 @@ namespace llaminar2
          * @param mpi_ctx MPI context for distributed execution
          * @param device_idx Device index for execution
          * @param workspace Optional pre-allocated workspace (nullptr = kernel allocates)
+         * @param activation_row_offset Row offset into A to start reading from (default 0).
+         *        When non-zero, reads m rows starting at A[activation_row_offset, :].
          *
          * @return true on success, false if format combination not supported
          */
@@ -410,7 +417,8 @@ namespace llaminar2
             const TensorBase *bias = nullptr,
             const MPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
-            DeviceWorkspaceManager *workspace = nullptr)
+            DeviceWorkspaceManager *workspace = nullptr,
+            int activation_row_offset = 0)
         {
             // Default: not supported
             (void)A;
@@ -425,6 +433,7 @@ namespace llaminar2
             (void)mpi_ctx;
             (void)device_idx;
             (void)workspace;
+            (void)activation_row_offset;
             return false;
         }
 

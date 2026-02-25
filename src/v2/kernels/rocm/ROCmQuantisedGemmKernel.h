@@ -203,23 +203,23 @@ namespace llaminar2
             std::vector<float> scales;          ///< [N] per-column (per-output-feature) scale factors
 
             // Phase-1 ratio-VNNI compact container (IQ4_NL, Q4_0, optional Q4_1 min side-channel)
-            std::vector<uint8_t> ratio_vnni_payload; ///< [blocks × N × payload_bytes] compact nibble payload
-            std::vector<int8_t> ratio_vnni_ratio;    ///< [blocks × N] per-block int8 ratio
-            std::vector<int8_t> ratio_vnni_min;      ///< [blocks × N] optional per-block int8 min side-channel
+            std::vector<uint8_t> ratio_vnni_payload;                          ///< [blocks × N × payload_bytes] compact nibble payload
+            std::vector<int8_t> ratio_vnni_ratio;                             ///< [blocks × N] per-block int8 ratio
+            std::vector<int8_t> ratio_vnni_min;                               ///< [blocks × N] optional per-block int8 min side-channel
             uint16_t ratio_vnni_abi_version = ROCM_RATIO_VNNI_PREFILL_ABI_V2; ///< Metadata descriptor version
-            uint8_t ratio_vnni_bitwidth = 0;         ///< 4 for Phase-1
-            uint8_t ratio_vnni_codebook_id = 0;      ///< 0=linear(Q4_0), 4=IQ4(IQ4_NL)
-            uint8_t ratio_vnni_has_min = 0;          ///< 0 in Phase-1
-            uint8_t ratio_vnni_block_size = 0;       ///< 32 in Phase-1
-            uint16_t ratio_vnni_payload_bytes = 0;   ///< 16 in Phase-1
-            uint8_t ratio_vnni_ratio_bytes = 1;      ///< Side-channel ratio bytes per record (int8 today)
-            uint8_t ratio_vnni_min_bytes = 0;        ///< Side-channel min bytes per record (0=no min, int8=1)
-            uint8_t ratio_vnni_reserved0 = 0;        ///< Reserved for future metadata
-            uint32_t ratio_vnni_flags = 0;           ///< Reserved metadata flags
-            uint32_t ratio_vnni_blocks_per_row = 0;  ///< K / block_size when block_size > 0
-            uint32_t ratio_vnni_payload_stride_bytes = 0; ///< Byte stride between payload records
-            uint32_t ratio_vnni_ratio_stride_bytes = 1;   ///< Byte stride between ratio records
-            uint32_t ratio_vnni_min_stride_bytes = 0;     ///< Byte stride between min records
+            uint8_t ratio_vnni_bitwidth = 0;                                  ///< 4 for Phase-1
+            uint8_t ratio_vnni_codebook_id = 0;                               ///< 0=linear(Q4_0), 4=IQ4(IQ4_NL)
+            uint8_t ratio_vnni_has_min = 0;                                   ///< 0 in Phase-1
+            uint8_t ratio_vnni_block_size = 0;                                ///< 32 in Phase-1
+            uint16_t ratio_vnni_payload_bytes = 0;                            ///< 16 in Phase-1
+            uint8_t ratio_vnni_ratio_bytes = 1;                               ///< Side-channel ratio bytes per record (int8 today)
+            uint8_t ratio_vnni_min_bytes = 0;                                 ///< Side-channel min bytes per record (0=no min, int8=1)
+            uint8_t ratio_vnni_reserved0 = 0;                                 ///< Reserved for future metadata
+            uint32_t ratio_vnni_flags = 0;                                    ///< Reserved metadata flags
+            uint32_t ratio_vnni_blocks_per_row = 0;                           ///< K / block_size when block_size > 0
+            uint32_t ratio_vnni_payload_stride_bytes = 0;                     ///< Byte stride between payload records
+            uint32_t ratio_vnni_ratio_stride_bytes = 1;                       ///< Byte stride between ratio records
+            uint32_t ratio_vnni_min_stride_bytes = 0;                         ///< Byte stride between min records
 
             int K = 0; ///< Input features (rows in CK B matrix)
             int N = 0; ///< Output features (cols in CK B matrix)
@@ -232,18 +232,18 @@ namespace llaminar2
             // Option B: Only VNNI layout is uploaded to device. Row-major is repacked
             // on-demand into a shared workspace scratch buffer for CK GEMM prefill.
             // Phase 4 pilot: optional persistent row-major buffer precomputed on GPU at startup.
-            int8_t *d_int8_data_vnni = nullptr;      ///< Device pointer to VNNI-packed weights (sole device copy)
-            int8_t *d_int8_data_rowmajor = nullptr;  ///< Optional persistent row-major CK buffer (startup GPU repack)
-            uint8_t *d_ratio_vnni_payload = nullptr; ///< Device pointer to compact ratio-VNNI payload
-            int8_t *d_ratio_vnni_ratio = nullptr;    ///< Device pointer to ratio-VNNI per-block ratios
-            int8_t *d_ratio_vnni_min = nullptr;      ///< Device pointer to ratio-VNNI per-block mins
-            float *d_scales = nullptr;               ///< Device pointer to scales
+            int8_t *d_int8_data_vnni = nullptr;         ///< Device pointer to VNNI-packed weights (sole device copy)
+            int8_t *d_int8_data_rowmajor = nullptr;     ///< Optional persistent row-major CK buffer (startup GPU repack)
+            uint8_t *d_ratio_vnni_payload = nullptr;    ///< Device pointer to compact ratio-VNNI payload
+            int8_t *d_ratio_vnni_ratio = nullptr;       ///< Device pointer to ratio-VNNI per-block ratios
+            int8_t *d_ratio_vnni_min = nullptr;         ///< Device pointer to ratio-VNNI per-block mins
+            float *d_scales = nullptr;                  ///< Device pointer to scales
             void *startup_repack_ready_event = nullptr; ///< Optional startup repack completion event (hipEvent_t*)
             bool startup_repack_event_pending = false;  ///< True until startup repack event is consumed by CK stream wait
             void *startup_commit_ready_event = nullptr; ///< Optional startup commit completion event (hipEvent_t*)
             bool startup_commit_event_pending = false;  ///< True until startup commit event is consumed by CK stream wait
-            int rocm_device_id = -1;                 ///< Device where data is uploaded
-            bool uploaded = false;                   ///< Whether device memory is allocated
+            int rocm_device_id = -1;                    ///< Device where data is uploaded
+            bool uploaded = false;                      ///< Whether device memory is allocated
 
             ROCmPackedWeights() = default;
             ROCmPackedWeights(const ROCmPackedWeights &) = delete;
@@ -467,7 +467,8 @@ namespace llaminar2
                 const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override;
+                DeviceWorkspaceManager *workspace = nullptr,
+                int activation_row_offset = 0) override;
 
             /**
              * @brief Tensor-based GEMM with explicit dimensions
@@ -482,7 +483,8 @@ namespace llaminar2
                 const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override;
+                DeviceWorkspaceManager *workspace = nullptr,
+                int activation_row_offset = 0) override;
 
             /**
              * @brief Raw FP32 pointer GEMM (fallback path)
@@ -716,11 +718,12 @@ namespace llaminar2
             PrefillDispatchPath selectPrefillDispatchPath(int m, int n, int k) const;
 
             /**
-             * @brief Attempt experimental native prefill execution for M>1.
+             * @brief Attempt native INT8 VNNI prefill execution for M>1.
              *
-             * This helper is scaffold-only in early phases. It centralizes all
-             * gate checks and one-time explanatory logging so call sites stay small
-             * and junior developers can follow the route/fallback logic in one place.
+             * This is the primary prefill dispatch path for VNNI-packed weights.
+             * It centralizes all gate checks and one-time explanatory logging so
+             * call sites stay small and junior developers can follow the
+             * route/fallback logic in one place.
              *
              * @param d_A_int8 Quantized activations [M x K] in row-major INT8.
              * @param d_output FP32 output [M x N].
@@ -736,7 +739,7 @@ namespace llaminar2
              * @return true if native path succeeded and produced final FP32 output,
              *         false when caller should continue with CK fallback.
              */
-            bool tryExperimentalPrefillNativeGemm(
+            bool tryPrefillNativeGemm(
                 const int8_t *d_A_int8,
                 float *d_output,
                 const float *d_scales_A,

@@ -151,7 +151,8 @@ namespace llaminar2
             const TensorBase *bias,
             const MPIContext * /*mpi_ctx*/,
             int /*device_idx*/,
-            DeviceWorkspaceManager *workspace)
+            DeviceWorkspaceManager *workspace,
+            int activation_row_offset)
         {
             if (!A || !C)
             {
@@ -164,7 +165,7 @@ namespace llaminar2
             int n = static_cast<int>(N_);
             int k = static_cast<int>(K_);
 
-            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, nullptr, -1, workspace);
+            return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, nullptr, -1, workspace, activation_row_offset);
         }
 
         bool CUDAFloatingPointGemmKernel::multiply_tensor(
@@ -175,7 +176,8 @@ namespace llaminar2
             const TensorBase *bias,
             const MPIContext * /*mpi_ctx*/,
             int /*device_idx*/,
-            DeviceWorkspaceManager *workspace)
+            DeviceWorkspaceManager *workspace,
+            int activation_row_offset)
         {
             (void)workspace; // TODO: Use workspace for intermediate allocations
             if (!A || !C)
@@ -208,6 +210,12 @@ namespace llaminar2
             {
                 LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] A and C must be on GPU");
                 return false;
+            }
+
+            // Apply activation row offset
+            if (activation_row_offset > 0)
+            {
+                d_A += static_cast<size_t>(activation_row_offset) * k;
             }
 
             // Extract bias pointer if provided

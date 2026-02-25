@@ -945,7 +945,8 @@ namespace llaminar2
                 const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override
+                DeviceWorkspaceManager *workspace = nullptr,
+                int activation_row_offset = 0) override
             {
                 (void)mpi_ctx;
                 (void)device_idx;
@@ -976,11 +977,13 @@ namespace llaminar2
                 // Extract bias pointer (FP32 fused bias only for now)
                 const float *bias_ptr = bias ? bias->data() : nullptr;
 
+                const size_t row_offset = static_cast<size_t>(activation_row_offset) * k;
+
                 switch (weight_type_)
                 {
                 case TensorType::FP32:
                 {
-                    const float *A_data = A->data();
+                    const float *A_data = A->data() + row_offset;
                     float *C_data = C->mutable_data();
                     const float *B_data = weight_tensor_->data();
                     // OneDNN FP32 matmul supports fused bias natively
@@ -1061,7 +1064,8 @@ namespace llaminar2
                 const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override
+                DeviceWorkspaceManager *workspace = nullptr,
+                int activation_row_offset = 0) override
             {
                 (void)mpi_ctx;
                 (void)device_idx;
@@ -1086,11 +1090,13 @@ namespace llaminar2
                 // Extract bias pointer (FP32 fused bias only for now)
                 const float *bias_ptr = bias ? bias->data() : nullptr;
 
+                const size_t row_offset = static_cast<size_t>(activation_row_offset) * k;
+
                 switch (weight_type_)
                 {
                 case TensorType::FP32:
                 {
-                    const float *A_data = A->data();
+                    const float *A_data = A->data() + row_offset;
                     float *C_data = C->mutable_data();
                     const float *B_data = weight_tensor_->data();
                     // OneDNN FP32 matmul supports fused bias natively

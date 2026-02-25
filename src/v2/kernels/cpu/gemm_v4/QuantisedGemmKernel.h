@@ -2498,7 +2498,8 @@ namespace llaminar2
                 const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override
+                DeviceWorkspaceManager *workspace = nullptr,
+                int activation_row_offset = 0) override
             {
                 (void)transpose_B; // Weights are pre-packed
                 (void)workspace;   // CPU kernel doesn't need external workspace
@@ -2509,78 +2510,7 @@ namespace llaminar2
                 int k = static_cast<int>(a_shape.size() > 1 ? a_shape[1] : 1);
                 int n = static_cast<int>(c_shape.size() > 1 ? c_shape[1] : c_shape[0]);
 
-                // Determine input/output types
-                const TensorType a_type = A->native_type();
-                const TensorType c_type = C->native_type();
-
-                // =====================================================================
-                // Q8_1 output paths (avoid dequant→requant roundtrip)
-                // =====================================================================
-                if (c_type == TensorType::Q8_1)
-                {
-                    auto *C_q8 = static_cast<Q8_1Tensor *>(C);
-
-                    if (a_type == TensorType::Q8_1)
-                    {
-                        // Q8_1 → Q8_1: Optimal path, both quantized
-                        auto *A_q8 = static_cast<const Q8_1Tensor *>(A);
-                        return multiply_with_precomputed_q8_1_to_q8_1(
-                            A_q8->typed_data(),
-                            C_q8->mutable_typed_data(),
-                            m, n, k,
-                            bias,
-                            false, // accumulate (not supported for Q8_1 output)
-                            mpi_ctx, device_idx);
-                    }
-                    else
-                    {
-                        // FP32/BF16/FP16 → Q8_1: Quantize input on-the-fly, output to Q8_1
-                        return multiply_to_q8_1(
-                            A->data(), // Dequant to FP32 if needed
-                            C_q8->mutable_typed_data(),
-                            m, n, k,
-                            mpi_ctx, device_idx);
-                    }
-                }
-
-                // =====================================================================
-                // FP32 output paths
-                // =====================================================================
-                if (a_type == TensorType::Q8_1)
-                {
-                    // Q8_1 → FP32: Use pre-quantized blocks, output FP32
-                    return multiply_q8_1_direct(
-                        static_cast<const Q8_1Tensor *>(A),
-                        C->mutable_data(), m, n, k,
-                        bias, beta != 0.0f, alpha, beta, mpi_ctx, device_idx);
-                }
-
-                // Any IActivationTensor → FP32: Use tensor's quantize_to_q8_1()
-                const IActivationTensor *activation = dynamic_cast<const IActivationTensor *>(A);
-                if (activation)
-                {
-                    // Allocate Q8_1 buffer for input quantization
-                    size_t q8_1_size = IActivationTensor::get_q8_1_buffer_size(m, k);
-                    std::vector<uint8_t> q8_1_buffer(q8_1_size + 64); // +64 for alignment
-
-                    // Quantize using tensor's type-specific implementation
-                    if (!activation->quantize_to_q8_1(q8_1_buffer.data(), m, k))
-                    {
-                        LOG_ERROR("quantize_to_q8_1 failed in multiply_tensor");
-                        return false;
-                    }
-
-                    // Use pre-quantized path → FP32 output
-                    return multiply_with_precomputed_q8_1(
-                        q8_1_buffer.data(), C->mutable_data(), m, n, k,
-                        bias,
-                        beta != 0.0f, alpha, beta,
-                        mpi_ctx, device_idx,
-                        GemmFusedOps::none());
-                }
-
-                // Fallback: FP32 path with inline quantization
-                return multiply(A->data(), C->mutable_data(), m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
+                return multiply_tensor(A, C, m, n, k, transpose_B, alpha, beta, bias, mpi_ctx, device_idx, workspace, activation_row_offset);
             }
 
             /**
@@ -2614,10 +2544,14 @@ namespace llaminar2
                 const TensorBase *bias = nullptr,
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
-                DeviceWorkspaceManager *workspace = nullptr) override
+                DeviceWorkspaceManager *workspace = nullptr,
+                int activation_row_offset = 0) override
             {
                 (void)transpose_B; // Weights are pre-packed
                 (void)workspace;   // CPU kernel doesn't need external workspace
+
+                // Compute row offset for FP32 data pointer arithmetic
+                const size_t row_offset_elements = static_cast<size_t>(activation_row_offset) * k;
 
                 // Determine input/output types
                 const TensorType a_type = A->native_type();
@@ -2632,6 +2566,11 @@ namespace llaminar2
 
                     if (a_type == TensorType::Q8_1)
                     {
+                        if (activation_row_offset != 0)
+                        {
+                            LOG_ERROR("[QuantisedGemmKernel] activation_row_offset not supported for Q8_1 activations");
+                            return false;
+                        }
                         // Q8_1 → Q8_1: Optimal path, both quantized
                         auto *A_q8 = static_cast<const Q8_1Tensor *>(A);
                         return multiply_with_precomputed_q8_1_to_q8_1(
@@ -2646,7 +2585,7 @@ namespace llaminar2
                     {
                         // FP32/BF16/FP16 → Q8_1: Quantize input on-the-fly, output to Q8_1
                         return multiply_to_q8_1(
-                            A->data(), // Dequant to FP32 if needed
+                            A->data() + row_offset_elements, // Dequant to FP32 if needed
                             C_q8->mutable_typed_data(),
                             m, n, k,
                             mpi_ctx, device_idx);
@@ -2658,6 +2597,11 @@ namespace llaminar2
                 // =====================================================================
                 if (a_type == TensorType::Q8_1)
                 {
+                    if (activation_row_offset != 0)
+                    {
+                        LOG_ERROR("[QuantisedGemmKernel] activation_row_offset not supported for Q8_1 activations");
+                        return false;
+                    }
                     // Q8_1 → FP32: Use pre-quantized blocks, output FP32
                     return multiply_q8_1_direct(
                         static_cast<const Q8_1Tensor *>(A),
@@ -2666,31 +2610,35 @@ namespace llaminar2
                 }
 
                 // Any IActivationTensor → FP32: Use tensor's quantize_to_q8_1()
-                const IActivationTensor *activation = dynamic_cast<const IActivationTensor *>(A);
-                if (activation)
+                // Skip this path when offset is used (quantize_to_q8_1 reads from tensor start)
+                if (activation_row_offset == 0)
                 {
-                    // Allocate Q8_1 buffer for input quantization
-                    size_t q8_1_size = IActivationTensor::get_q8_1_buffer_size(m, k);
-                    std::vector<uint8_t> q8_1_buffer(q8_1_size + 64); // +64 for alignment
-
-                    // Quantize using tensor's type-specific implementation
-                    if (!activation->quantize_to_q8_1(q8_1_buffer.data(), m, k))
+                    const IActivationTensor *activation = dynamic_cast<const IActivationTensor *>(A);
+                    if (activation)
                     {
-                        LOG_ERROR("quantize_to_q8_1 failed in multiply_tensor (explicit dims)");
-                        return false;
-                    }
+                        // Allocate Q8_1 buffer for input quantization
+                        size_t q8_1_size = IActivationTensor::get_q8_1_buffer_size(m, k);
+                        std::vector<uint8_t> q8_1_buffer(q8_1_size + 64); // +64 for alignment
 
-                    // Use pre-quantized path → FP32 output
-                    return multiply_with_precomputed_q8_1(
-                        q8_1_buffer.data(), C->mutable_data(), m, n, k,
-                        bias,
-                        beta != 0.0f, alpha, beta,
-                        mpi_ctx, device_idx,
-                        GemmFusedOps::none());
+                        // Quantize using tensor's type-specific implementation
+                        if (!activation->quantize_to_q8_1(q8_1_buffer.data(), m, k))
+                        {
+                            LOG_ERROR("quantize_to_q8_1 failed in multiply_tensor (explicit dims)");
+                            return false;
+                        }
+
+                        // Use pre-quantized path → FP32 output
+                        return multiply_with_precomputed_q8_1(
+                            q8_1_buffer.data(), C->mutable_data(), m, n, k,
+                            bias,
+                            beta != 0.0f, alpha, beta,
+                            mpi_ctx, device_idx,
+                            GemmFusedOps::none());
+                    }
                 }
 
-                // Fallback: FP32 path with inline quantization
-                return multiply(A->data(), C->mutable_data(), m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
+                // Fallback: FP32 path with inline quantization (supports row offset)
+                return multiply(A->data() + row_offset_elements, C->mutable_data(), m, n, k, transpose_B, alpha, beta, mpi_ctx, device_idx);
             }
 
         private:

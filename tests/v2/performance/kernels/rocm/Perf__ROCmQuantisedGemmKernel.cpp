@@ -62,13 +62,13 @@ using namespace llaminar2::test;
  */
 struct ROCmBenchConfig
 {
-    std::string name; ///< Human-readable name (e.g., "Qwen-7B FFN Up")
-    int M;            ///< Batch/sequence dimension
-    int N;            ///< Output features (weight rows)
-    int K;            ///< Input features (weight cols)
-    int warmup_iters; ///< Warmup iterations (not timed)
-    int bench_iters;  ///< Timed benchmark iterations
-    int num_trials;   ///< Independent trials for statistics
+    std::string name;               ///< Human-readable name (e.g., "Qwen-7B FFN Up")
+    int M;                          ///< Batch/sequence dimension
+    int N;                          ///< Output features (weight rows)
+    int K;                          ///< Input features (weight cols)
+    int warmup_iters;               ///< Warmup iterations (not timed)
+    int bench_iters;                ///< Timed benchmark iterations
+    int num_trials;                 ///< Independent trials for statistics
     bool end_to_end_timing = false; ///< If true, time full multiply_tensor path (quantize + GEMM + scaling)
 };
 
@@ -683,7 +683,6 @@ TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_GridKParSweep)
 
         for (const auto &mode : modes)
         {
-            ScopedEnvOverride prefill_enabled("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "1");
             ScopedEnvOverride grid_enabled("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", mode.grid_kpar);
             ScopedEnvOverride grid_splits("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_SPLITS", mode.splits);
 
@@ -763,7 +762,6 @@ TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_RealModelAspectSweep)
 
             for (const auto &variant : variants)
             {
-                ScopedEnvOverride prefill_enabled("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "1");
                 ScopedEnvOverride grid_enabled("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", "0");
                 ScopedEnvOverride variant_override("LLAMINAR_ROCM_VNNI_PREFILL_VARIANT", variant.variant);
 
@@ -826,7 +824,6 @@ TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_CptAndKbSweep)
         {
             // Baseline (grid off) for this CPT
             {
-                ScopedEnvOverride prefill_enabled("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "1");
                 ScopedEnvOverride grid_enabled("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", "0");
                 ScopedEnvOverride prefill_cpt("LLAMINAR_ROCM_VNNI_PREFILL_CPT", cpt);
 
@@ -849,7 +846,6 @@ TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_CptAndKbSweep)
             // Grid-kpar with KB sweep for this CPT
             for (const auto &kb : kbs)
             {
-                ScopedEnvOverride prefill_enabled("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "1");
                 ScopedEnvOverride grid_enabled("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", "1");
                 ScopedEnvOverride prefill_cpt("LLAMINAR_ROCM_VNNI_PREFILL_CPT", cpt);
                 ScopedEnvOverride grid_kb("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_KB", kb);
@@ -911,8 +907,7 @@ TEST_F(ROCmQuantisedGemmPerf, PrefillFullPath_CKCanonicalHarvest_Qwen0_5B_3B)
         {"Qwen2.5-3B_LM_Head", 128, 151936, 2048},
     };
 
-    // Force baseline CK full-path behavior for canonical harvesting.
-    ScopedEnvOverride prefill_experimental("LLAMINAR_ROCM_VNNI_PREFILL_EXPERIMENTAL", "0");
+    // Canonical CK full-path: native dispatch now handles this automatically.
     ScopedEnvOverride grid_kpar("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR", "0");
     ScopedEnvOverride grid_splits("LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR_SPLITS", "0");
 
