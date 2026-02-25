@@ -109,6 +109,19 @@ extern "C"
         float alpha, float beta,
         const float *d_C_existing,
         int device_id, void *stream);
+
+    bool rocmGemv_fused_scatter_selfreduce_fp32_int8_vnni(
+        const float *d_A_fp32,
+        const int8_t *d_B_int8_vnni,
+        float *d_C_fp32,
+        const float *d_scales_B,
+        const float *d_bias,
+        float *d_partial_buf,
+        int *d_counter,
+        int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing,
+        int device_id, void *stream);
 }
 
 namespace
@@ -659,6 +672,108 @@ namespace
 #endif
         }
 
+        // =========================================================================
+        // Benchmark self-reducing scatter (single-kernel approach)
+        // =========================================================================
+        BenchResult benchmarkSelfReduce(int N, int K, int warmup_runs = 5, int bench_runs = 20)
+        {
+            BenchResult result{};
+#ifndef HAVE_ROCM
+            return result;
+#else
+            std::mt19937 rng(42);
+            std::uniform_real_distribution<float> dist_a(-1.0f, 1.0f);
+            std::uniform_int_distribution<int> dist_b(-127, 127);
+            std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+
+            std::vector<float> h_A(K);
+            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
+            std::vector<int8_t> h_B_vnni;
+            std::vector<float> h_scale(N);
+
+            for (auto &v : h_A)
+                v = dist_a(rng);
+            for (auto &v : h_B)
+                v = static_cast<int8_t>(dist_b(rng));
+            for (auto &v : h_scale)
+                v = dist_s(rng);
+
+            packVnniWeights(h_B, N, K, h_B_vnni);
+
+            float *d_A = nullptr, *d_scale = nullptr, *d_C = nullptr;
+            int8_t *d_B_vnni = nullptr;
+            float *d_partial = nullptr;
+            int *d_counter = nullptr;
+
+            hipMalloc(&d_A, K * sizeof(float));
+            hipMalloc(&d_scale, N * sizeof(float));
+            hipMalloc(&d_C, N * sizeof(float));
+            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+
+            constexpr int MAX_KB = 64;
+            const int grid_n = (N + 127) / 128;
+            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+            hipMalloc(&d_counter, grid_n * sizeof(int));
+
+            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            hipDeviceSynchronize();
+
+            // Warmup
+            for (int i = 0; i < warmup_runs; ++i)
+            {
+                rocmGemv_fused_scatter_selfreduce_fp32_int8_vnni(
+                    d_A, d_B_vnni, d_C, d_scale, nullptr,
+                    d_partial, d_counter, N, K, 1.0f, 0.0f, nullptr,
+                    device_id_, nullptr);
+            }
+            hipDeviceSynchronize();
+
+            // Timed runs
+            std::vector<double> times;
+            times.reserve(bench_runs);
+
+            hipEvent_t start, stop;
+            hipEventCreate(&start);
+            hipEventCreate(&stop);
+
+            for (int i = 0; i < bench_runs; ++i)
+            {
+                hipDeviceSynchronize();
+                hipEventRecord(start, 0);
+
+                rocmGemv_fused_scatter_selfreduce_fp32_int8_vnni(
+                    d_A, d_B_vnni, d_C, d_scale, nullptr,
+                    d_partial, d_counter, N, K, 1.0f, 0.0f, nullptr,
+                    device_id_, nullptr);
+
+                hipEventRecord(stop, 0);
+                hipEventSynchronize(stop);
+                float ms = 0.0f;
+                hipEventElapsedTime(&ms, start, stop);
+                times.push_back(static_cast<double>(ms));
+            }
+
+            hipEventDestroy(start);
+            hipEventDestroy(stop);
+            hipFree(d_A);
+            hipFree(d_scale);
+            hipFree(d_C);
+            hipFree(d_B_vnni);
+            hipFree(d_partial);
+            hipFree(d_counter);
+
+            computeStats(times, result.mean_ms, result.min_ms,
+                         result.max_ms, result.stddev_ms);
+
+            double bytes = static_cast<double>(K) * N * 1 + K * 4 + N * 4 + N * 4;
+            result.gbps = (bytes / (result.min_ms * 1e-3)) / 1e9;
+            result.success = true;
+            return result;
+#endif
+        }
+
         BenchResult benchmarkGemv(int N, int K, int warmup_runs = 5, int bench_runs = 20)
         {
             auto split = benchmarkGemvSplit(N, K, warmup_runs, bench_runs);
@@ -884,6 +999,78 @@ namespace
             hipFree(d_C);
             hipFree(d_B_vnni);
             hipFree(d_partial);
+
+            return checkCorrectness(gpu_out.data(), ref.data(), N);
+#endif
+        }
+
+        // =========================================================================
+        // Correctness check: self-reducing scatter (single-kernel path)
+        // =========================================================================
+        CorrectnessResult testCorrectnessSelfReduce(int N, int K)
+        {
+            CorrectnessResult bad{0, 0, 0, false};
+#ifndef HAVE_ROCM
+            return bad;
+#else
+            // Use same seed as scatter test for comparable results
+            std::mt19937 rng(12345);
+            std::uniform_real_distribution<float> dist_a(-1.0f, 1.0f);
+            std::uniform_int_distribution<int> dist_b(-127, 127);
+            std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
+
+            std::vector<float> h_A(K);
+            std::vector<int8_t> h_B(static_cast<size_t>(K) * N);
+            std::vector<float> h_scale(N);
+
+            for (auto &v : h_A)
+                v = dist_a(rng);
+            for (auto &v : h_B)
+                v = static_cast<int8_t>(dist_b(rng));
+            for (auto &v : h_scale)
+                v = dist_s(rng);
+
+            std::vector<float> ref(N);
+            cpuReferenceGemv(h_A.data(), h_B.data(), h_scale.data(), ref.data(), N, K);
+
+            std::vector<int8_t> h_B_vnni;
+            packVnniWeights(h_B, N, K, h_B_vnni);
+
+            float *d_A = nullptr, *d_scale = nullptr, *d_C = nullptr;
+            int8_t *d_B_vnni = nullptr;
+            float *d_partial = nullptr;
+            int *d_counter = nullptr;
+
+            hipMalloc(&d_A, K * sizeof(float));
+            hipMalloc(&d_scale, N * sizeof(float));
+            hipMalloc(&d_C, N * sizeof(float));
+            hipMalloc(&d_B_vnni, h_B_vnni.size() * sizeof(int8_t));
+
+            constexpr int MAX_KB = 64;
+            const int grid_n = (N + 127) / 128;
+            hipMalloc(&d_partial, static_cast<size_t>(MAX_KB) * N * sizeof(float));
+            hipMalloc(&d_counter, grid_n * sizeof(int));
+
+            hipMemcpy(d_A, h_A.data(), K * sizeof(float), hipMemcpyHostToDevice);
+            hipMemcpy(d_B_vnni, h_B_vnni.data(), h_B_vnni.size() * sizeof(int8_t), hipMemcpyHostToDevice);
+            hipMemcpy(d_scale, h_scale.data(), N * sizeof(float), hipMemcpyHostToDevice);
+            hipDeviceSynchronize();
+
+            rocmGemv_fused_scatter_selfreduce_fp32_int8_vnni(
+                d_A, d_B_vnni, d_C, d_scale, nullptr,
+                d_partial, d_counter, N, K, 1.0f, 0.0f, nullptr,
+                device_id_, nullptr);
+            hipDeviceSynchronize();
+
+            std::vector<float> gpu_out(N);
+            hipMemcpy(gpu_out.data(), d_C, N * sizeof(float), hipMemcpyDeviceToHost);
+
+            hipFree(d_A);
+            hipFree(d_scale);
+            hipFree(d_C);
+            hipFree(d_B_vnni);
+            hipFree(d_partial);
+            hipFree(d_counter);
 
             return checkCorrectness(gpu_out.data(), ref.data(), N);
 #endif
@@ -1123,6 +1310,137 @@ namespace
                                 << " cosine=" << r.cosine_sim;
         }
         printCorrectnessFooter();
+#endif
+    }
+
+    // ============================================================================
+    // TEST: Correctness — Self-reducing scatter (single-kernel)
+    // ============================================================================
+
+    TEST_F(ROCmGemvPerfTest, Correctness_SelfReduce)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+        printCorrectnessHeader("Self-Reducing Scatter Correctness (M=1 decode)");
+
+        struct Shape
+        {
+            const char *name;
+            int N;
+            int K;
+        };
+        std::vector<Shape> shapes = {
+            // Qwen7B
+            {"7B Q proj", kQwen7B.hidden, kQwen7B.hidden},
+            {"7B K proj", kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.hidden},
+            {"7B V proj", kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.hidden},
+            {"7B Wo proj", kQwen7B.hidden, kQwen7B.hidden},
+            {"7B FFN Gate", kQwen7B.intermediate, kQwen7B.hidden},
+            {"7B FFN Up", kQwen7B.intermediate, kQwen7B.hidden},
+            {"7B FFN Down", kQwen7B.hidden, kQwen7B.intermediate},
+            {"7B LM Head", kQwen7B.vocab, kQwen7B.hidden},
+            // Qwen0.5B
+            {"0.5B Q proj", kQwen05B.hidden, kQwen05B.hidden},
+            {"0.5B K proj", kQwen05B.num_kv_heads * kQwen05B.head_dim, kQwen05B.hidden},
+            {"0.5B V proj", kQwen05B.num_kv_heads * kQwen05B.head_dim, kQwen05B.hidden},
+            {"0.5B Wo proj", kQwen05B.hidden, kQwen05B.hidden},
+            {"0.5B FFN Gate", kQwen05B.intermediate, kQwen05B.hidden},
+            {"0.5B FFN Up", kQwen05B.intermediate, kQwen05B.hidden},
+            {"0.5B FFN Down", kQwen05B.hidden, kQwen05B.intermediate},
+            {"0.5B LM Head", kQwen05B.vocab, kQwen05B.hidden},
+        };
+
+        for (const auto &s : shapes)
+        {
+            auto r = testCorrectnessSelfReduce(s.N, s.K);
+            printCorrectnessRow(s.name, s.N, s.K, r);
+            EXPECT_TRUE(r.pass) << s.name << " N=" << s.N << " K=" << s.K
+                                << " cosine=" << r.cosine_sim;
+        }
+        printCorrectnessFooter();
+#endif
+    }
+
+    // ============================================================================
+    // TEST: Performance — Self-reduce vs Scatter+Reduce comparison
+    // ============================================================================
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_SelfReduceVsScatter)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+
+        auto shapes = getDecodeShapes(kQwen7B);
+        auto lm = getLMHeadShape(kQwen7B);
+
+        // Table
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Shape" << "N" << "K"
+              << "Scatter min(ms)" << "SelfReduce min(ms)" << "Speedup"
+              << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int i = 1; i <= 5; ++i)
+            table.column(i).set_cell_text_align(fort::text_align::right);
+
+        double total_sc_layer = 0;
+        double total_sr_layer = 0;
+        double lm_sc = 0, lm_sr = 0;
+
+        std::vector<GemvShape> all_shapes = shapes;
+        all_shapes.push_back(lm);
+
+        for (const auto &s : all_shapes)
+        {
+            auto scatter = benchmarkFusedScatter(s.N, s.K);
+            auto selfreduce = benchmarkSelfReduce(s.N, s.K);
+
+            double speedup = scatter.min_ms / std::max(1e-9, selfreduce.min_ms);
+
+            char buf_sc[32], buf_sr[32], buf_spd[32];
+            snprintf(buf_sc, sizeof(buf_sc), "%.3f", scatter.min_ms);
+            snprintf(buf_sr, sizeof(buf_sr), "%.3f", selfreduce.min_ms);
+            snprintf(buf_spd, sizeof(buf_spd), "%.2fx", speedup);
+
+            table << s.name << s.N << s.K << buf_sc << buf_sr << buf_spd << fort::endr;
+
+            const bool is_lm = (s.N == lm.N && s.K == lm.K);
+            if (is_lm)
+            {
+                lm_sc = scatter.min_ms;
+                lm_sr = selfreduce.min_ms;
+            }
+            else
+            {
+                total_sc_layer += scatter.min_ms;
+                total_sr_layer += selfreduce.min_ms;
+            }
+        }
+
+        fprintf(stderr, "\n%s\n", table.to_string().c_str());
+
+        double all_sc = total_sc_layer * kQwen7B.num_layers + lm_sc;
+        double all_sr = total_sr_layer * kQwen7B.num_layers + lm_sr;
+
+        fprintf(stderr, "  Scatter    per-layer:   %8.3f ms\n", total_sc_layer);
+        fprintf(stderr, "  SelfReduce per-layer:   %8.3f ms\n", total_sr_layer);
+        fprintf(stderr, "  Scatter    all %d + LM: %8.3f ms  (%.1f tok/s)\n",
+                kQwen7B.num_layers, all_sc, 1000.0 / all_sc);
+        fprintf(stderr, "  SelfReduce all %d + LM: %8.3f ms  (%.1f tok/s)\n",
+                kQwen7B.num_layers, all_sr, 1000.0 / all_sr);
+        fprintf(stderr, "  Overall speedup:       %.2fx\n\n", all_sc / std::max(1e-9, all_sr));
 #endif
     }
 

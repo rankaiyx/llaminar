@@ -1907,6 +1907,203 @@ __global__ void gemv_reduce_scale_kernel_t(
 
 
 // ============================================================================
+// Self-reducing scatter kernel: fused scatter + inline reduce (single kernel)
+//
+// Instead of writing partials to a buffer and launching a separate reduce
+// kernel, the last k-block to complete each n-block sums all partials inline
+// using a "last-to-arrive" atomic counter pattern.
+//
+// Benefits:
+//   - Eliminates reduce kernel launch overhead (5-27μs savings per shape)
+//   - Single kernel launch instead of two
+//   - INT32 atomicAdd for counter (native HW on gfx906, ~1 cycle)
+//
+// Requires: d_counter array must be zero-initialized before launch.
+//           d_counter has ceil(N/TILE_N) elements.
+//
+// Grid: dim3(grid_n, KB), Block: dim3(TILE_N / CPT) = dim3(64)
+// ============================================================================
+template <int TILE_N, int CPT>
+__global__ void gemv_fused_scatter_selfreduce_int8_vnni_kernel_t(
+    const float* __restrict__ d_A_fp32,          // [K] FP32 activations
+    const int8_t* __restrict__ d_B_int8_vnni,    // [K/4][N][4] VNNI weights
+    float* __restrict__ d_partial_fp32,           // [KB × N] FP32 partial buffer
+    float* __restrict__ d_C_fp32,                // [N] FP32 output
+    const float* __restrict__ d_scales_B,        // [N] per-column weight scales
+    const float* __restrict__ d_bias,            // [N] optional bias (nullable)
+    int* __restrict__ d_counter,                 // [grid_n] atomic completion counters
+    int N, int K, int kblocks, int valid_kb,
+    float alpha, float beta,
+    const float* __restrict__ d_C_existing)      // [N] used when beta != 0
+{
+    constexpr int THREADS = TILE_N / CPT;  // 64 threads = 1 wavefront
+    constexpr int QUANT_TILE_K = 256;
+
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    const bool active = (n_base < N);
+    const int k_block = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int k_per_raw = (K + kblocks - 1) / kblocks;
+    const int k_per = ((k_per_raw + 3) / 4) * 4;
+    const int k_start = k_block * k_per;
+    const int k_end = min(k_start + k_per, K);
+
+    if (k_start >= K) return;
+
+    __shared__ float s_A_fp32[QUANT_TILE_K];
+    __shared__ float s_absmax;
+    __shared__ int8_t s_A_int8[QUANT_TILE_K];
+
+    float f_acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) f_acc[c] = 0.0f;
+
+    for (int k_tile_start = k_start; k_tile_start < k_end; k_tile_start += QUANT_TILE_K)
+    {
+        const int tile_end = min(k_tile_start + QUANT_TILE_K, k_end);
+        const int tile_len = tile_end - k_tile_start;
+        const int tile_kgroups = tile_len / 4;
+
+        // Phase 1: Cooperative load of FP32 activations to shared memory
+        for (int i = tid; i < tile_len; i += THREADS)
+            s_A_fp32[i] = d_A_fp32[k_tile_start + i];
+        __syncthreads();
+
+        // Phase 2: Find absmax via warp reduction
+        float local_max = 0.0f;
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            float v = s_A_fp32[i];
+            float a = (v >= 0.0f) ? v : -v;
+            local_max = (a > local_max) ? a : local_max;
+        }
+
+        #pragma unroll
+        for (int offset = 32; offset > 0; offset >>= 1)
+        {
+            float other = __shfl_down(local_max, offset);
+            local_max = (other > local_max) ? other : local_max;
+        }
+
+        if (tid == 0) s_absmax = local_max;
+        __syncthreads();
+
+        const float absmax = s_absmax;
+        const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
+        const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
+
+        // Phase 3: Cooperative quantize FP32 → INT8 in shared memory
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            float val = s_A_fp32[i] * inv_scale;
+            int q = static_cast<int>(rintf(val));
+            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+            s_A_int8[i] = static_cast<int8_t>(q);
+        }
+        __syncthreads();
+
+        // Phase 4: INT8 dot product using v_dot4_i32_i8
+        if (active)
+        {
+            int32_t tile_acc[CPT];
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c) tile_acc[c] = 0;
+
+            const int32_t* __restrict__ b_row =
+                reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+            const size_t b_stride = static_cast<size_t>(N);
+            const int kg_offset = k_tile_start / 4;
+
+            #pragma unroll 4
+            for (int tkg = 0; tkg < tile_kgroups; ++tkg)
+            {
+                const int32_t a_packed = *reinterpret_cast<const int32_t*>(
+                    s_A_int8 + tkg * 4);
+
+                if constexpr (CPT == 2)
+                {
+                    const int2 b_pair = *reinterpret_cast<const int2*>(
+                        b_row + (kg_offset + tkg) * b_stride);
+                    tile_acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, tile_acc[0], false);
+                    tile_acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, tile_acc[1], false);
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int c = 0; c < CPT; ++c)
+                    {
+                        const int32_t b_packed = *(b_row + (kg_offset + tkg) * b_stride + c);
+                        tile_acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, tile_acc[c], false);
+                    }
+                }
+            }
+
+            // Convert tile INT32 → FP32 with tile-local scale
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+                f_acc[c] += static_cast<float>(tile_acc[c]) * scale;
+        }
+    }
+
+    // Phase 5: Write FP32 partials to buffer (plain store, no atomicAdd)
+    if (active)
+    {
+        const size_t partial_offset = static_cast<size_t>(k_block) * N;
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+            d_partial_fp32[partial_offset + n_base + c] = f_acc[c];
+    }
+
+    // Phase 6: Last-to-arrive reduction
+    // Make partial writes globally visible, then atomically increment counter.
+    // The last k-block to arrive for each n-block sums all partials and
+    // writes the final output (eliminating the separate reduce kernel).
+    __threadfence();
+
+    if (tid == 0)
+    {
+        // Shared flag: did this block's lane 0 observe completion?
+        // We use s_absmax (reusing LDS since scatter phase is done)
+        unsigned int old = atomicAdd(&d_counter[blockIdx.x], 1);
+        // Store 1.0 if last-to-arrive, 0.0 otherwise (broadcast via LDS)
+        s_absmax = (old + 1 == static_cast<unsigned int>(valid_kb)) ? 1.0f : 0.0f;
+    }
+    __syncthreads();
+
+    // Only the last k-block's wavefront performs the reduction
+    if (s_absmax > 0.0f && active)
+    {
+        // Sum all valid_kb partials for this thread's columns
+        float sum[CPT];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c) sum[c] = 0.0f;
+
+        for (int kb = 0; kb < valid_kb; ++kb)
+        {
+            const size_t off = static_cast<size_t>(kb) * N + n_base;
+            #pragma unroll
+            for (int c = 0; c < CPT; ++c)
+                sum[c] += d_partial_fp32[off + c];
+        }
+
+        // Apply scale_B, alpha, beta, bias and write final output
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            const int n = n_base + c;
+            float result = sum[c] * d_scales_B[n] * alpha;
+            if (beta != 0.0f && d_C_existing)
+                result += beta * d_C_existing[n];
+            if (d_bias)
+                result += d_bias[n];
+            d_C_fp32[n] = result;
+        }
+    }
+}
+
+
+// ============================================================================
 // C API: Launch wrappers
 // ============================================================================
 
@@ -2562,25 +2759,203 @@ bool rocmGemv_fused_scatter_fp32_int8_vnni(
     }
     else
     {
-        // Two-kernel path: fused scatter → reduce+scale
-        // Kernel 1: fused quantize + INT8 GEMV → FP32 partials
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_fused_scatter_int8_vnni_kernel_t<TN, CPT>),
-            dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
-            d_A_fp32, d_B_int8_vnni, d_partial_buf, N, K, kb);
+        // Hybrid dispatch: use self-reducing scatter for small N (few n-blocks),
+        // 2-kernel scatter+reduce for large N.
+        //
+        // Rationale: For small grid_n (< 16), the reduce kernel has too few
+        // blocks to fill 60 CUs → catastrophically slow (~27μs for 4 blocks).
+        // Self-reduce eliminates the reduce kernel using atomicAdd counters.
+        // For large grid_n, the reduce kernel is fast (~4μs) and the atomic
+        // overhead in self-reduce would cause a slight regression.
+        constexpr int SELFREDUCE_GRID_N_THRESHOLD = 16;
 
-        // Kernel 2: reduce KB partials + apply scale_B + bias
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_reduce_scale_kernel_t<TN, CPT>),
-            dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
-            d_partial_buf, d_C_fp32, d_scales_B, d_bias, N, kb,
-            alpha, beta, d_C_existing);
+        if (grid_n < SELFREDUCE_GRID_N_THRESHOLD)
+        {
+            // Self-reducing path: use a small persistent counter buffer.
+            // Max grid_n for self-reduce is SELFREDUCE_GRID_N_THRESHOLD-1 = 15,
+            // so we need at most 15 ints = 60 bytes.
+            constexpr int MAX_SELFREDUCE_BLOCKS = 16;
+            static int* s_selfreduce_counters[8] = {};  // per device_id
+
+            int dev_slot = device_id & 7;  // clamp to array bounds
+            if (!s_selfreduce_counters[dev_slot])
+            {
+                hipMalloc(&s_selfreduce_counters[dev_slot],
+                          MAX_SELFREDUCE_BLOCKS * sizeof(int));
+            }
+            int* d_counter = s_selfreduce_counters[dev_slot];
+
+            int k_per_block = (k_groups + kb - 1) / kb;
+            int valid_kb = (k_groups + k_per_block - 1) / k_per_block;
+
+            hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
+                           static_cast<hipStream_t>(stream));
+
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_fused_scatter_selfreduce_int8_vnni_kernel_t<TN, CPT>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_fp32, d_B_int8_vnni, d_partial_buf, d_C_fp32, d_scales_B, d_bias,
+                d_counter, N, K, kb, valid_kb, alpha, beta, d_C_existing);
+        }
+        else
+        {
+            // Two-kernel path: fused scatter → reduce+scale
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_fused_scatter_int8_vnni_kernel_t<TN, CPT>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_fp32, d_B_int8_vnni, d_partial_buf, N, K, kb);
+
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_reduce_scale_kernel_t<TN, CPT>),
+                dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_partial_buf, d_C_fp32, d_scales_B, d_bias, N, kb,
+                alpha, beta, d_C_existing);
+        }
     }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
     {
         fprintf(stderr, "[rocmGemv_fused_scatter] Kernel launch failed: %s (N=%d K=%d kb=%d)\n",
+                hipGetErrorString(err), N, K, kb);
+        return false;
+    }
+
+    return true;
+}
+
+
+// =============================================================================
+// Self-Reducing Scatter: single-kernel GEMV with last-to-arrive reduction
+// =============================================================================
+//
+// Fuses scatter + reduce into a single kernel using atomicAdd counters.
+// The last k-block to complete for each n-block performs the reduction
+// inline, eliminating the reduce kernel launch entirely.
+//
+// Requires:
+//   - d_counter: [grid_n] int array, zeroed before each launch
+//   - d_partial_buf: [KB_MAX × N] float buffer for partials
+//
+bool rocmGemv_fused_scatter_selfreduce_fp32_int8_vnni(
+    const float* d_A_fp32,           // [K] FP32 activations
+    const int8_t* d_B_int8_vnni,     // [K/4 × N × 4] VNNI-packed weights
+    float* d_C_fp32,                 // [N] FP32 output
+    const float* d_scales_B,         // [N] per-column weight scales
+    const float* d_bias,             // [N] optional bias (nullable)
+    float* d_partial_buf,            // [KB_MAX × N] pre-allocated partial buffer
+    int* d_counter,                  // [grid_n] atomic counters (zeroed before call)
+    int N, int K,
+    float alpha, float beta,
+    const float* d_C_existing,       // [N] used when beta != 0
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if ((K % 4) != 0 || (N % 4) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_selfreduce] N and K must be multiples of 4 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+
+    constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;  // 128
+    constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;    // 2
+    constexpr int NUM_CUS = 60;  // MI50/MI60
+
+    const int grid_n = (N + TN - 1) / TN;
+    const int k_groups = K / 4;
+
+    // Same KB heuristic as scatter dispatch
+    constexpr int TARGET_WAVES_PER_CU = 8;
+    constexpr int MIN_KGROUPS_PER_WAVE = 16;
+
+    int target_blocks = TARGET_WAVES_PER_CU * NUM_CUS;  // 480
+    int kb_raw = max(1, (target_blocks + grid_n - 1) / grid_n);
+
+    int kb_max = max(1, k_groups / MIN_KGROUPS_PER_WAVE);
+    kb_raw = min(kb_raw, kb_max);
+
+    // Round to nearest factor of k_groups
+    int kb = kb_raw;
+    if (k_groups % kb_raw != 0)
+    {
+        for (int d = 1; d < kb_raw; ++d)
+        {
+            if (kb_raw - d >= 1 && k_groups % (kb_raw - d) == 0) { kb = kb_raw - d; break; }
+            if (kb_raw + d <= kb_max && k_groups % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
+        }
+    }
+
+    if (kb <= 1)
+    {
+        // Single-kernel path: no k-splitting needed, use existing fused kernel
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_fused_fp32_int8_vnni_kernel_t<TN, CPT>),
+            dim3(grid_n, 1), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+            d_A_fp32, d_B_int8_vnni, d_C_fp32, d_scales_B, nullptr, N, K, 1);
+
+        if (alpha != 1.0f || beta != 0.0f)
+        {
+            fprintf(stderr, "[rocmGemv_selfreduce] alpha/beta not supported in kb=1 path\n");
+            return false;
+        }
+        if (d_bias)
+        {
+            extern bool rocmQuantGemm_biasAdd(
+                float *d_output, const float *d_bias,
+                int M, int N, int rocm_device_id, void *stream);
+            if (!rocmQuantGemm_biasAdd(d_C_fp32, d_bias, 1, N, device_id, stream))
+                return false;
+        }
+    }
+    else
+    {
+        // Compute valid_kb: the actual number of k-blocks that will participate.
+        // With uniform k-splitting, all kb blocks do work when k_groups is
+        // exactly divisible. The heuristic above ensures this is usually the case,
+        // but guard against edge cases.
+        int k_per_block = (k_groups + kb - 1) / kb;
+        int valid_kb = (k_groups + k_per_block - 1) / k_per_block;
+
+        // Hybrid dispatch: use self-reducing scatter only when grid_n is small
+        // (< 16 n-blocks, i.e. N < 2048). For small grid_n, the reduce kernel
+        // has too few blocks to fill 60 CUs and becomes catastrophically slow
+        // (~27μs for 4 blocks). For large grid_n, the reduce kernel is fast
+        // (~4μs) and avoiding atomicAdd/threadfence overhead is better.
+        constexpr int SELFREDUCE_GRID_N_THRESHOLD = 16;
+
+        if (grid_n < SELFREDUCE_GRID_N_THRESHOLD && d_counter)
+        {
+            // Self-reducing path: single kernel, last-to-arrive reduction
+            hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
+                           static_cast<hipStream_t>(stream));
+
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_fused_scatter_selfreduce_int8_vnni_kernel_t<TN, CPT>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_fp32, d_B_int8_vnni, d_partial_buf, d_C_fp32, d_scales_B, d_bias,
+                d_counter, N, K, kb, valid_kb, alpha, beta, d_C_existing);
+        }
+        else
+        {
+            // Two-kernel path: scatter + reduce (better for large grid_n)
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_fused_scatter_int8_vnni_kernel_t<TN, CPT>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_fp32, d_B_int8_vnni, d_partial_buf, N, K, kb);
+
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_reduce_scale_kernel_t<TN, CPT>),
+                dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_partial_buf, d_C_fp32, d_scales_B, d_bias, N, kb,
+                alpha, beta, d_C_existing);
+        }
+    }
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_selfreduce] Kernel launch failed: %s (N=%d K=%d kb=%d)\n",
                 hipGetErrorString(err), N, K, kb);
         return false;
     }
