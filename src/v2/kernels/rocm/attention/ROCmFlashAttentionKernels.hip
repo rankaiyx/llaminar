@@ -9,7 +9,7 @@
  *
  * Algorithms implemented:
  * - Flash Attention 2: Tiled attention with online softmax
- *   - Uses vectorized FP16 operations (v_pk_*) for 2x throughput
+ *   - Uses v_dot2_f32_f16 for native FP16 dot products with FP32 accumulation
  *   - LDS double-buffering for overlapped load/compute
  *   - Explicit wavefront reductions via DPP
  *   - NO WMMA/Matrix Cores - pure VALU implementation
@@ -80,10 +80,23 @@ namespace
     constexpr int FA2_TILE_KV = 64;  // KV tile rows
     constexpr int FA2_NUM_STAGES = 2; // Double buffering
 
-    // LDS padding to avoid bank conflicts (32 banks, 4-byte elements)
-    // Pad by 4 elements (16 bytes) for FP32, 8 elements (16 bytes) for FP16
-    constexpr int FA2_LDS_PAD_FP16 = 8;
-    constexpr int FA2_LDS_PAD_FP32 = 4;
+    // LDS padding to avoid bank conflicts (32 banks, 4-byte granularity)
+    // The critical access pattern: threads in a wavefront access DIFFERENT ROWS
+    // at the SAME column (e.g., different K rows in the Q@K^T dot product).
+    // Bank index = (row × stride_dwords + col) mod 32.
+    // To avoid conflicts, stride_dwords must be coprime with 32 (i.e., odd).
+    //
+    // For FP16: stride_dwords = (head_dim + pad) / 2
+    //   head_dim=128: (128+2)/2 = 65 → 65 mod 32 = 1 → gcd(1,32) = 1 ✓
+    //   head_dim=64:  (64+2)/2  = 33 → 33 mod 32 = 1 → gcd(1,32) = 1 ✓
+    // For FP32: stride_dwords = tile_kv + pad
+    //   tile_kv=32: 32+1 = 33 → coprime with 32 ✓
+    //   tile_kv=64: 64+1 = 65 → coprime with 32 ✓
+    //
+    // Previous values (8/4) gave stride_dwords ≡ 4 (mod 32) → gcd(4,32)=4
+    // → 8-way bank conflicts on K/V reads in the dot product inner loop!
+    constexpr int FA2_LDS_PAD_FP16 = 2;
+    constexpr int FA2_LDS_PAD_FP32 = 1;
 
     // Block configuration
     // We use 256 threads = 4 wavefronts per block for good occupancy
@@ -581,7 +594,7 @@ namespace
      * Uses vectorized FP16 VALU operations for Q@K^T computation.
      * No WMMA/Matrix Cores - pure ALU implementation optimized for Vega.
      */
-    __global__ void flash_attention_2_mi50_kernel(
+    __global__ __launch_bounds__(256, 4) void flash_attention_2_mi50_kernel(
         const float *__restrict__ Q,
         const float *__restrict__ K,
         const float *__restrict__ V,
@@ -838,7 +851,7 @@ namespace
             }
 
             // =================================================================
-            // PHASE 2: Compute Q @ K^T (vectorized FP16 with FP32 accumulator)
+            // PHASE 2: Compute Q @ K^T (v_dot2_f32_f16 with FP32 accumulator)
             // =================================================================
             // Each thread computes a subset of score matrix elements
 
@@ -857,38 +870,45 @@ namespace
                 const __half *Q_ptr = Q_tile + q_row * lds_layout.q_stride;
                 const __half *K_ptr = K_tile + kv_col * lds_layout.kv_stride;
 
-                // Vectorized dot product (process 2 FP16 elements at a time)
-                // On MI50, this maps to v_pk_fma_f16 for 2x throughput
+                // Vectorized dot product using v_dot2_f32_f16 (MI50 gfx906+)
+                // Each instruction: d.f32 = a.f16x2 · b.f16x2 + c.f32
+                // Replaces 4× fp16→fp32 convert + 2× FP32 FMA per half2 pair
+                // with a single hardware dot-product instruction.
                 if ((head_dim & 1) == 0)
                 {
                     const int head_dim_vec2 = head_dim / 2;
                     const __half2 *Q_ptr2 = reinterpret_cast<const __half2 *>(Q_ptr);
                     const __half2 *K_ptr2 = reinterpret_cast<const __half2 *>(K_ptr);
-                    for (int d2 = 0; d2 < head_dim_vec2; d2++)
+
+                    // Use 4 independent accumulators to break dependency chain.
+                    // v_dot2_f32_f16 has ~4 cycle latency; with 4 accumulators
+                    // the pipeline stays full (ILP hiding).
+                    float score0 = 0.0f, score1 = 0.0f, score2 = 0.0f, score3 = 0.0f;
+                    int d2 = 0;
+                    const int head_dim_vec2_aligned = head_dim_vec2 & ~3; // round down to multiple of 4
+                    for (; d2 < head_dim_vec2_aligned; d2 += 4)
                     {
-                        float2 qf = __half22float2(Q_ptr2[d2]);
-                        float2 kf = __half22float2(K_ptr2[d2]);
-                        score += qf.x * kf.x + qf.y * kf.y;
+                        score0 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 0], K_ptr2[d2 + 0], score0, false);
+                        score1 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 1], K_ptr2[d2 + 1], score1, false);
+                        score2 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 2], K_ptr2[d2 + 2], score2, false);
+                        score3 = __builtin_amdgcn_fdot2(Q_ptr2[d2 + 3], K_ptr2[d2 + 3], score3, false);
                     }
+                    // Handle remaining pairs (head_dim not multiple of 8)
+                    for (; d2 < head_dim_vec2; d2++)
+                    {
+                        score0 = __builtin_amdgcn_fdot2(Q_ptr2[d2], K_ptr2[d2], score0, false);
+                    }
+                    score = score0 + score1 + score2 + score3;
                 }
                 else
                 {
-                    for (int d = 0; d < head_dim; d += 2)
+                    for (int d = 0; d < head_dim; d++)
                     {
-                        float q0 = half_to_float(Q_ptr[d]);
-                        float k0 = half_to_float(K_ptr[d]);
-                        score += q0 * k0;
-
-                        if (d + 1 < head_dim)
-                        {
-                            float q1 = half_to_float(Q_ptr[d + 1]);
-                            float k1 = half_to_float(K_ptr[d + 1]);
-                            score += q1 * k1;
-                        }
+                        score += half_to_float(Q_ptr[d]) * half_to_float(K_ptr[d]);
                     }
                 }
 
-                scores[q_row * lds_layout.scores_stride + kv_col] = score;
+                scores[q_row * lds_layout.scores_stride + kv_col] = score * softmax_scale;
             }
             __syncthreads();
 
@@ -896,52 +916,79 @@ namespace
             // PHASE 3: Apply softmax and accumulate O = softmax(QK^T) @ V
             // =================================================================
             // Each thread processes its assigned Q rows
+            //
+            // Optimization: check at the tile level whether ALL scores in this
+            // tile are unmasked (fully valid). For causal attention, ~90% of
+            // tiles are fully valid since only the diagonal tiles need masking.
+            // This eliminates 3-5 conditional branches per score element.
 
             if (thread_has_row)
             {
                 int global_q_row = q_block_start + local_q_row;
                 float *my_scores = scores + local_q_row * lds_layout.scores_stride;
 
+                // Determine if this tile needs per-element masking
+                // Tile is fully unmasked when:
+                //   - No external mask
+                //   - No sliding window (or window covers entire tile)
+                //   - For causal: last KV position <= first Q position in block
+                const bool tile_needs_masking =
+                    mask != nullptr ||
+                    (window_size > 0) ||
+                    (causal && (kv_start + actual_kv_len - 1) > (global_q_row + position_offset_runtime));
+
                 // Find max for this row (with masking)
                 float m_ij = -FLT_MAX;
-                for (int j = 0; j < actual_kv_len; j++)
+
+                if (!tile_needs_masking)
                 {
-                    int kv_pos = kv_start + j;
-                    bool masked = false;
-
-                    // Causal masking
-                    if (causal && kv_pos > global_q_row + position_offset_runtime)
-                        masked = true;
-
-                    // Sliding window
-                    if (window_size > 0)
+                    // FAST PATH: no masking needed — scores already pre-scaled
+                    for (int j = 0; j < actual_kv_len; j++)
                     {
-                        int q_pos = global_q_row + position_offset_runtime;
-                        if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
-                            masked = true;
+                        m_ij = fmaxf(m_ij, my_scores[j]);
                     }
-
-                    if (mask)
+                }
+                else
+                {
+                    // SLOW PATH: per-element masking
+                    for (int j = 0; j < actual_kv_len; j++)
                     {
-                        float mask_val = mask[(batch_idx * seq_len + global_q_row) * mask_stride + kv_pos];
-                        if (mask_val <= -1.0e20f)
-                        {
+                        int kv_pos = kv_start + j;
+                        bool masked = false;
+
+                        // Causal masking
+                        if (causal && kv_pos > global_q_row + position_offset_runtime)
                             masked = true;
+
+                        // Sliding window
+                        if (window_size > 0)
+                        {
+                            int q_pos = global_q_row + position_offset_runtime;
+                            if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
+                                masked = true;
+                        }
+
+                        if (mask)
+                        {
+                            float mask_val = mask[(batch_idx * seq_len + global_q_row) * mask_stride + kv_pos];
+                            if (mask_val <= -1.0e20f)
+                            {
+                                masked = true;
+                            }
+                            else
+                            {
+                                my_scores[j] += mask_val;
+                            }
+                        }
+
+                        if (masked)
+                        {
+                            my_scores[j] = -FLT_MAX;
                         }
                         else
                         {
-                            my_scores[j] += mask_val;
+                            m_ij = fmaxf(m_ij, my_scores[j]);
                         }
-                    }
-
-                    if (masked)
-                    {
-                        my_scores[j] = -FLT_MAX;
-                    }
-                    else
-                    {
-                        my_scores[j] *= softmax_scale;
-                        m_ij = fmaxf(m_ij, my_scores[j]);
                     }
                 }
 
@@ -998,6 +1045,273 @@ namespace
             for (int d = row_lane; d < head_dim; d += THREADS_PER_ROW)
             {
                 O_row[d] = O_acc[d_local++] * inv_l;
+            }
+        }
+    }
+
+    // =========================================================================
+    // Flash Attention 2 - Cooperative Prefill Kernel for MI50
+    // =========================================================================
+    //
+    // Wavefront-cooperative prefill kernel adapted from the decode kernel's
+    // architecture (lanes own output dims, not score elements) to handle
+    // multiple Q rows.
+    //
+    // Key differences from the tiled prefill kernel above:
+    //   - No K/V tiles in LDS — K and V loaded per-position from HBM
+    //   - No score matrix in LDS — scores computed inline and consumed
+    //   - Only Q tile in LDS — ~10KB vs 58KB, dramatically reduced footprint
+    //   - Each wavefront independently handles a subset of Q rows
+    //   - 5x higher occupancy (20 waves/CU vs 4)
+    //
+    // CRITICAL: Template parameters ensure all per-Q-row arrays are
+    // register-promoted (not spilled to scratch). Without compile-time
+    // loop bounds, the compiler places O_lane/m_i/l_i in private memory
+    // (432 bytes scratch → 2.3× slower than the tiled kernel).
+    //
+    // Grid: (n_heads, num_q_tiles, batch_size)
+    // Block: (256,) threads = 4 wavefronts
+    //
+    // =========================================================================
+
+    template <int Q_PER_WAVE, int DIMS_PER_LANE>
+    __global__ __launch_bounds__(256, 3)
+    void flash_attention_2_cooperative_mi50_kernel(
+        const float *__restrict__ Q,
+        const float *__restrict__ K,
+        const float *__restrict__ V,
+        float *__restrict__ O,
+        int batch_size,
+        int seq_len,
+        int kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        float softmax_scale,
+        bool causal,
+        int window_size,
+        int position_offset,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        const float *__restrict__ mask,
+        int tile_q)
+    {
+        // =================================================================
+        // 1. Indexing and Setup
+        // =================================================================
+        const int batch_idx = blockIdx.z;
+        const int head_idx = blockIdx.x;
+        const int q_tile_idx = blockIdx.y;
+        const int tid = threadIdx.x;
+        constexpr int threads_per_block = 256;
+        const int wavefront_id = tid / WAVEFRONT_SIZE;  // 0-3
+        const int lane_id = tid % WAVEFRONT_SIZE;  // 0-63
+        constexpr int num_wavefronts = threads_per_block / WAVEFRONT_SIZE;  // 4
+
+        const int gqa_ratio = n_heads / n_kv_heads;
+        const int kv_head_idx = head_idx / gqa_ratio;
+
+        const int q_block_start = q_tile_idx * tile_q;
+        if (q_block_start >= seq_len) return;
+        const int q_tile_rows = min(tile_q, seq_len - q_block_start);
+
+        // =================================================================
+        // 2. LDS Layout (Q tile only)
+        // =================================================================
+        const int q_stride = head_dim + FA2_LDS_PAD_FP16;  // 130 for head_dim=128
+
+        extern __shared__ char smem[];
+        __half *Q_tile = reinterpret_cast<__half *>(smem);
+
+        // =================================================================
+        // 3. Q Row Assignment
+        // =================================================================
+        const int q_wave_start = wavefront_id * Q_PER_WAVE;
+        const int my_q_count = min(Q_PER_WAVE, max(0, q_tile_rows - q_wave_start));
+
+        // =================================================================
+        // 4. Thread-Local Accumulators (register-promoted via template params)
+        // =================================================================
+        float O_lane[Q_PER_WAVE][DIMS_PER_LANE];
+        float m_i[Q_PER_WAVE];
+        float l_i[Q_PER_WAVE];
+
+        #pragma unroll
+        for (int qi = 0; qi < Q_PER_WAVE; qi++) {
+            m_i[qi] = -FLT_MAX;
+            l_i[qi] = 0.0f;
+            #pragma unroll
+            for (int di = 0; di < DIMS_PER_LANE; di++) {
+                O_lane[qi][di] = 0.0f;
+            }
+        }
+
+        // =================================================================
+        // 5. Load Q into LDS (cooperative, all threads)
+        // =================================================================
+        const float *Q_batch = Q + batch_idx * seq_len * n_heads * head_dim;
+
+        if ((head_dim & 1) == 0) {
+            const int head_dim_vec2 = head_dim / 2;
+            for (int i = tid; i < q_tile_rows * head_dim_vec2; i += threads_per_block) {
+                int local_row = i / head_dim_vec2;
+                int d2 = i % head_dim_vec2;
+                int d = d2 * 2;
+                int global_row = q_block_start + local_row;
+
+                const float2 qv = *reinterpret_cast<const float2 *>(
+                    Q_batch + global_row * n_heads * head_dim + head_idx * head_dim + d);
+                reinterpret_cast<__half2 *>(Q_tile + local_row * q_stride + d)[0] = __float22half2_rn(qv);
+            }
+        } else {
+            for (int i = tid; i < q_tile_rows * head_dim; i += threads_per_block) {
+                int local_row = i / head_dim;
+                int d = i % head_dim;
+                int global_row = q_block_start + local_row;
+                float val = Q_batch[global_row * n_heads * head_dim + head_idx * head_dim + d];
+                Q_tile[local_row * q_stride + d] = float_to_half(val);
+            }
+        }
+        __syncthreads();
+
+        // =================================================================
+        // 6. Runtime Parameters (device_params)
+        // =================================================================
+        int kv_stride_global = kv_len;
+        int kv_len_runtime = kv_len;
+        int position_offset_runtime = position_offset;
+        int mask_stride = kv_len;
+
+        if (device_params) {
+            kv_len_runtime = device_params->kv_len;
+            position_offset_runtime = device_params->position_offset;
+            mask_stride = device_params->mask_stride;
+        }
+
+        // =================================================================
+        // 7. Batch/Head Pointers for K/V
+        // =================================================================
+        const float *K_batch = K + batch_idx * kv_stride_global * n_kv_heads * head_dim;
+        const float *V_batch = V + batch_idx * kv_stride_global * n_kv_heads * head_dim;
+        const int kv_head_offset = kv_head_idx * head_dim;
+        const int kv_row_stride = n_kv_heads * head_dim;
+
+        // =================================================================
+        // 8. Main Loop: Wavefront-Cooperative KV Processing
+        // =================================================================
+        // Each wavefront iterates over ALL KV positions. For each position,
+        // all 64 lanes cooperate on dot products and V accumulation.
+        // K and V are in FP32 global memory; Q is in FP16 in LDS.
+        // All inner loops use #pragma unroll with compile-time template bounds
+        // to ensure register promotion of O_lane/m_i/l_i arrays.
+
+        for (int kv_pos = 0; kv_pos < kv_len_runtime; kv_pos++) {
+            // Early termination for causal: if ALL Q rows in this wavefront
+            // have kv_pos beyond their causal boundary, skip.
+            if (causal) {
+                int max_q_pos = q_block_start + q_wave_start + my_q_count - 1;
+                if (kv_pos > max_q_pos + position_offset_runtime) break;
+            }
+
+            const float *K_ptr = K_batch + kv_pos * kv_row_stride + kv_head_offset;
+            const float *V_ptr = V_batch + kv_pos * kv_row_stride + kv_head_offset;
+
+            // Cooperative K/V load: each lane loads its output dims (coalesced!)
+            float k_vals[DIMS_PER_LANE];
+            float v_vals[DIMS_PER_LANE];
+            #pragma unroll
+            for (int di = 0; di < DIMS_PER_LANE; di++) {
+                int d = lane_id + di * WAVEFRONT_SIZE;
+                k_vals[di] = (d < head_dim) ? K_ptr[d] : 0.0f;
+                v_vals[di] = (d < head_dim) ? V_ptr[d] : 0.0f;
+            }
+
+            // Process each Q row owned by this wavefront.
+            // Fully unrolled: compiler maps O_lane[qi][di] → VGPRs.
+            // Partial tiles: qi >= my_q_count → softmax stays at -FLT_MAX,
+            // output write is masked, so extra work is harmless.
+            #pragma unroll
+            for (int qi = 0; qi < Q_PER_WAVE; qi++) {
+                if (qi >= my_q_count) continue;
+
+                int local_q = q_wave_start + qi;
+                int global_q = q_block_start + local_q;
+
+                // Cooperative dot product: Q (FP16 from LDS) * K (FP32 from HBM)
+                float partial_dot = 0.0f;
+                #pragma unroll
+                for (int di = 0; di < DIMS_PER_LANE; di++) {
+                    int d = lane_id + di * WAVEFRONT_SIZE;
+                    if (d < head_dim) {
+                        float q_val = half_to_float(Q_tile[local_q * q_stride + d]);
+                        partial_dot += q_val * k_vals[di];
+                    }
+                }
+
+                // Wavefront-wide reduction (6 shuffles) -> score uniform across all lanes
+                float score = wavefrontReduceSum(partial_dot) * softmax_scale;
+
+                // Masking
+                bool masked = false;
+                if (causal && kv_pos > global_q + position_offset_runtime)
+                    masked = true;
+                if (window_size > 0) {
+                    int q_pos = global_q + position_offset_runtime;
+                    if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
+                        masked = true;
+                }
+                // External mask
+                float mask_addend = 0.0f;
+                if (mask && !masked) {
+                    float mask_val = mask[(batch_idx * seq_len + global_q) * mask_stride + kv_pos];
+                    if (mask_val <= -1.0e20f) {
+                        masked = true;
+                    } else {
+                        mask_addend = mask_val;
+                    }
+                }
+
+                if (!masked) {
+                    score += mask_addend;
+
+                    // Online softmax update
+                    float m_new = fmaxf(m_i[qi], score);
+                    float scale_old = fast_expf(m_i[qi] - m_new);
+                    float p = fast_expf(score - m_new);
+
+                    // Update O accumulators and softmax state
+                    l_i[qi] = l_i[qi] * scale_old + p;
+                    #pragma unroll
+                    for (int di = 0; di < DIMS_PER_LANE; di++) {
+                        O_lane[qi][di] = O_lane[qi][di] * scale_old + p * v_vals[di];
+                    }
+                    m_i[qi] = m_new;
+                }
+            }
+        }
+
+        // =================================================================
+        // 9. Write Final Output
+        // =================================================================
+        // Each wavefront writes its Q rows independently. Each lane writes
+        // its owned output dims. No inter-wavefront coordination needed.
+
+        float *O_batch = O + batch_idx * seq_len * n_heads * head_dim;
+
+        #pragma unroll
+        for (int qi = 0; qi < Q_PER_WAVE; qi++) {
+            if (qi >= my_q_count) continue;
+
+            int local_q = q_wave_start + qi;
+            int global_q_row = q_block_start + local_q;
+            float inv_l = (l_i[qi] > 0.0f) ? (1.0f / l_i[qi]) : 0.0f;
+
+            float *O_row = O_batch + global_q_row * n_heads * head_dim + head_idx * head_dim;
+            #pragma unroll
+            for (int di = 0; di < DIMS_PER_LANE; di++) {
+                int d = lane_id + di * WAVEFRONT_SIZE;
+                if (d < head_dim) {
+                    O_row[d] = O_lane[qi][di] * inv_l;
+                }
             }
         }
     }
@@ -1442,6 +1756,75 @@ extern "C"
         }
 
         float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+        if (head_dim >= 64) {
+            // Cooperative kernel — dramatic LDS reduction, 5× higher occupancy
+            // Template parameters ensure register promotion (no scratch spills).
+            int tile_q = 32;  // Optimal for head_dim=128 (44 VGPRs, 5 waves/SIMD)
+
+            // Allow override via environment
+            const char *tq_env = getenv("LLAMINAR_FA2_COOPERATIVE_TILE_Q");
+            if (tq_env) {
+                int tq_override = atoi(tq_env);
+                if (tq_override == 16 || tq_override == 32 || tq_override == 64)
+                    tile_q = tq_override;
+            }
+
+            const int q_stride = head_dim + FA2_LDS_PAD_FP16;
+            const int lds_size = tile_q * q_stride * static_cast<int>(sizeof(__half));
+
+            const int num_q_tiles = (seq_len + tile_q - 1) / tile_q;
+            dim3 grid(n_heads, num_q_tiles, batch_size);
+            dim3 block(FA2_THREADS_PER_BLOCK);
+
+            // Dispatch template instantiation based on (tile_q, head_dim).
+            // Q_PER_WAVE = tile_q / 4 (4 wavefronts per block)
+            // DIMS_PER_LANE = ceil(head_dim / 64) (64 lanes per wavefront)
+            constexpr int WAVES_PER_BLOCK = 4;
+            const int q_per_wave = tile_q / WAVES_PER_BLOCK;
+            const int dims_per_lane = (head_dim + WAVEFRONT_SIZE - 1) / WAVEFRONT_SIZE;
+
+            // Template dispatch — must cover all valid (q_per_wave, dims_per_lane) combos
+            #define LAUNCH_COOP_KERNEL(QPW, DPL) \
+                hipLaunchKernelGGL( \
+                    (flash_attention_2_cooperative_mi50_kernel<QPW, DPL>), \
+                    grid, block, lds_size, hip_stream, \
+                    Q, K, V, O, \
+                    batch_size, seq_len, kv_len, \
+                    n_heads, n_kv_heads, head_dim, \
+                    softmax_scale, causal, window_size, position_offset, \
+                    device_params, mask, \
+                    tile_q)
+
+            bool dispatched = false;
+            if (dims_per_lane == 2) {
+                // head_dim 65-128 (most common: 128)
+                if (q_per_wave == 8) { LAUNCH_COOP_KERNEL(8, 2); dispatched = true; }
+                else if (q_per_wave == 4) { LAUNCH_COOP_KERNEL(4, 2); dispatched = true; }
+                else if (q_per_wave == 16) { LAUNCH_COOP_KERNEL(16, 2); dispatched = true; }
+            } else if (dims_per_lane == 1) {
+                // head_dim 1-64
+                if (q_per_wave == 8) { LAUNCH_COOP_KERNEL(8, 1); dispatched = true; }
+                else if (q_per_wave == 4) { LAUNCH_COOP_KERNEL(4, 1); dispatched = true; }
+                else if (q_per_wave == 16) { LAUNCH_COOP_KERNEL(16, 1); dispatched = true; }
+            }
+            #undef LAUNCH_COOP_KERNEL
+
+            if (!dispatched) {
+                printf("[hipFlashAttn_prefill_fa2] Unsupported config: q_per_wave=%d, dims_per_lane=%d\n",
+                       q_per_wave, dims_per_lane);
+                return -1;
+            }
+
+            hipError_t err = hipGetLastError();
+            if (err != hipSuccess) {
+                printf("[hipFlashAttn_prefill_fa2] Cooperative kernel launch failed: %s\n", hipGetErrorString(err));
+                return -1;
+            }
+            return 0;
+        }
+
+        // Fall through to existing tiled kernel for head_dim < 64
 
         // Adaptively select tile sizes based on LDS constraints.
         // Prefer larger tile area, then larger tile_q (better Q reuse / fewer blocks).
