@@ -36,6 +36,8 @@
 
 // CUTLASS INT8 GEMM using Tensor Cores (SM 8.0+ Ampere/Ada/Hopper)
 // Uses dp4a instruction for int8×int8 dot product with int32 accumulation
+//
+// Standard tile: 128×128×64 — optimized for large M (prefill, batched)
 using CutlassInt8Gemm = cutlass::gemm::device::Gemm<
     int8_t,                                 // ElementA
     cutlass::layout::RowMajor,              // LayoutA
@@ -54,6 +56,35 @@ using CutlassInt8Gemm = cutlass::gemm::device::Gemm<
     cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, // Swizzle
     3                                                             // Pipeline stages
     >;
+
+// GEMV-optimized tile: 32×128×64 — for small M (decode, M=1-4)
+// With 128×128 at M=1: only 1 of 128 M-rows is used (99.2% waste).
+// With 32×128 at M=1: only 1 of 32 M-rows is used (96.9% waste in tiles,
+// but 4× more tiles → 4× more SMs utilized → much better occupancy).
+// For N=3584, K=3584: 128×128 gives ceil(3584/128)=28 tiles on N.
+// 32×128 gives 28 tiles on N × 4 = effectively 4× the grid parallelism.
+using CutlassInt8GemmSmallM = cutlass::gemm::device::Gemm<
+    int8_t,                                // ElementA
+    cutlass::layout::RowMajor,             // LayoutA
+    int8_t,                                // ElementB
+    cutlass::layout::ColumnMajor,          // LayoutB
+    int32_t,                               // ElementOutput
+    cutlass::layout::RowMajor,             // LayoutC
+    int32_t,                               // ElementAccumulator
+    cutlass::arch::OpClassTensorOp,        // OpClass (Tensor Cores)
+    cutlass::arch::Sm80,                   // ArchTag (Ampere SM 8.0+)
+    cutlass::gemm::GemmShape<32, 128, 64>, // ThreadblockShape (4× smaller M tile)
+    cutlass::gemm::GemmShape<32, 64, 64>,  // WarpShape (fits 32×128 with 2 warps on N)
+    cutlass::gemm::GemmShape<16, 8, 32>,   // InstructionShape (same mma)
+    cutlass::epilogue::thread::LinearCombination<
+        int32_t, 1, int32_t, int32_t>,                            // EpilogueOp
+    cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>, // Swizzle
+    3                                                             // Pipeline stages
+    >;
+
+// Threshold for switching between large and small M tiles.
+// At M <= this value, we use the GEMV-optimized 32×128 tile.
+static constexpr int GEMV_M_THRESHOLD = 4;
 
 // =========================================================================
 // CUDA Error Checking Macros
@@ -314,6 +345,17 @@ extern "C"
     /**
      * @brief Execute CUTLASS INT8 GEMM
      */
+    /**
+     * @brief Execute CUTLASS INT8 GEMM with automatic tile selection
+     *
+     * For small M (decode, M<=4), uses GemmShape<32,128,64> for better SM
+     * utilization. For large M (prefill), uses GemmShape<128,128,64>.
+     *
+     * With 128×128 at M=1 and N=3584: ceil(3584/128)=28 tiles, all waste
+     * 127/128 of their M dimension. With 32×128: same 28 N-tiles but the
+     * M-tile granularity is 4× smaller, allowing CUTLASS to skip more
+     * empty tiles and reducing wasted Tensor Core cycles.
+     */
     bool cudaQuantGemm_execute(
         const int8_t *d_A_int8,
         const int8_t *d_weights_int8,
@@ -338,22 +380,52 @@ extern "C"
             CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
         }
 
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        if (M <= GEMV_M_THRESHOLD)
+        {
+            // Small-M path: use 32×128×64 tile for better occupancy
+            CutlassInt8GemmSmallM gemm_op;
+
+            typename CutlassInt8GemmSmallM::Arguments args(
+                {M, N, K},
+                {d_A_int8, K},
+                {d_weights_int8, K},
+                {d_C_int32, N},
+                {d_C_int32, N},
+                {1, 0});
+
+            cutlass::Status can_status = CutlassInt8GemmSmallM::can_implement(args);
+            if (can_status != cutlass::Status::kSuccess)
+            {
+                // Fall through to large tile if small tile can't handle it
+                goto large_tile;
+            }
+
+            cutlass::Status status = gemm_op(args, nullptr, cuda_stream);
+            if (status != cutlass::Status::kSuccess)
+            {
+                std::ostringstream oss;
+                oss << "[CUDAQuantGemm] CUTLASS GEMM (small-M) failed with status " << static_cast<int>(status)
+                    << " (M=" << M << ", N=" << N << ", K=" << K << ")";
+                throw std::runtime_error(oss.str());
+            }
+            return true;
+        }
+
+    large_tile:
+    {
+        // Large-M path: standard 128×128×64 tile
         CutlassInt8Gemm gemm_op;
 
-        // CUTLASS problem shape: M × N × K
-        // A: [M × K] RowMajor, stride = K
-        // B: [K × N] ColumnMajor, stride = K (leading dimension is number of rows = K)
-        // C: [M × N] RowMajor, stride = N
         typename CutlassInt8Gemm::Arguments args(
-            {M, N, K},           // Problem size
-            {d_A_int8, K},       // TensorRef A (RowMajor, stride = K)
-            {d_weights_int8, K}, // TensorRef B (ColumnMajor, stride = K) [FIXED: was N]
-            {d_C_int32, N},      // TensorRef C (RowMajor, stride = N)
-            {d_C_int32, N},      // TensorRef D (output, RowMajor, stride = N)
-            {1, 0}               // alpha=1, beta=0
-        );
+            {M, N, K},
+            {d_A_int8, K},
+            {d_weights_int8, K},
+            {d_C_int32, N},
+            {d_C_int32, N},
+            {1, 0});
 
-        // Check if CUTLASS can execute this problem
         cutlass::Status can_status = CutlassInt8Gemm::can_implement(args);
         if (can_status != cutlass::Status::kSuccess)
         {
@@ -363,12 +435,7 @@ extern "C"
             throw std::runtime_error(oss.str());
         }
 
-        // CRITICAL: CUTLASS operator() signature is (args, workspace, stream).
-        // workspace is void*, stream is cudaStream_t (also a pointer).
-        // Passing stream as 2nd arg would silently bind it as workspace!
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         cutlass::Status status = gemm_op(args, nullptr, cuda_stream);
-
         if (status != cutlass::Status::kSuccess)
         {
             std::ostringstream oss;
@@ -376,9 +443,7 @@ extern "C"
                 << " (M=" << M << ", N=" << N << ", K=" << K << ")";
             throw std::runtime_error(oss.str());
         }
-
-        // Note: No cudaDeviceSynchronize() here - let CUDA stream ordering handle dependencies
-        // This enables GPU pipeline parallelism between consecutive kernel launches
+    }
 
         return true;
     }

@@ -75,9 +75,14 @@ namespace llaminar2
         LOG_DEBUG("[FusedGateUpGEMMStage] Looking up kernel for gate=" << (void *)w_gate_base
                                                                        << " up=" << (void *)w_up_base << " device=" << params_.device_id.to_string());
 
-        // Get fused Gate/Up kernel from KernelFactory with explicit DeviceId
-        auto *fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-            w_gate_base, w_up_base, params_.device_id);
+        // Get fused Gate/Up kernel — use stage-level cache to avoid KernelFactory mutex per call
+        ITensorFusedGateUpGemm *fused_kernel = cached_kernel_;
+        if (!fused_kernel)
+        {
+            fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
+                w_gate_base, w_up_base, params_.device_id);
+            cached_kernel_ = fused_kernel;
+        }
 
         LOG_DEBUG("[FusedGateUpGEMMStage] Got fused_kernel=" << (void *)fused_kernel);
 

@@ -140,6 +140,14 @@ namespace llaminar2
 
     private:
         Params params_;
+
+        // === Cached kernel pointers (avoid KernelFactory mutex per execute) ===
+        // These are populated on first execute() and reused thereafter.
+        // The KernelFactory owns the lifetime of these objects (they're in
+        // registry maps), so raw pointers are safe here.
+        ITensorGemm *cached_gemm_ = nullptr;
+        const void *cached_prepared_ = nullptr; // PreparedGemmHandle*
+        bool cache_resolved_ = false;
     };
 
 } // namespace llaminar2

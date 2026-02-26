@@ -12,6 +12,10 @@
 namespace llaminar2
 {
 
+    // Forward declarations for cached kernel pointers
+    class ITensorFusedQKVGemm;
+    class ITensorGemm;
+
     /**
      * @brief Fused Q/K/V projection stage
      *
@@ -96,6 +100,14 @@ namespace llaminar2
 
     private:
         Params params_;
+
+        // === Cached kernel pointers (avoid KernelFactory mutex per execute) ===
+        ITensorFusedQKVGemm *cached_fused_kernel_ = nullptr;
+        ITensorGemm *cached_gemm_q_ = nullptr;
+        ITensorGemm *cached_gemm_k_ = nullptr;
+        ITensorGemm *cached_gemm_v_ = nullptr;
+        bool cache_resolved_fused_ = false;
+        bool cache_resolved_individual_ = false;
     };
 
 } // namespace llaminar2

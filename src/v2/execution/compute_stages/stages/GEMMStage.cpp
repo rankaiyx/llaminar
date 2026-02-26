@@ -170,15 +170,24 @@ namespace llaminar2
         // Cast weights to TensorBase for KernelFactory
         auto *B_base = requireTensorBase(params_.B, "weight B");
 
-        // Get kernel from KernelFactory (which caches by tensor + device)
+        // Get kernel — use stage-level cache to avoid KernelFactory mutex per call.
+        // KernelFactory caches are append-only (never evict), so raw pointers are
+        // valid for the entire program lifetime after first resolve.
         auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
         llaminar2::ITensorGemm *gemm = nullptr;
 
-        if (is_sliced)
+        if (cache_resolved_)
+        {
+            // Fast path: reuse previously-resolved kernel (no mutex)
+            gemm = cached_gemm_;
+        }
+        else if (is_sliced)
         {
             // Use sliced kernel for tensor parallelism
             gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
                 B_base, params_.output_range.start, params_.output_range.end);
+            cached_gemm_ = gemm;
+            cache_resolved_ = true;
             LOG_DEBUG("[GEMMStage] Using sliced kernel for rows [" << params_.output_range.start
                                                                    << ", " << params_.output_range.end << ")");
         }
@@ -187,6 +196,9 @@ namespace llaminar2
             // Use device-targeted kernel creation
             auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(B_base, params_.device_id);
             gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+            cached_gemm_ = gemm;
+            cached_prepared_ = prepared;
+            cache_resolved_ = true;
         }
 
         if (!gemm)
