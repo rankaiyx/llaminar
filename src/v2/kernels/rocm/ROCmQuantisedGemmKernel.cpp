@@ -395,15 +395,15 @@ namespace llaminar2
             // Defined in ROCmGemvKernel.hip
             // =========================================================================
             bool rocmGemv_int8_scatter_batched_vnni(
-                const int8_t *d_A_int8,            // [K] pre-quantized INT8 activations
-                const float *d_scale_A,            // [1] activation scale (device pointer)
-                float *d_partial_buf,              // [KB_MAX × max_N] partial buffer
-                int num_projections,               // Number of projections (1..8)
-                const int8_t *const *d_B_ptrs,     // [num_proj] VNNI weight pointers
-                float *const *d_C_ptrs,            // [num_proj] FP32 output pointers
+                const int8_t *d_A_int8,              // [K] pre-quantized INT8 activations
+                const float *d_scale_A,              // [1] activation scale (device pointer)
+                float *d_partial_buf,                // [KB_MAX × max_N] partial buffer
+                int num_projections,                 // Number of projections (1..8)
+                const int8_t *const *d_B_ptrs,       // [num_proj] VNNI weight pointers
+                float *const *d_C_ptrs,              // [num_proj] FP32 output pointers
                 const float *const *d_scales_B_ptrs, // [num_proj] weight scale pointers
-                const float *const *d_bias_ptrs,   // [num_proj] bias pointers
-                const int *N_per_proj,             // [num_proj] output dimensions
+                const float *const *d_bias_ptrs,     // [num_proj] bias pointers
+                const int *N_per_proj,               // [num_proj] output dimensions
                 int K,
                 float alpha, float beta,
                 int device_id, void *stream);
@@ -2381,9 +2381,9 @@ namespace llaminar2
                         static std::once_flag gemv_mapped_once;
                         std::call_once(gemv_mapped_once, [&]()
                                        { LOG_WARN("[multiply_tensor] GEMV MAPPED OUTPUT REDIRECT: M=1 N=" << n
-                                                  << " mapped_ptr=" << d_output
-                                                  << " -> d_C_fp32=" << impl_->d_C_fp32
-                                                  << " (" << (n * 4 / 1024) << " KB)"); });
+                                                                                                          << " mapped_ptr=" << d_output
+                                                                                                          << " -> d_C_fp32=" << impl_->d_C_fp32
+                                                                                                          << " (" << (n * 4 / 1024) << " KB)"); });
                     }
 
                     if (d_weights_vnni &&
@@ -2565,9 +2565,9 @@ namespace llaminar2
                         static std::once_flag bias_mapped_once;
                         std::call_once(bias_mapped_once, [&]()
                                        { LOG_WARN("[multiply_tensor] BIAS PATH MAPPED REDIRECT: M=" << m << " N=" << n
-                                                  << " mapped_ptr=" << d_output
-                                                  << " -> d_C_fp32=" << impl_->d_C_fp32
-                                                  << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)"); });
+                                                                                                    << " mapped_ptr=" << d_output
+                                                                                                    << " -> d_C_fp32=" << impl_->d_C_fp32
+                                                                                                    << " (" << (static_cast<size_t>(m) * n * 4 / 1024) << " KB)"); });
                     }
 
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Using CK bias path (d_input="
@@ -3427,6 +3427,8 @@ namespace llaminar2
             const MPIContext * /*mpi_ctx*/,
             DeviceWorkspaceManager *workspace)
         {
+            ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM, static_cast<hipStream_t>(gpu_stream_));
+
             // Use passed workspace if provided, otherwise fall back to bound workspace
             DeviceWorkspaceManager *ws = workspace ? workspace : workspace_;
             DeviceWorkspaceManager *saved_workspace = workspace_;
@@ -3515,10 +3517,10 @@ namespace llaminar2
             const bool serialize_rocm_gemm = debugEnv().validation.serialize_rocm_gemm_stage;
 
             // Batched INT8 scatter GEMV collection arrays (for M=1 VNNI projections)
-            const int8_t* batch_B_ptrs[8] = {};
-            float* batch_C_ptrs[8] = {};
-            const float* batch_scales_B_ptrs[8] = {};
-            const float* batch_bias_ptrs[8] = {};
+            const int8_t *batch_B_ptrs[8] = {};
+            float *batch_C_ptrs[8] = {};
+            const float *batch_scales_B_ptrs[8] = {};
+            const float *batch_bias_ptrs[8] = {};
             int batch_N[8] = {};
             int batch_count = 0;
 
@@ -4020,9 +4022,9 @@ namespace llaminar2
                           << batch_count << " projections, K=" << k);
 
                 if (!rocmGemv_int8_scatter_batched_vnni(
-                        impl_->d_A_int8,               // Pre-quantized INT8 activations
-                        impl_->d_scales_A,             // Activation scale
-                        impl_->d_scatter_partial,      // Shared partial buffer (workspace-managed)
+                        impl_->d_A_int8,          // Pre-quantized INT8 activations
+                        impl_->d_scales_A,        // Activation scale
+                        impl_->d_scatter_partial, // Shared partial buffer (workspace-managed)
                         batch_count,
                         batch_B_ptrs,
                         batch_C_ptrs,

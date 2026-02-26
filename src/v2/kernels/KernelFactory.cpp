@@ -4062,6 +4062,7 @@ namespace llaminar
                     int device_idx) override
                 {
                     (void)ctx; // Currently unused, kernels use device_idx directly
+                    (void)device_idx;
 
                     if (!gemm_gate_ || !gemm_up_)
                     {
@@ -4069,38 +4070,16 @@ namespace llaminar
                         return false;
                     }
 
-                    // Execute both GEMMs via multiply_tensor for proper type dispatch
-                    bool gate_ok = gemm_gate_->multiply_tensor(
-                        input, output_gate,
-                        m, n_gate, k,
-                        false,      // transpose_B
-                        1.0f, 0.0f, // alpha, beta
-                        nullptr,    // bias
-                        nullptr,    // mpi_ctx
-                        device_idx);
+                    // Use fused multi-projection GEMM: quantize activations ONCE,
+                    // batch scatter+reduce kernels → eliminates redundant quantization
+                    // and reduces kernel launches from 6 to 3 per layer.
+                    // On CPU: default fallback calls individual multiply_tensor() per projection.
+                    // On ROCm: batched dispatch with shared activation quantization.
+                    std::vector<llaminar2::ITensorGemm::TensorProjectionDesc> projections = {
+                        {gemm_gate_, output_gate, n_gate, nullptr, nullptr, false, "gate"},
+                        {gemm_up_, output_up, n_up, nullptr, nullptr, false, "up"}};
 
-                    if (!gate_ok)
-                    {
-                        LOG_ERROR("[FusedGateUpGemmAdapter] Gate GEMM failed");
-                        return false;
-                    }
-
-                    bool up_ok = gemm_up_->multiply_tensor(
-                        input, output_up,
-                        m, n_up, k,
-                        false,      // transpose_B
-                        1.0f, 0.0f, // alpha, beta
-                        nullptr,    // bias
-                        nullptr,    // mpi_ctx
-                        device_idx);
-
-                    if (!up_ok)
-                    {
-                        LOG_ERROR("[FusedGateUpGemmAdapter] Up GEMM failed");
-                        return false;
-                    }
-
-                    return true;
+                    return gemm_gate_->multiply_fused_tensor(input, projections, m, k);
                 }
 
                 bool execute_with_bias(

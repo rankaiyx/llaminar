@@ -45,6 +45,10 @@ namespace llaminar2
 
             LOG_INFO("[ROCm] Found " << device_count << " ROCm device(s)");
 
+            // Save the current device so we can restore it after enumeration
+            int saved_device = 0;
+            hipGetDevice(&saved_device);
+
             for (int i = 0; i < device_count; ++i)
             {
                 hipDeviceProp_t prop;
@@ -131,6 +135,9 @@ namespace llaminar2
 
                 devices.push_back(dev);
             }
+
+            // Restore the original device to avoid side effects on callers
+            hipSetDevice(saved_device);
 
             return devices;
         }
