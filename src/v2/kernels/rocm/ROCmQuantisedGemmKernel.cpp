@@ -2365,6 +2365,27 @@ namespace llaminar2
 
                     validateWorkspace();
 
+                    // =================================================================
+                    // CRITICAL: Detect mapped output memory (same fix as prefill).
+                    // Mapped memory is used for logits (CPU sampling needs host access).
+                    // GPU scattered writes to mapped memory go over PCIe (~1.6 GB/s)
+                    // instead of HBM (~1000 GB/s). For LM_Head M=1 N=152064 → 608KB,
+                    // this causes ~2700µs vs ~520µs expected from HBM bandwidth.
+                    // Fix: redirect kernel output to HBM workspace, then bulk DMA.
+                    // =================================================================
+                    const bool gemv_output_is_mapped = C_fp32->isMapped();
+                    float *d_gemv_output = d_output;
+                    if (gemv_output_is_mapped)
+                    {
+                        d_gemv_output = impl_->d_C_fp32;
+                        static std::once_flag gemv_mapped_once;
+                        std::call_once(gemv_mapped_once, [&]()
+                                       { LOG_WARN("[multiply_tensor] GEMV MAPPED OUTPUT REDIRECT: M=1 N=" << n
+                                                  << " mapped_ptr=" << d_output
+                                                  << " -> d_C_fp32=" << impl_->d_C_fp32
+                                                  << " (" << (n * 4 / 1024) << " KB)"); });
+                    }
+
                     if (d_weights_vnni &&
                         !validatePointerDeviceOrLog(
                             d_weights_vnni, rocm_device_id_, "d_weights_vnni", "ROCmQuantisedGemmKernel::multiply_tensor"))
@@ -2400,7 +2421,7 @@ namespace llaminar2
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_payload,
                                 impl_->d_weights_native_scales,
-                                d_output,
+                                d_gemv_output,
                                 impl_->d_scales_A,
                                 n, k,
                                 impl_->native_vnni_codebook_id,
@@ -2412,11 +2433,19 @@ namespace llaminar2
 
                         if (d_bias)
                         {
-                            if (!rocmQuantGemm_biasAdd(d_output, d_bias, m, n, rocm_device_id_, gpu_stream_))
+                            if (!rocmQuantGemm_biasAdd(d_gemv_output, d_bias, m, n, rocm_device_id_, gpu_stream_))
                             {
                                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI bias add failed");
                                 return false;
                             }
+                        }
+                        // Bulk DMA from HBM workspace to mapped output
+                        if (gemv_output_is_mapped)
+                        {
+                            hipMemcpyAsync(d_output, impl_->d_C_fp32,
+                                           static_cast<size_t>(n) * sizeof(float),
+                                           hipMemcpyDeviceToDevice,
+                                           static_cast<hipStream_t>(gpu_stream_));
                         }
                         return true;
                     }
@@ -2432,7 +2461,7 @@ namespace llaminar2
                             return false;
                         }
                         if (!rocmGemv_int8_scatter_vnni(
-                                impl_->d_A_int8, d_weights_vnni, d_output, impl_->d_scales_A, d_scales_B, d_bias,
+                                impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A, d_scales_B, d_bias,
                                 impl_->d_scatter_partial,
                                 n, k, alpha, beta, nullptr,
                                 rocm_device_id_, gpu_stream_))
@@ -2451,13 +2480,13 @@ namespace llaminar2
                             return false;
                         }
 
-                        const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
+                        const float *d_existing = (beta != 0.0f) ? d_gemv_output : nullptr;
                         bool fused_scale = false;
                         bool gemv_ok = false;
                         if (d_weights_vnni)
                         {
                             fused_scale = rocmGemv_int8_int8_fp32_vnni_scaled(
-                                impl_->d_A_int8, d_weights_vnni, d_output,
+                                impl_->d_A_int8, d_weights_vnni, d_gemv_output,
                                 impl_->d_scales_A, d_scales_B,
                                 n, k,
                                 alpha, beta,
@@ -2479,7 +2508,7 @@ namespace llaminar2
                         }
 
                         if (!fused_scale && !rocmQuantGemm_applyScaling(
-                                                impl_->d_C_int32, d_output, impl_->d_scales_A, d_scales_B,
+                                                impl_->d_C_int32, d_gemv_output, impl_->d_scales_A, d_scales_B,
                                                 m, n, alpha, beta, d_existing, d_bias, rocm_device_id_, gpu_stream_))
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] INT8 GEMV scaling failed");
@@ -2487,6 +2516,14 @@ namespace llaminar2
                         }
                     }
 
+                    // Bulk DMA from HBM workspace to mapped output
+                    if (gemv_output_is_mapped)
+                    {
+                        hipMemcpyAsync(d_output, impl_->d_C_fp32,
+                                       static_cast<size_t>(n) * sizeof(float),
+                                       hipMemcpyDeviceToDevice,
+                                       static_cast<hipStream_t>(gpu_stream_));
+                    }
                     return true;
                 }
                 // Fall through to CK path if weight pointers unavailable

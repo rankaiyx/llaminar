@@ -2131,6 +2131,83 @@ __global__ void gemv_fused_scatter_selfreduce_int8_vnni_kernel_t(
 
 
 // ============================================================================
+// INT8-input DIRECT kernel: pre-quantized GEMV → final FP32 output
+//
+// Single-kernel path for kb=1 (no K-parallelism). Instead of writing to a
+// partial buffer and launching a separate reduce, this kernel writes the
+// final scaled+biased FP32 output directly. Eliminates the reduce kernel
+// entirely, saving ~2ms per call on large-N projections (e.g., LM_HEAD).
+//
+// Grid: dim3(grid_n), Block: dim3(TILE_N / CPT) = dim3(64)
+// ============================================================================
+template <int TILE_N, int CPT>
+__global__ void gemv_int8_direct_vnni_kernel_t(
+    const int8_t* __restrict__ d_A_int8,        // [K] pre-quantized INT8 activations
+    const int8_t* __restrict__ d_B_int8_vnni,   // [K/4][N][4] VNNI weights
+    float* __restrict__ d_C_fp32,               // [N] FP32 output (final)
+    const float* __restrict__ d_scale_A,         // [1] activation scale (scalar)
+    const float* __restrict__ d_scales_B,        // [N] per-column weight scales
+    const float* __restrict__ d_bias,            // [N] optional bias (nullable)
+    int N, int K,
+    float alpha, float beta,
+    const float* __restrict__ d_C_existing)      // [N] used when beta != 0
+{
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    const bool active = (n_base < N);
+
+    int32_t acc[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c) acc[c] = 0;
+
+    if (active)
+    {
+        const int k_groups = K / 4;
+
+        const int32_t* __restrict__ b_row =
+            reinterpret_cast<const int32_t*>(d_B_int8_vnni) + n_base;
+        const size_t b_stride = static_cast<size_t>(N);
+
+        #pragma unroll 4
+        for (int kg = 0; kg < k_groups; ++kg)
+        {
+            const int32_t a_packed = *reinterpret_cast<const int32_t*>(d_A_int8 + kg * 4);
+
+            if constexpr (CPT == 2)
+            {
+                const int2 b_pair = *reinterpret_cast<const int2*>(
+                    b_row + kg * b_stride);
+                acc[0] = __builtin_amdgcn_sdot4(a_packed, b_pair.x, acc[0], false);
+                acc[1] = __builtin_amdgcn_sdot4(a_packed, b_pair.y, acc[1], false);
+            }
+            else
+            {
+                #pragma unroll
+                for (int c = 0; c < CPT; ++c)
+                {
+                    const int32_t b_packed = *(b_row + kg * b_stride + c);
+                    acc[c] = __builtin_amdgcn_sdot4(a_packed, b_packed, acc[c], false);
+                }
+            }
+        }
+
+        // Write final FP32 output: acc * scale_A * scale_B + bias
+        const float sA = d_scale_A[0];
+        #pragma unroll
+        for (int c = 0; c < CPT; ++c)
+        {
+            const int n = n_base + c;
+            float result = static_cast<float>(acc[c]) * sA * d_scales_B[n] * alpha;
+            if (beta != 0.0f && d_C_existing)
+                result += beta * d_C_existing[n];
+            if (d_bias)
+                result += d_bias[n];
+            d_C_fp32[n] = result;
+        }
+    }
+}
+
+
+// ============================================================================
 // INT8-input scatter kernel: pre-quantized GEMV → partial buffer
 //
 // Like gemv_fused_scatter_int8_vnni_kernel_t but takes pre-quantized INT8
@@ -3401,57 +3478,77 @@ bool rocmGemv_int8_scatter_vnni(
 
     if (kb <= 1)
     {
-        // kb=1: scatter writes one partial = final output (no reduce needed).
-        // Launch scatter kernel and apply scale_B ourselves.
-        // Actually: scatter writes (int32 * scale_A), reduce adds scale_B.
-        // For kb=1 we still need the reduce kernel (or apply scale_B inline).
-        // Use the 2-kernel path with kb=1 for simplicity.
         kb = 1;
     }
 
-    // Hybrid dispatch: self-reduce for small N, 2-kernel for large N
-    constexpr int SELFREDUCE_GRID_N_THRESHOLD = 16;
+    // =======================================================================
+    // Dispatch strategy by kb value:
+    //
+    // kb=1:  Direct kernel — single kernel writes final FP32 output with
+    //        scale_A * scale_B * alpha + bias fused. No partial buffer.
+    //        Eliminates reduce kernel entirely (~2ms savings on LM_HEAD).
+    //
+    // kb>1, small N:  Self-reducing scatter — last-to-arrive inline reduce.
+    //
+    // kb>1, large N:  Two-kernel path — scatter + reduce.
+    // =======================================================================
 
-    if (grid_n < SELFREDUCE_GRID_N_THRESHOLD && kb > 1)
+    if (kb == 1)
     {
-        // Self-reducing path: single kernel, last-to-arrive reduction
-        constexpr int MAX_SELFREDUCE_BLOCKS = 16;
-        static int* s_int8_selfreduce_counters[8] = {};  // per device_id
-
-        int dev_slot = device_id & 7;
-        if (!s_int8_selfreduce_counters[dev_slot])
-        {
-            hipMalloc(&s_int8_selfreduce_counters[dev_slot],
-                      MAX_SELFREDUCE_BLOCKS * sizeof(int));
-        }
-        int* d_counter = s_int8_selfreduce_counters[dev_slot];
-
-        int k_per_block = (k_groups + kb - 1) / kb;
-        int valid_kb = (k_groups + k_per_block - 1) / k_per_block;
-
-        hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
-                       static_cast<hipStream_t>(stream));
-
+        // Direct output path: no partial buffer, no reduce kernel
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_int8_scatter_selfreduce_vnni_kernel_t<TN, CPT>),
-            dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_B_int8_vnni, d_partial_buf, d_C_fp32, d_scale_A,
-            d_scales_B, d_bias, d_counter, N, K, kb, valid_kb,
+            HIP_KERNEL_NAME(gemv_int8_direct_vnni_kernel_t<TN, CPT>),
+            dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scale_A,
+            d_scales_B, d_bias, N, K,
             alpha, beta, d_C_existing);
     }
     else
     {
-        // Two-kernel path: scatter + reduce
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_int8_scatter_vnni_kernel_t<TN, CPT>),
-            dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_B_int8_vnni, d_partial_buf, d_scale_A, N, K, kb);
+        // Hybrid dispatch: self-reduce for small N, 2-kernel for large N
+        constexpr int SELFREDUCE_GRID_N_THRESHOLD = 16;
 
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_reduce_scale_kernel_t<TN, CPT>),
-            dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
-            d_partial_buf, d_C_fp32, d_scales_B, d_bias, N, kb,
-            alpha, beta, d_C_existing);
+        if (grid_n < SELFREDUCE_GRID_N_THRESHOLD)
+        {
+            // Self-reducing path: single kernel, last-to-arrive reduction
+            constexpr int MAX_SELFREDUCE_BLOCKS = 16;
+            static int* s_int8_selfreduce_counters[8] = {};  // per device_id
+
+            int dev_slot = device_id & 7;
+            if (!s_int8_selfreduce_counters[dev_slot])
+            {
+                hipMalloc(&s_int8_selfreduce_counters[dev_slot],
+                          MAX_SELFREDUCE_BLOCKS * sizeof(int));
+            }
+            int* d_counter = s_int8_selfreduce_counters[dev_slot];
+
+            int k_per_block = (k_groups + kb - 1) / kb;
+            int valid_kb = (k_groups + k_per_block - 1) / k_per_block;
+
+            hipMemsetAsync(d_counter, 0, grid_n * sizeof(int),
+                           static_cast<hipStream_t>(stream));
+
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_int8_scatter_selfreduce_vnni_kernel_t<TN, CPT>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_B_int8_vnni, d_partial_buf, d_C_fp32, d_scale_A,
+                d_scales_B, d_bias, d_counter, N, K, kb, valid_kb,
+                alpha, beta, d_C_existing);
+        }
+        else
+        {
+            // Two-kernel path: scatter + reduce
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_int8_scatter_vnni_kernel_t<TN, CPT>),
+                dim3(grid_n, kb), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_B_int8_vnni, d_partial_buf, d_scale_A, N, K, kb);
+
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_reduce_scale_kernel_t<TN, CPT>),
+                dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
+                d_partial_buf, d_C_fp32, d_scales_B, d_bias, N, kb,
+                alpha, beta, d_C_existing);
+        }
     }
 
     hipError_t err = hipGetLastError();
