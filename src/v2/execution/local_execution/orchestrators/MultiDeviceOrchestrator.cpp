@@ -25,6 +25,7 @@
 #include "../../../tensors/TensorClasses.h"
 #include "../../../tensors/TensorFactory.h"
 #include "../../../backends/p2p/DirectP2P.h" // DirectP2PEngine for BAR pre-init in cross-vendor PP
+#include "../../../backends/BackendManager.h" // getBackendFor() for partial D2H in gatherLogits
 #include "../../../utils/Logger.h"
 #include <algorithm>
 #include <future>
@@ -952,17 +953,24 @@ namespace llaminar2
             return true;
         }
 
-        // Column-parallel LM head: each device has logits_local [seq_len, vocab_local]
+        // Column-parallel LM head: each device has logits_local [max_seq_len, vocab_local]
         // We need to gather along the vocab dimension (axis=1), producing [seq_len, vocab_total]
         //
-        // For each row (token position), concatenate vocab_local slices from all devices:
-        //   output[row, 0:vocab_local_0] = device_0_logits[row, :]
-        //   output[row, vocab_local_0:vocab_local_0+vocab_local_1] = device_1_logits[row, :]
-        //   etc.
+        // PERF: logits_local is pre-allocated for max_seq_len (e.g. 4096) but for decode
+        // only 1 row is needed. Calling data() triggers ensureOnHost() which D2H-copies
+        // the ENTIRE tensor (e.g. 4096 * 75968 * 4 = 1.16 GB per device). Instead, we do
+        // a targeted partial D2H of only seq_len rows (~303 KB for decode), which is ~3840x
+        // less data transferred.
 
-        // Collect info from all devices
-        std::vector<const float *> device_data;
-        std::vector<size_t> vocab_locals;
+        // Phase 1: Validate all devices and collect metadata
+        struct DeviceLogitInfo {
+            size_t vocab_local;
+            const void *gpu_ptr;             // GPU buffer pointer (null if CPU-only)
+            std::optional<DeviceId> device;  // GPU device for backend lookup
+            TensorBase *logits_local;        // For CPU fallback path (calls data() via FP32Tensor)
+        };
+        std::vector<DeviceLogitInfo> device_infos;
+        device_infos.reserve(device_runners_.size());
 
         for (const auto &runner : device_runners_)
         {
@@ -986,19 +994,19 @@ namespace llaminar2
                 return false;
             }
 
-            // Use the passed-in seq_len instead of reading from tensor shape
-            // (tensor shape is pre-allocated for max_seq_len, but for decode we only want 1 row)
-            size_t this_vocab_local = shape[1];
-
-            device_data.push_back(state.logits_local->data());
-            vocab_locals.push_back(this_vocab_local);
+            device_infos.push_back(DeviceLogitInfo{
+                shape[1],                                   // vocab_local
+                state.logits_local->gpu_data_ptr(),         // GPU pointer (null for CPU)
+                state.logits_local->current_device(),       // GPU device ID
+                state.logits_local.get()                    // tensor ptr for fallback
+            });
         }
 
         // Calculate total vocab and validate output buffer
         size_t total_vocab = 0;
-        for (size_t vl : vocab_locals)
+        for (const auto &info : device_infos)
         {
-            total_vocab += vl;
+            total_vocab += info.vocab_local;
         }
 
         size_t expected_output_size = seq_len * total_vocab;
@@ -1009,33 +1017,52 @@ namespace llaminar2
             return false;
         }
 
-        // Perform row-by-row column gathering
+        // Phase 2: Partial D2H — only transfer seq_len rows per device
+        // For decode (seq_len=1): ~303 KB per device instead of ~1.16 GB
+        // GPU sync already completed in syncLogitsAtBoundary (called by worker threads)
+        std::vector<std::vector<float>> staging_buffers(device_infos.size());
+        std::vector<const float *> device_data(device_infos.size());
+
+        for (size_t dev = 0; dev < device_infos.size(); ++dev)
+        {
+            const auto &info = device_infos[dev];
+
+            if (info.gpu_ptr && info.device.has_value())
+            {
+                // GPU path: partial D2H of only seq_len rows
+                IBackend *backend = getBackendFor(*info.device);
+                if (backend)
+                {
+                    size_t copy_bytes = seq_len * info.vocab_local * sizeof(float);
+                    staging_buffers[dev].resize(seq_len * info.vocab_local);
+                    backend->deviceToHost(staging_buffers[dev].data(), info.gpu_ptr,
+                                          copy_bytes, info.device->gpu_ordinal());
+                    device_data[dev] = staging_buffers[dev].data();
+                }
+                else
+                {
+                    // Backend lookup failed, fall back to full tensor download
+                    LOG_WARN("MultiDeviceOrchestrator::gatherLogits: no backend for device "
+                             << info.device->toString() << ", falling back to full D2H");
+                    device_data[dev] = info.logits_local->data();
+                }
+            }
+            else
+            {
+                // CPU path: data already on host
+                device_data[dev] = info.logits_local->data();
+            }
+        }
+
+        // Phase 3: Interleave vocab slices into combined output
         float *output = combined_logits_->mutable_data();
 
         // Debug: Log first elements from each device for decode debugging
         if (seq_len == 1 && device_data.size() >= 2)
         {
-            LOG_DEBUG("MultiDeviceOrchestrator::gatherLogits: DECODE DEBUG" << " device0_first=" << device_data[0][0] << " device0_max_idx=" << [&]()
-                      {
-                          size_t max_idx = 0;
-                          float max_val = device_data[0][0];
-                          for (size_t i = 1; i < vocab_locals[0]; ++i) {
-                              if (device_data[0][i] > max_val) {
-                                  max_val = device_data[0][i];
-                                  max_idx = i;
-                              }
-                          }
-                          return std::to_string(max_idx) + " (val=" + std::to_string(max_val) + ")"; }() << " device1_first=" << device_data[1][0] << " device1_max_idx=" << [&]()
-                      {
-                          size_t max_idx = 0;
-                          float max_val = device_data[1][0];
-                          for (size_t i = 1; i < vocab_locals[1]; ++i) {
-                              if (device_data[1][i] > max_val) {
-                                  max_val = device_data[1][i];
-                                  max_idx = i;
-                              }
-                          }
-                          return std::to_string(max_idx) + " (val=" + std::to_string(max_val) + ")"; }());
+            LOG_DEBUG("MultiDeviceOrchestrator::gatherLogits: DECODE DEBUG"
+                      << " device0_first=" << device_data[0][0]
+                      << " device1_first=" << device_data[1][0]);
         }
 
         for (size_t row = 0; row < seq_len; ++row)
@@ -1043,10 +1070,10 @@ namespace llaminar2
             size_t col_offset = 0;
             for (size_t dev = 0; dev < device_data.size(); ++dev)
             {
-                const float *src = device_data[dev] + row * vocab_locals[dev];
+                const float *src = device_data[dev] + row * device_infos[dev].vocab_local;
                 float *dst = output + row * total_vocab + col_offset;
-                std::memcpy(dst, src, vocab_locals[dev] * sizeof(float));
-                col_offset += vocab_locals[dev];
+                std::memcpy(dst, src, device_infos[dev].vocab_local * sizeof(float));
+                col_offset += device_infos[dev].vocab_local;
             }
         }
 

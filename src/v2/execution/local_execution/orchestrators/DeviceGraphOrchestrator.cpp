@@ -780,7 +780,7 @@ namespace llaminar2
             auto end = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / 1000.0;
 
-            LOG_TRACE("[DeviceGraphOrchestrator] Forward (cached decode) completed in "
+            LOG_DEBUG("[DeviceGraphOrchestrator] Forward (cached decode) completed in "
                       << ms << "ms, success=" << success);
 
             return success;

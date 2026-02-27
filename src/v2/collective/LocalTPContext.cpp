@@ -1128,6 +1128,7 @@ namespace llaminar2
             // Woke up - get the shared result
             bool result = barrier_result_;
             LOG_DEBUG("LocalTPContext::allreduceWithBarrierMultiGpu: Waiter released with result=" << result);
+
             return result;
         }
 

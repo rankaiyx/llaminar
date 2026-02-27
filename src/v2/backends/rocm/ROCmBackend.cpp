@@ -10,6 +10,7 @@
 
 #include "ROCmBackend.h"
 #include "AMDDeviceContext.h"
+#include "HipDeviceGuard.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "../../utils/Logger.h"
 #include <hip/hip_runtime.h>
@@ -30,6 +31,42 @@ namespace llaminar2
 
     namespace
     {
+        /**
+         * RAII guard that saves the current HIP device on construction and
+         * restores it (including HipDeviceGuard tracking) on destruction.
+         *
+         * This ensures that ROCmBackend operations that internally call
+         * hipSetDevice() do not corrupt the caller's device context.
+         * Without this, TP threads running on device 0 can find themselves
+         * silently switched to device 1 after a coherence operation,
+         * causing "invalid resource handle" errors on kernel launch.
+         */
+        class HipDeviceSaveRestore
+        {
+        public:
+            HipDeviceSaveRestore() : saved_device_(-1), valid_(false)
+            {
+                hipError_t err = hipGetDevice(&saved_device_);
+                valid_ = (err == hipSuccess && saved_device_ >= 0);
+            }
+
+            ~HipDeviceSaveRestore()
+            {
+                if (valid_)
+                {
+                    // Restore the HIP device and synchronize HipDeviceGuard tracking
+                    HipDeviceGuard::forceSetDevice(saved_device_);
+                }
+            }
+
+            HipDeviceSaveRestore(const HipDeviceSaveRestore &) = delete;
+            HipDeviceSaveRestore &operator=(const HipDeviceSaveRestore &) = delete;
+
+        private:
+            int saved_device_;
+            bool valid_;
+        };
+
         struct PointerEvent
         {
             const char *kind = "?";
@@ -101,6 +138,7 @@ namespace llaminar2
             return false;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipError_t err_set = hipSetDevice(device_id);
         if (err_set != hipSuccess)
         {
@@ -139,6 +177,7 @@ namespace llaminar2
             return false;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipError_t err_set = hipSetDevice(device_id);
         if (err_set != hipSuccess)
         {
@@ -177,6 +216,7 @@ namespace llaminar2
             return false;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipError_t err_set = hipSetDevice(device_id);
         if (err_set != hipSuccess)
         {
@@ -194,6 +234,7 @@ namespace llaminar2
             return false;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipError_t err_set = hipSetDevice(device_id);
         if (err_set != hipSuccess)
         {
@@ -216,6 +257,7 @@ namespace llaminar2
             return nullptr;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
@@ -240,6 +282,7 @@ namespace llaminar2
             return;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipSetDevice(device_id);
         hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
         hipEventDestroy(hip_event);
@@ -252,6 +295,7 @@ namespace llaminar2
             return false;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
@@ -279,6 +323,7 @@ namespace llaminar2
             return false;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
@@ -319,8 +364,10 @@ namespace llaminar2
             return false;
         }
 
-        hipError_t err = hipSetDevice(device_id);
-        return (err == hipSuccess);
+        // Intentional device change — update HipDeviceGuard tracking
+        // (no save/restore here, caller explicitly wants to change device)
+        int result = HipDeviceGuard::forceSetDevice(device_id);
+        return (result == 0);
     }
 
     // ====================================================================
@@ -336,6 +383,7 @@ namespace llaminar2
         }
 
         // Set device before allocation
+        HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
@@ -399,6 +447,7 @@ namespace llaminar2
         }
 
         // Set device before allocation
+        HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
@@ -450,6 +499,7 @@ namespace llaminar2
         }
 
         // hipHostFree doesn't require setting device, but we do it for consistency
+        HipDeviceSaveRestore device_guard;
         if (device_id >= device_count_ || device_id < 0)
         {
             LOG_WARN("[ROCmBackend] Invalid device ID " << device_id << " for freeMapped, attempting anyway");
@@ -480,6 +530,7 @@ namespace llaminar2
         }
 
         // Set device before freeing
+        HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
@@ -599,6 +650,7 @@ namespace llaminar2
         }
 
         // Set device before memset
+        HipDeviceSaveRestore device_guard;
         hipError_t err = hipSetDevice(device_id);
         if (err != hipSuccess)
         {
@@ -672,6 +724,7 @@ namespace llaminar2
             return 0;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipError_t err_set = hipSetDevice(device_id);
         if (err_set != hipSuccess)
         {
@@ -990,6 +1043,7 @@ namespace llaminar2
             return false;
         }
 
+        HipDeviceSaveRestore device_guard;
         hipError_t err_set = hipSetDevice(device_id);
         if (err_set != hipSuccess)
         {
