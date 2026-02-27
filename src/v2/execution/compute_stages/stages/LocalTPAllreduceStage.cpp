@@ -64,10 +64,18 @@ namespace llaminar2
                                                               << " (params_.count=" << params_.count
                                                               << ", tensor numel=" << params_.tensor->numel() << ")");
 
-        // Use stage_name overload with count parameter
-        // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size)
+        // When a GPU stream is set (graph capture or explicit stream execution),
+        // use the on-stream allreduce path. This issues rcclAllReduce directly
+        // on the caller's stream without cross-stream event sync, making it
+        // compatible with HIP/CUDA graph capture.
         bool success;
-        if (!params_.stage_name.empty())
+        void *stream = gpuStream();
+        if (stream)
+        {
+            success = params_.tp_ctx->allreduceOnStream(
+                params_.tensor, params_.stage_name, effective_count, stream);
+        }
+        else if (!params_.stage_name.empty())
         {
             success = params_.tp_ctx->allreduce(params_.tensor, params_.stage_name, effective_count);
         }

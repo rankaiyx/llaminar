@@ -98,6 +98,8 @@ namespace llaminar2
 
         bool allreduce(TensorBase *tensor) override;
         bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override;
+        bool allreduceOnStream(TensorBase *tensor, const std::string &stage_name,
+                               size_t count, void *stream) override;
         bool allreduce(const TensorBase *input, TensorBase *output) override;
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override;
         bool gatherFromDevices(
@@ -202,6 +204,29 @@ namespace llaminar2
         std::pair<int, int> colRangeForDevice(
             const GlobalDeviceAddress &device, int total_cols) const override;
 
+        // =====================================================================
+        // Abort (for one-sided failure recovery)
+        // =====================================================================
+
+        /**
+         * @brief Request abort of all pending collective operations.
+         *
+         * Called when one device thread fails (e.g., graph capture error) and
+         * the other device may be blocked waiting for a matching RCCL call.
+         * This calls ncclCommAbort() on all communicators to force-unblock
+         * any pending operations, preventing deadlocks.
+         *
+         * After calling this, the LocalTPContext is NOT usable for further
+         * collectives. The process should exit soon after.
+         */
+        void requestAbort();
+
+        /**
+         * @brief Check if abort has been requested by any device thread.
+         * @return true if requestAbort() was called
+         */
+        bool isAbortRequested() const { return abort_requested_.load(std::memory_order_acquire); }
+
     private:
         std::vector<GlobalDeviceAddress> devices_;
         std::vector<float> weights_; ///< Normalized weights (sum to 1.0)
@@ -295,6 +320,7 @@ namespace llaminar2
         std::atomic<bool> logged_real_path_marker_{false};
         std::atomic<bool> logged_graph_policy_reject_marker_{false};
         std::atomic<bool> logged_graph_policy_allow_marker_{false};
+        std::atomic<bool> abort_requested_{false};
 
         // =====================================================================
         // BAR-Backed Tensor Registry
@@ -400,6 +426,19 @@ namespace llaminar2
          * @return true on success (same result for all participants)
          */
         bool allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
+
+        /**
+         * @brief Per-device async allreduce with barrier fallback
+         *
+         * Tries barrier-free per-device allreduce first (host never blocks).
+         * Falls back to allreduceWithBarrierMultiGpu if backend doesn't support it.
+         *
+         * @param tensor This device's tensor
+         * @param stage_name Stage identifier for logging
+         * @param count Number of elements (0 = use numel)
+         * @return true on success
+         */
+        bool allreducePerDeviceOrBarrier(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
 
         /**
          * @brief Validate barrier-collected tensors before multi-GPU allreduce launch.

@@ -642,6 +642,7 @@ namespace llaminar2
         std::vector<std::string> gpu_graph_collective_segmented_capture_allow; ///< Optional stage-name allowlist for segmented collective capture (env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW)
         bool gpu_graph_stream_only = false;                                    ///< Execute segmented path on stream-only mode (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY)
         bool gpu_graph_stream_only_default = false;                            ///< Stream-only mode uses default stream (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT)
+        bool gpu_graph_trace_replay = false;                                   ///< Trace per-segment progress during graph replay (env: LLAMINAR_GPU_GRAPH_TRACE_REPLAY)
         bool force_mpi_collective_context = false;                             ///< Force MPI-backed CollectiveContext in GLOBAL TP (env: LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT)
 
         // =================================================================
@@ -836,6 +837,12 @@ namespace llaminar2
             if (gpu_graph_stream_only_default_env)
             {
                 gpu_graph_stream_only_default = (std::atoi(gpu_graph_stream_only_default_env) != 0);
+            }
+
+            const char *gpu_graph_trace_replay_env = std::getenv("LLAMINAR_GPU_GRAPH_TRACE_REPLAY");
+            if (gpu_graph_trace_replay_env)
+            {
+                gpu_graph_trace_replay = (std::atoi(gpu_graph_trace_replay_env) != 0);
             }
 
             const char *force_mpi_collective_ctx_env = std::getenv("LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT");

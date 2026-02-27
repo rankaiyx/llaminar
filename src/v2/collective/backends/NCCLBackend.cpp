@@ -384,9 +384,9 @@ namespace llaminar2
 
         initialized_ = true;
         LOG_INFO("[NCCLReady] status=ready"
-             << " mode=" << (is_multi_gpu_single_process_ ? "multi_gpu_single_process" : (is_multi_process ? "multi_process" : "single_gpu"))
-             << " num_ranks=" << num_ranks_
-             << " local_rank=" << local_rank_);
+                 << " mode=" << (is_multi_gpu_single_process_ ? "multi_gpu_single_process" : (is_multi_process ? "multi_process" : "single_gpu"))
+                 << " num_ranks=" << num_ranks_
+                 << " local_rank=" << local_rank_);
         return true;
 #else
         last_error_ = "NCCL not available (HAVE_NCCL not defined)";
@@ -1317,6 +1317,97 @@ namespace llaminar2
         (void)count;
         (void)dtype;
         (void)op;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::allreduceMultiWithComputeDeps(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allreduceMultiWithComputeDeps requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") doesn't match GPU count (" + std::to_string(num_ranks_) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allreduceMultiWithComputeDeps(buffers, count, dtype, op))
+        {
+            last_error_ = "NCCLCoordinator allreduceMultiWithComputeDeps failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLBackend::allreduceSingleDeviceAsync(
+        void *buffer, size_t count,
+        CollectiveDataType dtype, CollectiveOp op,
+        int device_idx)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_)
+        {
+            last_error_ = "NCCLBackend not initialized";
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "No NCCLCoordinator";
+            return false;
+        }
+
+        if (!coordinator_->allreduceSingleDeviceAsync(buffer, count, dtype, op, device_idx))
+        {
+            last_error_ = "NCCLCoordinator allreduceSingleDeviceAsync failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)device_idx;
         last_error_ = "NCCL not available";
         return false;
 #endif

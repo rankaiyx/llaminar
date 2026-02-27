@@ -19,6 +19,7 @@
 #include "../kernels/KernelFactory.h"
 #include "../collective/backends/PCIeBARBackend.h"
 #include "../collective/BackendRouter.h"
+#include "../execution/local_execution/graph/GraphCaptureGuard.h"
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
@@ -1126,6 +1127,34 @@ namespace llaminar2
     bool TensorBase::ensureOnDevice(DeviceId target_device)
     {
         std::lock_guard<std::mutex> lock(coherence_mutex_);
+
+        // ===== GRAPH CAPTURE FAST PATH =====
+        // During HIP/CUDA graph capture, synchronization operations
+        // (hipDeviceSynchronize, hipMemcpy, event waits) are illegal and
+        // poison the capture state. When the thread-local capture flag is
+        // set, we ONLY check that data is already on the target device.
+        // This is safe because Phase 1 (warmup) already executed all stages
+        // normally, ensuring all tensors are uploaded before capture begins.
+        if (isGraphCaptureActive())
+        {
+            if (gpu_data_ptr_ && gpu_device_.has_value() &&
+                *gpu_device_ == target_device && device_valid_)
+            {
+                return true;
+            }
+            // BAR-backed and mapped tensors also work during capture
+            if (is_bar_backed_ || (is_mapped_ && mapped_device_ptr_ != nullptr))
+            {
+                return true;
+            }
+            LOG_ERROR("[TensorBase::ensureOnDevice] Called during graph capture but "
+                      "tensor is NOT on device "
+                      << target_device.toString()
+                      << " — data must be uploaded during warmup phase first."
+                      << " gpu_data_ptr=" << gpu_data_ptr_
+                      << " device_valid=" << device_valid_);
+            return false;
+        }
 
         // Validate target device - must be a GPU
         if (!target_device.is_gpu())

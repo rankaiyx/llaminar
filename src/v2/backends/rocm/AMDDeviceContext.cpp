@@ -486,10 +486,33 @@ namespace llaminar2
 
     void AMDDeviceContext::synchronize()
     {
+        // During graph capture, hipDeviceSynchronize() is illegal — it poisons
+        // the capture state. Skip the sync entirely since no real GPU work is
+        // happening during capture recording (kernels are just being recorded).
+        if (capture_active_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
         submitAndWait([this]()
                       {
+        // Re-check capture_active_ inside worker — another thread's capture
+        // controller may have started capture between our outer check and
+        // this worker dispatch (race in multi-device TP graph capture).
+        if (capture_active_.load(std::memory_order_acquire))
+            return;
+
         hipError_t err = hipDeviceSynchronize();
         if (err != hipSuccess) {
+            // hipErrorStreamCaptureUnsupported (900): another thread started
+            // graph capture on this device after our check. Benign race in
+            // multi-device TP — the capture will complete without this sync.
+            if (err == hipErrorStreamCaptureUnsupported ||
+                err == hipErrorStreamCaptureImplicit) {
+                LOG_DEBUG("[AMDDeviceContext] Skipping hipDeviceSynchronize during "
+                          "concurrent graph capture (ordinal=" << device_ordinal_ << ")");
+                return;
+            }
             LOG_ERROR("[AMDDeviceContext] hipDeviceSynchronize failed: " 
                       << hipGetErrorString(err));
         } });
@@ -497,10 +520,25 @@ namespace llaminar2
 
     void AMDDeviceContext::synchronizeStream(void *stream)
     {
+        // During graph capture, stream sync is illegal on the capture stream.
+        if (capture_active_.load(std::memory_order_acquire))
+        {
+            return;
+        }
+
         hipStream_t hip_stream = stream ? static_cast<hipStream_t>(stream) : hipStream_t(0);
         hipError_t err = hipStreamSynchronize(hip_stream);
         if (err != hipSuccess)
         {
+            // Benign race: another thread started capture after our check.
+            if (err == hipErrorStreamCaptureUnsupported ||
+                err == hipErrorStreamCaptureImplicit)
+            {
+                LOG_DEBUG("[AMDDeviceContext] Skipping hipStreamSynchronize during "
+                          "concurrent graph capture (ordinal="
+                          << device_ordinal_ << ")");
+                return;
+            }
             LOG_ERROR("[AMDDeviceContext] hipStreamSynchronize failed: "
                       << hipGetErrorString(err));
         }
@@ -513,6 +551,17 @@ namespace llaminar2
         // Unlike synchronizeStream(), this does NOT block the CPU.
         hipStream_t dep_stream = dependent_stream ? static_cast<hipStream_t>(dependent_stream) : hipStream_t(0);
         hipStream_t src_stream = dependency_stream ? static_cast<hipStream_t>(dependency_stream) : hipStream_t(0);
+
+        // hipEventCreate associates the event with the "current" device on the
+        // calling thread.  When called from multi-device TP replay threads the
+        // thread-local device may not match this context's device, so force it.
+        hipError_t set_err = hipSetDevice(device_ordinal_);
+        if (set_err != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipSetDevice(" << device_ordinal_
+                                                         << ") failed in insertStreamDependency: " << hipGetErrorString(set_err));
+            return;
+        }
 
         hipEvent_t event;
         hipError_t err = hipEventCreateWithFlags(&event, hipEventDisableTiming);

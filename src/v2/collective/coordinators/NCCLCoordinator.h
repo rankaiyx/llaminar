@@ -154,6 +154,33 @@ namespace llaminar2
                                           CollectiveDataType dtype, CollectiveOp op);
 
         /**
+         * @brief In-place allreduce with GPU stream dependency insertion (non-blocking)
+         *
+         * Queues NCCL collective and inserts cudaStreamWaitEvent(compute_stream,
+         * completion_event) per device so the compute stream waits for NCCL results
+         * on the GPU side. Host is NOT blocked waiting for GPU completion.
+         *
+         * Requires compute streams to be registered via setComputeStreams().
+         * Falls back to allreduceMultiAndSynchronize() if compute streams not set.
+         */
+        bool allreduceMultiWithComputeDeps(const std::vector<void *> &buffers, size_t count,
+                                           CollectiveDataType dtype, CollectiveOp op);
+
+        /**
+         * @brief Per-device non-blocking allreduce (barrier-free)
+         *
+         * Each device thread calls this independently. NCCL internally matches
+         * calls across devices. Host returns immediately — synchronization is
+         * GPU-side via stream dependencies.
+         *
+         * Thread-safe: each call accesses only device_idx's resources.
+         * Requires compute streams registered via setComputeStreams().
+         */
+        bool allreduceSingleDeviceAsync(void *buffer, size_t count,
+                                        CollectiveDataType dtype, CollectiveOp op,
+                                        int device_idx);
+
+        /**
          * @brief Allgather across all local GPUs
          *
          * Each device contributes send_count elements, receives
@@ -306,6 +333,7 @@ namespace llaminar2
         bool doAllreduceMulti(const std::vector<void *> &buffers, size_t count,
                               int dtype_int, int op_int);
         bool doSynchronizeAll();
+        bool doInsertComputeStreamDeps();
         bool doAllgatherMulti(const std::vector<const void *> &send_buffers,
                               const std::vector<void *> &recv_buffers,
                               size_t send_count, int dtype_int);
@@ -331,8 +359,8 @@ namespace llaminar2
         std::vector<void *> completion_events_; // cudaEvent_t[] - signaled after each collective
 
         // Compute stream state for stream-level pre-sync (set via setComputeStreams)
-        std::vector<void *> compute_streams_;   // cudaStream_t[] - one per device (compute streams)
-        std::vector<void *> compute_events_;    // cudaEvent_t[] - pre-created for event-based sync
+        std::vector<void *> compute_streams_; // cudaStream_t[] - one per device (compute streams)
+        std::vector<void *> compute_events_;  // cudaEvent_t[] - pre-created for event-based sync
 
         // Worker thread
         std::thread coordinator_thread_;
@@ -344,6 +372,10 @@ namespace llaminar2
         std::queue<std::function<void()>> work_queue_;
         mutable std::mutex queue_mutex_;
         std::condition_variable queue_cv_;
+
+        // Direct execution mutex — serializes direct-path allreduce calls
+        // that bypass the coordinator thread (see allreduceMultiWithComputeDeps)
+        std::mutex direct_exec_mutex_;
     };
 
 } // namespace llaminar2

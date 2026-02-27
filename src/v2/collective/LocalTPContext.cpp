@@ -429,6 +429,27 @@ namespace llaminar2
     // Configuration
     // =========================================================================
 
+    void LocalTPContext::requestAbort()
+    {
+        // Set the flag first so other threads see it immediately
+        bool was_set = abort_requested_.exchange(true, std::memory_order_acq_rel);
+        if (was_set)
+        {
+            LOG_WARN("[LocalTPContext] requestAbort() called but abort already in progress");
+            return;
+        }
+
+        LOG_WARN("[LocalTPContext] Abort requested — aborting collective backend to unblock stuck devices");
+
+        if (backend_impl_)
+        {
+            backend_impl_->abort();
+        }
+
+        // Wake any threads blocked on the barrier condition variable
+        barrier_cv_.notify_all();
+    }
+
     const std::vector<GlobalDeviceAddress> &LocalTPContext::devices() const
     {
         return devices_;
@@ -536,20 +557,19 @@ namespace llaminar2
 #endif
 
         // ================================================================
-        // Multi-GPU Backends (NCCL/RCCL): Use barrier-synchronized allreduce
+        // Multi-GPU Backends (NCCL/RCCL): Prefer barrier-free per-device allreduce
         // ================================================================
-        // For LOCAL TP with multiple threads (one per device), each thread calls
-        // allreduce() with its OWN tensor. We CANNOT use getDeviceBuffers() on a
-        // single tensor because TensorBase can only be on ONE GPU at a time.
-        // Instead, use the barrier-synchronized approach where all device threads
-        // rendezvous, collect their buffers, then the last arrival executes
-        // allreduceMulti with all buffers.
+        // Each device thread independently calls rcclAllReduce with its own
+        // communicator. RCCL internally matches calls across devices.
+        // Stream dependencies ensure GPU-side ordering — host never blocks.
+        //
+        // Falls back to barrier-synchronized path if the backend doesn't
+        // support per-device async (e.g., PCIeBAR or older NCCL).
         if (backend_impl_->isMultiGpuSingleProcess() && degree() > 1)
         {
-            // Release the main mutex before entering barrier (to avoid deadlock)
-            // The barrier has its own mutex for synchronization
+            // Release the main mutex before any blocking path
             lock.unlock();
-            return allreduceWithBarrierMultiGpu(tensor, stage_name, effective_count);
+            return allreducePerDeviceOrBarrier(tensor, stage_name, effective_count);
         }
         else
         {
@@ -589,6 +609,89 @@ namespace llaminar2
             }
             return result;
         }
+    }
+
+    bool LocalTPContext::allreduceOnStream(TensorBase *tensor, const std::string &stage_name,
+                                           size_t count, void *stream)
+    {
+        // When no stream is provided, fall back to the normal allreduce path
+        if (!stream)
+        {
+            return allreduce(tensor, stage_name, count);
+        }
+
+        if (!tensor)
+        {
+            LOG_ERROR("LocalTPContext::allreduceOnStream: null tensor");
+            return false;
+        }
+
+        // Single-device context — no-op
+        if (degree() == 1)
+        {
+            return true;
+        }
+
+        const size_t effective_count = (count > 0) ? count : tensor->numel();
+
+        // Determine device index from tensor placement
+        int device_index = -1;
+        auto tensor_device = tensor->current_device();
+        if (tensor_device.has_value())
+        {
+            for (size_t i = 0; i < devices_.size(); ++i)
+            {
+                if (devices_[i].toLocalDeviceId() == *tensor_device)
+                {
+                    device_index = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+
+        if (device_index < 0 || device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::allreduceOnStream: tensor device "
+                      << (tensor_device.has_value() ? tensor_device->toString() : "none")
+                      << " not found in devices list (degree=" << degree() << ")");
+            return false;
+        }
+
+        // Get GPU pointer directly — do NOT call ensureOnDevice() here.
+        // During HIP/CUDA graph capture, ensureOnDevice() can trigger
+        // hipDeviceSynchronize() (via event waits, backend sync, or H2D copy),
+        // which is illegal and poisons the capture state.
+        // This is safe because:
+        //   - Phase 1 (warmup) already executed all stages normally, uploading
+        //     all tensors to their target devices
+        //   - Phase 2 (capture) replays the same stages, so data is already on-device
+        //   - If gpu_data_ptr() is null here, it's a bug in the warmup path
+        void *buffer = tensor->gpu_data_ptr();
+        if (!buffer)
+        {
+            LOG_ERROR("LocalTPContext::allreduceOnStream: null GPU buffer for slot "
+                      << device_index << " — tensor was not uploaded during warmup. "
+                      << "This is a bug: allreduceOnStream requires data already on-device.");
+            return false;
+        }
+
+        // Issue allreduce directly on the caller's stream (graph-capturable)
+        CollectiveDataType dtype = tensorDTypeToCollective(tensor);
+        bool success = backend_impl_->allreduceSingleDeviceOnStream(
+            buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM,
+            device_index, stream);
+
+        if (success)
+        {
+            // Mark tensor dirty (the allreduce result is on-device)
+            tensor->mark_device_dirty_flags_only();
+            return true;
+        }
+
+        LOG_WARN("LocalTPContext::allreduceOnStream: on-stream allreduce not supported, "
+                 "falling back to normal path for stage="
+                 << stage_name);
+        return allreduce(tensor, stage_name, effective_count);
     }
 
     bool LocalTPContext::allreduce(const TensorBase *input, TensorBase *output)
@@ -867,6 +970,74 @@ namespace llaminar2
     // This is necessary because TensorBase can only exist on ONE GPU at a time,
     // so we cannot use getDeviceBuffers() to gather buffers from a single tensor.
     // =========================================================================
+
+    bool LocalTPContext::allreducePerDeviceOrBarrier(TensorBase *tensor,
+                                                     const std::string &stage_name, size_t count)
+    {
+        // Fast path: per-device async allreduce — no barrier, no buffer collection.
+        // Each device thread independently calls RCCL/NCCL AllReduce with its own
+        // communicator. RCCL internally matches calls from different threads.
+        // Host returns immediately; all sync is GPU-side via stream deps.
+
+        // 1. Determine device index from tensor placement
+        int device_index = -1;
+        auto tensor_device = tensor->current_device();
+        if (tensor_device.has_value())
+        {
+            for (size_t i = 0; i < devices_.size(); ++i)
+            {
+                if (devices_[i].toLocalDeviceId() == *tensor_device)
+                {
+                    device_index = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
+
+        if (device_index < 0 || device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::allreducePerDeviceOrBarrier: tensor device "
+                      << (tensor_device.has_value() ? tensor_device->toString() : "none")
+                      << " not found in devices list (degree=" << degree() << ")");
+            return false;
+        }
+
+        // 2. Ensure tensor is on device and get GPU pointer
+        DeviceId expected_device = devices_[device_index].toLocalDeviceId();
+        if (!tensor->ensureOnDevice(expected_device))
+        {
+            LOG_ERROR("LocalTPContext::allreducePerDeviceOrBarrier: ensureOnDevice failed for slot "
+                      << device_index);
+            return false;
+        }
+
+        void *buffer = tensor->gpu_data_ptr();
+        if (!buffer)
+        {
+            LOG_ERROR("LocalTPContext::allreducePerDeviceOrBarrier: null GPU buffer for slot "
+                      << device_index);
+            return false;
+        }
+
+        // 3. Try per-device async allreduce (barrier-free)
+        CollectiveDataType dtype = tensorDTypeToCollective(tensor);
+        bool success = backend_impl_->allreduceSingleDeviceAsync(
+            buffer, count, dtype, CollectiveOp::ALLREDUCE_SUM, device_index);
+
+        if (success)
+        {
+            // Mark tensor dirty (flags only — RCCL may not have completed yet,
+            // but compute stream has a WaitEvent dep on RCCL completion)
+            tensor->mark_device_dirty_flags_only();
+            return true;
+        }
+
+        // 4. Fallback: barrier-synchronized path (for backends that don't support per-device async)
+        LOG_DEBUG("LocalTPContext::allreducePerDeviceOrBarrier: per-device async not supported, "
+                  "falling back to barrier path for stage="
+                  << stage_name);
+        return allreduceWithBarrierMultiGpu(tensor, stage_name, count);
+    }
 
     bool LocalTPContext::allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name, size_t count)
     {
@@ -1396,7 +1567,7 @@ namespace llaminar2
 #endif
             }
 
-            bool success = backend_impl_->allreduceMultiAndSynchronize(
+            bool success = backend_impl_->allreduceMultiWithComputeDeps(
                 buffers, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM);
 
             if (backend_ == CollectiveBackendType::NCCL)
@@ -1517,12 +1688,19 @@ namespace llaminar2
             }
 #endif
 
-            // Mark all tensors as device-dirty (data was modified on GPU)
+            // Mark all tensors as device-dirty (data was modified on GPU).
+            // Use flags-only variant because with non-blocking allreduce
+            // (allreduceMultiWithComputeDeps), the RCCL work may not have
+            // completed on the GPU yet. Recording an event here would be
+            // on the wrong stream. The compute stream has a WaitEvent dep
+            // on the RCCL completion event, so subsequent GPU kernels are
+            // safe. If data() is later called (e.g., for sampling), it
+            // falls back to a full device sync which IS correct.
             for (int i = 0; i < num_participants; ++i)
             {
                 if (barrier_tensors_[i])
                 {
-                    barrier_tensors_[i]->mark_device_dirty_with_event();
+                    barrier_tensors_[i]->mark_device_dirty_flags_only();
                 }
             }
 

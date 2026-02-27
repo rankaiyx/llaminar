@@ -1086,7 +1086,8 @@ namespace llaminar2
                 *segment_cache,
                 gpu_stream,
                 gpu_ctx,
-                collective_nodes);
+                collective_nodes,
+                policy.collectives_graph_capturable);
 
             if (success)
             {
@@ -1109,7 +1110,8 @@ namespace llaminar2
                                                                GraphSegmentCache &segment_cache,
                                                                void *gpu_stream,
                                                                IWorkerGPUContext *gpu_ctx,
-                                                               const std::unordered_set<std::string> *collective_nodes)
+                                                               const std::unordered_set<std::string> *collective_nodes,
+                                                               bool collectives_graph_capturable)
     {
         if (!gpu_stream || !gpu_ctx)
         {
@@ -1238,16 +1240,39 @@ namespace llaminar2
         // We do NOT capture on the first call. Some kernels lazily initialize workspace
         // buffers (hipMalloc), which isn't compatible with stream capture.
         // First call builds the segment list and runs via executeFastDecode.
+        //
+        // CRITICAL: Run warmup on the CAPTURE stream (not default stream). CK and
+        // ROCm kernel dispatch may cache per-stream state (dispatch tables, workspace
+        // allocations). If warmup runs on the default stream, the capture stream sees
+        // "fresh" kernel contexts that trigger capture-unsafe lazy initialization,
+        // causing intermittent "operation failed due to a previous error during capture".
         if (phase_transition.phase == DeviceGraphCaptureController::Phase::Warmup)
         {
             DeviceGraphCaptureController::executeWarmupPhase(
                 graph,
                 segment_cache,
                 collective_nodes,
-                has_collective_nodes);
+                has_collective_nodes,
+                collectives_graph_capturable);
+
+            // Create the capture stream early so warmup runs on it.
+            if (segment_cache.ensureCaptureStream(gpu_ctx))
+            {
+                void *warmup_stream = segment_cache.capture_stream;
+                // Point all stages at the capture stream for warmup execution.
+                for (const auto &name : graph.getExecutionOrder())
+                {
+                    auto *node = graph.getNode(name);
+                    if (node && node->stage)
+                    {
+                        node->stage->setGPUStream(warmup_stream);
+                    }
+                }
+            }
 
             // Warmup executes all stages normally (no capture) to ensure
-            // lazy kernel initialization and workspace allocation complete.
+            // lazy kernel initialization and workspace allocation complete
+            // on the capture stream.
             return executeFastDecode(graph, ctx, collective_nodes);
         }
 
@@ -1272,6 +1297,9 @@ namespace llaminar2
             {
                 if (capture_result.fallback_to_fast_decode)
                 {
+                    // The partial capture marked some nodes completed —
+                    // reset so fast decode re-executes all stages.
+                    graph.reset();
                     return executeFastDecode(graph, ctx, collective_nodes);
                 }
                 return false;

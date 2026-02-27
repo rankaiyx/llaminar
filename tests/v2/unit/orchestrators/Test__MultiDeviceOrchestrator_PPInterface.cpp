@@ -152,6 +152,9 @@ namespace llaminar2::test
         bool reserveTempBufferBytes(size_t) override { return true; }
         bool broadcast(TensorBase *, int) override { return true; }
 
+        void requestAbort() override {}
+        bool isAbortRequested() const override { return false; }
+
     private:
         std::vector<GlobalDeviceAddress> devices_;
         std::vector<float> weights_;

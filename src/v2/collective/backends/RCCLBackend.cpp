@@ -416,6 +416,21 @@ namespace llaminar2
 #endif
     }
 
+    void RCCLBackend::abort()
+    {
+#ifdef HAVE_RCCL
+        LOG_WARN("RCCLBackend: Aborting all collective operations");
+
+        if (coordinator_)
+        {
+            coordinator_->abortCommunicators();
+        }
+
+        initialized_ = false;
+        LOG_WARN("RCCLBackend: Abort complete");
+#endif
+    }
+
     // =========================================================================
     // Collective Operations
     // =========================================================================
@@ -1181,6 +1196,135 @@ namespace llaminar2
         (void)count;
         (void)dtype;
         (void)op;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allreduceMultiWithComputeDeps(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allreduceMultiWithComputeDeps requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") doesn't match GPU count (" + std::to_string(num_ranks_) + ")";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allreduceMultiWithComputeDeps(buffers, count, dtype, op))
+        {
+            last_error_ = "RCCLCoordinator allreduceMultiWithComputeDeps failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allreduceSingleDeviceAsync(
+        void *buffer, size_t count,
+        CollectiveDataType dtype, CollectiveOp op,
+        int device_idx)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "No RCCLCoordinator";
+            return false;
+        }
+
+        if (!coordinator_->allreduceSingleDeviceAsync(buffer, count, dtype, op, device_idx))
+        {
+            last_error_ = "RCCLCoordinator allreduceSingleDeviceAsync failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)device_idx;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allreduceSingleDeviceOnStream(
+        void *buffer, size_t count,
+        CollectiveDataType dtype, CollectiveOp op,
+        int device_idx, void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "No RCCLCoordinator";
+            return false;
+        }
+
+        if (!coordinator_->allreduceSingleDeviceOnStream(buffer, count, dtype, op, device_idx, stream))
+        {
+            last_error_ = "RCCLCoordinator allreduceSingleDeviceOnStream failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)device_idx;
+        (void)stream;
         last_error_ = "RCCL not available";
         return false;
 #endif

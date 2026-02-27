@@ -135,6 +135,27 @@ namespace llaminar2
         }
 
         /**
+         * @brief All-reduce sum on a specific GPU stream (graph-capturable)
+         *
+         * Like allreduce() but issues the collective directly on the provided
+         * GPU stream. This makes the operation compatible with GPU graph capture.
+         * When stream is nullptr, falls back to the normal allreduce() path.
+         *
+         * @param tensor Tensor to all-reduce (modified in-place)
+         * @param stage_name Stage identifier
+         * @param count Elements to reduce (0 = use tensor->numel())
+         * @param stream GPU stream (hipStream_t/cudaStream_t cast to void*), or nullptr
+         * @return true on success, false on error
+         */
+        virtual bool allreduceOnStream(TensorBase *tensor, const std::string &stage_name,
+                                       size_t count, void *stream)
+        {
+            (void)stream;
+            // Default: delegate to normal allreduce, ignoring stream
+            return allreduce(tensor, stage_name, count);
+        }
+
+        /**
          * @brief Broadcast tensor from source to all participants
          *
          * Copies tensor from source_index participant to all others.

@@ -234,6 +234,26 @@ namespace llaminar2
         virtual void setComputeStreams(const std::vector<void *> &compute_streams) { (void)compute_streams; }
 
         // =====================================================================
+        // Abort (for one-sided failure recovery)
+        // =====================================================================
+
+        /**
+         * @brief Request abort of all pending collective operations.
+         *
+         * Called when one device thread fails and others may be stuck in
+         * collective calls waiting for matching operations. Forcefully
+         * tears down communicators to unblock pending operations.
+         *
+         * After calling this, the context is NOT usable for further collectives.
+         */
+        virtual void requestAbort() = 0;
+
+        /**
+         * @brief Check if abort has been requested by any device thread.
+         */
+        virtual bool isAbortRequested() const = 0;
+
+        // =====================================================================
         // Device Management
         // =====================================================================
 

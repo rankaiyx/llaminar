@@ -91,6 +91,21 @@ namespace llaminar2
         void shutdown() override;
 
         /**
+         * @brief Forcefully abort all RCCL communicators.
+         *
+         * Calls ncclCommAbort() on every communicator to immediately unblock
+         * any pending RCCL collective operations (e.g., allreduce waiting for
+         * a matching call from another device that will never come).
+         *
+         * After calling this, the coordinator is NOT usable for further
+         * collective operations. This is intended for error recovery when
+         * one device thread has failed and the other is stuck in RCCL.
+         *
+         * Thread-safe: may be called from any thread.
+         */
+        void abortCommunicators();
+
+        /**
          * @brief Check if coordinator is initialized and ready
          */
         bool isInitialized() const override { return initialized_.load(); }
@@ -149,6 +164,82 @@ namespace llaminar2
          */
         bool allreduceMultiAndSynchronize(const std::vector<void *> &buffers, size_t count,
                                           CollectiveDataType dtype, CollectiveOp op);
+
+        /**
+         * @brief In-place allreduce with GPU stream dependency insertion (non-blocking)
+         *
+         * Queues RCCL collective and inserts hipStreamWaitEvent(compute_stream,
+         * completion_event) per device so the compute stream waits for RCCL results
+         * on the GPU side. Host is NOT blocked waiting for GPU completion.
+         *
+         * This is the preferred path for pipeline-overlapped execution where the
+         * host thread should continue dispatching compute stages immediately.
+         *
+         * Requires compute streams to be registered via setComputeStreams().
+         * Falls back to allreduceMultiAndSynchronize() if compute streams not set.
+         */
+        bool allreduceMultiWithComputeDeps(const std::vector<void *> &buffers, size_t count,
+                                           CollectiveDataType dtype, CollectiveOp op);
+
+        /**
+         * @brief Per-device non-blocking allreduce (barrier-free)
+         *
+         * Each device thread calls this independently with its own buffer and
+         * device index. RCCL internally matches calls across devices. The host
+         * returns immediately — all synchronization is GPU-side via stream deps.
+         *
+         * This eliminates the host barrier, condition_variable, and grouped
+         * RCCL launch overhead. Each call:
+         * 1. Records compute_event on compute_stream (pre-sync)
+         * 2. RCCL stream waits for compute_event
+         * 3. Launches rcclAllReduce on RCCL stream (non-grouped)
+         * 4. Records completion_event on RCCL stream
+         * 5. Compute stream waits for completion_event (post-sync)
+         *
+         * Thread-safe: each call accesses only device_idx's resources.
+         * Requires compute streams registered via setComputeStreams().
+         *
+         * @param buffer In-place buffer on device_idx's GPU
+         * @param count Elements to reduce
+         * @param dtype Data type
+         * @param op Reduction operation
+         * @param device_idx Device index (0 to num_devices-1)
+         * @return true on success
+         */
+        bool allreduceSingleDeviceAsync(void *buffer, size_t count,
+                                        CollectiveDataType dtype, CollectiveOp op,
+                                        int device_idx);
+
+        /**
+         * @brief Per-device allreduce on a caller-provided stream (graph-capturable)
+         *
+         * Like allreduceSingleDeviceAsync() but issues rcclAllReduce directly on
+         * the caller's stream instead of the coordinator's internal RCCL stream.
+         * This makes the operation compatible with HIP/CUDA graph capture —
+         * the RCCL kernel is recorded into the graph being captured on `stream`.
+         *
+         * No cross-stream event synchronization is performed; the caller's stream
+         * provides ordering (all prior work on the stream completes before the
+         * allreduce, and subsequent work waits for the allreduce to finish).
+         *
+         * Prerequisites:
+         * - Communicators must be initialized (warmup pass completed)
+         * - RCCL must have pre-allocated internal buffers for this count/dtype
+         *   (ensured by running at least one warmup allreduce with the same args)
+         *
+         * Thread-safe: each call accesses only device_idx's communicator.
+         *
+         * @param buffer In-place buffer on device_idx's GPU
+         * @param count Elements to reduce
+         * @param dtype Data type
+         * @param op Reduction operation
+         * @param device_idx Device index (0 to num_devices-1)
+         * @param stream HIP stream (hipStream_t cast to void*) to issue the allreduce on
+         * @return true on success
+         */
+        bool allreduceSingleDeviceOnStream(void *buffer, size_t count,
+                                           CollectiveDataType dtype, CollectiveOp op,
+                                           int device_idx, void *stream);
 
         /**
          * @brief Allgather across all local GPUs
@@ -304,6 +395,7 @@ namespace llaminar2
         bool doAllreduceMulti(const std::vector<void *> &buffers, size_t count,
                               int dtype_int, int op_int);
         bool doSynchronizeAll();
+        bool doInsertComputeStreamDeps();
         bool doAllgatherMulti(const std::vector<const void *> &send_buffers,
                               const std::vector<void *> &recv_buffers,
                               size_t send_count, int dtype_int);
@@ -327,8 +419,8 @@ namespace llaminar2
         std::vector<void *> comms_;             // rcclComm_t[]
         std::vector<void *> streams_;           // hipStream_t[] - one per device
         std::vector<void *> completion_events_; // hipEvent_t[] - signaled after each collective
-        std::vector<void *> compute_streams_;    // hipStream_t[] - device compute streams (optional, for stream-level pre-sync)
-        std::vector<void *> compute_events_;     // hipEvent_t[] - pre-created events for compute stream sync
+        std::vector<void *> compute_streams_;   // hipStream_t[] - device compute streams (optional, for stream-level pre-sync)
+        std::vector<void *> compute_events_;    // hipEvent_t[] - pre-created events for compute stream sync
 
         // Worker thread
         std::thread coordinator_thread_;
@@ -345,6 +437,11 @@ namespace llaminar2
         std::queue<std::function<void()>> work_queue_;
         mutable std::mutex queue_mutex_;
         std::condition_variable queue_cv_;
+
+        // Direct execution mutex: serializes direct-on-caller-thread execution
+        // against coordinator thread work. Used by allreduceMultiWithComputeDeps
+        // to bypass the coordinator thread hop for lower latency.
+        std::mutex direct_exec_mutex_;
     };
 
 } // namespace llaminar2

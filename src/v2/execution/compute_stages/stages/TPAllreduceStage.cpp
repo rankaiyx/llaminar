@@ -94,9 +94,20 @@ namespace llaminar2
         // Use stage_name overload with count parameter
         // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size)
         bool success;
+        void *stage_stream = gpuStream();
         if (!params_.stage_name.empty())
         {
-            success = params_.tp_ctx->allreduce(params_.tensor, params_.stage_name, effective_count);
+            // When a GPU stream is set (e.g., from graph capture), route through
+            // the on-stream path so the allreduce kernel is recorded into the graph.
+            if (stage_stream)
+            {
+                success = params_.tp_ctx->allreduceOnStream(
+                    params_.tensor, params_.stage_name, effective_count, stage_stream);
+            }
+            else
+            {
+                success = params_.tp_ctx->allreduce(params_.tensor, params_.stage_name, effective_count);
+            }
         }
         else
         {

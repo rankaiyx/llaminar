@@ -152,7 +152,8 @@ namespace llaminar2
             ComputeGraph &graph,
             DeviceGraphExecutor::GraphSegmentCache &segment_cache,
             const std::unordered_set<std::string> *collective_nodes,
-            bool has_collective_nodes);
+            bool has_collective_nodes,
+            bool collectives_graph_capturable = false);
 
         /**
          * @brief Build segmented execution plan for warmup/capture/replay phases.
@@ -164,7 +165,8 @@ namespace llaminar2
             ComputeGraph &graph,
             DeviceGraphExecutor::GraphSegmentCache &segment_cache,
             const std::unordered_set<std::string> *collective_nodes,
-            bool has_collective_nodes);
+            bool has_collective_nodes,
+            bool collectives_graph_capturable = false);
 
         /**
          * @brief Precompute `onGraphReplayed()` callback lists for capturable segments.

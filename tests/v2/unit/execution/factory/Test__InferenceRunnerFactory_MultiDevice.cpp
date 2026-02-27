@@ -130,7 +130,10 @@ namespace
         bool reserveTempBufferBytes(size_t /*bytes*/) override { return true; }
 
         // Broadcast (no-op)
-        bool broadcast(TensorBase* /*tensor*/, int /*source_device_index*/ = 0) override { return true; }
+        bool broadcast(TensorBase * /*tensor*/, int /*source_device_index*/ = 0) override { return true; }
+
+        void requestAbort() override {}
+        bool isAbortRequested() const override { return false; }
 
     private:
         std::vector<GlobalDeviceAddress> devices_;

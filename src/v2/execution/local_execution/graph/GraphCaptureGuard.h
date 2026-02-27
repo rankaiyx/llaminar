@@ -1,0 +1,63 @@
+#pragma once
+
+namespace llaminar2
+{
+    /**
+     * @brief Thread-local flag indicating that the current thread is inside
+     *        a HIP/CUDA graph capture recording window.
+     *
+     * During graph capture (between beginCapture/endCapture), many HIP/CUDA
+     * operations are illegal:
+     *   - hipDeviceSynchronize / cudaDeviceSynchronize
+     *   - hipStreamSynchronize / cudaStreamSynchronize (on capture stream)
+     *   - hipMemcpy (synchronous variants)
+     *   - hipEventSynchronize
+     *
+     * Code that might call these operations (e.g., TensorBase::ensureOnDevice)
+     * can check isGraphCaptureActive() and take a fast path that avoids sync.
+     *
+     * Usage:
+     *   // In capture controller (between beginCapture/endCapture):
+     *   {
+     *       GraphCaptureGuard guard;  // sets flag true
+     *       for (auto& stage : stages)
+     *           stage->execute(ctx);
+     *   }  // guard destructor sets flag false
+     *
+     *   // In tensor code:
+     *   if (isGraphCaptureActive() && device_valid_)
+     *       return true;  // skip sync, data already on device from warmup
+     */
+
+    /// Thread-local flag: true when inside a graph capture recording window.
+    inline thread_local bool tls_graph_capture_active = false;
+
+    /// Query whether the current thread is recording into a GPU graph.
+    inline bool isGraphCaptureActive() { return tls_graph_capture_active; }
+
+    /**
+     * @brief RAII guard that sets the graph-capture-active flag for the
+     *        duration of a capture recording window.
+     */
+    class GraphCaptureGuard
+    {
+    public:
+        GraphCaptureGuard() : prev_(tls_graph_capture_active)
+        {
+            tls_graph_capture_active = true;
+        }
+
+        ~GraphCaptureGuard()
+        {
+            tls_graph_capture_active = prev_;
+        }
+
+        // Non-copyable, non-movable
+        GraphCaptureGuard(const GraphCaptureGuard &) = delete;
+        GraphCaptureGuard &operator=(const GraphCaptureGuard &) = delete;
+
+    private:
+        bool prev_; ///< Previous value (for nested guard support)
+    };
+
+} // namespace llaminar2

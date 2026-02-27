@@ -345,7 +345,7 @@ namespace llaminar2
         if (static_cast<int>(compute_streams.size()) != num_devices_)
         {
             LOG_ERROR("[NCCLCoordinator] setComputeStreams: expected " << num_devices_
-                      << " streams, got " << compute_streams.size());
+                                                                       << " streams, got " << compute_streams.size());
             return;
         }
 
@@ -710,6 +710,146 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLCoordinator::allreduceMultiWithComputeDeps(const std::vector<void *> &buffers, size_t count,
+                                                        CollectiveDataType dtype, CollectiveOp op)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") doesn't match device count (" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        // If compute streams aren't registered, fall back to synchronous path
+        if (compute_streams_.empty() ||
+            static_cast<int>(compute_streams_.size()) != num_devices_)
+        {
+            LOG_DEBUG("[NCCLCoordinator] allreduceMultiWithComputeDeps: no compute streams, "
+                      "falling back to synchronous allreduceMultiAndSynchronize");
+            return allreduceMultiAndSynchronize(buffers, count, dtype, op);
+        }
+
+        // Direct execution on caller thread — bypasses submitAndWait coordinator
+        // thread roundtrip (~25-35µs savings per call). Safe because:
+        // 1. LocalTPContext barrier ensures only ONE thread calls this at a time
+        // 2. Coordinator thread is sleeping (no queued work during inference)
+        // 3. direct_exec_mutex_ prevents any rare concurrent coordinator access
+        {
+            std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+            if (!doAllreduceMulti(buffers, count, toDataTypeInt(dtype), toOpInt(op)))
+            {
+                return false;
+            }
+            return doInsertComputeStreamDeps();
+        }
+#else
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::allreduceSingleDeviceAsync(void *buffer, size_t count,
+                                                     CollectiveDataType dtype, CollectiveOp op,
+                                                     int device_idx)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!buffer)
+        {
+            last_error_ = "Null buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        if (compute_streams_.empty() ||
+            static_cast<int>(compute_streams_.size()) != num_devices_)
+        {
+            last_error_ = "Compute streams not registered";
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        cudaStream_t compute_stream = static_cast<cudaStream_t>(compute_streams_[device_idx]);
+        cudaEvent_t compute_event = static_cast<cudaEvent_t>(compute_events_[device_idx]);
+        cudaStream_t nccl_stream = static_cast<cudaStream_t>(streams_[device_idx]);
+        cudaEvent_t completion_event = static_cast<cudaEvent_t>(completion_events_[device_idx]);
+        nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
+
+        cudaError_t err;
+
+        err = cudaSetDevice(ordinal);
+        if (err != cudaSuccess)
+        {
+            last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+            return false;
+        }
+
+        // Pre-sync: compute → NCCL
+        err = cudaEventRecord(compute_event, compute_stream);
+        if (err != cudaSuccess)
+        {
+            last_error_ = std::string("cudaEventRecord(compute) failed: ") + cudaGetErrorString(err);
+            return false;
+        }
+
+        err = cudaStreamWaitEvent(nccl_stream, compute_event, 0);
+        if (err != cudaSuccess)
+        {
+            last_error_ = std::string("cudaStreamWaitEvent(nccl←compute) failed: ") + cudaGetErrorString(err);
+            return false;
+        }
+
+        // Non-grouped allreduce — NCCL matches calls internally
+        nccl::ncclResult_t r = nccl::ncclAllReduce(
+            buffer, buffer, count,
+            toNcclDataTypeInt(toDataTypeInt(dtype)), toNcclRedOpInt(toOpInt(op)),
+            comm, nccl_stream);
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclAllReduce failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        // Post-sync: NCCL → compute
+        err = cudaEventRecord(completion_event, nccl_stream);
+        if (err != cudaSuccess)
+        {
+            last_error_ = std::string("cudaEventRecord(completion) failed: ") + cudaGetErrorString(err);
+            return false;
+        }
+
+        err = cudaStreamWaitEvent(compute_stream, completion_event, 0);
+        if (err != cudaSuccess)
+        {
+            last_error_ = std::string("cudaStreamWaitEvent(compute←nccl) failed: ") + cudaGetErrorString(err);
+            return false;
+        }
+
+        return true;
+#else
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLCoordinator::allgatherMulti(const std::vector<const void *> &send_buffers,
                                          const std::vector<void *> &recv_buffers,
                                          size_t send_count, CollectiveDataType dtype)
@@ -887,6 +1027,43 @@ namespace llaminar2
                 return false;
             }
         }
+        return true;
+#else
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::doInsertComputeStreamDeps()
+    {
+#ifdef HAVE_NCCL
+        // Insert GPU-side dependencies: make each compute stream wait for the
+        // NCCL completion event. This ensures the compute stream cannot execute
+        // post-allreduce kernels until NCCL has finished, WITHOUT blocking the
+        // host thread. The host returns immediately after these API calls.
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed in doInsertComputeStreamDeps: ") +
+                              cudaGetErrorString(err);
+                return false;
+            }
+
+            cudaStream_t compute_stream = static_cast<cudaStream_t>(compute_streams_[i]);
+            cudaEvent_t completion_event = static_cast<cudaEvent_t>(completion_events_[i]);
+
+            err = cudaStreamWaitEvent(compute_stream, completion_event, 0);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaStreamWaitEvent(compute, nccl_completion) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " + cudaGetErrorString(err);
+                return false;
+            }
+        }
+
+        LOG_TRACE("[NCCLCoordinator] Inserted compute stream deps for " << num_devices_ << " devices");
         return true;
 #else
         last_error_ = "NCCL not available";

@@ -90,6 +90,7 @@ namespace llaminar2
         bool initialize(const DeviceGroup &group) override;
         bool isInitialized() const override { return initialized_; }
         void shutdown() override;
+        void abort() override;
         void setComputeStreams(const std::vector<void *> &compute_streams) override;
 
         // =====================================================================
@@ -233,6 +234,22 @@ namespace llaminar2
             size_t count,
             CollectiveDataType dtype,
             CollectiveOp op) override;
+
+        bool allreduceMultiWithComputeDeps(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op) override;
+
+        bool allreduceSingleDeviceAsync(
+            void *buffer, size_t count,
+            CollectiveDataType dtype, CollectiveOp op,
+            int device_idx) override;
+
+        bool allreduceSingleDeviceOnStream(
+            void *buffer, size_t count,
+            CollectiveDataType dtype, CollectiveOp op,
+            int device_idx, void *stream) override;
 
         bool allgatherMulti(
             const std::vector<const void *> &send_bufs,

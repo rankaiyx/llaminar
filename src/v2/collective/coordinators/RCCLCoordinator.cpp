@@ -295,6 +295,47 @@ namespace llaminar2
         LOG_INFO("[RCCLCoordinator] Shutdown complete");
     }
 
+    void RCCLCoordinator::abortCommunicators()
+    {
+#ifdef HAVE_RCCL
+        LOG_WARN("[RCCLCoordinator] Aborting all " << comms_.size()
+                                                   << " communicators to unblock pending RCCL operations");
+
+        for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+        {
+            if (comms_[i] != nullptr)
+            {
+                if (i < static_cast<int>(device_ordinals_.size()))
+                {
+                    hipSetDevice(device_ordinals_[i]);
+                }
+                rccl::ncclResult_t r = rccl::ncclCommAbort(
+                    static_cast<rccl::ncclComm_t>(comms_[i]));
+                if (r != rccl::ncclSuccess)
+                {
+                    LOG_WARN("[RCCLCoordinator] ncclCommAbort on device "
+                             << i << " returned: " << rccl::ncclGetErrorString(r));
+                }
+                comms_[i] = nullptr; // Prevent double-free in cleanup
+            }
+        }
+
+        // Mark as uninitialized so no further collectives are attempted
+        initialized_.store(false);
+
+        // Signal coordinator thread to stop (it may be waiting)
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            running_.store(false);
+        }
+        queue_cv_.notify_all();
+
+        LOG_WARN("[RCCLCoordinator] All communicators aborted");
+#else
+        LOG_WARN("[RCCLCoordinator] abortCommunicators() called but RCCL not available");
+#endif
+    }
+
     // ============================================================================
     // Synchronization with Device Workers
     // ============================================================================
@@ -384,7 +425,7 @@ namespace llaminar2
         }
 
         LOG_INFO("[RCCLCoordinator] Compute streams registered for " << num_devices_
-                                                                      << " devices — using stream-level pre-sync");
+                                                                     << " devices — using stream-level pre-sync");
 #else
         (void)compute_streams;
 #endif
@@ -835,6 +876,222 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLCoordinator::allreduceMultiWithComputeDeps(const std::vector<void *> &buffers, size_t count,
+                                                        CollectiveDataType dtype, CollectiveOp op)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer count (" + std::to_string(buffers.size()) +
+                          ") doesn't match device count (" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        // If compute streams aren't registered, fall back to synchronous path
+        if (compute_streams_.empty() ||
+            static_cast<int>(compute_streams_.size()) != num_devices_)
+        {
+            LOG_DEBUG("[RCCLCoordinator] allreduceMultiWithComputeDeps: no compute streams, "
+                      "falling back to synchronous allreduceMultiAndSynchronize");
+            return allreduceMultiAndSynchronize(buffers, count, dtype, op);
+        }
+
+        // Direct execution on caller thread — bypasses submitAndWait coordinator
+        // thread roundtrip (~25-35µs savings per call). Safe because:
+        // 1. LocalTPContext barrier ensures only ONE thread calls this at a time
+        // 2. Coordinator thread is sleeping (no queued work during inference)
+        // 3. direct_exec_mutex_ prevents any rare concurrent coordinator access
+        {
+            std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+            if (!doAllreduceMulti(buffers, count, toDataTypeInt(dtype), toOpInt(op)))
+            {
+                return false;
+            }
+            return doInsertComputeStreamDeps();
+        }
+#else
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::allreduceSingleDeviceAsync(void *buffer, size_t count,
+                                                     CollectiveDataType dtype, CollectiveOp op,
+                                                     int device_idx)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!buffer)
+        {
+            last_error_ = "Null buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        // Require compute streams for async path
+        if (compute_streams_.empty() ||
+            static_cast<int>(compute_streams_.size()) != num_devices_)
+        {
+            last_error_ = "Compute streams not registered — call setComputeStreams() first";
+            return false;
+        }
+
+        // Per-device resources (no locking needed — each device_idx is accessed
+        // by exactly one thread in the barrier-free TP path)
+        const int ordinal = device_ordinals_[device_idx];
+        hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[device_idx]);
+        hipEvent_t compute_event = static_cast<hipEvent_t>(compute_events_[device_idx]);
+        hipStream_t rccl_stream = static_cast<hipStream_t>(streams_[device_idx]);
+        hipEvent_t completion_event = static_cast<hipEvent_t>(completion_events_[device_idx]);
+        rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+
+        hipError_t err;
+
+        // 1. Set device context
+        err = hipSetDevice(ordinal);
+        if (err != hipSuccess)
+        {
+            last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+            return false;
+        }
+
+        // 2. Pre-sync: record event on compute stream, RCCL stream waits for it
+        err = hipEventRecord(compute_event, compute_stream);
+        if (err != hipSuccess)
+        {
+            last_error_ = std::string("hipEventRecord(compute) failed: ") + hipGetErrorString(err);
+            return false;
+        }
+
+        err = hipStreamWaitEvent(rccl_stream, compute_event, 0);
+        if (err != hipSuccess)
+        {
+            last_error_ = std::string("hipStreamWaitEvent(rccl←compute) failed: ") + hipGetErrorString(err);
+            return false;
+        }
+
+        // 3. Launch allreduce (non-grouped — RCCL matches calls internally)
+        rccl::ncclResult_t r = rccl::ncclAllReduce(
+            buffer, buffer, count,
+            toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
+            comm, rccl_stream);
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclAllReduce failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        // 4. Post-sync: record completion on RCCL stream, compute stream waits
+        err = hipEventRecord(completion_event, rccl_stream);
+        if (err != hipSuccess)
+        {
+            last_error_ = std::string("hipEventRecord(completion) failed: ") + hipGetErrorString(err);
+            return false;
+        }
+
+        err = hipStreamWaitEvent(compute_stream, completion_event, 0);
+        if (err != hipSuccess)
+        {
+            last_error_ = std::string("hipStreamWaitEvent(compute←rccl) failed: ") + hipGetErrorString(err);
+            return false;
+        }
+
+        return true;
+#else
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::allreduceSingleDeviceOnStream(void *buffer, size_t count,
+                                                        CollectiveDataType dtype, CollectiveOp op,
+                                                        int device_idx, void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!buffer)
+        {
+            last_error_ = "Null buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        if (!stream)
+        {
+            last_error_ = "Null stream for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        // Per-device resources (no locking needed — each device_idx is accessed
+        // by exactly one thread in the barrier-free TP path)
+        const int ordinal = device_ordinals_[device_idx];
+        rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+        hipStream_t caller_stream = static_cast<hipStream_t>(stream);
+
+        hipError_t err;
+
+        // 1. Set device context
+        err = hipSetDevice(ordinal);
+        if (err != hipSuccess)
+        {
+            last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+            return false;
+        }
+
+        // 2. Launch allreduce directly on the caller's stream.
+        //    No cross-stream event sync needed — the caller's stream provides
+        //    ordering (prior compute → allreduce → subsequent compute).
+        rccl::ncclResult_t r = rccl::ncclAllReduce(
+            buffer, buffer, count,
+            toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
+            comm, caller_stream);
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclAllReduce(on-stream) failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffer;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::allgatherMulti(const std::vector<const void *> &send_buffers,
                                          const std::vector<void *> &recv_buffers,
                                          size_t send_count, CollectiveDataType dtype)
@@ -1013,6 +1270,43 @@ namespace llaminar2
                 return false;
             }
         }
+        return true;
+#else
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::doInsertComputeStreamDeps()
+    {
+#ifdef HAVE_RCCL
+        // Insert GPU-side dependencies: make each compute stream wait for the
+        // RCCL completion event. This ensures the compute stream cannot execute
+        // post-allreduce kernels until RCCL has finished, WITHOUT blocking the
+        // host thread. The host returns immediately after these API calls.
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed in doInsertComputeStreamDeps: ") +
+                              hipGetErrorString(err);
+                return false;
+            }
+
+            hipStream_t compute_stream = static_cast<hipStream_t>(compute_streams_[i]);
+            hipEvent_t completion_event = static_cast<hipEvent_t>(completion_events_[i]);
+
+            err = hipStreamWaitEvent(compute_stream, completion_event, 0);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipStreamWaitEvent(compute, rccl_completion) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " + hipGetErrorString(err);
+                return false;
+            }
+        }
+
+        LOG_TRACE("[RCCLCoordinator] Inserted compute stream deps for " << num_devices_ << " devices");
         return true;
 #else
         last_error_ = "RCCL not available";

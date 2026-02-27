@@ -15,7 +15,7 @@
 
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
-#include "config/OrchestrationConfig.h"  // CollectiveBackendType
+#include "config/OrchestrationConfig.h" // CollectiveBackendType
 #include <atomic>
 #include <cmath>
 #include <mutex>
@@ -34,7 +34,7 @@ namespace llaminar2::test
         size_t count = 0;
 
         AllreduceCall() = default;
-        AllreduceCall(TensorBase *t, const std::string& name = "", size_t c = 0)
+        AllreduceCall(TensorBase *t, const std::string &name = "", size_t c = 0)
             : tensor(t), stage_name(name), count(c) {}
     };
 
@@ -103,7 +103,7 @@ namespace llaminar2::test
 
         int myIndex() const override { return 0; }
 
-        const std::vector<GlobalDeviceAddress>& devices() const override
+        const std::vector<GlobalDeviceAddress> &devices() const override
         {
             std::lock_guard<std::mutex> lock(mutex_);
             return devices_;
@@ -114,14 +114,14 @@ namespace llaminar2::test
             return backend_;
         }
 
-        const std::vector<float>& weights() const override
+        const std::vector<float> &weights() const override
         {
             std::lock_guard<std::mutex> lock(mutex_);
             return weights_;
         }
 
         // Allreduce overloads
-        bool allreduce(TensorBase* tensor) override
+        bool allreduce(TensorBase *tensor) override
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -131,7 +131,7 @@ namespace llaminar2::test
             return !allreduce_should_fail_;
         }
 
-        bool allreduce(TensorBase* tensor, const std::string& stage_name, size_t count = 0) override
+        bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -141,37 +141,37 @@ namespace llaminar2::test
             return !allreduce_should_fail_;
         }
 
-        bool allreduce(const TensorBase* input, TensorBase* output) override
+        bool allreduce(const TensorBase *input, TensorBase *output) override
         {
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                allreduce_calls_.emplace_back(const_cast<TensorBase*>(input));
+                allreduce_calls_.emplace_back(const_cast<TensorBase *>(input));
             }
             ++allreduce_call_count_;
             return !allreduce_should_fail_;
         }
 
-        bool allgather(const TensorBase* local_shard, TensorBase* global_tensor) override
+        bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override
         {
             ++allgather_call_count_;
             return true;
         }
 
         bool gatherFromDevices(
-            const std::vector<const TensorBase*>& shards,
-            TensorBase* output) override
+            const std::vector<const TensorBase *> &shards,
+            TensorBase *output) override
         {
             ++gather_call_count_;
             return true;
         }
 
-        bool reduceScatter(const TensorBase* input, TensorBase* output_shard) override
+        bool reduceScatter(const TensorBase *input, TensorBase *output_shard) override
         {
             ++reduce_scatter_call_count_;
             return true;
         }
 
-        bool broadcast(TensorBase* tensor, int source_device_index = 0) override
+        bool broadcast(TensorBase *tensor, int source_device_index = 0) override
         {
             (void)tensor;
             (void)source_device_index;
@@ -184,7 +184,7 @@ namespace llaminar2::test
             ++synchronize_call_count_;
         }
 
-        int indexForDevice(const GlobalDeviceAddress& device) const override
+        int indexForDevice(const GlobalDeviceAddress &device) const override
         {
             std::lock_guard<std::mutex> lock(mutex_);
             for (size_t i = 0; i < devices_.size(); ++i)
@@ -195,7 +195,7 @@ namespace llaminar2::test
             return -1;
         }
 
-        const GlobalDeviceAddress& deviceAt(int index) const override
+        const GlobalDeviceAddress &deviceAt(int index) const override
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (index < 0 || index >= static_cast<int>(devices_.size()))
@@ -206,26 +206,29 @@ namespace llaminar2::test
             return devices_[index];
         }
 
-        float weightForDevice(const GlobalDeviceAddress& device) const override
+        float weightForDevice(const GlobalDeviceAddress &device) const override
         {
             std::lock_guard<std::mutex> lock(mutex_);
             int idx = -1;
             for (size_t i = 0; i < devices_.size(); ++i)
             {
-                if (devices_[i] == device) {
+                if (devices_[i] == device)
+                {
                     idx = static_cast<int>(i);
                     break;
                 }
             }
-            if (idx < 0) return 0.0f;
-            if (weights_.empty()) {
+            if (idx < 0)
+                return 0.0f;
+            if (weights_.empty())
+            {
                 // Equal distribution
                 return 1.0f / static_cast<float>(devices_.size());
             }
             return (idx < static_cast<int>(weights_.size())) ? weights_[idx] : 0.0f;
         }
 
-        int headsForDevice(const GlobalDeviceAddress& device, int total_heads) const override
+        int headsForDevice(const GlobalDeviceAddress &device, int total_heads) const override
         {
             // Simple proportional distribution
             float weight = weightForDevice(device);
@@ -233,19 +236,21 @@ namespace llaminar2::test
         }
 
         std::pair<int, int> rowRangeForDevice(
-            const GlobalDeviceAddress& device, int total_rows) const override
+            const GlobalDeviceAddress &device, int total_rows) const override
         {
             std::lock_guard<std::mutex> lock(mutex_);
             int idx = -1;
             for (size_t i = 0; i < devices_.size(); ++i)
             {
-                if (devices_[i] == device) {
+                if (devices_[i] == device)
+                {
                     idx = static_cast<int>(i);
                     break;
                 }
             }
-            if (idx < 0 || devices_.empty()) return {0, 0};
-            
+            if (idx < 0 || devices_.empty())
+                return {0, 0};
+
             int rows_per_device = total_rows / static_cast<int>(devices_.size());
             int remainder = total_rows % static_cast<int>(devices_.size());
             int start = idx * rows_per_device + std::min(idx, remainder);
@@ -254,16 +259,16 @@ namespace llaminar2::test
         }
 
         std::pair<int, int> colRangeForDevice(
-            const GlobalDeviceAddress& device, int total_cols) const override
+            const GlobalDeviceAddress &device, int total_cols) const override
         {
             // Same logic as rowRangeForDevice for symmetry
             return rowRangeForDevice(device, total_cols);
         }
 
         void registerBARBackedOutput(
-            const std::string& stage_name,
-            const GlobalDeviceAddress& device,
-            TensorBase* tensor) override
+            const std::string &stage_name,
+            const GlobalDeviceAddress &device,
+            TensorBase *tensor) override
         {
             // Mock: No-op
             (void)stage_name;
@@ -271,10 +276,10 @@ namespace llaminar2::test
             (void)tensor;
         }
 
-        bool hasBARBackedOutputs(const std::string& stage_name) const override
+        bool hasBARBackedOutputs(const std::string &stage_name) const override
         {
             (void)stage_name;
-            return false;  // Mock: Always false
+            return false; // Mock: Always false
         }
 
         void clearBARBackedOutputs() override
@@ -284,13 +289,13 @@ namespace llaminar2::test
 
         std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override
         {
-            return nullptr;  // Mock: No P2P engine
+            return nullptr; // Mock: No P2P engine
         }
 
         bool reserveTempBufferBytes(size_t bytes) override
         {
             (void)bytes;
-            return true;  // Mock: Always succeed
+            return true; // Mock: Always succeed
         }
 
         // =====================================================================
@@ -303,6 +308,9 @@ namespace llaminar2::test
         int reduceScatterCallCount() const { return reduce_scatter_call_count_.load(); }
         int broadcastCallCount() const { return broadcast_call_count_.load(); }
         int synchronizeCallCount() const { return synchronize_call_count_.load(); }
+
+        void requestAbort() override {}
+        bool isAbortRequested() const override { return false; }
 
         std::vector<AllreduceCall> getAllreduceCalls() const
         {

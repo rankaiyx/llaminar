@@ -209,6 +209,17 @@ namespace llaminar2
         virtual void shutdown() = 0;
 
         /**
+         * @brief Forcefully abort all pending collective operations.
+         *
+         * Used for error recovery when one device thread has failed and
+         * others may be stuck in collective calls waiting for matching ops.
+         * Default implementation does nothing. RCCL backend calls ncclCommAbort.
+         *
+         * After calling this, the backend is NOT usable for further collectives.
+         */
+        virtual void abort() {}
+
+        /**
          * @brief Reserve temporary buffer capacity for collective operations
          *
          * Pre-allocates internal temp buffers to avoid allocation in the hot path.
@@ -660,6 +671,87 @@ namespace llaminar2
                 return false;
             }
             return synchronize();
+        }
+
+        /**
+         * @brief Multi-GPU AllReduce with compute stream dependency insertion (non-blocking)
+         *
+         * Queues the collective and inserts GPU-side stream dependencies so that
+         * each device's compute stream waits for the collective result WITHOUT
+         * blocking the host thread. Preferred path for pipelined execution.
+         *
+         * Requires compute streams registered via setComputeStreams().
+         * Default implementation falls back to allreduceMultiAndSynchronize().
+         */
+        virtual bool allreduceMultiWithComputeDeps(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op)
+        {
+            return allreduceMultiAndSynchronize(buffers, count, dtype, op);
+        }
+
+        /**
+         * @brief Per-device non-blocking allreduce (barrier-free)
+         *
+         * Called independently by each device thread. RCCL/NCCL internally
+         * matches calls across devices. Host returns immediately.
+         *
+         * Sets up compute→collective and collective→compute stream deps.
+         * Requires compute streams registered via setComputeStreams().
+         *
+         * @param buffer In-place buffer on device_idx's GPU
+         * @param count Elements
+         * @param dtype Data type
+         * @param op Reduction operation
+         * @param device_idx Device index (0 to num_gpus-1)
+         * @return true on success, false if not supported
+         */
+        virtual bool allreduceSingleDeviceAsync(
+            void *buffer, size_t count,
+            CollectiveDataType dtype, CollectiveOp op,
+            int device_idx)
+        {
+            (void)buffer;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)device_idx;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Per-device allreduce on a caller-provided stream (graph-capturable)
+         *
+         * Like allreduceSingleDeviceAsync() but issues the collective directly on
+         * the caller's stream instead of the backend's internal collective stream.
+         * This makes the operation compatible with GPU graph capture — the collective
+         * kernel is recorded into the graph being captured on `stream`.
+         *
+         * No cross-stream event synchronization is performed. Stream ordering
+         * provides dependency management (prior work → allreduce → subsequent work).
+         *
+         * @param buffer In-place buffer on device_idx's GPU
+         * @param count Elements
+         * @param dtype Data type
+         * @param op Reduction operation
+         * @param device_idx Device index (0 to num_gpus-1)
+         * @param stream GPU stream (hipStream_t/cudaStream_t cast to void*)
+         * @return true on success, false if not supported
+         */
+        virtual bool allreduceSingleDeviceOnStream(
+            void *buffer, size_t count,
+            CollectiveDataType dtype, CollectiveOp op,
+            int device_idx, void *stream)
+        {
+            (void)buffer;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)device_idx;
+            (void)stream;
+            return false; // Not supported by default
         }
 
         /**

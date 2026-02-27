@@ -24,8 +24,8 @@
 #include "../graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config access
 #include "../../../tensors/TensorClasses.h"
 #include "../../../tensors/TensorFactory.h"
-#include "../../../backends/p2p/DirectP2P.h" // DirectP2PEngine for BAR pre-init in cross-vendor PP
-#include "../../../backends/BackendManager.h" // getBackendFor() for partial D2H in gatherLogits
+#include "../../../backends/p2p/DirectP2P.h"        // DirectP2PEngine for BAR pre-init in cross-vendor PP
+#include "../../../backends/BackendManager.h"       // getBackendFor() for partial D2H in gatherLogits
 #include "../../../backends/GPUDeviceContextPool.h" // Compute stream registration for event-based collective sync
 #include "../../../utils/Logger.h"
 #include <algorithm>
@@ -651,7 +651,7 @@ namespace llaminar2
             {
                 tp_ctx_->setComputeStreams(compute_streams);
                 LOG_INFO("MultiDeviceOrchestrator: Registered " << compute_streams.size()
-                         << " compute streams for event-based collective sync");
+                                                                << " compute streams for event-based collective sync");
             }
         }
     }
@@ -1006,11 +1006,12 @@ namespace llaminar2
         // less data transferred.
 
         // Phase 1: Validate all devices and collect metadata
-        struct DeviceLogitInfo {
+        struct DeviceLogitInfo
+        {
             size_t vocab_local;
-            const void *gpu_ptr;             // GPU buffer pointer (null if CPU-only)
-            std::optional<DeviceId> device;  // GPU device for backend lookup
-            TensorBase *logits_local;        // For CPU fallback path (calls data() via FP32Tensor)
+            const void *gpu_ptr;            // GPU buffer pointer (null if CPU-only)
+            std::optional<DeviceId> device; // GPU device for backend lookup
+            TensorBase *logits_local;       // For CPU fallback path (calls data() via FP32Tensor)
         };
         std::vector<DeviceLogitInfo> device_infos;
         device_infos.reserve(device_runners_.size());
@@ -1038,10 +1039,10 @@ namespace llaminar2
             }
 
             device_infos.push_back(DeviceLogitInfo{
-                shape[1],                                   // vocab_local
-                state.logits_local->gpu_data_ptr(),         // GPU pointer (null for CPU)
-                state.logits_local->current_device(),       // GPU device ID
-                state.logits_local.get()                    // tensor ptr for fallback
+                shape[1],                             // vocab_local
+                state.logits_local->gpu_data_ptr(),   // GPU pointer (null for CPU)
+                state.logits_local->current_device(), // GPU device ID
+                state.logits_local.get()              // tensor ptr for fallback
             });
         }
 
@@ -1259,74 +1260,138 @@ namespace llaminar2
         // When one device throws (e.g., VerificationFailure with NaN/Inf), it can cause CUDA
         // context destruction, which then makes other devices fail with misleading "context is
         // destroyed" errors. We want to surface the original root cause exception.
+        //
+        // CRITICAL: Use a polling loop instead of sequential futures[i].get() to handle
+        // the case where Device 1 fails but Device 0 is stuck. Sequential collection would
+        // block forever on futures[0].get(). The poll approach detects any failure early
+        // and, ONLY IF other devices remain stuck after a grace period, calls requestAbort()
+        // to unblock them via ncclCommAbort.
+        //
+        // IMPORTANT: We do NOT call requestAbort() immediately on first failure because the
+        // other device may be running normally (not stuck in RCCL) and ncclCommAbort would
+        // corrupt its GPU state causing a page fault. The grace period gives normally-failing
+        // devices time to complete.
         bool all_success = true;
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
+        bool any_failure_detected = false;
 
-        for (size_t i = 0; i < futures.size(); ++i)
+        std::vector<bool> collected(futures.size(), false);
+        size_t num_collected = 0;
+
+        // Grace period: after detecting first failure, allow up to 5 seconds for other
+        // devices to finish normally. Only escalate to ncclCommAbort if they're still stuck.
+        constexpr auto kAbortGracePeriod = std::chrono::seconds(5);
+        std::chrono::steady_clock::time_point first_failure_time{};
+
+        while (num_collected < futures.size())
         {
-            try
+            // Check if we've exceeded the grace period after a failure
+            if (any_failure_detected)
             {
-                bool success = futures[i].get();
-                if (!success)
+                auto elapsed = std::chrono::steady_clock::now() - first_failure_time;
+                if (elapsed > kAbortGracePeriod)
                 {
-                    LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i << " forward failed");
-                    all_success = false;
+                    // Some devices are likely stuck in RCCL — force abort
+                    if (tp_ctx_ && !tp_ctx_->isAbortRequested())
+                    {
+                        LOG_WARN("MultiDeviceOrchestrator::forwardTP: Grace period expired, "
+                                 "aborting collectives to unblock "
+                                 << (futures.size() - num_collected)
+                                 << " stuck device(s)");
+                        tp_ctx_->requestAbort();
+                    }
                 }
             }
-            catch (const std::exception &e)
+
+            for (size_t i = 0; i < futures.size(); ++i)
             {
-                all_success = false;
+                if (collected[i])
+                    continue;
 
-                // Check if this is a secondary "context destroyed" error vs the real root cause
-                std::string error_msg = e.what();
-                bool is_context_destroyed = (error_msg.find("context is destroyed") != std::string::npos ||
-                                             error_msg.find("context destroyed") != std::string::npos ||
-                                             error_msg.find("error 709") != std::string::npos);
+                // Non-blocking check: is this future ready?
+                auto status = futures[i].wait_for(std::chrono::milliseconds(10));
+                if (status != std::future_status::ready)
+                    continue;
 
-                if (!first_exception)
+                collected[i] = true;
+                num_collected++;
+
+                try
                 {
-                    // This is the first exception - store it
-                    first_exception = std::current_exception();
-                    first_exception_device = i;
-                    LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i
-                                                                            << " threw PRIMARY exception: " << error_msg);
-                }
-                else if (!is_context_destroyed)
-                {
-                    // This is a substantive error (not just context cleanup failure)
-                    // Replace the stored exception if the first one was a context error
-                    try
+                    bool success = futures[i].get();
+                    if (!success)
                     {
-                        std::rethrow_exception(first_exception);
-                    }
-                    catch (const std::exception &first_e)
-                    {
-                        std::string first_msg = first_e.what();
-                        bool first_is_context_destroyed =
-                            (first_msg.find("context is destroyed") != std::string::npos ||
-                             first_msg.find("context destroyed") != std::string::npos ||
-                             first_msg.find("error 709") != std::string::npos);
+                        LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i << " forward failed");
+                        all_success = false;
 
-                        if (first_is_context_destroyed)
+                        if (!any_failure_detected)
                         {
-                            // Replace context error with the real error
-                            LOG_WARN("MultiDeviceOrchestrator::forwardTP: Replacing secondary context error "
-                                     "with primary error from device "
-                                     << i);
-                            first_exception = std::current_exception();
-                            first_exception_device = i;
+                            any_failure_detected = true;
+                            first_failure_time = std::chrono::steady_clock::now();
                         }
                     }
-                    LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i
-                                                                            << " threw exception: " << error_msg);
                 }
-                else
+                catch (const std::exception &e)
                 {
-                    // Secondary context error - log but don't replace the primary exception
-                    LOG_WARN("MultiDeviceOrchestrator::forwardTP: Device " << i
-                                                                           << " threw SECONDARY exception (likely due to primary failure): "
-                                                                           << error_msg);
+                    all_success = false;
+
+                    if (!any_failure_detected)
+                    {
+                        any_failure_detected = true;
+                        first_failure_time = std::chrono::steady_clock::now();
+                    }
+
+                    // Check if this is a secondary "context destroyed" error vs the real root cause
+                    std::string error_msg = e.what();
+                    bool is_context_destroyed = (error_msg.find("context is destroyed") != std::string::npos ||
+                                                 error_msg.find("context destroyed") != std::string::npos ||
+                                                 error_msg.find("error 709") != std::string::npos);
+
+                    if (!first_exception)
+                    {
+                        // This is the first exception - store it
+                        first_exception = std::current_exception();
+                        first_exception_device = i;
+                        LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i
+                                                                                << " threw PRIMARY exception: " << error_msg);
+                    }
+                    else if (!is_context_destroyed)
+                    {
+                        // This is a substantive error (not just context cleanup failure)
+                        // Replace the stored exception if the first one was a context error
+                        try
+                        {
+                            std::rethrow_exception(first_exception);
+                        }
+                        catch (const std::exception &first_e)
+                        {
+                            std::string first_msg = first_e.what();
+                            bool first_is_context_destroyed =
+                                (first_msg.find("context is destroyed") != std::string::npos ||
+                                 first_msg.find("context destroyed") != std::string::npos ||
+                                 first_msg.find("error 709") != std::string::npos);
+
+                            if (first_is_context_destroyed)
+                            {
+                                // Replace context error with the real error
+                                LOG_WARN("MultiDeviceOrchestrator::forwardTP: Replacing secondary context error "
+                                         "with primary error from device "
+                                         << i);
+                                first_exception = std::current_exception();
+                                first_exception_device = i;
+                            }
+                        }
+                        LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Device " << i
+                                                                                << " threw exception: " << error_msg);
+                    }
+                    else
+                    {
+                        // Secondary context error - log but don't replace the primary exception
+                        LOG_WARN("MultiDeviceOrchestrator::forwardTP: Device " << i
+                                                                               << " threw SECONDARY exception (likely due to primary failure): "
+                                                                               << error_msg);
+                    }
                 }
             }
         }

@@ -363,11 +363,14 @@ public:
     // =====================================================================
     // ILocalTPContext Broadcast (no-op)
     // =====================================================================
-    bool broadcast(TensorBase* /*tensor*/, int /*source_device_index*/ = 0) override
+    bool broadcast(TensorBase * /*tensor*/, int /*source_device_index*/ = 0) override
     {
         broadcast_calls_.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
+
+    void requestAbort() override {}
+    bool isAbortRequested() const override { return false; }
 
     // =====================================================================
     // Test Utilities

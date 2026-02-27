@@ -148,6 +148,9 @@ namespace llaminar2
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override;
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) override;
 
+        void setGraphCaptureActive(bool active) override { capture_active_.store(active, std::memory_order_release); }
+        bool isDeviceGraphCaptureActive() const override { return capture_active_.load(std::memory_order_acquire); }
+
     private:
         // =========================================================================
         // Worker Thread Management
@@ -214,6 +217,14 @@ namespace llaminar2
         std::queue<std::packaged_task<void()>> work_queue_;
         std::mutex queue_mutex_;
         std::condition_variable queue_cv_;
+
+        // =========================================================================
+        // Graph Capture State
+        // =========================================================================
+
+        /// True while a HIP graph capture recording is active on this device.
+        /// During capture, hipDeviceSynchronize() and other sync calls are illegal.
+        std::atomic<bool> capture_active_{false};
     };
 
 } // namespace llaminar2

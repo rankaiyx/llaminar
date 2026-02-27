@@ -1,4 +1,5 @@
 #include "DeviceGraphCaptureController.h"
+#include "GraphCaptureGuard.h"
 
 #include "../coherence/StageCoherence.h"
 #include "../../../tensors/TensorClasses.h"
@@ -6,6 +7,7 @@
 #include "../../../utils/Logger.h"
 #ifdef HAVE_ROCM
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include <hip/hip_runtime.h>
 #endif
 
 #include <algorithm>
@@ -60,13 +62,15 @@ namespace llaminar2
         ComputeGraph &graph,
         DeviceGraphExecutor::GraphSegmentCache &segment_cache,
         const std::unordered_set<std::string> *collective_nodes,
-        bool has_collective_nodes)
+        bool has_collective_nodes,
+        bool collectives_graph_capturable)
     {
         buildWarmupSegments(
             graph,
             segment_cache,
             collective_nodes,
-            has_collective_nodes);
+            has_collective_nodes,
+            collectives_graph_capturable);
         markWarmupComplete(
             segment_cache.initialized,
             segment_cache.needs_capture);
@@ -76,7 +80,8 @@ namespace llaminar2
         ComputeGraph &graph,
         DeviceGraphExecutor::GraphSegmentCache &segment_cache,
         const std::unordered_set<std::string> *collective_nodes,
-        bool has_collective_nodes)
+        bool has_collective_nodes,
+        bool collectives_graph_capturable)
     {
         segment_cache.segments.clear();
 
@@ -122,30 +127,25 @@ namespace llaminar2
             bool stage_capturable = node->stage->isGraphCapturable();
             const bool collective_by_type = is_collective_stage(node->stage->type());
             const bool collective_by_name = (collective_nodes && collective_nodes->count(name));
+
+            // Collective stages: capturable only if the backend supports on-stream
+            // allreduce (graph-capturable collectives). Otherwise force manual.
             if (collective_by_type || collective_by_name)
             {
-                stage_capturable = false;
+                stage_capturable = collectives_graph_capturable;
             }
 
             if (has_collective_nodes && !segmented_collective_capture_allow.empty())
             {
+                // Explicit allowlist mode: only allowlisted stages are capturable
                 stage_capturable = stage_in_collective_allowlist(name);
             }
-
-            if (has_collective_nodes && node->stage->hasDynamicParams())
-            {
-                stage_capturable = false;
-            }
-
-            if (has_collective_nodes && node->stage->type() == ComputeStageType::ADD_RESIDUAL)
-            {
-                stage_capturable = false;
-            }
-
-            if (has_collective_nodes && (name == "final_norm" || name == "lm_head"))
-            {
-                stage_capturable = false;
-            }
+            // Otherwise: trust each stage's isGraphCapturable() declaration.
+            // Stages that need per-step updates (embedding, KV cache, fused
+            // attention) already return false from isGraphCapturable().
+            // Collective stages are forced manual above. Compute-only stages
+            // (GEMM, norms, SwiGLU, residual add, lm_head) can be safely
+            // captured in graph segments between the manual collective segments.
 
             if (first || stage_capturable != current_capturable)
             {
@@ -320,6 +320,9 @@ namespace llaminar2
                    t == ComputeStageType::ALLGATHER_V;
         };
 
+        const bool trace_replay = debugEnv().execution.gpu_graph_trace_replay;
+        const auto &device_id = ctx->deviceId();
+
         bool manual_had_collective = false;
         for (const auto &stage_name : segment.stage_names)
         {
@@ -331,41 +334,96 @@ namespace llaminar2
             }
 
             const auto stage_type = node->stage->type();
-            if (has_collective_nodes)
+            const bool is_collective = is_collective_stage(stage_type);
+
+            if (is_collective)
             {
-                manual_had_collective = manual_had_collective || is_collective_stage(stage_type);
-
-                if (needs_segment_sync)
-                {
-                    gpu_ctx->synchronizeStream(capture_stream);
-                }
-
-                node->stage->setGPUStream(nullptr);
-                if (!execute_node_cb(*node))
-                {
-                    LOG_ERROR("[DeviceGraphCaptureController] Manual stage failed on replay (collective graph): " << stage_name);
-                    return false;
-                }
-
-                gpu_ctx->synchronize();
-            }
-            else if (is_collective_stage(stage_type))
-            {
+                // Collective stages (allreduce, allgather) run on their own
+                // internal streams (RCCL/NCCL). The preceding captured graph
+                // segment was replayed on capture_stream, so we MUST ensure
+                // graph compute completes before the collective reads GPU data.
+                //
+                // We use GPU-side event dependencies instead of host-blocking
+                // synchronizeStream() + hipDeviceSynchronize().  Host-level
+                // blocking can deadlock multi-device TP: device A blocks in
+                // hipDeviceSynchronize (waiting for RCCL, which needs device B)
+                // while device B blocks in synchronizeStream or its own
+                // hipDeviceSynchronize from a different segment.
+                //
+                // GPU-side events let both device threads queue ALL segments
+                // without blocking, so all RCCL calls are enqueued promptly
+                // and the only host sync is the final gpu_ctx->synchronize()
+                // at the end of executeReplayPhase().
                 manual_had_collective = true;
 
-                if (needs_segment_sync)
+                // Use the ACTUAL default stream, not nullptr (hipStream_t(0)).
+                // AMDDeviceContext creates a real hipStream_t via
+                // hipStreamCreateWithFlags, so defaultStream() != nullptr.
+                // The RCCL coordinator's pre/post sync events are recorded
+                // on this same stream (registered via setComputeStreams()),
+                // so the event chain MUST target the same stream object.
+                // Using nullptr would target the HIP null stream which is
+                // a DIFFERENT stream — event dependencies wouldn't chain
+                // with the allreduce at all, causing intermittent stale
+                // reads and deadlocks.
+                void *compute_stream = gpu_ctx->defaultStream();
+
+                if (trace_replay)
                 {
-                    gpu_ctx->synchronizeStream(capture_stream);
+                    LOG_INFO("[ReplayTrace] " << device_id.toString()
+                                              << " COLLECTIVE enter: " << stage_name
+                                              << " insertStreamDependency(compute←capture)");
                 }
 
-                node->stage->setGPUStream(nullptr);
+                if (capture_stream)
+                {
+                    // GPU-side: compute_stream waits for capture_stream.
+                    // The allreduce's pre-sync event (hipEventRecord on
+                    // compute_stream) will then chain after graph
+                    // completion, ensuring RCCL reads committed data.
+                    gpu_ctx->insertStreamDependency(compute_stream, capture_stream);
+                }
+
+                if (trace_replay)
+                {
+                    LOG_INFO("[ReplayTrace] " << device_id.toString()
+                                              << " COLLECTIVE execute: " << stage_name);
+                }
+
+                node->stage->setGPUStream(compute_stream);
                 if (!execute_node_cb(*node))
                 {
                     LOG_ERROR("[DeviceGraphCaptureController] Manual collective stage failed on replay: " << stage_name);
                     return false;
                 }
 
-                gpu_ctx->synchronize();
+                if (capture_stream)
+                {
+                    // GPU-side: capture_stream waits for compute_stream.
+                    // compute_stream already has a dependency on RCCL
+                    // completion (via the allreduce's internal post-sync
+                    // event), so capture_stream chains after RCCL finishes.
+                    gpu_ctx->insertStreamDependency(capture_stream, compute_stream);
+                }
+
+                if (trace_replay)
+                {
+                    LOG_INFO("[ReplayTrace] " << device_id.toString()
+                                              << " COLLECTIVE done: " << stage_name);
+                }
+            }
+            else if (has_collective_nodes)
+            {
+                // Non-collective stages in a collective graph's manual segment
+                // (e.g., embedding, attention, KV cache, RoPE). These run on
+                // the capture stream for GPU-side ordering. No host sync needed
+                // between non-collective stages — the GPU stream provides ordering.
+                node->stage->setGPUStream(capture_stream);
+                if (!execute_node_cb(*node))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Manual stage failed on replay (collective graph): " << stage_name);
+                    return false;
+                }
             }
             else
             {
@@ -798,7 +856,9 @@ namespace llaminar2
             // execute() already ran host-side bookkeeping (e.g., KV cache head
             // advancement). Calling onGraphReplayed() would double-advance.
             segment.last_executed_step = current_step;
-            gpu_ctx->synchronize();
+            // Use stream-level sync (not device-wide) to avoid conflict with
+            // hipStreamCaptureModeGlobal on other TP devices.
+            gpu_ctx->synchronizeStream(capture_stream);
             LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+executed (Phase-2 semantics): "
                       << segment.capture->nodeCount() << " nodes, " << segment.stage_names.size() << " stages");
             return true;
@@ -813,7 +873,10 @@ namespace llaminar2
         // ran host-side bookkeeping during capture recording. onGraphReplayed()
         // must only run during the replay phase (Phase 3).
         post_launch_cb(segment, capture_stream);
-        gpu_ctx->synchronize();
+        // Use stream-level sync (not device-wide) — capture_stream is where
+        // the graph was launched, and hipDeviceSynchronize is illegal during
+        // global capture mode if another TP device is still capturing.
+        gpu_ctx->synchronizeStream(capture_stream);
         LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+launched: "
                   << segment.capture->nodeCount() << " nodes, " << segment.stage_names.size() << " stages");
         return true;
@@ -841,7 +904,21 @@ namespace llaminar2
                    t == ComputeStageType::ALLGATHER_V;
         };
 
-        gpu_ctx->synchronize();
+        // Use the real default stream, not nullptr. AMDDeviceContext creates a
+        // real hipStream_t via hipStreamCreateWithFlags, so defaultStream() is
+        // a distinct object from hipStream_t(0). The RCCL coordinator's
+        // compute_events are recorded on this same stream (registered via
+        // setComputeStreams()), so stages must target the same stream identity
+        // for event-based allreduce synchronization to chain correctly.
+        void *compute_stream = gpu_ctx->defaultStream();
+
+        // Use stream-level sync (not device-wide hipDeviceSynchronize) to avoid
+        // conflict with hipStreamCaptureModeGlobal. In multi-device TP, the other
+        // device may have already started graph capture by the time we reach this
+        // sync. hipDeviceSynchronize() is always illegal during global capture mode
+        // (returns hipErrorStreamCaptureUnsupported), but hipStreamSynchronize()
+        // on a non-captured stream is safe.
+        gpu_ctx->synchronizeStream(compute_stream);
 
         for (const auto &stage_name : segment.stage_names)
         {
@@ -852,7 +929,7 @@ namespace llaminar2
                 return false;
             }
 
-            node->stage->setGPUStream(nullptr);
+            node->stage->setGPUStream(compute_stream);
 
             const bool needs_execute_node = has_collective_nodes || is_collective_stage(node->stage->type());
             if (needs_execute_node)
@@ -873,7 +950,7 @@ namespace llaminar2
         }
 
         segment.last_executed_step = current_step;
-        gpu_ctx->synchronize();
+        gpu_ctx->synchronizeStream(compute_stream);
         return true;
     }
 
@@ -1036,9 +1113,16 @@ namespace llaminar2
 
         initializeReplayCallbacks(graph, segment_cache);
 
+        // When a capturable segment fails mid-capture, we CANNOT fall back to
+        // executeFastDecode (full re-execution) because prior manual segments
+        // already executed allreduces. Re-executing them would cause a collective
+        // count mismatch between devices → deadlock. Instead, we abandon capture
+        // and continue executing the remaining segments normally.
+        bool capture_abandoned = false;
+
         for (auto &seg : segment_cache.segments)
         {
-            if (seg.capturable)
+            if (seg.capturable && !capture_abandoned)
             {
                 // Capturable path: set stream -> begin capture -> execute nodes
                 // into graph -> end capture -> finalize for Phase-2 semantics.
@@ -1051,6 +1135,16 @@ namespace llaminar2
                     }
                 }
 
+                // Drain any pending warmup work on the capture stream before
+                // starting capture. During warmup (step 0), all stages —
+                // including RCCL allreduce — execute on this stream. If that
+                // work hasn't completed, beginCapture() encounters pending ops
+                // and either includes them in the graph (wrong) or fails.
+                // Use stream-level sync (not device-wide) because
+                // hipDeviceSynchronize() is illegal under global capture mode
+                // if another TP device has already started capturing.
+                gpu_ctx->synchronizeStream(capture_stream);
+
                 seg.capture = gpu_ctx->createGraphCapture(capture_stream);
                 if (!seg.capture)
                 {
@@ -1060,8 +1154,23 @@ namespace llaminar2
                     return result;
                 }
 
+                // Set capture-active flag BEFORE beginCapture() to minimize the
+                // race window where another device's thread might call synchronize()
+                // on this context after HIP starts capturing but before the flag is set.
+                gpu_ctx->setGraphCaptureActive(true);
+                GraphCaptureGuard capture_guard;
+
+                // Clear any sticky HIP error left over from warmup or prior
+                // operations on this stream. Without this, the first kernel
+                // launch after beginCapture would see the stale error and fail
+                // with "operation failed due to a previous error during capture".
+#ifdef HAVE_ROCM
+                hipGetLastError();
+#endif
+
                 if (!seg.capture->beginCapture())
                 {
+                    gpu_ctx->setGraphCaptureActive(false);
                     LOG_ERROR("[DeviceGraphCaptureController] beginCapture failed for segment");
                     result.reset_cache = true;
                     result.fallback_to_fast_decode = true;
@@ -1081,12 +1190,57 @@ namespace llaminar2
                     graph.markCompleted(stage_name);
                 }
 
+                // Clear capture-active flag BEFORE endCapture so that
+                // post-capture operations can sync normally.
+                gpu_ctx->setGraphCaptureActive(false);
+
                 if (!exec_ok || !seg.capture->endCapture())
                 {
-                    LOG_ERROR("[DeviceGraphCaptureController] Segmented capture failed");
-                    result.reset_cache = true;
-                    result.success = exec_ok;
-                    return result;
+                    LOG_WARN("[DeviceGraphCaptureController] Segmented capture failed, "
+                             "continuing without capture to preserve collective sync");
+
+                    // After a failed capture, the HIP/CUDA error state is sticky —
+                    // subsequent kernel launches on this device will fail with
+                    // "operation failed due to a previous error during capture" or
+                    // "invalid argument" until the error is consumed.
+                    // Synchronize both streams and clear the last error so that
+                    // the remaining stages can execute normally.
+                    // Use stream-level sync (not device-wide) to avoid conflict
+                    // with hipStreamCaptureModeGlobal on other TP devices.
+                    gpu_ctx->synchronizeStream(capture_stream);
+                    void *default_stream = gpu_ctx->defaultStream();
+                    gpu_ctx->synchronizeStream(default_stream);
+#ifdef HAVE_ROCM
+                    // hipGetLastError() consumes the sticky error from the failed capture.
+                    hipGetLastError();
+#endif
+                    // Re-execute the remaining un-completed stages of this segment
+                    // without capture. Stages that completed before the failure already
+                    // ran (capture mode executes AND records), so skip those.
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (!node || !node->stage)
+                            continue;
+                        if (node->completed)
+                            continue; // Already ran during the partial capture
+
+                        node->stage->setGPUStream(default_stream);
+                        if (!node->stage->execute(ctx))
+                        {
+                            LOG_ERROR("[DeviceGraphCaptureController] Recovery execution "
+                                      "failed for stage: "
+                                      << stage_name);
+                            result.reset_cache = true;
+                            result.success = false;
+                            return result;
+                        }
+                        graph.markCompleted(stage_name);
+                    }
+
+                    capture_abandoned = true;
+                    seg.capture.reset(); // Discard the failed capture object
+                    continue;            // Process remaining segments normally
                 }
 
                 const bool capture_finalize_ok = finalizeCapturePhaseCapturableSegment(
@@ -1107,7 +1261,10 @@ namespace llaminar2
             }
             else
             {
-                // Manual path: execute with normal stage semantics.
+                // Manual path (or abandoned-capture fallback): execute with
+                // normal stage semantics. When capture_abandoned is set, even
+                // capturable segments go through this path to preserve the
+                // 1:1 collective call balance between devices.
                 const bool manual_capture_ok = executeCapturePhaseManualSegment(
                     graph,
                     seg,
@@ -1122,6 +1279,13 @@ namespace llaminar2
                     return result;
                 }
             }
+        }
+
+        if (capture_abandoned)
+        {
+            // Execution completed but capture was abandoned. Reset cache so the
+            // next decode step tries capturing again from scratch.
+            result.reset_cache = true;
         }
 
         result.success = true;
@@ -1167,9 +1331,25 @@ namespace llaminar2
             return result;
         }
 
+        const bool trace_replay = exec_cfg.gpu_graph_trace_replay;
+        const auto &device_id = ctx->deviceId();
+        const int total_segments = static_cast<int>(segment_cache.segments.size());
+
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
         {
+            if (trace_replay)
+            {
+                const char *seg_type = seg.capturable ? "GRAPH" : "MANUAL";
+                const auto &first_name = seg.stage_names.empty() ? std::string("<empty>") : seg.stage_names.front();
+                LOG_INFO("[ReplayTrace] " << device_id.toString()
+                                          << " step=" << current_step
+                                          << " seg=" << seg_idx << "/" << total_segments
+                                          << " [" << seg_type << "]"
+                                          << " stages=" << seg.stage_names.size()
+                                          << " first=" << first_name);
+            }
+
             // Segment execution picks capturable or manual behavior based on
             // segment metadata prepared during warmup.
             const auto replay_result = executeReplaySegment(
@@ -1194,10 +1374,28 @@ namespace llaminar2
                 return result;
             }
 
+            if (trace_replay)
+            {
+                LOG_INFO("[ReplayTrace] " << device_id.toString()
+                                          << " step=" << current_step
+                                          << " seg=" << seg_idx << "/" << total_segments << " DONE");
+            }
+
             seg_idx++;
         }
 
+        if (trace_replay)
+        {
+            LOG_INFO("[ReplayTrace] " << device_id.toString()
+                                      << " step=" << current_step
+                                      << " ALL " << total_segments << " segments done, entering final synchronize()");
+        }
         gpu_ctx->synchronize();
+        if (trace_replay)
+        {
+            LOG_INFO("[ReplayTrace] " << device_id.toString()
+                                      << " step=" << current_step << " final synchronize() complete");
+        }
         result.success = true;
         return result;
     }

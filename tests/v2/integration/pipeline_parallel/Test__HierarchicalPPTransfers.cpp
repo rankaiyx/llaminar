@@ -47,7 +47,7 @@ namespace
     // =========================================================================
     // Custom Mock TP Context with Transfer Tracking
     // =========================================================================
-    
+
     /**
      * @brief Extended mock TP context that tracks broadcast details
      *
@@ -67,12 +67,12 @@ namespace
         // ILocalTPContext - Configuration
         int degree() const override { return static_cast<int>(devices_.size()); }
         int myIndex() const override { return 0; }
-        const std::vector<GlobalDeviceAddress>& devices() const override { return devices_; }
-        const std::vector<float>& weights() const override { return weights_; }
+        const std::vector<GlobalDeviceAddress> &devices() const override { return devices_; }
+        const std::vector<float> &weights() const override { return weights_; }
         CollectiveBackendType backend() const override { return CollectiveBackendType::HOST; }
 
         // ILocalTPContext - Device Management
-        int indexForDevice(const GlobalDeviceAddress& device) const override
+        int indexForDevice(const GlobalDeviceAddress &device) const override
         {
             for (size_t i = 0; i < devices_.size(); ++i)
             {
@@ -82,27 +82,27 @@ namespace
             return -1;
         }
 
-        const GlobalDeviceAddress& deviceAt(int index) const override
+        const GlobalDeviceAddress &deviceAt(int index) const override
         {
             if (index < 0 || index >= static_cast<int>(devices_.size()))
                 throw std::out_of_range("TrackingMockTPContext::deviceAt: index out of range");
             return devices_[index];
         }
 
-        float weightForDevice(const GlobalDeviceAddress& device) const override
+        float weightForDevice(const GlobalDeviceAddress &device) const override
         {
             int idx = indexForDevice(device);
             return (idx >= 0) ? weights_[idx] : 0.0f;
         }
 
-        int headsForDevice(const GlobalDeviceAddress& device, int total_heads) const override
+        int headsForDevice(const GlobalDeviceAddress &device, int total_heads) const override
         {
             float w = weightForDevice(device);
             return static_cast<int>(w * static_cast<float>(total_heads) + 0.5f);
         }
 
         std::pair<int, int> rowRangeForDevice(
-            const GlobalDeviceAddress& device, int total_rows) const override
+            const GlobalDeviceAddress &device, int total_rows) const override
         {
             int idx = indexForDevice(device);
             if (idx < 0)
@@ -116,36 +116,40 @@ namespace
         }
 
         std::pair<int, int> colRangeForDevice(
-            const GlobalDeviceAddress& device, int total_cols) const override
+            const GlobalDeviceAddress &device, int total_cols) const override
         {
             return rowRangeForDevice(device, total_cols);
         }
 
         // ILocalTPContext - Collective Operations (no-ops for tests)
-        bool allreduce(TensorBase* /*tensor*/) override { return true; }
-        bool allreduce(TensorBase* tensor, const std::string& /*stage_name*/, size_t /*count*/ = 0) override 
-        { 
-            return allreduce(tensor); 
+        bool allreduce(TensorBase * /*tensor*/) override { return true; }
+        bool allreduce(TensorBase *tensor, const std::string & /*stage_name*/, size_t /*count*/ = 0) override
+        {
+            return allreduce(tensor);
         }
-        bool allreduce(const TensorBase* /*input*/, TensorBase* /*output*/) override { return true; }
-        bool allgather(const TensorBase* /*local_shard*/, TensorBase* /*global_tensor*/) override { return true; }
-        bool gatherFromDevices(const std::vector<const TensorBase*>& /*shards*/, TensorBase* /*output*/) override { return true; }
-        bool reduceScatter(const TensorBase* /*input*/, TensorBase* /*output_shard*/) override { return true; }
+        bool allreduce(const TensorBase * /*input*/, TensorBase * /*output*/) override { return true; }
+        bool allgather(const TensorBase * /*local_shard*/, TensorBase * /*global_tensor*/) override { return true; }
+        bool gatherFromDevices(const std::vector<const TensorBase *> & /*shards*/, TensorBase * /*output*/) override { return true; }
+        bool reduceScatter(const TensorBase * /*input*/, TensorBase * /*output_shard*/) override { return true; }
 
         void synchronize() override {}
 
         // ILocalTPContext - BAR Registry (no-ops)
-        void registerBARBackedOutput(const std::string&, const GlobalDeviceAddress&, TensorBase*) override {}
-        bool hasBARBackedOutputs(const std::string&) const override { return false; }
+        void registerBARBackedOutput(const std::string &, const GlobalDeviceAddress &, TensorBase *) override {}
+        bool hasBARBackedOutputs(const std::string &) const override { return false; }
         void clearBARBackedOutputs() override {}
         std::shared_ptr<DirectP2PEngine> getDirectP2PEngine() const override { return nullptr; }
         bool reserveTempBufferBytes(size_t) override { return true; }
+
+        // ILocalTPContext - Abort
+        void requestAbort() override {}
+        bool isAbortRequested() const override { return false; }
 
         // =====================================================================
         // Broadcast with Tracking
         // =====================================================================
 
-        bool broadcast(TensorBase* tensor, int source_device_index = 0) override
+        bool broadcast(TensorBase *tensor, int source_device_index = 0) override
         {
             (void)tensor;
             BroadcastCall call;
@@ -166,7 +170,7 @@ namespace
             GlobalDeviceAddress source_device;
         };
 
-        const std::vector<BroadcastCall>& broadcastCalls() const { return broadcast_calls_; }
+        const std::vector<BroadcastCall> &broadcastCalls() const { return broadcast_calls_; }
         int broadcastCallCount() const { return broadcast_call_count_.load(); }
         void setBroadcastShouldFail(bool fail) { broadcast_should_fail_ = fail; }
 
@@ -202,19 +206,19 @@ namespace
          * @brief Create HierarchicalPPContext from stages and boundaries
          */
         static std::unique_ptr<ILocalPPContext> createPPContext(
-            const std::vector<PPStage>& stages,
-            const std::vector<int>& layer_boundaries)
+            const std::vector<PPStage> &stages,
+            const std::vector<int> &layer_boundaries)
         {
             HierarchicalPPConfig config;
             config.stages = stages;
             config.layer_boundaries = layer_boundaries;
-            
+
             if (!config.isValid())
             {
                 LOG_ERROR("Test helper: Invalid HierarchicalPPConfig");
                 return nullptr;
             }
-            
+
             return createLocalPPContext(config);
         }
 
@@ -238,13 +242,13 @@ namespace
         // GIVEN: Heterogeneous TP domain with rocm:0 at index 0, cuda:0 at index 1
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
-                GlobalDeviceAddress::rocm(0),  // Index 0 - representative
-                GlobalDeviceAddress::cuda(0)   // Index 1 - same vendor as destination
+                GlobalDeviceAddress::rocm(0), // Index 0 - representative
+                GlobalDeviceAddress::cuda(0)  // Index 1 - same vendor as destination
             });
 
         std::vector<PPStage> stages = {
-            PPStage::fromTPContext(tp_ctx),        // Stage 0: TP(rocm:0, cuda:0)
-            PPStage::fromDevice(GlobalDeviceAddress::cuda(1))  // Stage 1: cuda:1
+            PPStage::fromTPContext(tp_ctx),                   // Stage 0: TP(rocm:0, cuda:0)
+            PPStage::fromDevice(GlobalDeviceAddress::cuda(1)) // Stage 1: cuda:1
         };
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
@@ -258,16 +262,16 @@ namespace
         // The actual transfer will fail without real GPU infrastructure,
         // but we can verify the config was set up correctly
         EXPECT_EQ(pp_ctx->numStages(), 2);
-        
+
         // Verify stage 0 is the TP domain
         EXPECT_TRUE(stages[0].isTPDomain());
         EXPECT_EQ(stages[0].asTPContext()->degree(), 2);
-        
+
         // Verify the TP domain contains both vendor types
-        auto* tp = stages[0].asTPContext();
+        auto *tp = stages[0].asTPContext();
         EXPECT_TRUE(tp->deviceAt(0).device_type == DeviceType::ROCm);
         EXPECT_TRUE(tp->deviceAt(1).device_type == DeviceType::CUDA);
-        
+
         LOG_INFO("[Test] SmartSourceSelection_PrefersSameVendor_CudaToCuda: "
                  << "TP domain devices verified");
     }
@@ -285,13 +289,13 @@ namespace
         // GIVEN: Heterogeneous TP domain with cuda:0 at index 0, rocm:0 at index 1
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
-                GlobalDeviceAddress::cuda(0),  // Index 0 - representative
-                GlobalDeviceAddress::rocm(0)   // Index 1 - same vendor as destination
+                GlobalDeviceAddress::cuda(0), // Index 0 - representative
+                GlobalDeviceAddress::rocm(0)  // Index 1 - same vendor as destination
             });
 
         std::vector<PPStage> stages = {
-            PPStage::fromTPContext(tp_ctx),        // Stage 0: TP(cuda:0, rocm:0)
-            PPStage::fromDevice(GlobalDeviceAddress::rocm(1))  // Stage 1: rocm:1
+            PPStage::fromTPContext(tp_ctx),                   // Stage 0: TP(cuda:0, rocm:0)
+            PPStage::fromDevice(GlobalDeviceAddress::rocm(1)) // Stage 1: rocm:1
         };
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
@@ -300,11 +304,11 @@ namespace
         // Verify configuration
         EXPECT_EQ(pp_ctx->numStages(), 2);
         EXPECT_TRUE(stages[0].isTPDomain());
-        
-        auto* tp = stages[0].asTPContext();
+
+        auto *tp = stages[0].asTPContext();
         EXPECT_TRUE(tp->deviceAt(0).device_type == DeviceType::CUDA);
         EXPECT_TRUE(tp->deviceAt(1).device_type == DeviceType::ROCm);
-        
+
         LOG_INFO("[Test] SmartSourceSelection_PrefersSameVendor_RocmToRocm: "
                  << "TP domain devices verified");
     }
@@ -323,13 +327,11 @@ namespace
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::rocm(0),
-                GlobalDeviceAddress::cuda(0)
-            });
+                GlobalDeviceAddress::cuda(0)});
 
         std::vector<PPStage> stages = {
             PPStage::fromTPContext(tp_ctx),
-            PPStage::fromDevice(GlobalDeviceAddress::cpu())
-        };
+            PPStage::fromDevice(GlobalDeviceAddress::cpu())};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
@@ -337,7 +339,7 @@ namespace
         // Verify configuration
         EXPECT_EQ(pp_ctx->numStages(), 2);
         EXPECT_TRUE(stages[1].device().device_type == DeviceType::CPU);
-        
+
         LOG_INFO("[Test] SmartSourceSelection_CPUDestination: "
                  << "Configuration verified (CPU destination uses any source)");
     }
@@ -355,23 +357,21 @@ namespace
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::cuda(0),
-                GlobalDeviceAddress::cuda(1)
-            });
+                GlobalDeviceAddress::cuda(1)});
 
         std::vector<PPStage> stages = {
             PPStage::fromTPContext(tp_ctx),
-            PPStage::fromDevice(GlobalDeviceAddress::cuda(2))
-        };
+            PPStage::fromDevice(GlobalDeviceAddress::cuda(2))};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
 
         // Verify all devices are CUDA
-        auto* tp = stages[0].asTPContext();
+        auto *tp = stages[0].asTPContext();
         EXPECT_TRUE(tp->deviceAt(0).device_type == DeviceType::CUDA);
         EXPECT_TRUE(tp->deviceAt(1).device_type == DeviceType::CUDA);
         EXPECT_TRUE(stages[1].device().device_type == DeviceType::CUDA);
-        
+
         LOG_INFO("[Test] SmartSourceSelection_HomogeneousTPDomain: "
                  << "All CUDA devices - representative is optimal");
     }
@@ -389,23 +389,21 @@ namespace
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::rocm(0),
-                GlobalDeviceAddress::rocm(1)
-            });
+                GlobalDeviceAddress::rocm(1)});
 
         std::vector<PPStage> stages = {
             PPStage::fromTPContext(tp_ctx),
-            PPStage::fromDevice(GlobalDeviceAddress::cuda(0))
-        };
+            PPStage::fromDevice(GlobalDeviceAddress::cuda(0))};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
 
         // Verify no CUDA in TP domain
-        auto* tp = stages[0].asTPContext();
+        auto *tp = stages[0].asTPContext();
         EXPECT_TRUE(tp->deviceAt(0).device_type == DeviceType::ROCm);
         EXPECT_TRUE(tp->deviceAt(1).device_type == DeviceType::ROCm);
         EXPECT_TRUE(stages[1].device().device_type == DeviceType::CUDA);
-        
+
         LOG_INFO("[Test] SmartSourceSelection_NoSameVendor: "
                  << "Falls back to representative (rocm:0) when no CUDA in TP domain");
     }
@@ -427,12 +425,11 @@ namespace
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::cuda(1),
-                GlobalDeviceAddress::cuda(2)
-            });
+                GlobalDeviceAddress::cuda(2)});
 
         std::vector<PPStage> stages = {
-            PPStage::fromDevice(GlobalDeviceAddress::cuda(0)),  // Stage 0: cuda:0
-            PPStage::fromTPContext(tp_ctx)                      // Stage 1: TP(cuda:1, cuda:2)
+            PPStage::fromDevice(GlobalDeviceAddress::cuda(0)), // Stage 0: cuda:0
+            PPStage::fromTPContext(tp_ctx)                     // Stage 1: TP(cuda:1, cuda:2)
         };
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
@@ -447,7 +444,7 @@ namespace
 
         // Note: Actual transfer would call broadcast, but requires GPU infrastructure
         // We've verified the mock is properly configured to track broadcasts
-        
+
         LOG_INFO("[Test] BroadcastToTPDomain: Mock configured to track broadcasts");
     }
 
@@ -463,23 +460,22 @@ namespace
         // GIVEN: Source is CUDA, TP domain is heterogeneous
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
-                GlobalDeviceAddress::rocm(0),  // Index 0
-                GlobalDeviceAddress::cuda(1)   // Index 1 - same vendor as source
+                GlobalDeviceAddress::rocm(0), // Index 0
+                GlobalDeviceAddress::cuda(1)  // Index 1 - same vendor as source
             });
 
         std::vector<PPStage> stages = {
             PPStage::fromDevice(GlobalDeviceAddress::cuda(0)),
-            PPStage::fromTPContext(tp_ctx)
-        };
+            PPStage::fromTPContext(tp_ctx)};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
 
         // Verify TP domain has heterogeneous devices
-        auto* tp = stages[1].asTPContext();
+        auto *tp = stages[1].asTPContext();
         EXPECT_TRUE(tp->deviceAt(0).device_type == DeviceType::ROCm);
         EXPECT_TRUE(tp->deviceAt(1).device_type == DeviceType::CUDA);
-        
+
         LOG_INFO("[Test] BroadcastToTPDomain_PrefersSameVendor: "
                  << "Initial transfer should prefer cuda:1 (index 1)");
     }
@@ -496,20 +492,18 @@ namespace
         // GIVEN: Single-device TP domain
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
-                GlobalDeviceAddress::cuda(1)
-            });
+                GlobalDeviceAddress::cuda(1)});
 
         std::vector<PPStage> stages = {
             PPStage::fromDevice(GlobalDeviceAddress::cuda(0)),
-            PPStage::fromTPContext(tp_ctx)
-        };
+            PPStage::fromTPContext(tp_ctx)};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
 
         // Verify TP domain has single device
         EXPECT_EQ(tp_ctx->degree(), 1);
-        
+
         LOG_INFO("[Test] BroadcastToTPDomain_SkippedForSingleDevice: "
                  << "Single-device TP domain should skip broadcast");
     }
@@ -532,19 +526,17 @@ namespace
         auto tp_ctx_0 = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::rocm(0),
-                GlobalDeviceAddress::cuda(0)
-            });
+                GlobalDeviceAddress::cuda(0)});
 
         auto tp_ctx_2 = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::cuda(2),
-                GlobalDeviceAddress::rocm(1)
-            });
+                GlobalDeviceAddress::rocm(1)});
 
         std::vector<PPStage> stages = {
-            PPStage::fromTPContext(tp_ctx_0),               // Stage 0: TP(rocm:0, cuda:0)
-            PPStage::fromDevice(GlobalDeviceAddress::cuda(1)),  // Stage 1: cuda:1
-            PPStage::fromTPContext(tp_ctx_2)                // Stage 2: TP(cuda:2, rocm:1)
+            PPStage::fromTPContext(tp_ctx_0),                  // Stage 0: TP(rocm:0, cuda:0)
+            PPStage::fromDevice(GlobalDeviceAddress::cuda(1)), // Stage 1: cuda:1
+            PPStage::fromTPContext(tp_ctx_2)                   // Stage 2: TP(cuda:2, rocm:1)
         };
 
         auto pp_ctx = createPPContext(stages, {0, 8, 16, 24});
@@ -577,20 +569,19 @@ namespace
         // GIVEN: Both stages are heterogeneous TP domains
         auto tp_ctx_0 = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
-                GlobalDeviceAddress::rocm(0),  // Index 0
-                GlobalDeviceAddress::cuda(0)   // Index 1
+                GlobalDeviceAddress::rocm(0), // Index 0
+                GlobalDeviceAddress::cuda(0)  // Index 1
             });
 
         auto tp_ctx_1 = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
-                GlobalDeviceAddress::cuda(1),  // Index 0
-                GlobalDeviceAddress::rocm(1)   // Index 1
+                GlobalDeviceAddress::cuda(1), // Index 0
+                GlobalDeviceAddress::rocm(1)  // Index 1
             });
 
         std::vector<PPStage> stages = {
             PPStage::fromTPContext(tp_ctx_0),
-            PPStage::fromTPContext(tp_ctx_1)
-        };
+            PPStage::fromTPContext(tp_ctx_1)};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
@@ -617,13 +608,11 @@ namespace
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::cuda(0),
-                GlobalDeviceAddress::cuda(1)
-            });
+                GlobalDeviceAddress::cuda(1)});
 
         std::vector<PPStage> stages = {
             PPStage::fromTPContext(tp_ctx),
-            PPStage::fromDevice(GlobalDeviceAddress::cuda(2))
-        };
+            PPStage::fromDevice(GlobalDeviceAddress::cuda(2))};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
@@ -643,13 +632,11 @@ namespace
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::cuda(0),
-                GlobalDeviceAddress::cuda(1)
-            });
+                GlobalDeviceAddress::cuda(1)});
 
         std::vector<PPStage> stages = {
             PPStage::fromTPContext(tp_ctx),
-            PPStage::fromDevice(GlobalDeviceAddress::cuda(2))
-        };
+            PPStage::fromDevice(GlobalDeviceAddress::cuda(2))};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
@@ -671,13 +658,11 @@ namespace
         auto tp_ctx = std::make_shared<TrackingMockTPContext>(
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::cuda(0),
-                GlobalDeviceAddress::cuda(1)
-            });
+                GlobalDeviceAddress::cuda(1)});
 
         std::vector<PPStage> stages = {
             PPStage::fromTPContext(tp_ctx),
-            PPStage::fromDevice(GlobalDeviceAddress::cuda(2))
-        };
+            PPStage::fromDevice(GlobalDeviceAddress::cuda(2))};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
@@ -703,19 +688,17 @@ namespace
             std::vector<GlobalDeviceAddress>{
                 GlobalDeviceAddress::rocm(0),
                 GlobalDeviceAddress::cuda(0),
-                GlobalDeviceAddress::cpu()
-            });
+                GlobalDeviceAddress::cpu()});
 
         std::vector<PPStage> stages = {
             PPStage::fromTPContext(tp_ctx),
-            PPStage::fromDevice(GlobalDeviceAddress::cuda(1))
-        };
+            PPStage::fromDevice(GlobalDeviceAddress::cuda(1))};
 
         auto pp_ctx = createPPContext(stages, {0, 12, 24});
         ASSERT_NE(pp_ctx, nullptr);
 
         // Verify TP domain contains all three device types
-        auto* tp = stages[0].asTPContext();
+        auto *tp = stages[0].asTPContext();
         EXPECT_EQ(tp->degree(), 3);
         EXPECT_TRUE(tp->deviceAt(0).device_type == DeviceType::ROCm);
         EXPECT_TRUE(tp->deviceAt(1).device_type == DeviceType::CUDA);

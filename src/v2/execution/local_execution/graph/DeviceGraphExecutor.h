@@ -576,7 +576,8 @@ namespace llaminar2
                                               GraphSegmentCache &segment_cache,
                                               void *gpu_stream,
                                               IWorkerGPUContext *gpu_ctx,
-                                              const std::unordered_set<std::string> *collective_nodes = nullptr);
+                                              const std::unordered_set<std::string> *collective_nodes = nullptr,
+                                              bool collectives_graph_capturable = false);
 
         /**
          * @brief Policy object for decode capture/replay execution mode selection
@@ -586,6 +587,7 @@ namespace llaminar2
             bool allow_fast_decode = true;
             bool allow_segmented_capture = false;
             bool collective_segmented_enabled = false;
+            bool collectives_graph_capturable = false; ///< True when collective ops can be captured into GPU graph
             int max_segment_failures = 4;
         };
 

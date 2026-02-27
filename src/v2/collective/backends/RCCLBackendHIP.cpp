@@ -255,6 +255,12 @@ namespace llaminar2
         bool hipDeviceSynchronizeWrapper()
         {
             hipError_t err = hipDeviceSynchronize();
+            if (err == hipErrorStreamCaptureUnsupported ||
+                err == hipErrorStreamCaptureImplicit)
+            {
+                // Benign: graph capture is active on this device — skip sync.
+                return true;
+            }
             return (err == hipSuccess);
         }
 

@@ -326,6 +326,28 @@ namespace llaminar2
          */
         virtual std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) = 0;
 
+        // =========================================================================
+        // Graph Capture State
+        // =========================================================================
+
+        /**
+         * @brief Indicate that a graph capture recording is active on this device.
+         *
+         * While active, operations that are illegal during HIP/CUDA graph capture
+         * (e.g., hipDeviceSynchronize, hipStreamSynchronize on the capture stream,
+         * synchronous hipMemcpy) will be skipped or handled specially.
+         *
+         * @param active true when between beginCapture/endCapture, false otherwise
+         * @thread_safety Thread-safe; uses atomic internally
+         */
+        virtual void setGraphCaptureActive(bool active) { (void)active; }
+
+        /**
+         * @brief Check whether graph capture recording is active on this device.
+         * @return true if between beginCapture/endCapture
+         */
+        virtual bool isDeviceGraphCaptureActive() const { return false; }
+
     protected:
         IWorkerGPUContext() = default;
     };

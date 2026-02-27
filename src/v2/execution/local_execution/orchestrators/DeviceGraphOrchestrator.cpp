@@ -1050,8 +1050,30 @@ namespace llaminar2
             allow_collective_segmented &&
             collective_segmented_backend_supported;
 
+        // Check if collectives can be captured INTO the GPU graph
+        // (monolithic capture with on-stream allreduce).
+        //
+        // When enabled, LocalTPAllreduceStage issues rcclAllReduce directly
+        // on the capture stream (via allreduceOnStream), making the collective
+        // part of the captured graph.  This eliminates segmentation overhead
+        // (many small graphs + manual segments) in favour of a single monolithic
+        // graph per decode step.
+        //
+        // Requirements:
+        //   - Local TP with RCCL/NCCL backend (on-stream allreduce path)
+        //   - Stages must call allreduceOnStream(gpuStream()) during capture
+        //   - No cross-stream event sync (pre/post compute_event dance) during capture
+        //
+        // The segmented path remains as fallback when this is disabled or for
+        // MPI-based collectives that cannot be graph-captured.
+        policy.collectives_graph_capturable =
+            has_collective_nodes &&
+            env.execution.gpu_graphs &&
+            ctx && ctx->isGPU();
+
         const bool can_use_segmented_graph =
             !has_collective_nodes ||
+            policy.collectives_graph_capturable ||
             policy.collective_segmented_enabled;
 
         policy.allow_segmented_capture =
@@ -1068,8 +1090,16 @@ namespace llaminar2
     {
         const auto &graph_cfg = graph_builder_->config();
         const bool has_local_tp = graph_cfg.local_tp_ctx && graph_cfg.local_tp_ctx->degree() > 1;
+
+        // For Local TP (multi-GPU, single MPI rank), the per-device
+        // DeviceGraphOrchestrator may not have an injected_collective_ctx_
+        // because the MultiDeviceOrchestrator owns the LocalTPContext.
+        // The collective stages (TPAllreduceStage) execute as manual segments
+        // between graph-captured compute segments, so segmented replay is safe
+        // as long as the backend supports stream-ordered collectives.
         const bool single_rank_collectives =
-            injected_collective_ctx_ && injected_collective_ctx_->worldSize() == 1;
+            (injected_collective_ctx_ && injected_collective_ctx_->worldSize() == 1) ||
+            has_local_tp; // Local TP implies single-rank collectives
 
         if (!(has_local_tp && single_rank_collectives))
         {
