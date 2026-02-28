@@ -30,6 +30,8 @@
 #include "../../../utils/Logger.h"
 #include <algorithm>
 #include <future>
+#include <iomanip>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -336,7 +338,20 @@ namespace llaminar2
                   << device_runners_.size() << " injected device runners");
     }
 
-    MultiDeviceOrchestrator::~MultiDeviceOrchestrator() = default;
+    MultiDeviceOrchestrator::~MultiDeviceOrchestrator()
+    {
+        // Unpin combined_logits_ if it was pinned for DMA
+        if (combined_logits_pinned_ && combined_logits_ && !device_runners_.empty() &&
+            device_runners_[0]->hasInferenceState())
+        {
+            IBackend *backend = getBackendFor(device_runners_[0]->inferenceState().device_id);
+            if (backend)
+            {
+                backend->unpinHostMemory(combined_logits_->mutable_data());
+            }
+            combined_logits_pinned_ = false;
+        }
+    }
 
     // Move operations
     MultiDeviceOrchestrator::MultiDeviceOrchestrator(MultiDeviceOrchestrator &&) noexcept = default;
@@ -610,6 +625,24 @@ namespace llaminar2
                     std::vector<size_t>{max_tokens, static_cast<size_t>(vocab)});
                 LOG_DEBUG("MultiDeviceOrchestrator: Allocated combined logits buffer ["
                           << max_tokens << ", " << vocab << "]");
+
+                // Pin the logits buffer for faster D2H DMA in gatherLogits.
+                // Pinned (page-locked) memory enables zero-copy DMA without
+                // internal staging buffers in hipMemcpy, saving ~50-100µs/call.
+                if (device_runners_.size() > 1 && !device_runners_.empty())
+                {
+                    IBackend *backend = getBackendFor(device_runners_[0]->inferenceState().device_id);
+                    if (backend)
+                    {
+                        size_t pin_bytes = combined_logits_->numel() * sizeof(float);
+                        if (backend->pinHostMemory(combined_logits_->mutable_data(), pin_bytes))
+                        {
+                            combined_logits_pinned_ = true;
+                            LOG_DEBUG("MultiDeviceOrchestrator: Pinned combined logits buffer ("
+                                      << (pin_bytes / 1024) << " KB)");
+                        }
+                    }
+                }
             }
         }
 
@@ -1061,8 +1094,61 @@ namespace llaminar2
             return false;
         }
 
-        // Phase 2: Partial D2H — only transfer seq_len rows per device
-        // For decode (seq_len=1): ~303 KB per device instead of ~1.16 GB
+        float *output = combined_logits_->mutable_data();
+
+        // =====================================================================
+        // FAST PATH: Decode (seq_len=1) — D2H directly to combined_logits_
+        // =====================================================================
+        // For decode, each device has exactly 1 row of vocab_local logits.
+        // We D2H directly to the correct offset in combined_logits_, eliminating:
+        //   - Staging buffer allocation/deallocation (~100µs for mmap/munmap)
+        //   - Separate interleave memcpy pass (~40µs)
+        // Host memory is page-locked (hipHostRegister) for DMA without staging.
+        // GPU sync already completed in syncLogitsAtBoundary (called by worker threads).
+        if (seq_len == 1)
+        {
+            size_t col_offset = 0;
+            for (size_t dev = 0; dev < device_infos.size(); ++dev)
+            {
+                const auto &info = device_infos[dev];
+                float *dst = output + col_offset;
+                size_t copy_bytes = info.vocab_local * sizeof(float);
+
+                if (info.gpu_ptr && info.device.has_value())
+                {
+                    IBackend *backend = getBackendFor(*info.device);
+                    if (backend)
+                    {
+                        // Fast path: skip pointer validation — we trust the GPU pointer
+                        // (syncLogitsAtBoundary already did hipStreamSynchronize)
+                        backend->deviceToHostFast(dst, info.gpu_ptr, copy_bytes,
+                                                  info.device->gpu_ordinal());
+                    }
+                    else
+                    {
+                        std::memcpy(dst, info.logits_local->data(), copy_bytes);
+                    }
+                }
+                else
+                {
+                    std::memcpy(dst, info.logits_local->data(), copy_bytes);
+                }
+                col_offset += info.vocab_local;
+            }
+
+            last_gathered_logits_size_ = total_vocab;
+            LOG_DEBUG("MultiDeviceOrchestrator::gatherLogits: DECODE fast path — "
+                      << device_infos.size() << " devices, " << total_vocab << " total vocab");
+            return true;
+        }
+
+        // =====================================================================
+        // GENERAL PATH: Prefill (seq_len > 1) — staging buffers + interleave
+        // =====================================================================
+        // For multi-row prefill, device data is [seq_len, vocab_local] contiguous
+        // but the output is [seq_len, vocab_total] interleaved, so we need
+        // staging buffers for the D2H, then a row-by-row interleave pass.
+        //
         // GPU sync already completed in syncLogitsAtBoundary (called by worker threads)
         std::vector<std::vector<float>> staging_buffers(device_infos.size());
         std::vector<const float *> device_data(device_infos.size());
@@ -1098,17 +1184,7 @@ namespace llaminar2
             }
         }
 
-        // Phase 3: Interleave vocab slices into combined output
-        float *output = combined_logits_->mutable_data();
-
-        // Debug: Log first elements from each device for decode debugging
-        if (seq_len == 1 && device_data.size() >= 2)
-        {
-            LOG_DEBUG("MultiDeviceOrchestrator::gatherLogits: DECODE DEBUG"
-                      << " device0_first=" << device_data[0][0]
-                      << " device1_first=" << device_data[1][0]);
-        }
-
+        // Interleave vocab slices into combined output
         for (size_t row = 0; row < seq_len; ++row)
         {
             size_t col_offset = 0;
@@ -1214,6 +1290,10 @@ namespace llaminar2
             LOG_ERROR("MultiDeviceOrchestrator::forwardTP: No device runners available");
             return false;
         }
+
+        // TP timing diagnostic — enabled via LLAMINAR_TP_TIMING=1
+        const bool tp_timing = debugEnv().tp_timing;
+        auto tp_t0 = tp_timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
         LOG_DEBUG("MultiDeviceOrchestrator::forwardTP: seq_len=" << seq_len
                                                                  << ", devices=" << device_runners_.size());
@@ -1404,12 +1484,19 @@ namespace llaminar2
             std::rethrow_exception(first_exception);
         }
 
+        auto tp_t1 = tp_timing ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
+
         if (all_success)
         {
             // Gather logits from all devices
             // Pass seq_len so gatherLogits knows how many rows to gather
             // (logits_local buffer is pre-allocated for max_seq_len)
-            if (!gatherLogits(static_cast<size_t>(seq_len)))
+            //
+            // Skip for decode (seq_len=1) when GPU-side sampling enabled:
+            // caller will use sampleGreedyOnDevice() which does argmax on GPU,
+            // avoiding the ~286µs D2H of 600 KB logits.
+            bool need_gather = !(skip_logits_gather_decode_ && seq_len == 1);
+            if (need_gather && !gatherLogits(static_cast<size_t>(seq_len)))
             {
                 LOG_ERROR("MultiDeviceOrchestrator::forwardTP: Failed to gather logits");
                 all_success = false;
@@ -1419,6 +1506,18 @@ namespace llaminar2
             current_position_ += seq_len;
             current_padded_seq_len_ = seq_len;
             stats_dirty_ = true;
+        }
+
+        if (tp_timing)
+        {
+            auto tp_t2 = std::chrono::high_resolution_clock::now();
+            double forward_ms = std::chrono::duration<double, std::milli>(tp_t1 - tp_t0).count();
+            double gather_ms = std::chrono::duration<double, std::milli>(tp_t2 - tp_t1).count();
+            double total_ms = std::chrono::duration<double, std::milli>(tp_t2 - tp_t0).count();
+            LOG_INFO("[TP_TIMING] seq_len=" << seq_len
+                                            << " forward=" << std::fixed << std::setprecision(3) << forward_ms << "ms"
+                                            << " gather=" << std::fixed << std::setprecision(3) << gather_ms << "ms"
+                                            << " total=" << std::fixed << std::setprecision(3) << total_ms << "ms");
         }
 
         return all_success;
@@ -1585,6 +1684,118 @@ namespace llaminar2
 
         LOG_DEBUG("MultiDeviceOrchestrator::copyLogitsFromStage: Copied " << copy_elements
                                                                           << " elements from stage " << stage_idx);
+    }
+
+    int MultiDeviceOrchestrator::sampleGreedyOnDevice()
+    {
+        // Only supported for TP mode with multiple GPU devices
+        if (mode_ != ParallelismMode::TP || device_runners_.size() < 2)
+            return -1;
+
+        static bool logged_once = false;
+
+        // Collect per-device logits info (same as gatherLogits but we only need GPU pointers)
+        struct DeviceArgmaxInfo
+        {
+            const void *gpu_ptr;
+            std::optional<DeviceId> device;
+            size_t vocab_local;
+        };
+
+        std::vector<DeviceArgmaxInfo> infos;
+        infos.reserve(device_runners_.size());
+
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner || !runner->hasInferenceState())
+                return -1;
+            const auto &state = runner->inferenceState();
+            if (!state.logits_local)
+                return -1;
+
+            const auto &shape = state.logits_local->shape();
+            if (shape.size() < 2)
+                return -1;
+
+            const void *gpu_ptr = state.logits_local->gpu_data_ptr();
+            if (!gpu_ptr)
+            {
+                LOG_TRACE("[sampleGreedyOnDevice] gpu_data_ptr() null for device "
+                          << state.device_id.toString());
+                return -1; // Not on GPU — can't do device-side argmax
+            }
+
+            LOG_TRACE("[sampleGreedyOnDevice] Device "
+                      << state.device_id.toString()
+                      << " gpu_ptr=" << gpu_ptr << " vocab_local=" << shape[1]);
+
+            infos.push_back({gpu_ptr, state.logits_local->current_device(), shape[1]});
+        }
+
+        // For each device, run argmax on the last row of logits (decode only)
+        // GPU layout: [max_seq_len, vocab_local] — we want the last written row
+        // The logits are seq_len rows; for decode seq_len=1, so row 0 has the data.
+        struct DeviceResult
+        {
+            float value;
+            int local_index;
+            size_t col_offset; // Global vocab offset for this device
+        };
+
+        std::vector<DeviceResult> results;
+        results.reserve(infos.size());
+        size_t col_offset = 0;
+
+        for (const auto &info : infos)
+        {
+            if (!info.device.has_value())
+                return -1;
+
+            IBackend *backend = getBackendFor(*info.device);
+            if (!backend)
+                return -1;
+
+            float max_val = -std::numeric_limits<float>::infinity();
+            int max_idx = 0;
+
+            if (!backend->argmaxF32(info.gpu_ptr,
+                                    static_cast<int>(info.vocab_local),
+                                    info.device->gpu_ordinal(),
+                                    &max_val, &max_idx))
+            {
+                LOG_TRACE("[sampleGreedyOnDevice] argmaxF32 failed for device " << info.device->toString());
+                return -1; // Kernel failed — caller falls back to CPU
+            }
+
+            LOG_TRACE("[sampleGreedyOnDevice] Device " << info.device->toString()
+                                                       << " local_argmax=" << max_idx << " val=" << max_val);
+
+            results.push_back({max_val, max_idx, col_offset});
+            col_offset += info.vocab_local;
+        }
+
+        // Pick global winner across devices
+        int best_token = -1;
+        float best_value = -std::numeric_limits<float>::infinity();
+        for (const auto &r : results)
+        {
+            if (r.value > best_value)
+            {
+                best_value = r.value;
+                best_token = static_cast<int>(r.col_offset) + r.local_index;
+            }
+        }
+
+        LOG_TRACE("[sampleGreedyOnDevice] Winner: token=" << best_token << " val=" << best_value);
+
+        if (!logged_once)
+        {
+            LOG_INFO("[sampleGreedyOnDevice] GPU-side argmax active (" << device_runners_.size()
+                                                                       << " devices, vocab_local=" << infos[0].vocab_local << " each)");
+            logged_once = true;
+        }
+
+        return best_token;
     }
 
     const float *MultiDeviceOrchestrator::logits() const

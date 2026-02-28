@@ -1276,6 +1276,16 @@ int main(int argc, char *argv[])
                 orch_runner_->resetExecutorStats();
             }
 
+            int sampleGreedyOnDevice() override
+            {
+                return orch_runner_->sampleGreedyOnDevice();
+            }
+
+            void setSkipLogitsGatherDecode(bool skip) override
+            {
+                orch_runner_->setSkipLogitsGatherDecode(skip);
+            }
+
         private:
             IOrchestrationRunner *orch_runner_;
             int position_;

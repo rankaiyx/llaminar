@@ -1294,4 +1294,21 @@ namespace llaminar2
         }
     }
 
+    int OrchestrationRunner::sampleGreedyOnDevice()
+    {
+        if (runner_)
+        {
+            return runner_->sampleGreedyOnDevice();
+        }
+        return -1;
+    }
+
+    void OrchestrationRunner::setSkipLogitsGatherDecode(bool skip)
+    {
+        if (runner_)
+        {
+            runner_->setSkipLogitsGatherDecode(skip);
+        }
+    }
+
 } // namespace llaminar2

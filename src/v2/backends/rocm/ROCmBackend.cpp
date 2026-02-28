@@ -170,6 +170,94 @@ namespace llaminar2
         return (err == hipSuccess);
     }
 
+    bool ROCmBackend::deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id)
+    {
+        // Fast path: skip pointer validation and device save/restore.
+        // Caller guarantees src is valid device memory and GPU work is complete.
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+        hipError_t err = hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
+        return (err == hipSuccess);
+    }
+
+    bool ROCmBackend::pinHostMemory(void *ptr, size_t bytes)
+    {
+        hipError_t err = hipHostRegister(ptr, bytes, hipHostRegisterDefault);
+        if (err != hipSuccess)
+        {
+            LOG_WARN("[ROCmBackend::pinHostMemory] hipHostRegister failed for "
+                     << bytes << " bytes: " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::unpinHostMemory(void *ptr)
+    {
+        hipError_t err = hipHostUnregister(ptr);
+        if (err != hipSuccess)
+        {
+            LOG_WARN("[ROCmBackend::unpinHostMemory] hipHostUnregister failed: "
+                     << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // Forward declaration for HIP argmax kernel (implemented in ROCmArgmaxKernels.hip)
+    extern "C" bool rocmOps_argmax_f32(
+        const float *data, int n, float *out_value, int *out_index,
+        int device_idx, void *stream);
+
+    bool ROCmBackend::argmaxF32(const void *data_device, int n, int device_id,
+                                float *out_value, int *out_index)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0)
+            return false;
+
+        // Lazily allocate per-device result buffers
+        if (argmax_buffers_.empty())
+            argmax_buffers_.resize(device_count_);
+
+        auto &bufs = argmax_buffers_[device_id];
+        if (!bufs.value_ptr)
+        {
+            hipError_t err = hipSetDevice(device_id);
+            if (err != hipSuccess)
+                return false;
+            err = hipMalloc(&bufs.value_ptr, sizeof(float));
+            if (err != hipSuccess)
+                return false;
+            err = hipMalloc(&bufs.index_ptr, sizeof(int));
+            if (err != hipSuccess)
+            {
+                hipFree(bufs.value_ptr);
+                bufs.value_ptr = nullptr;
+                return false;
+            }
+        }
+
+        // Launch kernel on device's default stream
+        hipSetDevice(device_id);
+        if (!rocmOps_argmax_f32(
+                static_cast<const float *>(data_device), n,
+                static_cast<float *>(bufs.value_ptr),
+                static_cast<int *>(bufs.index_ptr),
+                device_id, nullptr /* default stream */))
+        {
+            return false;
+        }
+
+        // Sync and D2H the tiny result (8 bytes total)
+        hipDeviceSynchronize();
+        hipMemcpy(out_value, bufs.value_ptr, sizeof(float), hipMemcpyDeviceToHost);
+        hipMemcpy(out_index, bufs.index_ptr, sizeof(int), hipMemcpyDeviceToHost);
+
+        return true;
+    }
+
     bool ROCmBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id)
     {
         if (device_id >= device_count_ || device_id < 0)

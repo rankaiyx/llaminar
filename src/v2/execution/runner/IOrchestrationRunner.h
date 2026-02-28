@@ -309,6 +309,30 @@ namespace llaminar2
          * @brief Reset executor profiling statistics
          */
         virtual void resetExecutorStats() {}
+
+        // =====================================================================
+        // GPU-side Sampling (for benchmark optimization)
+        // =====================================================================
+
+        /**
+         * @brief Perform greedy argmax sampling on device (GPU)
+         *
+         * Avoids D2H transfer of logits + CPU scan. Each device runs argmax
+         * on its local logits shard, then the host picks the global winner.
+         *
+         * @return Token ID (>= 0) on success, -1 if not supported or failed
+         */
+        virtual int sampleGreedyOnDevice() { return -1; }
+
+        /**
+         * @brief Enable/disable skipping of logits D2H gather during decode
+         *
+         * When enabled, forwardTP() skips the gatherLogits call for decode
+         * (seq_len=1), since sampleGreedyOnDevice() reads GPU logits directly.
+         *
+         * @param skip true to skip logits gather, false to restore normal behavior
+         */
+        virtual void setSkipLogitsGatherDecode(bool /*skip*/) {}
     };
 
 } // namespace llaminar2

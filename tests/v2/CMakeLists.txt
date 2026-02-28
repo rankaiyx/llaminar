@@ -8230,6 +8230,38 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added HIP Graph Launch Overhead performance benchmarks")
+
+    # Performance Test: RCCL AllReduce Minimum Latency
+    # =============================================================================
+    # Measures the minimum achievable RCCL allreduce latency for small transfers
+    # (~14 KB = Qwen2.5-7B d_model × sizeof(float)). Explores:
+    #   - Latency vs message size (256B → 1MB)
+    #   - Group vs no-group overhead
+    #   - Batched allreduce (ncclGroupStart/End fusion)
+    #   - Sequential vs fused allreduce (56×14KB vs 1×784KB)
+    #   - In-place vs out-of-place
+    #   - FP16 vs FP32
+    #   - Rapid-fire sequential (simulates real decode pipeline)
+    # Results guide TP efficiency optimization for local tensor parallelism.
+    set_source_files_properties(
+        performance/Perf__RCCLAllreduceLatency.cpp
+        PROPERTIES LANGUAGE HIP
+    )
+    add_executable(v2_perf_rccl_allreduce_latency
+        performance/Perf__RCCLAllreduceLatency.cpp
+    )
+    target_link_libraries(v2_perf_rccl_allreduce_latency
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_RCCLAllreduceLatency
+        COMMAND $<TARGET_FILE:v2_perf_rccl_allreduce_latency>
+        LABELS "V2;Performance;ROCm;RCCL;AllReduce;Latency;TensorParallelism;gfx906;Benchmark"
+        MPI_PROCS 1
+        TIMEOUT 600
+    )
+    message(STATUS "V2 Tests: Added RCCL AllReduce Latency performance benchmarks")
 endif()
 
 # =============================================================================

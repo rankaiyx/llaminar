@@ -14,6 +14,7 @@
 #include <future>
 #include <memory>
 #include <cstdint>
+#include <vector>
 
 namespace llaminar2
 {
@@ -44,10 +45,19 @@ namespace llaminar2
 
         // Memory transfer operations (see IBackend documentation)
         bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id) override;
+        bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id) override;
         bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id) override;
         bool synchronize(int device_id) override;
         bool streamSynchronize(int device_id) override;
         bool setDevice(int device_id) override;
+
+        // Host memory pinning for async DMA
+        bool pinHostMemory(void *ptr, size_t bytes) override;
+        bool unpinHostMemory(void *ptr) override;
+
+        // GPU-side argmax for greedy sampling
+        bool argmaxF32(const void *data_device, int n, int device_id,
+                       float *out_value, int *out_index) override;
 
         // Event operations (fine-grained synchronization)
         void *createEvent(int device_id) override;
@@ -235,6 +245,15 @@ namespace llaminar2
 
     private:
         int device_count_;
+
+        // Per-device argmax result buffers (lazily allocated)
+        // Indices map to device_id. Stores device-side memory for kernel output.
+        struct ArgmaxDeviceBuffers
+        {
+            void *value_ptr = nullptr; // Device pointer for 1 float
+            void *index_ptr = nullptr; // Device pointer for 1 int
+        };
+        std::vector<ArgmaxDeviceBuffers> argmax_buffers_;
     };
 
 } // namespace llaminar2

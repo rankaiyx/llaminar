@@ -2554,10 +2554,18 @@ namespace llaminar2
         TopologyEnvConfig topology;                ///< Topology-related environment configuration
         MPIBootstrapEnvConfig mpi_bootstrap;       ///< MPI bootstrap environment snapshot
 
-        DebugEnv() = default;
+        bool tp_timing = false; ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
+
+        DebugEnv()
+        {
+            const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
+            tp_timing = tp_env && std::string(tp_env) == "1";
+        }
 
         void reload()
         {
+            const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
+            tp_timing = tp_env && std::string(tp_env) == "1";
             gemm.reload();
             profile.reload();
             rmsnorm.reload();

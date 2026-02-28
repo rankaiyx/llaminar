@@ -75,6 +75,22 @@ namespace llaminar2
         virtual bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id) = 0;
 
         /**
+         * @brief Fast D2H copy — skips pointer validation for hot paths
+         *
+         * Caller guarantees:
+         * - src is a valid device pointer on device_id
+         * - GPU work writing to src has already completed (stream synced)
+         * - dst is a valid host pointer with sufficient space
+         *
+         * Default implementation delegates to deviceToHost().
+         * ROCm override skips hipPointerGetAttributes() + HipDeviceSaveRestore (~30-60µs savings).
+         */
+        virtual bool deviceToHostFast(void *dst, const void *src, size_t bytes, int device_id)
+        {
+            return deviceToHost(dst, src, bytes, device_id);
+        }
+
+        /**
          * @brief Async variant of deviceToHost() - returns immediately
          *
          * @param dst Host destination pointer (must be pre-allocated)
@@ -475,6 +491,50 @@ namespace llaminar2
          * @return true if INT8 supported (e.g., CUDA compute capability ≥ 6.1)
          */
         virtual bool supportsINT8(int device_id) const = 0;
+
+        // ====================================================================
+        // Host Memory Pinning (for async DMA)
+        // ====================================================================
+
+        /**
+         * @brief Pin host memory for zero-copy DMA transfers
+         *
+         * Pinned (page-locked) memory enables true async DMA transfers and
+         * eliminates internal staging copies in hipMemcpy/cudaMemcpy.
+         *
+         * @param ptr Host pointer to pin
+         * @param bytes Size of the region in bytes
+         * @return true on success, false on error
+         *
+         * Call unpinHostMemory() when done. No-op on CPU backend.
+         */
+        virtual bool pinHostMemory(void *ptr, size_t bytes) { return true; }
+        virtual bool unpinHostMemory(void *ptr) { return true; }
+
+        /**
+         * @brief GPU-side argmax over FP32 data
+         *
+         * Finds the index and value of the maximum element entirely on the GPU,
+         * avoiding a full D2H transfer of the logits tensor.
+         * Used for greedy decode sampling.
+         *
+         * @param data_device Device pointer to FP32 data
+         * @param n Number of elements
+         * @param device_id Device where data resides
+         * @param out_value Receives the maximum value
+         * @param out_index Receives the index of the maximum element
+         * @return true if executed on device, false if not supported (caller should fall back)
+         */
+        virtual bool argmaxF32(const void *data_device, int n, int device_id,
+                               float *out_value, int *out_index)
+        {
+            (void)data_device;
+            (void)n;
+            (void)device_id;
+            (void)out_value;
+            (void)out_index;
+            return false; // Not supported by default
+        }
 
         // ====================================================================
         // Compute Operations

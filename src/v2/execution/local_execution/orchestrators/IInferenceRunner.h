@@ -120,6 +120,27 @@ namespace llaminar2
         virtual void clear_cache() = 0;
 
         /**
+         * @brief GPU-side greedy sampling (skip D2H of full logits)
+         *
+         * For multi-GPU TP inference, this performs argmax on each device's
+         * local logits partition on the GPU, then D2H only the (value, index)
+         * result pairs (8 bytes per device vs ~600 KB for full logits).
+         *
+         * @return Token ID (>= 0) if on-device sampling succeeded,
+         *         -1 if not supported (caller should fall back to logits() + CPU argmax)
+         */
+        virtual int sampleGreedyOnDevice() { return -1; }
+
+        /**
+         * @brief Enable GPU-side decode sampling mode
+         *
+         * When enabled, forward() may skip gathering logits to host for decode calls.
+         * Caller should use sampleGreedyOnDevice() instead of logits().
+         * Default: no-op (not all runners support this).
+         */
+        virtual void setSkipLogitsGatherDecode(bool) {}
+
+        /**
          * @brief Get current position in cache
          */
         virtual int get_position() const = 0;
@@ -201,8 +222,8 @@ namespace llaminar2
          *
          * @return Pointer to hidden state tensor [seq_len, d_model], or nullptr
          */
-        virtual TensorBase* getHiddenState() { return nullptr; }
-        virtual const TensorBase* getHiddenState() const { return nullptr; }
+        virtual TensorBase *getHiddenState() { return nullptr; }
+        virtual const TensorBase *getHiddenState() const { return nullptr; }
 
         /**
          * @brief Set initial hidden state for forward pass
@@ -213,7 +234,7 @@ namespace llaminar2
          *
          * @param hidden_state Tensor containing hidden state [seq_len, d_model]
          */
-        virtual void setHiddenState(TensorBase* hidden_state) { (void)hidden_state; }
+        virtual void setHiddenState(TensorBase *hidden_state) { (void)hidden_state; }
 
         /**
          * @brief Check if this runner has hidden state set for next forward

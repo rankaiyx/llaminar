@@ -158,6 +158,13 @@ namespace llaminar2
         const GraphExecutorStats *executorStats() const override;
         void resetExecutorStats() override;
 
+        // =====================================================================
+        // IOrchestrationRunner: GPU-side Sampling
+        // =====================================================================
+
+        int sampleGreedyOnDevice() override;
+        void setSkipLogitsGatherDecode(bool skip) override;
+
     private:
         // =====================================================================
         // Initialization Helpers

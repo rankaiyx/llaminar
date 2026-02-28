@@ -131,15 +131,22 @@ namespace llaminar2
         {
             int next_token = -1;
 
-            // Rank 0: Get logits and sample (greedy for deterministic benchmark)
+            // Rank 0: Sample next token (greedy for deterministic benchmark)
             if (mpi_ctx_->rank() == 0)
             {
-                const float *logits = runner_->logits();
-                size_t vocab_size = tokenizer_->vocab_size();
-
-                // Greedy sampling (argmax) directly on raw pointer — zero-copy
                 auto t0 = profile_sampler ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
-                next_token = sampler.sample_greedy(logits, vocab_size);
+
+                // Try GPU-side argmax first (avoids ~600 KB D2H + CPU scan)
+                next_token = runner_->sampleGreedyOnDevice();
+
+                if (next_token < 0)
+                {
+                    // Fallback: CPU-side greedy sampling
+                    const float *logits = runner_->logits();
+                    size_t vocab_size = tokenizer_->vocab_size();
+                    next_token = sampler.sample_greedy(logits, vocab_size);
+                }
+
                 if (profile_sampler)
                 {
                     auto t1 = std::chrono::high_resolution_clock::now();
@@ -262,6 +269,10 @@ namespace llaminar2
             LOG_INFO("  Benchmark runs: " << BENCHMARK_ITERATIONS);
             LOG_INFO("");
         }
+
+        // Enable GPU-side greedy sampling to skip D2H logits gather during decode.
+        // sampleGreedyOnDevice() returns -1 when unsupported, triggering CPU fallback.
+        runner_->setSkipLogitsGatherDecode(true);
 
         // ========================================================================
         // Warmup Phase - Run once to warm up caches, JIT, etc.

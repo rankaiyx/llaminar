@@ -386,6 +386,25 @@ namespace llaminar2
         const float *logits() const override;
 
         /**
+         * @brief GPU-side greedy sampling for decode
+         *
+         * Runs argmax on each device's local logits, D2H only the result pair (8 bytes per device).
+         * Avoids D2H-ing the entire combined logits tensor (~600 KB for 152K vocab).
+         *
+         * @return Token ID (>= 0) if on-device sampling succeeded, -1 if not supported
+         */
+        int sampleGreedyOnDevice() override;
+
+        /**
+         * @brief Enable GPU-side decode sampling (skip D2H gatherLogits for seq_len=1)
+         *
+         * When enabled, forwardTP() skips gatherLogits for decode tokens.
+         * Caller MUST use sampleGreedyOnDevice() instead of logits() for decode.
+         * Prefill logits are still gathered normally.
+         */
+        void setSkipLogitsGatherDecode(bool skip) { skip_logits_gather_decode_ = skip; }
+
+        /**
          * @brief Batched forward pass
          *
          * @param token_batches Vector of token sequences
@@ -751,6 +770,13 @@ namespace llaminar2
 
         /// Combined logits buffer after AllGather [vocab_size]
         std::unique_ptr<TensorBase> combined_logits_;
+
+        /// Whether combined_logits_ is pinned via hipHostRegister (for fast DMA)
+        bool combined_logits_pinned_ = false;
+
+        /// When true, forwardTP() skips gatherLogits for decode (seq_len=1).
+        /// Caller uses sampleGreedyOnDevice() instead for GPU-side argmax.
+        bool skip_logits_gather_decode_ = false;
 
         /// Actual size of gathered logits from last gatherLogits() call
         /// This may be smaller than combined_logits_->numel() for decode (1 token vs max_seq_len)
