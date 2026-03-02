@@ -151,9 +151,11 @@ struct NVNNITraits {
 // New ISA:      2× v_mul_lo + 1× v_and + 1× v_xor + 1× v_add ≈ 5 VALU per call.
 //
 // Math:
-//   spread = (sign_lo4 * 0x08040201) & 0x01010101
-//     Scatters bit[i] into byte[i] position 0.  No cross-byte carry because
-//     max(sign_lo4) = 15 and 15 * 0x08040201 = 0x783C1E0F (each byte < 256).
+//   spread = (sign_lo4 * 0x00204081) & 0x01010101
+//     Scatters bit[i] into byte[i] position 0.  The constant 0x00204081 has
+//     bits 0, 7, 14, 21 set so that bit k of sign_lo4 lands in byte k's bit 0
+//     after masking.  No cross-byte carry because
+//     max(sign_lo4) = 15 and 15 * 0x00204081 = 0x01E3C78F (each byte < 256).
 //
 //   mask = spread * 255
 //     Expands 0x00→0x00, 0x01→0xFF per byte.  No cross-byte carry because
@@ -161,9 +163,14 @@ struct NVNNITraits {
 //
 //   Result: (grid4 ^ mask) + spread  is two's complement conditional negate.
 //     (carry = mask & 0x01010101 = spread, since mask bytes are 0x00 or 0xFF)
+//
+// BUG FIX: The original constant 0x08040201 (bits 0,9,18,27) only captured
+// bit 0 of sign_lo4 — bits 1,2,3 were always masked away.  The correct
+// constant is 0x00204081 (bits 0,7,14,21) which places each bit k in the
+// bit-0 position of byte k.
 __device__ inline uint32_t iq_apply_signs_4(uint32_t grid4, uint8_t sign_lo4)
 {
-    uint32_t spread = (static_cast<uint32_t>(sign_lo4 & 0xFu) * 0x08040201u) & 0x01010101u;
+    uint32_t spread = (static_cast<uint32_t>(sign_lo4 & 0xFu) * 0x00204081u) & 0x01010101u;
     uint32_t mask = spread * 255u;
     return (grid4 ^ mask) + spread;
 }
