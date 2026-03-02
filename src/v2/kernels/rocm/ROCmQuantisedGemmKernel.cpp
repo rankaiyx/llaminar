@@ -1394,7 +1394,7 @@ namespace llaminar2
                 break;
             case TensorType::Q3_K:
                 codebook_id = 9;      // Q3_K kernel — 3-bit symmetric with dual-scale blocks
-                payload_bytes = 12;   // 8B packed 2-bit + 4B high bits per 32-element block
+                payload_bytes = 16;   // 32×4-bit nibbles: pre-merged (low2 | hbit<<2) per 32-element block
                 is_asymmetric = true; // Repurpose mins array for scale_hi (dual-scale)
                 is_superblock = true;
                 max_abs_factor = 4.0f; // range [-4, +3]
@@ -1773,6 +1773,10 @@ namespace llaminar2
                         // Symmetric: value = d * (raw6_scale - 32) * (low2 | (hbit<<2) - 4)
                         // 3-bit: low 2 bits from qs[64] (interleaved), high bit from hmask[32]
                         // 16 sub-blocks of 16 → paired into 8×32 for dual-scale
+                        //
+                        // Nibble-repack: Pre-merge (low2 | hbit<<2) into 4-bit nibbles.
+                        // Payload: 16 bytes (32 × 4-bit, packed 2 per byte: lo/hi nibble).
+                        // Decode cost: ~42 VALU (was 139 with separate q2+hbits layout).
                         const int super_blocks_per_row = K / 256;
                         const int sb_idx = b / 8;
                         const int sub_idx = b % 8;
@@ -1786,7 +1790,7 @@ namespace llaminar2
                         const int shift = group * 2;
                         const int hmask_bit_pos = 4 * chunk + group;
 
-                        // Extract 32 elements: qs[chunk*32 + e] >> shift & 3, hmask[e] >> hmask_bit_pos & 1
+                        // Extract 32 pre-merged 3-bit values [0..7]
                         uint8_t raw3[32];
                         for (int e = 0; e < 32; ++e)
                         {
@@ -1795,26 +1799,15 @@ namespace llaminar2
                             raw3[e] = static_cast<uint8_t>(low2 | (hbit << 2));
                         }
 
-                        // Pack into 12-byte payload: [0..7] = packed 2-bit, [8..11] = packed high bits
-                        uint8_t payload_buf[12];
-                        for (int g = 0; g < 8; ++g)
-                        {
-                            payload_buf[g] = static_cast<uint8_t>(
-                                (raw3[4 * g + 0] & 3) |
-                                ((raw3[4 * g + 1] & 3) << 2) |
-                                ((raw3[4 * g + 2] & 3) << 4) |
-                                ((raw3[4 * g + 3] & 3) << 6));
-                        }
-                        for (int j = 0; j < 4; ++j)
-                        {
-                            payload_buf[8 + j] = 0;
-                            for (int bit = 0; bit < 8; ++bit)
-                                payload_buf[8 + j] |= static_cast<uint8_t>(
-                                    ((raw3[8 * j + bit] >> 2) & 1) << bit);
-                        }
+                        // Pack as 4-bit nibbles: byte[g] = raw3[g] | (raw3[g+16] << 4)
+                        // Groups 0-3 (elements 0-15) in low nibbles
+                        // Groups 4-7 (elements 16-31) in high nibbles
+                        uint8_t payload_buf[16];
+                        for (int g = 0; g < 16; ++g)
+                            payload_buf[g] = raw3[g] | (raw3[g + 16] << 4);
 
                         uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
-                        std::memcpy(dst, payload_buf, 12);
+                        std::memcpy(dst, payload_buf, 16);
 
                         // Unpack 16 × 6-bit scales from scales[12] and compute dual scales
                         int8_t unpacked_scales[16];

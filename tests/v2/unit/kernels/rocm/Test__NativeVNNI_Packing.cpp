@@ -89,7 +89,7 @@ namespace
         {"Q6_K", 8, 24, true, true,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ6_KRandom({N, K}); }},
-        {"Q3_K", 9, 12, true, true,
+        {"Q3_K", 9, 16, true, true,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ3_KRandom({N, K}); }},
         {"Q2_K", 10, 12, true, true,

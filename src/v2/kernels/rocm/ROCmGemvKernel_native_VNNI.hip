@@ -124,7 +124,7 @@ struct NVNNITraits {
         is_iq1_grid ? ((FMT == NVNNI_IQ1_M) ? 14 : 10) :
         is_iq3_grid ? (has_qh ? 13 : 12) :
         is_iq2_grid ? (has_qh ? 9 : 8) :
-        is_6bit ? 24 : is_5bit ? 20 : (is_3bit || is_2bit) ? 12 : 16;
+        is_6bit ? 24 : is_5bit ? 20 : is_3bit ? 16 : is_2bit ? 12 : 16;
     // Centering offset for symmetric formats; asymmetric formats don't center
     static constexpr int center_4bit = (FMT == NVNNI_Q4_0) ? 8 : 0;
     static constexpr int center_5bit = (FMT == NVNNI_Q5_0) ? 16 : 0;
@@ -689,60 +689,37 @@ __global__ void gemv_native_vnni_kernel_t(
                     }
                     else if constexpr (Traits::is_3bit)
                     {
-                        // Q3_K: 3-bit decode via SWAR + v_perm byte transpose + codebook
-                        // Payload layout:
-                        //   [0..7]:  q2 — packed 2-bit:  byte[g] = elem[4g]&3 | (elem[4g+1]&3)<<2 | ...
-                        //   [8..11]: hbits — packed 1-bit high bits: 32 bits in 4 bytes
-                        // Decoded: int8 = (low2 | (hbit << 2)) - 4  → range [-4, +3]
+                        // Q3_K: 3-bit nibble-repack decode via SWAR nibble extraction + codebook
                         //
-                        // SWAR extracts all 4 × 2-bit field planes from 4 q2 bytes at once,
-                        // then v_perm byte transpose converts field-strided → element-strided.
-                        // This replaces 8× scalar byte-by-byte unpack with 2× batched decode.
+                        // Payload layout (nibble-repacked during CPU packing):
+                        //   [0..15]: 32 × 4-bit nibbles, each holding pre-merged (low2 | hbit<<2)
+                        //            value range [0..7], packed 2 per byte (lo/hi nibble)
+                        //
+                        // Decode: extract nibbles → v_perm codebook → signed INT8 [-4..+3]
+                        //
+                        // Previous ISA cost:  139 VALU (SWAR 2-bit + transpose + hbit deposit + codebook)
+                        // New ISA cost:       ~42 VALU (nibble extraction + codebook)
+                        // Payload increase:   12 → 16 bytes (+33%), acceptable at 24% BW utilisation
                         //
                         // 3-bit codebook: {-4,-3,-2,-1,0,1,2,3} = {0xFC,0xFD,0xFE,0xFF,0x00,0x01,0x02,0x03}
                         // Only 8 entries → single v_perm call (selector bits [2:0] = value)
                         constexpr uint32_t Q3_CB_A = 0xFFFEFDFCu;  // indices 0-3: {-4,-3,-2,-1}
                         constexpr uint32_t Q3_CB_B = 0x03020100u;  // indices 4-7: {0,1,2,3}
 
-                        const uint32_t hbits = *reinterpret_cast<const uint32_t*>(payload + 8);
-
-                        // Process 4 q2 bytes at a time (2 batches × 4 groups)
                         #pragma unroll
-                        for (int half = 0; half < 2; ++half)
+                        for (int g = 0; g < 4; ++g)
                         {
-                            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + half * 4);
+                            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
 
-                            // SWAR: extract 4 × 2-bit field planes across all 4 bytes
-                            const uint32_t f0 = raw & 0x03030303u;
-                            const uint32_t f1 = (raw >> 2) & 0x03030303u;
-                            const uint32_t f2 = (raw >> 4) & 0x03030303u;
-                            const uint32_t f3 = (raw >> 6) & 0x03030303u;
+                            // Low nibbles → groups 0-3 (elements [4g..4g+3])
+                            const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
+                            packed_groups[g] = static_cast<int32_t>(
+                                __builtin_amdgcn_perm(Q3_CB_A, Q3_CB_B, lo_nibs));
 
-                            // v_perm 4×4 byte transpose: field-strided → element-strided
-                            const uint32_t r01 = __builtin_amdgcn_perm(f0, f1, 0x05010400u);
-                            const uint32_t r23 = __builtin_amdgcn_perm(f2, f3, 0x05010400u);
-                            const uint32_t r45 = __builtin_amdgcn_perm(f0, f1, 0x07030602u);
-                            const uint32_t r67 = __builtin_amdgcn_perm(f2, f3, 0x07030602u);
-                            const uint32_t t0 = __builtin_amdgcn_perm(r01, r23, 0x05040100u);
-                            const uint32_t t1 = __builtin_amdgcn_perm(r01, r23, 0x07060302u);
-                            const uint32_t t2 = __builtin_amdgcn_perm(r45, r67, 0x05040100u);
-                            const uint32_t t3 = __builtin_amdgcn_perm(r45, r67, 0x07060302u);
-
-                            // Per-group: deposit hbits at bit 2, apply codebook via v_perm
-                            const int bg = half * 4;
-                            const uint32_t transposed[4] = {t0, t1, t2, t3};
-                            #pragma unroll
-                            for (int i = 0; i < 4; ++i)
-                            {
-                                const int base_elem = (bg + i) * 4;
-                                const uint32_t hb4 = (hbits >> base_elem) & 0xFu;
-                                const uint32_t hb_deposit = ((hb4 & 1u) << 2)
-                                                          | ((hb4 & 2u) << 9)
-                                                          | ((hb4 & 4u) << 16)
-                                                          | ((hb4 & 8u) << 23);
-                                packed_groups[bg + i] = static_cast<int32_t>(
-                                    __builtin_amdgcn_perm(Q3_CB_A, Q3_CB_B, transposed[i] | hb_deposit));
-                            }
+                            // High nibbles → groups 4-7 (elements [4g+16..4g+19])
+                            const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
+                            packed_groups[g + 4] = static_cast<int32_t>(
+                                __builtin_amdgcn_perm(Q3_CB_A, Q3_CB_B, hi_nibs));
                         }
                     }
                     else if constexpr (Traits::is_2bit)
