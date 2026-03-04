@@ -104,9 +104,10 @@ struct NVNNITraits {
     static constexpr bool is_dual_scale = (FMT == NVNNI_Q6_K || FMT == NVNNI_Q3_K || FMT == NVNNI_Q2_K
                                         || FMT == NVNNI_IQ2_S || FMT == NVNNI_IQ2_XS
                                         || FMT == NVNNI_IQ1_M);
-    // Dual-scale + asymmetric: embedded FP16 mins in payload for split sum_a correction
-    static constexpr bool is_dual_scale_asym = (FMT == NVNNI_Q2_K || FMT == NVNNI_IQ1_M);
-    // Q2_K: emins in separate global array; IQ1_M: emins = 0 (baked into grid)
+    // Dual-scale + asymmetric: split sum_a correction with per-sub-block emins
+    // IQ1_M uses Pattern D (not DA): emins are always zero (baked into grid values)
+    static constexpr bool is_dual_scale_asym = (FMT == NVNNI_Q2_K);
+    // Q2_K: emins in separate global array
     static constexpr bool needs_emin_array = (FMT == NVNNI_Q2_K);
     // All scales/mins now in global arrays — no embedded data in payload
     static constexpr bool has_embedded_scales = false;

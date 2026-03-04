@@ -85,13 +85,14 @@ struct NVNNIGemmTraits {
     static constexpr bool is_dual_scale = (FMT == NVNNI_GEMM_Q6_K || FMT == NVNNI_GEMM_Q3_K || FMT == NVNNI_GEMM_Q2_K
                                         || FMT == NVNNI_GEMM_IQ2_S || FMT == NVNNI_GEMM_IQ2_XS
                                         || FMT == NVNNI_GEMM_IQ1_M);
-    static constexpr bool is_dual_scale_asym = (FMT == NVNNI_GEMM_Q2_K || FMT == NVNNI_GEMM_IQ1_M);
+    static constexpr bool is_dual_scale_asym = (FMT == NVNNI_GEMM_Q2_K);
     // All scales/mins are in global arrays (not embedded in payload).
     static constexpr bool has_embedded_scales = false;
     static constexpr int  embedded_scale_offset = -1;
     static constexpr int  embedded_min_offset = -1;
     // Q2_K needs a separate emin array (per-sub-block FP16 min pairs).
-    // IQ1_M emins are always zero (delta baked into 8× grid values).
+    // IQ1_M uses Pattern D (not DA): emins are always zero (delta baked
+    // into 8× grid values), so the emin correction terms vanish.
     static constexpr bool needs_emin_array = (FMT == NVNNI_GEMM_Q2_K);
     static constexpr bool is_5bit   = (FMT == NVNNI_GEMM_Q5_0 || FMT == NVNNI_GEMM_Q5_1);
     static constexpr bool is_6bit   = (FMT == NVNNI_GEMM_Q6_K);
@@ -143,8 +144,8 @@ struct NVNNIGemmTraits {
     // causes register spilling.  Cooperative shares A-data through LDS,
     // reducing per-thread register pressure by ~20-30%.
     //
-    // Q2_K and IQ1_M see a 2× improvement with cooperative, from near-unusable
-    // 0.15x to tolerable 0.34x/0.29x.
+    // IQ1_M is Pattern D (not DA): emins are zero, so it uses streaming like
+    // other dual-scale formats.  Q2_K remains DA (real emins).
     static constexpr bool prefer_streaming =
         !is_asymmetric && !is_dual_scale_asym;  // Pattern S + D → streaming; Pattern A + DA → cooperative
 };
@@ -632,6 +633,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
     const uint16_t* __restrict__ aux_buf,
     const uint16_t* __restrict__ emin_lo_buf,
     const uint16_t* __restrict__ emin_hi_buf,
+    const int32_t* __restrict__ sum_a_buf,
     float (&acc)[M_PER_THREAD_][N_TILE / (BLOCK_SIZE_ / (M_TILE / M_PER_THREAD_))],
     int m_base, int t_n)
 {
@@ -644,25 +646,21 @@ __device__ __forceinline__ void accumulate_block_gemm(
 
     if constexpr (Traits::is_dual_scale_asym)
     {
-        // Pattern DA: dual-scale + asymmetric (Q2_K, IQ1_M)
+        // Pattern DA: dual-scale + asymmetric (Q2_K only)
         //
-        // Two-phase accumulation to reduce VGPR pressure:
-        // Instead of maintaining acc_lo/acc_hi/sum_a_lo/sum_a_hi simultaneously
-        // (24 VGPRs at N128/M16), we process each half and apply its scale
-        // immediately, reusing the same temp arrays (12 VGPRs).  Saves 12 VGPRs
-        // which eliminates scratch spilling on gfx906.
+        // Two-phase accumulation with cooperative sum_a precompute:
+        // sum_a (activation element sums for emin correction) is computed
+        // cooperatively during A-load and stored in sum_a_buf, eliminating
+        // 32 sdot4/block + 4 VGPRs from the inner loop.  Each half's
+        // scale is applied immediately, reusing the same temp_acc array.
         int32_t temp_acc[M_PER_THREAD][N_PER_THREAD];
-        int32_t temp_sum[M_PER_THREAD];
 
         // ---- Lo half (groups 0-3): accumulate then apply scale_lo + emin_lo ----
         #pragma unroll
         for (int mm = 0; mm < M_PER_THREAD; ++mm)
-        {
-            temp_sum[mm] = 0;
             #pragma unroll
             for (int nn = 0; nn < N_PER_THREAD; ++nn)
                 temp_acc[mm][nn] = 0;
-        }
         #pragma clang loop unroll_count(2)
         for (int g = 0; g < 4; ++g)
         {
@@ -670,11 +668,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
             int32_t a_reg[M_PER_THREAD];
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
-            {
                 a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
-                temp_sum[mm] = __builtin_amdgcn_sdot4(
-                    a_reg[mm], static_cast<int32_t>(0x01010101), temp_sum[mm], false);
-            }
             int32_t b_reg[N_PER_THREAD];
             #pragma unroll
             for (int nn = 0; nn < N_PER_THREAD; ++nn)
@@ -686,7 +680,11 @@ __device__ __forceinline__ void accumulate_block_gemm(
                     temp_acc[mm][nn] = __builtin_amdgcn_sdot4(
                         a_reg[mm], b_reg[nn], temp_acc[mm][nn], false);
         }
-        // Apply lo scale immediately → temp_acc/temp_sum are dead after this
+        // Apply lo scale + precomputed emin correction from cooperative sum_a
+        int32_t sa_lo[M_PER_THREAD];
+        #pragma unroll
+        for (int mm = 0; mm < M_PER_THREAD; ++mm)
+            sa_lo[mm] = sum_a_buf[(bp * 2) * M_TILE + m_base + mm];
         #pragma unroll
         for (int nn = 0; nn < N_PER_THREAD; ++nn)
         {
@@ -697,19 +695,16 @@ __device__ __forceinline__ void accumulate_block_gemm(
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
             {
                 acc[mm][nn] = __fmaf_rn(static_cast<float>(temp_acc[mm][nn]), scale_lo, acc[mm][nn]);
-                acc[mm][nn] = __fmaf_rn(static_cast<float>(temp_sum[mm]), emin_lo, acc[mm][nn]);
+                acc[mm][nn] = __fmaf_rn(static_cast<float>(sa_lo[mm]), emin_lo, acc[mm][nn]);
             }
         }
 
-        // ---- Hi half (groups 4-7): reuse temp arrays, apply scale_hi + emin_hi ----
+        // ---- Hi half (groups 4-7): reuse temp_acc, apply scale_hi + emin_hi ----
         #pragma unroll
         for (int mm = 0; mm < M_PER_THREAD; ++mm)
-        {
-            temp_sum[mm] = 0;
             #pragma unroll
             for (int nn = 0; nn < N_PER_THREAD; ++nn)
                 temp_acc[mm][nn] = 0;
-        }
         #pragma clang loop unroll_count(2)
         for (int g = 4; g < 8; ++g)
         {
@@ -717,11 +712,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
             int32_t a_reg[M_PER_THREAD];
             #pragma unroll
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
-            {
                 a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
-                temp_sum[mm] = __builtin_amdgcn_sdot4(
-                    a_reg[mm], static_cast<int32_t>(0x01010101), temp_sum[mm], false);
-            }
             int32_t b_reg[N_PER_THREAD];
             #pragma unroll
             for (int nn = 0; nn < N_PER_THREAD; ++nn)
@@ -733,7 +724,11 @@ __device__ __forceinline__ void accumulate_block_gemm(
                     temp_acc[mm][nn] = __builtin_amdgcn_sdot4(
                         a_reg[mm], b_reg[nn], temp_acc[mm][nn], false);
         }
-        // Apply hi scale
+        // Apply hi scale + precomputed emin correction
+        int32_t sa_hi[M_PER_THREAD];
+        #pragma unroll
+        for (int mm = 0; mm < M_PER_THREAD; ++mm)
+            sa_hi[mm] = sum_a_buf[(bp * 2 + 1) * M_TILE + m_base + mm];
         #pragma unroll
         for (int nn = 0; nn < N_PER_THREAD; ++nn)
         {
@@ -744,7 +739,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
             for (int mm = 0; mm < M_PER_THREAD; ++mm)
             {
                 acc[mm][nn] = __fmaf_rn(static_cast<float>(temp_acc[mm][nn]), scale_hi, acc[mm][nn]);
-                acc[mm][nn] = __fmaf_rn(static_cast<float>(temp_sum[mm]), emin_hi, acc[mm][nn]);
+                acc[mm][nn] = __fmaf_rn(static_cast<float>(sa_hi[mm]), emin_hi, acc[mm][nn]);
             }
         }
     }
@@ -1068,6 +1063,12 @@ void native_vnni_gemm_kernel(
     __shared__ uint16_t aux_lds[2][Traits::needs_aux_compute ? BPT * N_TILE : 1];  // Aux scale/min
     __shared__ uint16_t emin_lo_lds[2][Traits::is_dual_scale_asym ? BPT * N_TILE : 1]; // Embedded min lo
     __shared__ uint16_t emin_hi_lds[2][Traits::is_dual_scale_asym ? BPT * N_TILE : 1]; // Embedded min hi
+    // Precomputed activation sums for Pattern DA emin correction (Q2_K).
+    // Computed cooperatively during A-load: each A-load thread covers exactly
+    // one block-half for one M-row (4 sdot4 per thread vs 32 sdot4/block in
+    // the old per-thread approach → 64× fewer sdot4 total + 4 fewer VGPRs).
+    // Layout: [block_half_idx * M_TILE + mi], block_half_idx = bp*2 + {0=lo,1=hi}
+    __shared__ int32_t sum_a_lds[2][Traits::is_dual_scale_asym ? BPT * 2 * M_TILE : 1];
 
     // FP32 accumulators — accumulate across all K-blocks
     float acc[M_PER_THREAD][N_PER_THREAD];
@@ -1235,6 +1236,19 @@ void native_vnni_gemm_kernel(
         a_lds[0][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
         a_lds[0][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
         a_lds[0][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+        if constexpr (Traits::is_dual_scale_asym) {
+            // Cooperative sum_a: this thread's 4 k-groups = 1 block-half
+            const int bhi = a_kg / 4;
+            int32_t sa = __builtin_amdgcn_sdot4(
+                static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
+            sa = __builtin_amdgcn_sdot4(
+                static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
+            sa = __builtin_amdgcn_sdot4(
+                static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
+            sa = __builtin_amdgcn_sdot4(
+                static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+            sum_a_lds[0][bhi * M_TILE + mi] = sa;
+        }
     }
     if (threadIdx.x < B_LOAD_THREADS)
     {
@@ -1315,6 +1329,7 @@ void native_vnni_gemm_kernel(
                 bp, a_lds[cur_buf], b_lds[cur_buf],
                 scale_lds[cur_buf], aux_lds[cur_buf],
                 emin_lo_lds[cur_buf], emin_hi_lds[cur_buf],
+                sum_a_lds[cur_buf],
                 acc, m_base, t_n);
 
         // --- 3. Barrier: all reads from cur_buf done ---
@@ -1330,6 +1345,18 @@ void native_vnni_gemm_kernel(
             a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
             a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
             a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+            if constexpr (Traits::is_dual_scale_asym) {
+                const int bhi = a_kg / 4;
+                int32_t sa = __builtin_amdgcn_sdot4(
+                    static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
+                sa = __builtin_amdgcn_sdot4(
+                    static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
+                sa = __builtin_amdgcn_sdot4(
+                    static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
+                sa = __builtin_amdgcn_sdot4(
+                    static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
+            }
         }
 
         if (threadIdx.x < B_LOAD_THREADS)
@@ -1429,6 +1456,7 @@ void native_vnni_gemm_kernel(
                 bp, a_lds[cur_buf], b_lds[cur_buf],
                 scale_lds[cur_buf], aux_lds[cur_buf],
                 emin_lo_lds[cur_buf], emin_hi_lds[cur_buf],
+                sum_a_lds[cur_buf],
                 acc, m_base, t_n);
 
         // --- 3. Barrier: all reads from cur_buf done ---
@@ -1444,6 +1472,18 @@ void native_vnni_gemm_kernel(
             a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
             a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
             a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+            if constexpr (Traits::is_dual_scale_asym) {
+                const int bhi = a_kg / 4;
+                int32_t sa = __builtin_amdgcn_sdot4(
+                    static_cast<int32_t>(a_staging[p].x), static_cast<int32_t>(0x01010101), 0, false);
+                sa = __builtin_amdgcn_sdot4(
+                    static_cast<int32_t>(a_staging[p].y), static_cast<int32_t>(0x01010101), sa, false);
+                sa = __builtin_amdgcn_sdot4(
+                    static_cast<int32_t>(a_staging[p].z), static_cast<int32_t>(0x01010101), sa, false);
+                sa = __builtin_amdgcn_sdot4(
+                    static_cast<int32_t>(a_staging[p].w), static_cast<int32_t>(0x01010101), sa, false);
+                sum_a_lds[nxt_buf][bhi * M_TILE + mi] = sa;
+            }
         }
 
         if (threadIdx.x < B_LOAD_THREADS)
@@ -1480,6 +1520,7 @@ void native_vnni_gemm_kernel(
                 bp, a_lds[last_buf], b_lds[last_buf],
                 scale_lds[last_buf], aux_lds[last_buf],
                 emin_lo_lds[last_buf], emin_hi_lds[last_buf],
+                sum_a_lds[last_buf],
                 acc, m_base, t_n);
     }
 
@@ -1672,7 +1713,7 @@ void streaming_lm_head_kernel(
         // --- 3. Accumulate based on format pattern ---
         if constexpr (Traits::is_dual_scale_asym)
         {
-            // Pattern DA: two-phase accumulation (Q2_K, IQ1_M)
+            // Pattern DA: two-phase accumulation (Q2_K only)
             // Single-path with ternary bounds check — avoids m_safe code
             // duplication that would push VGPR past 64 (losing 4-wave occupancy).
             const int kg_base = block * 8;
@@ -2130,10 +2171,11 @@ static bool launch_native_vnni_gemm(
         }
     }
 
-    // NOTE: Pattern DA (Q2_K, IQ1_M) must NOT use streaming — tested at N=11008
+    // NOTE: Pattern DA (Q2_K) must NOT use streaming — tested at N=11008
     // and it was 2-3× slower (Q2_K: 1390μs vs 565μs cooperative).  The Pattern DA
-    // Pattern DA decode + accumulation (temp_acc + temp_sum + emin per half) is
+    // decode + accumulation (temp_acc + temp_sum + emin per half) is
     // too register-heavy for streaming's per-thread A-loading model.
+    // IQ1_M was moved from DA to D (emins always zero) and is now streaming-eligible.
 
     // Pattern A streaming with cooperative sum_a precompute:
     // Only for formats where streaming is proven faster than cooperative.
@@ -2148,10 +2190,11 @@ static bool launch_native_vnni_gemm(
     }
 
     if (use_n128) {
-        // Dual-scale-asymmetric formats (Pattern DA: Q2_K, IQ1_M):
+        // Dual-scale-asymmetric formats (Pattern DA: Q2_K only):
         // N128/M16/2-wave is the best tile for Pattern DA.
+        // IQ1_M moved to Pattern D (emins always zero) — uses hybrid dispatch below.
         //
-        // Tested alternatives (all regressed):
+        // Tested alternatives for Q2_K (all regressed):
         //   - N128/M32/2w: +200 bytes scratch from temp_acc+temp_sum+emin staging
         //   - N64/M16/3w:  +55% slower! N_PER_THREAD 2→1 kills ILP in the heavy
         //                  DA accumulation (sdot4 interleaving across N-columns)
@@ -2199,9 +2242,10 @@ static bool launch_native_vnni_gemm(
                 return launch(N128{}, M32{});
         }
     } else {
-        // Dual-scale-asymmetric formats (Pattern DA): force M16 on N64 path.
+        // Dual-scale-asymmetric formats (Pattern DA: Q2_K only): force M16 on N64.
         // N64/M16/3w: VGPR=84, 84B scratch (compiler spills to hit 3-wave).
         // N64/M16/2w: VGPR=106, 0 scratch.  Use 2-wave to avoid scratch.
+        // IQ1_M now uses Pattern D and falls through to the hybrid dispatch below.
         if constexpr (NVNNIGemmTraits<FMT>::is_dual_scale_asym) {
             return launch(N64{}, M16{});
         }
