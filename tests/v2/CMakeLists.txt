@@ -8064,18 +8064,23 @@ if(HAVE_ROCM)
     # Measures per-format bandwidth efficiency at model-realistic dimensions.
     add_executable(v2_perf_native_vnni_throughput
         performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp
+        performance/kernels/rocm/GpuVerification.hip
     )
     target_link_libraries(v2_perf_native_vnni_throughput
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
+        OpenMP::OpenMP_CXX
+        roc::hipblas
     )
+    target_compile_options(v2_perf_native_vnni_throughput PRIVATE -fopenmp)
+    target_link_options(v2_perf_native_vnni_throughput PRIVATE -fopenmp)
     add_v2_test(V2_Perf_NativeVNNI_Throughput
         COMMAND $<TARGET_FILE:v2_perf_native_vnni_throughput>
         LABELS "V2;Performance;ROCm;GEMV;NativeVNNI;Quantized;gfx906;Benchmark;Bandwidth"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added Native-VNNI throughput benchmark (16 formats)")
+    message(STATUS "V2 Tests: Added Native-VNNI throughput benchmark (18 formats, multi-GPU)")
 
     # Performance Test: Native-VNNI GEMM (Q4_0 + IQ4_NL, M>1 prefill)
     # Benchmarks native-VNNI GEMM kernel against INT8 V3/V7 baseline.

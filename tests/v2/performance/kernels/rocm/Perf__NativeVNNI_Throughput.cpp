@@ -15,6 +15,10 @@
  *   - Speedup vs INT8: int8_min_us / format_min_us
  *   - Theoretical speedup: 8.0 / bpw (from streaming fewer bytes)
  *   - Kernel efficiency: actual_speedup / theoretical_speedup × 100%
+ *   - Cosine similarity: GPU vs HipBLAS FP32 reference (correctness gate)
+ *
+ * Multi-GPU support: work items are distributed across all available GPUs
+ * using cost-descending round-robin to balance load evenly.
  *
  * The benchmark uses multiply_tensor() which includes:
  *   1. FP32→INT8 activation quantization on GPU
@@ -27,15 +31,20 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <omp.h>
 
 #include "kernels/rocm/ROCmQuantisedGemmKernel.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -46,6 +55,7 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include "GpuVerification.h"
 #endif
 
 using namespace llaminar2;
@@ -54,6 +64,12 @@ using namespace llaminar2::test;
 
 namespace
 {
+#ifdef HAVE_ROCM
+    using gpu_verify::destroyAllHipBLAS;
+    using gpu_verify::gpuCosineSimilarity;
+    using gpu_verify::gpuReferenceFP32Gemm;
+    using gpu_verify::GpuWeightsCache;
+#endif
 
     // =============================================================================
     // Constants
@@ -65,6 +81,12 @@ namespace
 
     constexpr int WARMUP_RUNS = 5;
     constexpr int BENCH_RUNS = 20;
+
+    /// Correctness gate: cosine similarity between native-VNNI and FP32 reference
+    constexpr float COSINE_SIM_GATE = 0.99f;
+
+    /// Number of GPUs to use (auto-detected, capped at available)
+    static int NUM_GPUS = 1;
 
     // =============================================================================
     // Format descriptors
@@ -182,6 +204,10 @@ namespace
         double speedup_vs_int8 = 0.0;     // int8_min_us / min_us (>1 = faster than INT8)
         double theoretical_speedup = 0.0; // 8.0 / bpw (expected from bandwidth savings)
         double kernel_efficiency = 0.0;   // (speedup_vs_int8 / theoretical_speedup) * 100%
+
+        // Correctness (GPU-based HipBLAS reference)
+        float cosine_sim = 0.0f;
+        bool correctness_pass = false;
     };
 
     // =============================================================================
@@ -218,6 +244,7 @@ namespace
             has_device_ = (err == hipSuccess && device_count > 0);
             if (has_device_)
             {
+                NUM_GPUS = std::min(device_count, 3);
                 (void)hipSetDevice(0);
                 hipDeviceProp_t props;
                 hipGetDeviceProperties(&props, 0);
@@ -228,20 +255,28 @@ namespace
 #endif
         }
 
+        void TearDown() override
+        {
+#ifdef HAVE_ROCM
+            destroyAllHipBLAS();
+#endif
+        }
+
         bool has_device_ = false;
         std::string device_name_;
 
 #ifdef HAVE_ROCM
-        /// Time a kernel+workspace pair for a given shape. Returns min time in μs.
-        /// Shared between native-VNNI and INT8 reference benchmarking.
-        double timeKernel(ROCmQuantisedGemmKernel &kernel, const GEMVShape &shape,
-                          TensorBase *input, TensorBase *output)
+        /// Time a GEMV kernel on a specific device. Returns sorted timing vector in μs.
+        static std::vector<double> timeKernel(ROCmQuantisedGemmKernel &kernel,
+                                              TensorBase *input, TensorBase *output,
+                                              int N, int K, int device_id)
         {
+            (void)hipSetDevice(device_id);
             const int M = 1;
 
             // Warmup
             for (int i = 0; i < WARMUP_RUNS; ++i)
-                kernel.multiply_tensor(input, output, M, shape.N, shape.K);
+                kernel.multiply_tensor(input, output, M, N, K);
             (void)hipDeviceSynchronize();
 
             // Timed runs
@@ -256,7 +291,7 @@ namespace
             {
                 (void)hipDeviceSynchronize();
                 (void)hipEventRecord(start);
-                kernel.multiply_tensor(input, output, M, shape.N, shape.K);
+                kernel.multiply_tensor(input, output, M, N, K);
                 (void)hipEventRecord(stop);
                 (void)hipEventSynchronize(stop);
 
@@ -268,15 +303,16 @@ namespace
             (void)hipEventDestroy(start);
             (void)hipEventDestroy(stop);
 
-            double mean, min_val, max_val, stddev;
-            computeStats(times_us, mean, min_val, max_val, stddev);
-            return min_val;
+            std::sort(times_us.begin(), times_us.end());
+            return times_us;
         }
 
         /// Benchmark INT8 VNNI reference (Q8_0 → INT8 scatter GEMV) for a shape.
+        /// Thread-safe: creates all resources locally.
         /// Returns min kernel time in μs.
-        double benchmarkINT8Reference(const GEMVShape &shape)
+        static double benchmarkINT8Reference(const GEMVShape &shape, int device_id)
         {
+            (void)hipSetDevice(device_id);
             const int M = 1;
 
             // Create Q8_0 weights — packs to INT8 VNNI (no native-VNNI payload)
@@ -289,11 +325,11 @@ namespace
             if (!packWeightsToROCm(weights.get(), packed))
                 return 0.0;
 
-            ROCmQuantisedGemmKernel kernel(&packed, 0);
+            ROCmQuantisedGemmKernel kernel(&packed, device_id);
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (4 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
-                DeviceId::rocm(0), budget);
+                DeviceId::rocm(device_id), budget);
             if (!workspace->allocate(reqs))
                 return 0.0;
             kernel.bindWorkspace(workspace.get());
@@ -302,20 +338,28 @@ namespace
                 {static_cast<size_t>(M), static_cast<size_t>(shape.K)});
             auto output = TestTensorFactory::createFP32(
                 {static_cast<size_t>(M), static_cast<size_t>(shape.N)});
-            if (!input->ensureOnDevice(DeviceId::rocm(0)))
+            if (!input->ensureOnDevice(DeviceId::rocm(device_id)))
                 return 0.0;
-            if (!output->allocateOnDevice(DeviceId::rocm(0)))
+            if (!output->allocateOnDevice(DeviceId::rocm(device_id)))
                 return 0.0;
 
-            double min_us = timeKernel(kernel, shape, input.get(), output.get());
+            auto times = timeKernel(kernel, input.get(), output.get(),
+                                    shape.N, shape.K, device_id);
             kernel.unbindWorkspace();
-            return min_us;
+            return times.empty() ? 0.0 : times.front();
         }
 
-        /// Run a single format+shape benchmark, returning the result.
-        BenchResult benchmarkFormat(const PerfFormatSpec &fmt,
-                                    const GEMVShape &shape)
+        /// Run a single format+shape benchmark on a specific device.
+        /// Thread-safe: does not use gtest assertions internally.
+        static BenchResult benchmarkFormat(const PerfFormatSpec &fmt,
+                                           const GEMVShape &shape,
+                                           double int8_ref_us,
+                                           TensorBase *weights,
+                                           const GpuWeightsCache *gpu_weights,
+                                           int device_id)
         {
+            (void)hipSetDevice(device_id);
+
             BenchResult result{};
             result.format_name = fmt.name;
             result.bpw = fmt.bpw;
@@ -325,75 +369,110 @@ namespace
 
             const int M = 1;
 
-            // 1. Create quantized weights and pack
-            auto weights = fmt.create(
-                static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
-            EXPECT_NE(weights, nullptr);
             if (!weights)
                 return result;
 
+            // 1. Pack pre-created quantized weights
             ROCmPackedWeights packed;
-            EXPECT_TRUE(packWeightsToROCm(weights.get(), packed));
+            if (!packWeightsToROCm(weights, packed))
+                return result;
             if (packed.native_vnni_payload.empty())
                 return result;
 
             // Calculate weight bytes (native-VNNI payload + scales + mins)
-            result.weight_bytes = static_cast<double>(packed.native_vnni_payload.size()) + static_cast<double>(packed.native_vnni_scales.size() * sizeof(uint16_t)) + static_cast<double>(packed.native_vnni_mins.size() * sizeof(uint16_t));
+            result.weight_bytes =
+                static_cast<double>(packed.native_vnni_payload.size()) +
+                static_cast<double>(packed.native_vnni_scales.size() * sizeof(uint16_t)) +
+                static_cast<double>(packed.native_vnni_mins.size() * sizeof(uint16_t));
 
-            // 2. Create kernel + workspace (budget computed from actual requirements)
-            ROCmQuantisedGemmKernel kernel(&packed, 0);
+            // 2. Create kernel + workspace
+            ROCmQuantisedGemmKernel kernel(&packed, device_id);
             auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
             const size_t budget = reqs.total_bytes_with_alignment() + (4 * 1024 * 1024);
             auto workspace = std::make_unique<DeviceWorkspaceManager>(
-                DeviceId::rocm(0), budget);
-            EXPECT_TRUE(workspace->allocate(reqs));
+                DeviceId::rocm(device_id), budget);
+            if (!workspace->allocate(reqs))
+                return result;
             kernel.bindWorkspace(workspace.get());
 
             // 3. Create input/output tensors and upload to GPU
-            //    (essential: multiply_tensor uses gpu_data_ptr() to detect GPU-resident
-            //     tensors and route to the M==1 GEMV fast path with native-VNNI)
             auto input = TestTensorFactory::createFP32Random(
                 {static_cast<size_t>(M), static_cast<size_t>(shape.K)});
             auto output = TestTensorFactory::createFP32(
                 {static_cast<size_t>(M), static_cast<size_t>(shape.N)});
-            EXPECT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
-            EXPECT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
-
-            // 4+5. Timed runs
-            result.min_us = timeKernel(kernel, shape, input.get(), output.get());
-
-            // Compute full stats from a second timed pass for mean/stddev
+            if (!input->ensureOnDevice(DeviceId::rocm(device_id)))
             {
-                std::vector<double> times_us;
-                times_us.reserve(BENCH_RUNS);
-                hipEvent_t ev_start = nullptr, ev_stop = nullptr;
-                (void)hipEventCreate(&ev_start);
-                (void)hipEventCreate(&ev_stop);
-
-                for (int i = 0; i < BENCH_RUNS; ++i)
-                {
-                    (void)hipDeviceSynchronize();
-                    (void)hipEventRecord(ev_start);
-                    kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
-                    (void)hipEventRecord(ev_stop);
-                    (void)hipEventSynchronize(ev_stop);
-
-                    float ms = 0.0f;
-                    (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
-                    times_us.push_back(static_cast<double>(ms) * 1000.0);
-                }
-
-                (void)hipEventDestroy(ev_start);
-                (void)hipEventDestroy(ev_stop);
-
-                double max_us;
-                computeStats(times_us, result.mean_us, result.min_us, max_us, result.stddev_us);
+                kernel.unbindWorkspace();
+                return result;
+            }
+            if (!output->allocateOnDevice(DeviceId::rocm(device_id)))
+            {
+                kernel.unbindWorkspace();
+                return result;
             }
 
-            // 6. Compute stats
+            // 4. Correctness: GPU-based FP32 reference via hipBLAS
+            {
+                kernel.multiply_tensor(input.get(), output.get(), M, shape.N, shape.K);
+                (void)hipDeviceSynchronize();
+                output->mark_device_dirty();
+
+                if (gpu_weights && gpu_weights->d_weights)
+                {
+                    auto *in_fp32 = dynamic_cast<FP32Tensor *>(input.get());
+                    const float *d_input = reinterpret_cast<const float *>(
+                        in_fp32->gpu_data_ptr());
+                    if (d_input)
+                    {
+                        const size_t out_elems = static_cast<size_t>(shape.N);
+                        float *d_ref_output = nullptr;
+                        auto hip_err = hipMalloc(&d_ref_output, out_elems * sizeof(float));
+                        if (hip_err == hipSuccess)
+                        {
+                            // hipBLAS GEMM with M=1 is effectively GEMV
+                            bool gemm_ok = gpuReferenceFP32Gemm(
+                                d_input, gpu_weights->d_weights,
+                                d_ref_output, M, shape.N, shape.K, device_id);
+                            (void)hipDeviceSynchronize();
+
+                            if (gemm_ok)
+                            {
+                                const float *d_gpu_output = reinterpret_cast<const float *>(
+                                    dynamic_cast<FP32Tensor *>(output.get())
+                                        ->gpu_data_ptr());
+                                result.cosine_sim = gpuCosineSimilarity(
+                                    d_gpu_output, d_ref_output, out_elems, device_id);
+                                result.correctness_pass =
+                                    (result.cosine_sim >= COSINE_SIM_GATE);
+                            }
+                            (void)hipFree(d_ref_output);
+                        }
+                    }
+                }
+
+                // Re-upload output for timed runs
+                output->ensureOnDevice(DeviceId::rocm(device_id));
+            }
+
+            // 5. Timed runs
+            auto times = timeKernel(kernel, input.get(), output.get(),
+                                    shape.N, shape.K, device_id);
+
+            double max_us;
+            computeStats(times, result.mean_us, result.min_us, max_us, result.stddev_us);
+
+            // 6. Compute metrics
             result.eff_bw_gbps = (result.weight_bytes / (result.min_us * 1e-6)) / 1e9;
             result.bw_efficiency = (result.eff_bw_gbps / HBM2_PEAK_GBPS) * 100.0;
             result.theoretical_speedup = 8.0 / result.bpw;
+
+            if (int8_ref_us > 0.0 && result.min_us > 0.0)
+            {
+                result.int8_min_us = int8_ref_us;
+                result.speedup_vs_int8 = int8_ref_us / result.min_us;
+                result.kernel_efficiency =
+                    (result.speedup_vs_int8 / result.theoretical_speedup) * 100.0;
+            }
 
             kernel.unbindWorkspace();
             return result;
@@ -402,7 +481,7 @@ namespace
     };
 
     // =============================================================================
-    // Test: Single-shape sweep across all 16 formats (quick CI check)
+    // Test: Single-shape sweep across all 18 formats (quick CI check)
     // =============================================================================
 
     TEST_F(NativeVNNIPerfTest, AllFormats_0_5B_FFN_Up)
@@ -419,28 +498,49 @@ namespace
         fprintf(stderr, "[NativeVNNI Perf] Shape: %s (N=%d K=%d) | %d warmup + %d runs\n",
                 shape.name.c_str(), shape.N, shape.K, WARMUP_RUNS, BENCH_RUNS);
 
+        // INT8 reference
+        double int8_us = benchmarkINT8Reference(shape, 0);
+        fprintf(stderr, "[NativeVNNI Perf] INT8 reference: %.1f μs\n", int8_us);
+
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
               << "Format" << "BPW" << "Weight KB" << "Min μs" << "Mean μs"
-              << "BW GB/s" << "BW Eff %" << fort::endr;
+              << "Speedup" << "Kern Eff" << "BW GB/s" << "BW Eff %" << "Cosine"
+              << fort::endr;
 
         table.column(0).set_cell_text_align(fort::text_align::left);
-        for (int c = 1; c <= 6; ++c)
+        for (int c = 1; c <= 9; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
         for (const auto &fmt : ALL_PERF_FORMATS)
         {
-            auto r = benchmarkFormat(fmt, shape);
-            char buf_bpw[16], buf_kb[16], buf_min[16], buf_mean[16], buf_bw[16], buf_eff[16];
+            auto weights = fmt.create(
+                static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
+            GpuWeightsCache gpu_w;
+            if (weights)
+            {
+                std::vector<float> w_fp32(static_cast<size_t>(shape.N) * shape.K);
+                weights->to_fp32(w_fp32.data());
+                gpu_w.upload(w_fp32.data(), shape.N, shape.K, 0);
+            }
+
+            auto r = benchmarkFormat(fmt, shape, int8_us, weights.get(), &gpu_w, 0);
+
+            char buf_bpw[16], buf_kb[16], buf_min[16], buf_mean[16];
+            char buf_speedup[16], buf_keff[16], buf_bw[16], buf_eff[16], buf_cos[16];
             snprintf(buf_bpw, sizeof(buf_bpw), "%.1f", r.bpw);
             snprintf(buf_kb, sizeof(buf_kb), "%.0f", r.weight_bytes / 1024.0);
             snprintf(buf_min, sizeof(buf_min), "%.1f", r.min_us);
             snprintf(buf_mean, sizeof(buf_mean), "%.1f", r.mean_us);
+            snprintf(buf_speedup, sizeof(buf_speedup), "%.2fx", r.speedup_vs_int8);
+            snprintf(buf_keff, sizeof(buf_keff), "%.0f%%", r.kernel_efficiency);
             snprintf(buf_bw, sizeof(buf_bw), "%.1f", r.eff_bw_gbps);
             snprintf(buf_eff, sizeof(buf_eff), "%.1f%%", r.bw_efficiency);
+            snprintf(buf_cos, sizeof(buf_cos), "%.4f", r.cosine_sim);
             table << r.format_name << buf_bpw << buf_kb << buf_min << buf_mean
-                  << buf_bw << buf_eff << fort::endr;
+                  << buf_speedup << buf_keff << buf_bw << buf_eff << buf_cos
+                  << fort::endr;
         }
 
         fprintf(stderr, "\n%s\n", table.to_string().c_str());
@@ -448,7 +548,7 @@ namespace
     }
 
     // =============================================================================
-    // Test: Full matrix — all formats × all shapes
+    // Test: Full matrix — all formats × all shapes — multi-GPU
     // =============================================================================
 
     TEST_F(NativeVNNIPerfTest, AllFormats_AllShapes_Matrix)
@@ -462,45 +562,133 @@ namespace
         fprintf(stderr, "\n[NativeVNNI Perf] Device: %s\n", device_name_.c_str());
         fprintf(stderr, "[NativeVNNI Perf] %zu formats × %zu shapes | %d warmup + %d runs each\n",
                 ALL_PERF_FORMATS.size(), SHAPES.size(), WARMUP_RUNS, BENCH_RUNS);
+        fprintf(stderr, "[NativeVNNI Perf] Using %d GPU(s) for parallel benchmarking\n", NUM_GPUS);
 
         // =========================================================================
-        // Phase 1: Benchmark INT8 VNNI reference for each shape
+        // Phase 1: Benchmark INT8 VNNI reference for each shape — multi-GPU
         // =========================================================================
-        fprintf(stderr, "\n[NativeVNNI Perf] Benchmarking INT8 VNNI reference...\n");
-        std::unordered_map<std::string, double> int8_ref_us;
-        for (const auto &shape : SHAPES)
+        fprintf(stderr, "\n[Phase 1] Benchmarking INT8 VNNI reference on %d GPU(s)...\n",
+                NUM_GPUS);
+
+        struct Int8Work
         {
-            double ref_us = benchmarkINT8Reference(shape);
-            int8_ref_us[shape.name] = ref_us;
-            fprintf(stderr, "  INT8 ref %s: %.1f μs\n", shape.name.c_str(), ref_us);
+            int shape_idx;
+            double cost;
+        };
+        std::vector<Int8Work> int8_work;
+        for (int si = 0; si < (int)SHAPES.size(); ++si)
+            int8_work.push_back({si, (double)SHAPES[si].N * SHAPES[si].K});
+
+        std::sort(int8_work.begin(), int8_work.end(),
+                  [](const Int8Work &a, const Int8Work &b)
+                  { return a.cost > b.cost; });
+
+        std::vector<std::vector<Int8Work>> int8_per_gpu(NUM_GPUS);
+        for (size_t i = 0; i < int8_work.size(); ++i)
+            int8_per_gpu[i % NUM_GPUS].push_back(int8_work[i]);
+
+        std::vector<double> int8_times(SHAPES.size(), 0.0);
+        std::atomic<int> int8_done{0};
+
+        {
+            std::vector<std::thread> threads;
+            for (int g = 0; g < NUM_GPUS; ++g)
+            {
+                threads.emplace_back([&, g]()
+                                     {
+                    for (const auto &w : int8_per_gpu[g])
+                    {
+                        double ref_us = benchmarkINT8Reference(SHAPES[w.shape_idx], g);
+                        int8_times[w.shape_idx] = ref_us;
+                        int done = ++int8_done;
+                        fprintf(stderr, "  [GPU %d] INT8 %s: %.1f μs  (%d/%zu)\n",
+                                g, SHAPES[w.shape_idx].name.c_str(), ref_us,
+                                done, int8_work.size());
+                    } });
+            }
+            for (auto &t : threads)
+                t.join();
         }
 
-        // =========================================================================
-        // Phase 2: Benchmark all native-VNNI formats
-        // =========================================================================
-        fprintf(stderr, "\n[NativeVNNI Perf] Benchmarking %zu native-VNNI formats...\n",
-                ALL_PERF_FORMATS.size());
+        std::unordered_map<std::string, double> int8_ref_us;
+        for (int si = 0; si < (int)SHAPES.size(); ++si)
+            int8_ref_us[SHAPES[si].name] = int8_times[si];
 
-        std::vector<BenchResult> results;
-        results.reserve(ALL_PERF_FORMATS.size() * SHAPES.size());
+        // =========================================================================
+        // Phase 2: Benchmark all native-VNNI formats — multi-GPU
+        // =========================================================================
+        fprintf(stderr, "\n[Phase 2] Benchmarking %zu native-VNNI formats on %d GPU(s)...\n",
+                ALL_PERF_FORMATS.size(), NUM_GPUS);
 
-        for (const auto &fmt : ALL_PERF_FORMATS)
+        struct WorkGroup
         {
-            for (const auto &shape : SHAPES)
-            {
-                auto r = benchmarkFormat(fmt, shape);
+            int format_idx;
+            int shape_idx;
+            double cost;
+        };
+        std::vector<WorkGroup> groups;
+        for (int fi = 0; fi < (int)ALL_PERF_FORMATS.size(); ++fi)
+            for (int si = 0; si < (int)SHAPES.size(); ++si)
+                groups.push_back({fi, si, (double)SHAPES[si].N * SHAPES[si].K});
 
-                // Populate INT8 comparison fields
-                auto it = int8_ref_us.find(shape.name);
-                if (it != int8_ref_us.end() && it->second > 0.0 && r.min_us > 0.0)
-                {
-                    r.int8_min_us = it->second;
-                    r.speedup_vs_int8 = it->second / r.min_us;
-                    r.theoretical_speedup = 8.0 / r.bpw;
-                    r.kernel_efficiency = (r.speedup_vs_int8 / r.theoretical_speedup) * 100.0;
-                }
-                results.push_back(std::move(r));
+        std::sort(groups.begin(), groups.end(),
+                  [](const WorkGroup &a, const WorkGroup &b)
+                  { return a.cost > b.cost; });
+
+        std::vector<std::vector<WorkGroup>> per_gpu(NUM_GPUS);
+        for (size_t i = 0; i < groups.size(); ++i)
+            per_gpu[i % NUM_GPUS].push_back(groups[i]);
+
+        const size_t num_shapes = SHAPES.size();
+        const size_t total = ALL_PERF_FORMATS.size() * num_shapes;
+        std::vector<BenchResult> results(total);
+        std::atomic<int> phase2_done{0};
+        const size_t total_groups = groups.size();
+
+        {
+            std::vector<std::thread> threads;
+            for (int g = 0; g < NUM_GPUS; ++g)
+            {
+                threads.emplace_back([&, g]()
+                                     {
+                    (void)hipSetDevice(g);
+                    for (const auto &wg : per_gpu[g])
+                    {
+                        const auto &fmt = ALL_PERF_FORMATS[wg.format_idx];
+                        const auto &shape = SHAPES[wg.shape_idx];
+
+                        auto weights = fmt.create(
+                            static_cast<size_t>(shape.N),
+                            static_cast<size_t>(shape.K));
+                        GpuWeightsCache gpu_w;
+                        if (weights)
+                        {
+                            std::vector<float> w_fp32(
+                                static_cast<size_t>(shape.N) * shape.K);
+                            weights->to_fp32(w_fp32.data());
+                            gpu_w.upload(w_fp32.data(), shape.N, shape.K, g);
+                        }
+
+                        double ref_us = int8_ref_us.count(shape.name)
+                                            ? int8_ref_us[shape.name]
+                                            : 0.0;
+
+                        auto r = benchmarkFormat(fmt, shape, ref_us,
+                                                 weights.get(), &gpu_w, g);
+
+                        size_t idx = wg.format_idx * num_shapes + wg.shape_idx;
+                        results[idx] = std::move(r);
+
+                        int done = ++phase2_done;
+                        fprintf(stderr, "  [GPU %d] %s/%s %.1f μs cos=%.4f %s  (%d/%zu)\n",
+                                g, fmt.name.c_str(), shape.name.c_str(),
+                                results[idx].min_us, results[idx].cosine_sim,
+                                results[idx].correctness_pass ? "✓" : "✗",
+                                done, total_groups);
+                    } });
             }
+            for (auto &t : threads)
+                t.join();
         }
 
         // =========================================================================
@@ -522,10 +710,10 @@ namespace
             table << fort::header
                   << "Format" << "BPW" << "Wt KB" << "Min μs"
                   << "Speedup" << "Theoret." << "Kern Eff"
-                  << "BW GB/s" << "BW Eff %" << fort::endr;
+                  << "BW GB/s" << "BW Eff %" << "Cosine" << fort::endr;
 
             table.column(0).set_cell_text_align(fort::text_align::left);
-            for (int c = 1; c <= 8; ++c)
+            for (int c = 1; c <= 9; ++c)
                 table.column(c).set_cell_text_align(fort::text_align::right);
 
             for (const auto &r : results)
@@ -535,7 +723,7 @@ namespace
 
                 char b_bpw[16], b_kb[16], b_min[16];
                 char b_speedup[16], b_theo[16], b_keff[16];
-                char b_bw[16], b_bweff[16];
+                char b_bw[16], b_bweff[16], b_cos[16];
 
                 snprintf(b_bpw, sizeof(b_bpw), "%.1f", r.bpw);
                 snprintf(b_kb, sizeof(b_kb), "%.0f", r.weight_bytes / 1024.0);
@@ -545,17 +733,18 @@ namespace
                 snprintf(b_keff, sizeof(b_keff), "%.0f%%", r.kernel_efficiency);
                 snprintf(b_bw, sizeof(b_bw), "%.1f", r.eff_bw_gbps);
                 snprintf(b_bweff, sizeof(b_bweff), "%.1f%%", r.bw_efficiency);
+                snprintf(b_cos, sizeof(b_cos), "%.4f", r.cosine_sim);
 
                 table << r.format_name << b_bpw << b_kb << b_min
                       << b_speedup << b_theo << b_keff
-                      << b_bw << b_bweff << fort::endr;
+                      << b_bw << b_bweff << b_cos << fort::endr;
             }
 
             fprintf(stderr, "\n%s\n%s\n", title, table.to_string().c_str());
         }
 
         // =========================================================================
-        // Phase 4: Summary — average across all shapes
+        // Phase 4: Grand Summary — average across all shapes, sorted by kern eff
         // =========================================================================
         fprintf(stderr, "\n");
         fort::utf8_table summary;
@@ -563,15 +752,32 @@ namespace
         summary << fort::header
                 << "Format" << "BPW" << "Avg Min μs" << "Avg Speedup"
                 << "Theoretical" << "Avg Kern Eff" << "Avg BW GB/s"
+                << "Avg Cosine" << "Status"
                 << fort::endr;
 
         summary.column(0).set_cell_text_align(fort::text_align::left);
-        for (int c = 1; c <= 6; ++c)
+        for (int c = 1; c <= 8; ++c)
             summary.column(c).set_cell_text_align(fort::text_align::right);
+
+        struct FormatSummary
+        {
+            std::string name;
+            double bpw;
+            double avg_min_us;
+            double avg_speedup;
+            double theoretical;
+            double avg_kern_eff;
+            double avg_bw;
+            double avg_cosine;
+            bool all_pass;
+        };
+        std::vector<FormatSummary> format_summaries;
 
         for (const auto &fmt : ALL_PERF_FORMATS)
         {
-            double total_min = 0.0, total_speedup = 0.0, total_keff = 0.0, total_bw = 0.0;
+            double total_min = 0.0, total_speedup = 0.0, total_keff = 0.0;
+            double total_bw = 0.0, total_cos = 0.0;
+            bool all_pass = true;
             int count = 0;
             for (const auto &r : results)
             {
@@ -581,29 +787,66 @@ namespace
                     total_speedup += r.speedup_vs_int8;
                     total_keff += r.kernel_efficiency;
                     total_bw += r.eff_bw_gbps;
+                    total_cos += r.cosine_sim;
+                    if (!r.correctness_pass)
+                        all_pass = false;
                     ++count;
                 }
             }
             if (count == 0)
                 continue;
 
-            char b_bpw[16], b_min[16], b_speedup[16], b_theo[16], b_keff[16], b_bw[16];
-            snprintf(b_bpw, sizeof(b_bpw), "%.1f", fmt.bpw);
-            snprintf(b_min, sizeof(b_min), "%.1f", total_min / count);
-            snprintf(b_speedup, sizeof(b_speedup), "%.2fx", total_speedup / count);
-            snprintf(b_theo, sizeof(b_theo), "%.2fx", 8.0 / fmt.bpw);
-            snprintf(b_keff, sizeof(b_keff), "%.0f%%", total_keff / count);
-            snprintf(b_bw, sizeof(b_bw), "%.1f", total_bw / count);
-
-            summary << fmt.name << b_bpw << b_min << b_speedup
-                    << b_theo << b_keff << b_bw << fort::endr;
+            format_summaries.push_back({
+                fmt.name,
+                fmt.bpw,
+                total_min / count,
+                total_speedup / count,
+                8.0 / fmt.bpw,
+                total_keff / count,
+                total_bw / count,
+                total_cos / count,
+                all_pass,
+            });
         }
 
-        fprintf(stderr, "SUMMARY: Average across all shapes (vs INT8 VNNI reference)\n%s\n",
-                summary.to_string().c_str());
+        // Sort by kernel efficiency ascending (worst first) for tuning focus
+        std::sort(format_summaries.begin(), format_summaries.end(),
+                  [](const FormatSummary &a, const FormatSummary &b)
+                  { return a.avg_kern_eff < b.avg_kern_eff; });
+
+        for (const auto &fs : format_summaries)
+        {
+            char b_bpw[16], b_min[16], b_speedup[16], b_theo[16];
+            char b_keff[16], b_bw[16], b_cos[16];
+            snprintf(b_bpw, sizeof(b_bpw), "%.1f", fs.bpw);
+            snprintf(b_min, sizeof(b_min), "%.1f", fs.avg_min_us);
+            snprintf(b_speedup, sizeof(b_speedup), "%.2fx", fs.avg_speedup);
+            snprintf(b_theo, sizeof(b_theo), "%.2fx", fs.theoretical);
+            snprintf(b_keff, sizeof(b_keff), "%.0f%%", fs.avg_kern_eff);
+            snprintf(b_bw, sizeof(b_bw), "%.1f", fs.avg_bw);
+            snprintf(b_cos, sizeof(b_cos), "%.4f", fs.avg_cosine);
+            const char *status = fs.all_pass ? "✓" : "✗";
+
+            summary << fs.name << b_bpw << b_min << b_speedup
+                    << b_theo << b_keff << b_bw << b_cos << status
+                    << fort::endr;
+        }
+
+        fprintf(stderr, "GRAND SUMMARY: Average across all shapes (sorted by Kern Eff ascending — worst first)\n");
+        fprintf(stderr, "%s\n", summary.to_string().c_str());
         fprintf(stderr, "Speedup = INT8_time / format_time (>1x = faster than INT8)\n");
         fprintf(stderr, "Theoretical = 8.0/BPW (ideal speedup from bandwidth savings alone)\n");
         fprintf(stderr, "Kern Eff = Speedup/Theoretical × 100%% (how close to bandwidth-optimal)\n");
+        fprintf(stderr, "Cosine = GPU output vs HipBLAS FP32 reference (gate: >= %.2f)\n",
+                COSINE_SIM_GATE);
+
+        // Validate correctness
+        for (const auto &r : results)
+        {
+            EXPECT_GE(r.cosine_sim, COSINE_SIM_GATE)
+                << r.format_name << "/" << r.shape_name
+                << " cosine=" << r.cosine_sim;
+        }
 #endif
     }
 
@@ -644,10 +887,10 @@ namespace
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
               << "Format" << "BPW" << "Weight MB" << "Min μs" << "BW GB/s"
-              << "BW Eff %" << "Bytes/Elem" << fort::endr;
+              << "BW Eff %" << "Bytes/Elem" << "Cosine" << fort::endr;
 
         table.column(0).set_cell_text_align(fort::text_align::left);
-        for (int c = 1; c <= 6; ++c)
+        for (int c = 1; c <= 7; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
         for (const auto &sel_name : selected)
@@ -658,20 +901,32 @@ namespace
             if (it == ALL_PERF_FORMATS.end())
                 continue;
 
-            auto r = benchmarkFormat(*it, shape);
+            auto weights = it->create(
+                static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
+            GpuWeightsCache gpu_w;
+            if (weights)
+            {
+                std::vector<float> w_fp32(static_cast<size_t>(shape.N) * shape.K);
+                weights->to_fp32(w_fp32.data());
+                gpu_w.upload(w_fp32.data(), shape.N, shape.K, 0);
+            }
+
+            auto r = benchmarkFormat(*it, shape, 0.0, weights.get(), &gpu_w, 0);
 
             double bytes_per_elem = r.weight_bytes / (static_cast<double>(r.N) * r.K);
 
-            char buf_bpw[16], buf_mb[16], buf_min[16], buf_bw[16], buf_eff[16], buf_bpe[16];
+            char buf_bpw[16], buf_mb[16], buf_min[16], buf_bw[16];
+            char buf_eff[16], buf_bpe[16], buf_cos[16];
             snprintf(buf_bpw, sizeof(buf_bpw), "%.1f", r.bpw);
             snprintf(buf_mb, sizeof(buf_mb), "%.2f", r.weight_bytes / (1024.0 * 1024.0));
             snprintf(buf_min, sizeof(buf_min), "%.1f", r.min_us);
             snprintf(buf_bw, sizeof(buf_bw), "%.1f", r.eff_bw_gbps);
             snprintf(buf_eff, sizeof(buf_eff), "%.1f%%", r.bw_efficiency);
             snprintf(buf_bpe, sizeof(buf_bpe), "%.3f", bytes_per_elem);
+            snprintf(buf_cos, sizeof(buf_cos), "%.4f", r.cosine_sim);
 
             table << r.format_name << buf_bpw << buf_mb << buf_min << buf_bw
-                  << buf_eff << buf_bpe << fort::endr;
+                  << buf_eff << buf_bpe << buf_cos << fort::endr;
         }
 
         fprintf(stderr, "\n%s\n", table.to_string().c_str());
