@@ -664,8 +664,9 @@ namespace llaminar2
              */
             enum class PrefillDispatchPath
             {
-                INT8_VNNI_NATIVE,
-                CK_FALLBACK
+                NATIVE_VNNI,      ///< Native-VNNI path (lossless ≤6-bit decode, FP16 scales)
+                INT8_VNNI_NATIVE, ///< INT8-VNNI path (requantized 8-bit weights)
+                CK_FALLBACK       ///< CK ComposableKernel (debug override only)
             };
 
             // =========================================================================

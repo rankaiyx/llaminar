@@ -1908,6 +1908,457 @@ namespace llaminar2
             // =============================================================================
             // KernelFactory Integration Tests
             // =============================================================================
+            // Format-Conditional Dispatch Tests
+            // =============================================================================
+            //
+            // These tests verify the end-to-end dispatch logic introduced in Phase 1/2:
+            //   - Native-VNNI formats (Q4_0, IQ4_NL) → native-VNNI GEMV/GEMM path
+            //   - INT8-VNNI formats (Q8_0, Q8_1) → INT8 requant + CK GEMM path
+            //
+            // Each test:
+            //   1. Packs weights via packWeightsToROCm (format-conditional)
+            //   2. Calls multiply_tensor (auto-dispatches based on packed fields)
+            //   3. Compares GPU output against CPU FP32 reference
+            //
+            // Complements the dedicated NativeVNNI_GEMM/GEMV test files that cover
+            // all dispatch paths exhaustively for native-VNNI formats.
+
+            namespace
+            {
+                float cosineSim(const float *a, const float *b, size_t n)
+                {
+                    double dot = 0.0, na = 0.0, nb = 0.0;
+                    for (size_t i = 0; i < n; ++i)
+                    {
+                        dot += static_cast<double>(a[i]) * b[i];
+                        na += static_cast<double>(a[i]) * a[i];
+                        nb += static_cast<double>(b[i]) * b[i];
+                    }
+                    if (na == 0.0 || nb == 0.0)
+                        return 0.0f;
+                    return static_cast<float>(dot / (std::sqrt(na) * std::sqrt(nb)));
+                }
+
+                /// CPU FP32 reference: C[i,j] = sum_k(A[i,k] * W[j,k])
+                void cpuFP32GemmRef(const float *A, const float *W, float *C,
+                                    int M, int N, int K)
+                {
+                    for (int i = 0; i < M; ++i)
+                        for (int j = 0; j < N; ++j)
+                        {
+                            double acc = 0.0;
+                            for (int k = 0; k < K; ++k)
+                                acc += static_cast<double>(A[i * K + k]) *
+                                       static_cast<double>(W[j * K + k]);
+                            C[i * N + j] = static_cast<float>(acc);
+                        }
+                }
+            } // anonymous namespace
+
+            /**
+             * @test End-to-end multiply_tensor for Q8_0 (INT8-VNNI path) — decode (M=1)
+             *
+             * Verifies that Q8_0 weights go through INT8 requantization and the
+             * CK GEMM pipeline produces correct results for single-token decode.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q8_0_Decode_M1)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1, N = 896, K = 896;
+
+                auto weights = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+
+                // Verify INT8 path was used (not native-VNNI)
+                EXPECT_FALSE(packed.int8_data.empty()) << "Q8_0 must use INT8 path";
+                EXPECT_TRUE(packed.native_vnni_payload.empty()) << "Q8_0 must NOT use native-VNNI";
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                (void)hipDeviceSynchronize();
+                output->mark_device_dirty();
+
+                // CPU reference
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                LOG_INFO("[Dispatch] Q8_0 decode M=1: cosine=" << cos);
+                EXPECT_GT(cos, 0.985f) << "Q8_0 decode cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test End-to-end multiply_tensor for Q8_0 (INT8-VNNI path) — prefill (M=64)
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q8_0_Prefill_M64)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 64, N = 4864, K = 896;
+
+                auto weights = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                EXPECT_FALSE(packed.int8_data.empty());
+                EXPECT_TRUE(packed.native_vnni_payload.empty());
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                (void)hipDeviceSynchronize();
+                output->mark_device_dirty();
+
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                LOG_INFO("[Dispatch] Q8_0 prefill M=64 N=" << N << " K=" << K << ": cosine=" << cos);
+                EXPECT_GT(cos, 0.985f) << "Q8_0 prefill cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test End-to-end multiply_tensor for Q8_1 (INT8-VNNI generic path) — decode (M=1)
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q8_1_Decode_M1)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1, N = 896, K = 896;
+
+                auto weights = TestTensorFactory::createQ8_1Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                EXPECT_FALSE(packed.int8_data.empty());
+                EXPECT_TRUE(packed.native_vnni_payload.empty());
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                (void)hipDeviceSynchronize();
+                output->mark_device_dirty();
+
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                LOG_INFO("[Dispatch] Q8_1 decode M=1: cosine=" << cos);
+                EXPECT_GT(cos, 0.985f) << "Q8_1 decode cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test End-to-end multiply_tensor for Q4_0 (native-VNNI path) — decode (M=1)
+             *
+             * Verifies that Q4_0 weights go through native-VNNI packing and the
+             * native-VNNI GEMV path produces correct results for single-token decode.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q4_0_Decode_M1)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1, N = 896, K = 896;
+
+                auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+
+                // Verify native-VNNI path was used (not INT8)
+                EXPECT_FALSE(packed.native_vnni_payload.empty()) << "Q4_0 must use native-VNNI";
+                EXPECT_TRUE(packed.int8_data.empty()) << "Q4_0 must NOT use INT8 path";
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                (void)hipDeviceSynchronize();
+                output->mark_device_dirty();
+
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                LOG_INFO("[Dispatch] Q4_0 decode M=1: cosine=" << cos);
+                EXPECT_GT(cos, 0.990f) << "Q4_0 decode cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test End-to-end multiply_tensor for Q4_0 (native-VNNI path) — prefill (M=64)
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q4_0_Prefill_M64)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 64, N = 4864, K = 896;
+
+                auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                EXPECT_FALSE(packed.native_vnni_payload.empty());
+                EXPECT_TRUE(packed.int8_data.empty());
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                (void)hipDeviceSynchronize();
+                output->mark_device_dirty();
+
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                LOG_INFO("[Dispatch] Q4_0 prefill M=64 N=" << N << " K=" << K << ": cosine=" << cos);
+                EXPECT_GT(cos, 0.990f) << "Q4_0 prefill cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test End-to-end multiply_tensor for IQ4_NL (native-VNNI path) — decode (M=1)
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_IQ4_NL_Decode_M1)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1, N = 896, K = 896;
+
+                auto weights = TestTensorFactory::createIQ4_NLRandom({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                EXPECT_FALSE(packed.native_vnni_payload.empty());
+                EXPECT_TRUE(packed.int8_data.empty());
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                (void)hipDeviceSynchronize();
+                output->mark_device_dirty();
+
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                LOG_INFO("[Dispatch] IQ4_NL decode M=1: cosine=" << cos);
+                EXPECT_GT(cos, 0.990f) << "IQ4_NL decode cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
+             * @test Cross-path consistency: same dimensions, different formats
+             *
+             * Verifies that Q8_0 (INT8-VNNI) and Q4_0 (native-VNNI) both produce
+             * valid outputs for the same shape. While the outputs will differ due to
+             * different quantization methods, both should have high cosine similarity
+             * against their respective FP32 references.
+             *
+             * This tests the dispatch routing: both formats go through multiply_tensor
+             * and are automatically routed to the correct kernel path.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_CrossPath_BothFormatsCorrect)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 32, N = 896, K = 896;
+
+                // --- Q8_0 (INT8-VNNI path) ---
+                auto w_q8 = TestTensorFactory::createQ8_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_q8_fp32(static_cast<size_t>(N) * K);
+                w_q8->to_fp32(W_q8_fp32.data());
+
+                ROCmPackedWeights packed_q8;
+                ASSERT_TRUE(packWeightsToROCm(w_q8.get(), packed_q8));
+                EXPECT_FALSE(packed_q8.int8_data.empty());
+                EXPECT_TRUE(packed_q8.native_vnni_payload.empty());
+
+                // --- Q4_0 (native-VNNI path) ---
+                auto w_q4 = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_q4_fp32(static_cast<size_t>(N) * K);
+                w_q4->to_fp32(W_q4_fp32.data());
+
+                ROCmPackedWeights packed_q4;
+                ASSERT_TRUE(packWeightsToROCm(w_q4.get(), packed_q4));
+                EXPECT_TRUE(packed_q4.int8_data.empty());
+                EXPECT_FALSE(packed_q4.native_vnni_payload.empty());
+
+                // Shared input
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                const float *in_host = input->data();
+
+                // --- Q8_0 kernel ---
+                {
+                    ROCmQuantisedGemmKernel kernel(&packed_q8, 0);
+                    ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                    auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                    ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+                    ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                    (void)hipDeviceSynchronize();
+                    output->mark_device_dirty();
+
+                    std::vector<float> ref(static_cast<size_t>(M) * N);
+                    cpuFP32GemmRef(in_host, W_q8_fp32.data(), ref.data(), M, N, K);
+
+                    float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                    LOG_INFO("[Dispatch] CrossPath Q8_0 (INT8-VNNI): cosine=" << cos);
+                    EXPECT_GT(cos, 0.985f) << "Q8_0 cross-path cosine too low";
+
+                    cleanupWorkspace(kernel);
+                }
+
+                // --- Q4_0 kernel ---
+                {
+                    ROCmQuantisedGemmKernel kernel(&packed_q4, 0);
+                    ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                    auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+                    ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+                    ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                    (void)hipDeviceSynchronize();
+                    output->mark_device_dirty();
+
+                    std::vector<float> ref(static_cast<size_t>(M) * N);
+                    cpuFP32GemmRef(in_host, W_q4_fp32.data(), ref.data(), M, N, K);
+
+                    float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                    LOG_INFO("[Dispatch] CrossPath Q4_0 (native-VNNI): cosine=" << cos);
+                    EXPECT_GT(cos, 0.990f) << "Q4_0 cross-path cosine too low";
+
+                    cleanupWorkspace(kernel);
+                }
+            }
+
+            /**
+             * @test End-to-end multiply_tensor for Q5_K (native-VNNI K-quant) — decode (M=1)
+             *
+             * Tests a super-block format to ensure the format-conditional logic also
+             * routes K-quant formats through native-VNNI correctly.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_Q5_K_Decode_M1)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1, N = 896, K = 896;
+
+                auto weights = TestTensorFactory::createQ5_KRandom({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                EXPECT_FALSE(packed.native_vnni_payload.empty()) << "Q5_K must use native-VNNI";
+                EXPECT_TRUE(packed.int8_data.empty()) << "Q5_K must NOT use INT8 path";
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                (void)hipDeviceSynchronize();
+                output->mark_device_dirty();
+
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                LOG_INFO("[Dispatch] Q5_K decode M=1: cosine=" << cos);
+                EXPECT_GT(cos, 0.990f) << "Q5_K decode cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            // =============================================================================
+            // KernelFactory Integration Tests
+            // =============================================================================
             // These tests verify that KernelFactory correctly creates ROCm kernels.
             // Moved from unit tests since HAVE_ROCM is only enabled in integration builds.
 

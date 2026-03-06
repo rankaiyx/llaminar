@@ -367,26 +367,30 @@ namespace
     }
 
     // =============================================================================
-    // INT8 requantized path is also populated
+    // Native-VNNI formats get ONLY native packing (no INT8 requantization)
     // =============================================================================
 
     /**
-     * @test Verify that packWeightsToROCm populates both native-VNNI and
-     * INT8/CK paths (native-VNNI is an accelerator, not a replacement).
+     * @test Verify that packWeightsToROCm populates ONLY the native-VNNI path
+     * for native-VNNI formats (≤6-bit).
+     *
+     * After the format-conditional repack change, native-VNNI formats no longer
+     * receive INT8 requantization — only the native-VNNI payload/scales are populated.
      */
-    TEST_F(NativeVNNIPackingTest, BothPathsPopulated)
+    TEST_F(NativeVNNIPackingTest, NativeVNNI_OnlyNativePathPopulated)
     {
         auto tensor = TestTensorFactory::createQ4_0Random({32, 128});
         ROCmPackedWeights packed;
         ASSERT_TRUE(packWeightsToROCm(tensor.get(), packed));
 
-        // INT8 path
-        EXPECT_FALSE(packed.int8_data.empty());
-        EXPECT_FALSE(packed.scales.empty());
-
-        // Native-VNNI path
+        // Native-VNNI path — must be populated
         EXPECT_FALSE(packed.native_vnni_payload.empty());
         EXPECT_FALSE(packed.native_vnni_scales.empty());
+
+        // INT8 quantized data — must be EMPTY for native-VNNI formats
+        EXPECT_TRUE(packed.int8_data.empty());
+        EXPECT_TRUE(packed.int8_data_vnni.empty());
+        // Note: scales IS populated by packNativeVNNI for force_ck compatibility
     }
 
     // =============================================================================

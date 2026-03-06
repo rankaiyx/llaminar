@@ -99,6 +99,9 @@ namespace
 
     /**
      * @test Verify packWeightsToROCm produces valid output for IQ4_NL
+     *
+     * IQ4_NL is a native-VNNI format (≤6-bit). After the format-conditional
+     * repack change, it receives ONLY native-VNNI packing — no INT8 requantization.
      */
     TEST_F(ROCmQuantisedGemmKernelUnitTest, PackWeightsToROCm_IQ4_NL_CreatesValidOutput)
     {
@@ -110,8 +113,11 @@ namespace
         ROCmPackedWeights packed;
         ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
 
-        EXPECT_FALSE(packed.int8_data.empty());
-        EXPECT_FALSE(packed.scales.empty());
+        // IQ4_NL is native-VNNI: native payload populated, INT8 path empty
+        EXPECT_FALSE(packed.native_vnni_payload.empty());
+        EXPECT_FALSE(packed.native_vnni_scales.empty());
+        EXPECT_TRUE(packed.int8_data.empty());
+        EXPECT_TRUE(packed.int8_data_vnni.empty());
         EXPECT_EQ(packed.N, static_cast<int>(N));
         EXPECT_EQ(packed.K, static_cast<int>(K));
     }
@@ -553,6 +559,252 @@ namespace
             // Scale should not be zero or denormalized
             EXPECT_TRUE(std::isnormal(scale) || scale == 0.0f)
                 << "Scale is denormalized for column " << n;
+        }
+    }
+
+    // =============================================================================
+    // Format-Conditional Repack Tests
+    // =============================================================================
+    //
+    // These tests verify the format-conditional repack logic introduced in Phase 2:
+    //   - Native-VNNI formats (≤6-bit) → native-VNNI packing ONLY
+    //   - INT8-VNNI formats (Q8_0, Q8_1) → INT8 requant + VNNI interleave ONLY
+    //
+    // The two paths are mutually exclusive: native-VNNI formats must NOT have
+    // int8_data/scales populated, and INT8-VNNI formats must NOT have
+    // native_vnni_payload/native_vnni_scales populated.
+
+    /**
+     * @test INT8-VNNI format (Q8_0) produces ONLY INT8 packing, no native-VNNI
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q8_0_OnlyInt8Path)
+    {
+        const size_t N = 32;
+        const size_t K = 64;
+
+        auto weights = TestTensorFactory::createQ8_0Random({N, K});
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+
+        // INT8 path populated
+        EXPECT_FALSE(packed.int8_data.empty()) << "Q8_0 must populate int8_data";
+        EXPECT_FALSE(packed.scales.empty()) << "Q8_0 must populate scales";
+        EXPECT_FALSE(packed.int8_data_vnni.empty()) << "Q8_0 must populate VNNI layout";
+
+        // Native-VNNI path empty
+        EXPECT_TRUE(packed.native_vnni_payload.empty())
+            << "Q8_0 must NOT populate native-VNNI payload";
+        EXPECT_TRUE(packed.native_vnni_scales.empty())
+            << "Q8_0 must NOT populate native-VNNI scales";
+        EXPECT_EQ(packed.native_vnni_codebook_id, 0)
+            << "Q8_0 must NOT set codebook_id";
+        EXPECT_EQ(packed.native_vnni_blocks_per_row, 0u)
+            << "Q8_0 must NOT set blocks_per_row";
+    }
+
+    /**
+     * @test INT8-VNNI format (Q8_1) produces ONLY INT8 packing, no native-VNNI
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q8_1_OnlyInt8Path)
+    {
+        const size_t N = 32;
+        const size_t K = 64;
+
+        auto weights = TestTensorFactory::createQ8_1Random({N, K});
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+
+        // INT8 path populated
+        EXPECT_FALSE(packed.int8_data.empty()) << "Q8_1 must populate int8_data";
+        EXPECT_FALSE(packed.scales.empty()) << "Q8_1 must populate scales";
+        EXPECT_FALSE(packed.int8_data_vnni.empty()) << "Q8_1 must populate VNNI layout";
+
+        // Native-VNNI path empty
+        EXPECT_TRUE(packed.native_vnni_payload.empty())
+            << "Q8_1 must NOT populate native-VNNI payload";
+        EXPECT_TRUE(packed.native_vnni_scales.empty())
+            << "Q8_1 must NOT populate native-VNNI scales";
+    }
+
+    /**
+     * @test Native-VNNI format (Q4_0) produces ONLY native packing, no INT8
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q4_0_OnlyNativeVnniPath)
+    {
+        const size_t N = 32;
+        const size_t K = 128;
+
+        auto weights = TestTensorFactory::createQ4_0Random({N, K});
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+
+        // Native-VNNI path populated
+        EXPECT_FALSE(packed.native_vnni_payload.empty())
+            << "Q4_0 must populate native-VNNI payload";
+        EXPECT_FALSE(packed.native_vnni_scales.empty())
+            << "Q4_0 must populate native-VNNI scales";
+        EXPECT_GT(packed.native_vnni_blocks_per_row, 0u)
+            << "Q4_0 must set blocks_per_row";
+
+        // INT8 quantized data must NOT be populated
+        EXPECT_TRUE(packed.int8_data.empty())
+            << "Q4_0 must NOT populate int8_data";
+        EXPECT_TRUE(packed.int8_data_vnni.empty())
+            << "Q4_0 must NOT populate int8_data_vnni";
+        // Note: scales IS populated by packNativeVNNI for force_ck debug compatibility
+    }
+
+    /**
+     * @test Native-VNNI format (IQ4_NL) produces ONLY native packing, no INT8
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_IQ4_NL_OnlyNativeVnniPath)
+    {
+        const size_t N = 32;
+        const size_t K = 64;
+
+        auto weights = TestTensorFactory::createIQ4_NLRandom({N, K});
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+
+        // Native-VNNI path populated
+        EXPECT_FALSE(packed.native_vnni_payload.empty());
+        EXPECT_FALSE(packed.native_vnni_scales.empty());
+
+        // INT8 quantized data must NOT be populated
+        EXPECT_TRUE(packed.int8_data.empty());
+        EXPECT_TRUE(packed.int8_data_vnni.empty());
+    }
+
+    /**
+     * @test Super-block native-VNNI format (Q6_K) produces ONLY native packing
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q6_K_OnlyNativeVnniPath)
+    {
+        const size_t N = 32;
+        const size_t K = 256; // Super-block K must be multiple of 256
+
+        auto weights = TestTensorFactory::createQ6_KRandom({N, K});
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+
+        // Native-VNNI path populated
+        EXPECT_FALSE(packed.native_vnni_payload.empty());
+        EXPECT_FALSE(packed.native_vnni_scales.empty());
+        EXPECT_FALSE(packed.native_vnni_mins.empty())
+            << "Q6_K is dual-scale, must have mins";
+        EXPECT_EQ(packed.native_vnni_codebook_id, 8);
+
+        // INT8 quantized data must NOT be populated
+        EXPECT_TRUE(packed.int8_data.empty());
+        EXPECT_TRUE(packed.int8_data_vnni.empty());
+    }
+
+    /**
+     * @test Verify repack mutual exclusion exhaustively for all format families
+     *
+     * Tests a representative from each native-VNNI format family:
+     *   - Simple 4-bit (Q4_0)
+     *   - Asymmetric 4-bit (Q4_1)
+     *   - 5-bit (Q5_0)
+     *   - K-quant (Q4_K, Q6_K)
+     *   - IQ formats (IQ4_NL, IQ3_S, IQ2_XXS, IQ1_S)
+     *
+     * And all INT8-VNNI formats:
+     *   - Q8_0, Q8_1
+     */
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_MutualExclusion_AllFamilies)
+    {
+        struct FormatCase
+        {
+            const char *name;
+            bool expect_native_vnni; // true = native-VNNI, false = INT8-VNNI
+            std::function<std::unique_ptr<TensorBase>()> create;
+        };
+
+        std::vector<FormatCase> cases = {
+            // Native-VNNI formats (≤6-bit) → only native packing
+            {"Q4_0", true, []
+             { return TestTensorFactory::createQ4_0Random({32, 128}); }},
+            {"Q4_1", true, []
+             { return TestTensorFactory::createQ4_1Random({32, 128}); }},
+            {"Q5_0", true, []
+             { return TestTensorFactory::createQ5_0Random({32, 128}); }},
+            {"Q5_1", true, []
+             { return TestTensorFactory::createQ5_1Random({32, 128}); }},
+            {"Q4_K", true, []
+             { return TestTensorFactory::createQ4_KRandom({32, 256}); }},
+            {"Q6_K", true, []
+             { return TestTensorFactory::createQ6_KRandom({32, 256}); }},
+            {"Q3_K", true, []
+             { return TestTensorFactory::createQ3_KRandom({32, 256}); }},
+            {"Q2_K", true, []
+             { return TestTensorFactory::createQ2_KRandom({32, 256}); }},
+            {"IQ4_NL", true, []
+             { return TestTensorFactory::createIQ4_NLRandom({32, 64}); }},
+            {"IQ4_XS", true, []
+             { return TestTensorFactory::createIQ4_XSRandom({32, 256}); }},
+            {"IQ3_S", true, []
+             { return TestTensorFactory::createIQ3_SRandom({32, 256}); }},
+            {"IQ3_XXS", true, []
+             { return TestTensorFactory::createIQ3_XXSRandom({32, 256}); }},
+            {"IQ2_S", true, []
+             { return TestTensorFactory::createIQ2_SRandom({32, 256}); }},
+            {"IQ2_XS", true, []
+             { return TestTensorFactory::createIQ2_XSRandom({32, 256}); }},
+            {"IQ2_XXS", true, []
+             { return TestTensorFactory::createIQ2_XXSRandom({32, 256}); }},
+            {"IQ1_S", true, []
+             { return TestTensorFactory::createIQ1_SRandom({32, 256}); }},
+            {"IQ1_M", true, []
+             { return TestTensorFactory::createIQ1_MRandom({32, 256}); }},
+
+            // INT8-VNNI formats (8-bit) → only INT8 packing
+            {"Q8_0", false, []
+             { return TestTensorFactory::createQ8_0Random({32, 64}); }},
+            {"Q8_1", false, []
+             { return TestTensorFactory::createQ8_1Random({32, 64}); }},
+        };
+
+        for (const auto &tc : cases)
+        {
+            auto tensor = tc.create();
+            ASSERT_NE(tensor, nullptr) << "Failed to create " << tc.name;
+
+            ROCmPackedWeights packed;
+            ASSERT_TRUE(packWeightsToROCm(tensor.get(), packed))
+                << "packWeightsToROCm failed for " << tc.name;
+
+            if (tc.expect_native_vnni)
+            {
+                // Native-VNNI path populated
+                EXPECT_FALSE(packed.native_vnni_payload.empty())
+                    << tc.name << " (native-VNNI format) must have native_vnni_payload";
+                EXPECT_FALSE(packed.native_vnni_scales.empty())
+                    << tc.name << " (native-VNNI format) must have native_vnni_scales";
+
+                // INT8 quantized data must NOT be populated
+                EXPECT_TRUE(packed.int8_data.empty())
+                    << tc.name << " (native-VNNI format) must NOT have int8_data";
+                EXPECT_TRUE(packed.int8_data_vnni.empty())
+                    << tc.name << " (native-VNNI format) must NOT have int8_data_vnni";
+                // Note: scales IS populated by packNativeVNNI for force_ck compatibility
+            }
+            else
+            {
+                // INT8 path populated
+                EXPECT_FALSE(packed.int8_data.empty())
+                    << tc.name << " (INT8-VNNI format) must have int8_data";
+                EXPECT_FALSE(packed.scales.empty())
+                    << tc.name << " (INT8-VNNI format) must have scales";
+                EXPECT_FALSE(packed.int8_data_vnni.empty())
+                    << tc.name << " (INT8-VNNI format) must have int8_data_vnni";
+
+                // Native-VNNI path must be empty
+                EXPECT_TRUE(packed.native_vnni_payload.empty())
+                    << tc.name << " (INT8-VNNI format) must NOT have native_vnni_payload";
+                EXPECT_TRUE(packed.native_vnni_scales.empty())
+                    << tc.name << " (INT8-VNNI format) must NOT have native_vnni_scales";
+            }
         }
     }
 

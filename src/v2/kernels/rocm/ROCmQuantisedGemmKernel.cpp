@@ -1574,8 +1574,9 @@ namespace llaminar2
             out.native_vnni_blocks_per_row = static_cast<uint32_t>(blocks_per_row);
 
             // Per-row max-abs for CK prefill INT8 requantization compatibility.
-            // The native-VNNI GEMV path doesn't use these, but the CK GEMM fallback does.
+            // The native-VNNI GEMV path doesn't use these, but the force_ck debug path does.
             out.scales.resize(N);
+#pragma omp parallel for schedule(static)
             for (int n = 0; n < N; ++n)
             {
                 float max_abs = 0.0f;
@@ -1605,8 +1606,12 @@ namespace llaminar2
                 return false;
             }
 
+            bool interleave_error = false;
+#pragma omp parallel for schedule(static)
             for (int n = 0; n < N; ++n)
             {
+                if (interleave_error)
+                    continue; // skip remaining rows on error
                 for (int b = 0; b < blocks_per_row; ++b)
                 {
                     const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
@@ -2304,9 +2309,12 @@ namespace llaminar2
                         break;
                     }
                     default:
-                        LOG_ERROR("[packNativeVNNI] Unexpected type in block loop");
-                        return false;
+                        interleave_error = true;
+                        break;
                     }
+
+                    if (interleave_error)
+                        break;
 
                     // Copy payload: qs[16] for 4-bit, qs[16]+qh[4] for 5-bit
                     uint8_t *dst = out.native_vnni_payload.data() + linear * payload_bytes;
@@ -2318,6 +2326,12 @@ namespace llaminar2
                     if (is_asymmetric)
                         out.native_vnni_mins[linear] = min_fp16;
                 }
+            }
+
+            if (interleave_error)
+            {
+                LOG_ERROR("[packNativeVNNI] Unexpected type in block loop");
+                return false;
             }
 
             LOG_DEBUG("[packNativeVNNI] Built native-VNNI container for " << N << "x" << K
@@ -2490,101 +2504,122 @@ namespace llaminar2
             out.K = K;
             out.N = N;
 
-            // Native-VNNI path: Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL get lossless native-VNNI packing.
-            // This runs in addition to (not instead of) other paths during transition.
-            if (packNativeVNNI(tensor, out))
-            {
-                LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K
-                                                        << " weights to native-VNNI");
-            }
+            const TensorType wt = tensor->native_type();
 
-            // === Fast path: Q8_0 direct INT8 extraction (no FP32 round-trip) ===
-            if (tensor->native_type() == TensorType::Q8_0 && packWeightsToROCm_Q8_0_fast(tensor, out))
+            // ---- Native-VNNI path (≤6-bit formats) ----
+            // These formats get lossless native packing only.
+            // No generic INT8 requantization is performed — the native-VNNI
+            // GEMV and GEMM kernels decode the quantized blocks directly.
+            if (isNativeVnniFormat(wt))
             {
+                if (!packNativeVNNI(tensor, out))
+                {
+                    LOG_ERROR("[packWeightsToROCm] Native-VNNI packing failed for "
+                              << tensorTypeName(wt) << " " << N << "x" << K);
+                    return false;
+                }
+                LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " "
+                                                        << tensorTypeName(wt) << " to native-VNNI only");
                 return true;
             }
 
-            // === Generic fallback: dequantize to FP32 then requantize to INT8 ===
-            const float *h_weights_fp32 = tensor->fp32_data();
-            if (!h_weights_fp32)
+            // ---- INT8-VNNI path (8-bit formats: Q8_0, Q8_1, Q8_K) ----
+            // These formats get symmetric INT8 requantization with per-row scales.
+            // No native-VNNI packing is needed — the INT8-VNNI kernels consume
+            // row-major and VNNI-interleaved INT8 buffers directly.
+            if (isInt8VnniFormat(wt))
             {
-                LOG_ERROR("[packWeightsToROCm] Failed to get FP32 data from tensor");
-                return false;
-            }
-
-            out.scales.resize(N);
-
-            // Legacy generic path for all other quant formats:
-            out.int8_data.resize(static_cast<size_t>(N) * K);
-
-            // Per-row (per-output-feature) symmetric quantization
-#pragma omp parallel for schedule(static)
-            for (int n = 0; n < N; ++n)
-            {
-                // Find max_abs for this output feature (row n of model weights)
-                float max_abs = 0.0f;
-                for (int k = 0; k < K; ++k)
+                // Fast path: Q8_0 direct INT8 extraction (no FP32 round-trip)
+                if (wt == TensorType::Q8_0 && packWeightsToROCm_Q8_0_fast(tensor, out))
                 {
-                    float val = h_weights_fp32[n * K + k];
-                    max_abs = std::max(max_abs, std::abs(val));
+                    return true;
                 }
 
-                // Symmetric quantization: scale = max_abs / 127
-                float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
-                float inv_scale = 1.0f / scale;
-                out.scales[n] = scale;
-
-                for (int k = 0; k < K; ++k)
+                // Generic INT8 path for Q8_1, Q8_K (and Q8_0 if fast path failed)
+                const float *h_weights_fp32 = tensor->fp32_data();
+                if (!h_weights_fp32)
                 {
-                    float val = h_weights_fp32[n * K + k];
-                    int8_t quantized = static_cast<int8_t>(
-                        std::round(std::clamp(val * inv_scale, -127.0f, 127.0f)));
-                    out.int8_data[n * K + k] = quantized;
+                    LOG_ERROR("[packWeightsToROCm] Failed to get FP32 data from "
+                              << tensorTypeName(wt) << " tensor");
+                    return false;
                 }
-            }
 
-            // Optional VNNI layout: [K/4][N][4] for GEMV experimentation
-            out.int8_data_vnni.clear();
-            if ((K % 4) == 0)
-            {
-                const size_t k_groups = static_cast<size_t>(K) / 4;
-                out.int8_data_vnni.resize(k_groups * static_cast<size_t>(N) * 4);
+                out.scales.resize(N);
+                out.int8_data.resize(static_cast<size_t>(N) * K);
+
+                // Per-row (per-output-feature) symmetric quantization
 #pragma omp parallel for schedule(static)
                 for (int n = 0; n < N; ++n)
                 {
-                    const size_t row_base = static_cast<size_t>(n) * K;
-                    for (size_t kg = 0; kg < k_groups; ++kg)
+                    float max_abs = 0.0f;
+                    for (int k = 0; k < K; ++k)
                     {
-                        const size_t src = row_base + kg * 4;
-                        const size_t dst = (kg * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4;
-                        out.int8_data_vnni[dst + 0] = out.int8_data[src + 0];
-                        out.int8_data_vnni[dst + 1] = out.int8_data[src + 1];
-                        out.int8_data_vnni[dst + 2] = out.int8_data[src + 2];
-                        out.int8_data_vnni[dst + 3] = out.int8_data[src + 3];
+                        float val = h_weights_fp32[n * K + k];
+                        max_abs = std::max(max_abs, std::abs(val));
+                    }
+
+                    float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+                    float inv_scale = 1.0f / scale;
+                    out.scales[n] = scale;
+
+                    for (int k = 0; k < K; ++k)
+                    {
+                        float val = h_weights_fp32[n * K + k];
+                        int8_t quantized = static_cast<int8_t>(
+                            std::round(std::clamp(val * inv_scale, -127.0f, 127.0f)));
+                        out.int8_data[n * K + k] = quantized;
                     }
                 }
+
+                // VNNI layout: [K/4][N][4]
+                out.int8_data_vnni.clear();
+                if ((K % 4) == 0)
+                {
+                    const size_t k_groups = static_cast<size_t>(K) / 4;
+                    out.int8_data_vnni.resize(k_groups * static_cast<size_t>(N) * 4);
+#pragma omp parallel for schedule(static)
+                    for (int n = 0; n < N; ++n)
+                    {
+                        const size_t row_base = static_cast<size_t>(n) * K;
+                        for (size_t kg = 0; kg < k_groups; ++kg)
+                        {
+                            const size_t src = row_base + kg * 4;
+                            const size_t dst = (kg * static_cast<size_t>(N) + static_cast<size_t>(n)) * 4;
+                            out.int8_data_vnni[dst + 0] = out.int8_data[src + 0];
+                            out.int8_data_vnni[dst + 1] = out.int8_data[src + 1];
+                            out.int8_data_vnni[dst + 2] = out.int8_data[src + 2];
+                            out.int8_data_vnni[dst + 3] = out.int8_data[src + 3];
+                        }
+                    }
+                }
+
+                // Phase 3 (opt-in): keep only VNNI host buffer and drop row-major host copy.
+                if (debugEnv().rocm.pack_vnni_only_host)
+                {
+                    if (!out.int8_data_vnni.empty())
+                    {
+                        out.int8_data.clear();
+                        out.int8_data.shrink_to_fit();
+                        LOG_DEBUG("[packWeightsToROCm] VNNI-only host pack enabled; released row-major host copy for "
+                                  << N << "x" << K << " weights");
+                    }
+                    else
+                    {
+                        LOG_WARN("[packWeightsToROCm] LLAMINAR_ROCM_PACK_VNNI_ONLY=1 requested but VNNI layout unavailable "
+                                 << "(K=" << K << " not divisible by 4). Falling back to row-major host pack.");
+                    }
+                }
+
+                LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " "
+                                                        << tensorTypeName(wt) << " to INT8"
+                                                        << (out.int8_data_vnni.empty() ? "" : " + VNNI"));
+                return true;
             }
 
-            // Phase 3 (opt-in): keep only VNNI host buffer and drop row-major host copy.
-            if (debugEnv().rocm.pack_vnni_only_host)
-            {
-                if (!out.int8_data_vnni.empty())
-                {
-                    out.int8_data.clear();
-                    out.int8_data.shrink_to_fit();
-                    LOG_DEBUG("[packWeightsToROCm] VNNI-only host pack enabled; released row-major host copy for "
-                              << N << "x" << K << " weights");
-                }
-                else
-                {
-                    LOG_WARN("[packWeightsToROCm] LLAMINAR_ROCM_PACK_VNNI_ONLY=1 requested but VNNI layout unavailable "
-                             << "(K=" << K << " not divisible by 4). Falling back to row-major host pack.");
-                }
-            }
-
-            LOG_DEBUG("[packWeightsToROCm] Packed " << N << "x" << K << " weights to INT8 (mk_nk_mn layout)"
-                                                    << (out.int8_data_vnni.empty() ? "" : " + VNNI"));
-            return true;
+            // Unsupported format
+            LOG_ERROR("[packWeightsToROCm] Unsupported tensor type for weight packing: "
+                      << tensorTypeName(wt));
+            return false;
         }
 
         // =====================================================================
@@ -2694,16 +2729,19 @@ namespace llaminar2
         /**
          * @brief Classify the best prefill route for the current shape and weight format.
          *
-         * This is the single source of truth for Phase-0/1 routing decisions. Keeping
-         * this logic centralized prevents subtle callsite drift where one entrypoint
-         * might treat the same shape or metadata differently than another.
+         * This is the single source of truth for dispatch routing decisions.
+         * The dispatch policy is:
+         *   - ≤6-bit weights (has_native_vnni) → NATIVE_VNNI
+         *   - 8-bit weights (d_weights_int8_vnni) → INT8_VNNI_NATIVE
+         *   - LLAMINAR_ROCM_FORCE_CK=1 override  → CK_FALLBACK
+         *
+         * CK_FALLBACK is only reachable via the debug env override or if impl_ is
+         * missing / dimensions are invalid.
          */
         ROCmQuantisedGemmKernel::PrefillDispatchPath ROCmQuantisedGemmKernel::selectPrefillDispatchPath(int m, int n, int k) const
         {
             (void)n;
 
-            // This helper is intentionally strict and conservative: if anything is
-            // unclear, we keep the existing CK path as the safety net.
             if (m <= 1 || k <= 0 || (k % 4) != 0)
             {
                 return PrefillDispatchPath::CK_FALLBACK;
@@ -2714,6 +2752,19 @@ namespace llaminar2
                 return PrefillDispatchPath::CK_FALLBACK;
             }
 
+            // Debug override: force CK for all GEMMs
+            if (debugEnv().rocm.force_ck)
+            {
+                return PrefillDispatchPath::CK_FALLBACK;
+            }
+
+            // ≤6-bit formats use native-VNNI (lossless decode, FP16 block scales)
+            if (impl_->has_native_vnni)
+            {
+                return PrefillDispatchPath::NATIVE_VNNI;
+            }
+
+            // 8-bit formats use INT8-VNNI (requantized symmetric INT8)
             if (impl_->d_weights_int8_vnni != nullptr)
             {
                 return PrefillDispatchPath::INT8_VNNI_NATIVE;
@@ -2725,9 +2776,8 @@ namespace llaminar2
         /**
          * @brief Try native M>1 prefill execution for INT8 VNNI or ratio-VNNI formats.
          *
-         * The helper follows a strict "native first, CK fallback always available"
-         * contract. A false return means the caller should continue with existing CK
-         * logic; it does not represent a fatal error by itself.
+         * A false return means neither INT8-VNNI nor native-VNNI prefill could
+         * execute. The caller will error unless LLAMINAR_ROCM_FORCE_CK=1 is set.
          */
         bool ROCmQuantisedGemmKernel::tryPrefillNativeGemm(
             const int8_t *d_A_int8,
@@ -2743,6 +2793,8 @@ namespace llaminar2
             {
                 switch (p)
                 {
+                case PrefillDispatchPath::NATIVE_VNNI:
+                    return "native_vnni";
                 case PrefillDispatchPath::INT8_VNNI_NATIVE:
                     return "int8_vnni_native";
                 case PrefillDispatchPath::CK_FALLBACK:
@@ -3408,6 +3460,25 @@ namespace llaminar2
             }
 
             // =========================================================================
+            // DISPATCH POLICY (unified):
+            //
+            //   ≤6-bit weights (has_native_vnni) → native-VNNI GEMV/GEMM
+            //   8-bit weights (d_weights_int8_vnni) → INT8-VNNI GEMV/GEMM
+            //   LLAMINAR_ROCM_FORCE_CK=1 → CK ComposableKernel (debug only)
+            //
+            // CK is never a normal fallback. If both VNNI paths fail without
+            // force_ck, that is a hard error.
+            // =========================================================================
+            const bool force_ck = debugEnv().rocm.force_ck;
+            if (force_ck)
+            {
+                static std::once_flag force_ck_once;
+                std::call_once(force_ck_once, []()
+                               { LOG_WARN("[ROCmQuantisedGemmKernel] LLAMINAR_ROCM_FORCE_CK=1: "
+                                          "forcing CK ComposableKernel dispatch for all GEMMs (debug override)"); });
+            }
+
+            // =========================================================================
             // DECODE FAST PATH: M=1 GEMV (skips activation quantization + CK GEMM)
             //
             // For M=1 (single-token decode), the CK INT8 GEMM is catastrophically
@@ -3421,8 +3492,9 @@ namespace llaminar2
             //   4. INT32→FP32 scale application kernel
             //
             // Handles optional bias in a single fused kernel launch.
+            // Skipped when LLAMINAR_ROCM_FORCE_CK=1 to allow CK debug testing.
             // =========================================================================
-            if (use_gpu_path && m == 1)
+            if (use_gpu_path && m == 1 && !force_ck)
             {
                 // Ensure weights are on device
                 ensureWeightsConverted();
@@ -3627,7 +3699,11 @@ namespace llaminar2
                     }
                     return true;
                 }
-                // Fall through to CK path if weight pointers unavailable
+                // No VNNI weight pointers available for M=1 decode — this should
+                // not happen unless weights failed to upload.
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] M=1 decode: "
+                          "no native-VNNI or INT8-VNNI weights available");
+                return false;
             }
 
             // =========================================================================
@@ -3637,8 +3713,9 @@ namespace llaminar2
             // because both native prefill formats consume INT8 activations.
             // =========================================================================
 
-            // CK path: if bias is present and we're on GPU, use multiply_fp32_to_fp32_with_bias
-            if (bias && use_gpu_path)
+            // CK FP32 bias path: only used when LLAMINAR_ROCM_FORCE_CK=1 is set.
+            // The VNNI paths handle bias via rocmQuantGemm_biasAdd post-kernel.
+            if (bias && use_gpu_path && force_ck)
             {
                 // Get bias device pointer - check BAR-backed status
                 const float *d_bias = nullptr;
@@ -4023,7 +4100,8 @@ namespace llaminar2
                 // This path reads compact native-VNNI payloads (4.5 bpw) directly,
                 // decodes to INT8 in-register, and produces FP32 output with per-block
                 // FP16 scales applied inline — no separate scaling epilogue needed.
-                if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f && !d_prefill_bias)
+                // Bias is applied via a lightweight biasAdd kernel after the GEMM.
+                if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
                 {
                     const uint8_t cb_id = impl_->native_vnni_codebook_id;
                     {
@@ -4042,7 +4120,18 @@ namespace llaminar2
                             LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] "
                                       "Native-VNNI GEMM succeeded (M="
                                       << m << " N=" << n << " K=" << k
-                                      << " codebook=" << static_cast<int>(cb_id) << ")");
+                                      << " codebook=" << static_cast<int>(cb_id)
+                                      << (d_prefill_bias ? " +bias" : "") << ")");
+
+                            // Apply bias if present (same post-kernel pattern as GEMV)
+                            if (d_prefill_bias)
+                            {
+                                if (!rocmQuantGemm_biasAdd(d_prefill_output, d_prefill_bias, m, n, rocm_device_id_, gpu_stream_))
+                                {
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI GEMM bias add failed");
+                                    return false;
+                                }
+                            }
 
                             // Handle mapped output redirect (same copy-out as INT8 path)
                             if (!use_gpu_path || output_is_mapped)
@@ -4134,7 +4223,18 @@ namespace llaminar2
                     return true;
                 }
 
-                // Native prefill path failed — lazily resolve CK row-major weights
+                // Both VNNI paths failed for M>1 prefill.
+                if (!force_ck)
+                {
+                    // Without force_ck, CK is not a normal fallback — this is a hard error.
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] M>1 prefill: "
+                              "both native-VNNI and INT8-VNNI paths failed (M="
+                              << m << " N=" << n << " K=" << k
+                              << "). Set LLAMINAR_ROCM_FORCE_CK=1 to use CK as a debug fallback.");
+                    return false;
+                }
+
+                // CK debug override: lazily resolve CK row-major weights
                 // now (was deferred because we expected native to succeed).
                 if (native_prefill_likely && !d_weights_int8)
                 {
@@ -4143,7 +4243,7 @@ namespace llaminar2
                 }
             }
 
-            LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Quantized activations, now executing CK GEMM");
+            LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] CK debug path (LLAMINAR_ROCM_FORCE_CK=1): executing CK GEMM");
 
 #if 0 // Debug dump code disabled - was causing heap corruption with non-standard sizes
       // DEBUG: Dump INT8 inputs before GEMM
@@ -4232,11 +4332,14 @@ namespace llaminar2
             }
 
             // =========================================================================
-            // CK TWO-KERNEL DISPATCH (with M-padding for decode)
+            // CK TWO-KERNEL DISPATCH (debug override only, LLAMINAR_ROCM_FORCE_CK=1)
             // =========================================================================
             //
-            // CK INT8 Two-Kernel is the ONLY path. For small M (decode), we pad
-            // activations to CK_MIN_M (128), run CK, then extract first M rows.
+            // This path is only reachable when LLAMINAR_ROCM_FORCE_CK=1 is set.
+            // Normal dispatch uses native-VNNI (≤6-bit) or INT8-VNNI (8-bit).
+            //
+            // For small M (decode), we pad activations to CK_MIN_M (128), run CK,
+            // then extract first M rows.
             //
             // NOTE: hipBLAS INT8 on gfx906 has N <= K limitation, breaking FFN.
             //       M-padding for CK is more efficient and universally supported.
@@ -6401,6 +6504,46 @@ namespace llaminar2
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel] Activation quantization failed");
                 return false;
+            }
+
+            // Step 1b: Try native-VNNI GEMM (halved HBM bandwidth, no epilogue)
+            // Same pattern as multiply_tensor and multiply_fp32_to_fp32: native-VNNI
+            // produces final FP32 output with per-block scales applied inline.
+            // Bias is applied via a lightweight biasAdd kernel after the GEMM.
+            if (m > 1 && impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+            {
+                const uint8_t cb_id = impl_->native_vnni_codebook_id;
+                if (rocmGemm_native_vnni_fp32(
+                        impl_->d_A_int8,
+                        impl_->d_weights_native_payload,
+                        impl_->d_weights_native_scales,
+                        impl_->d_weights_native_mins,
+                        impl_->d_weights_native_emins,
+                        d_C,
+                        impl_->d_scales_A,
+                        m, n, k,
+                        cb_id,
+                        rocm_device_id_, gpu_stream_))
+                {
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
+                              "Native-VNNI GEMM succeeded (M="
+                              << m << " N=" << n << " K=" << k
+                              << " codebook=" << static_cast<int>(cb_id) << " +bias)");
+
+                    if (d_bias)
+                    {
+                        if (!rocmQuantGemm_biasAdd(d_C, d_bias, m, n, rocm_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI GEMM bias add failed");
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                static std::once_flag nvnni_gemm_bias_fallback_once;
+                std::call_once(nvnni_gemm_bias_fallback_once, [&]()
+                               { LOG_WARN("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
+                                          "Native-VNNI GEMM failed; falling back to INT8 GEMM"); });
             }
 
             if (m > 1 && tryPrefillNativeGemm(

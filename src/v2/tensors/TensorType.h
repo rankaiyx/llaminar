@@ -112,4 +112,63 @@ namespace llaminar2
         }
     }
 
+    /**
+     * @brief Check if tensor type is a native-VNNI format (≤6-bit quantization)
+     *
+     * These formats use lossless native-VNNI decode with per-block FP16 scales.
+     * All other quantized types (Q8_0, Q8_1, Q8_K) use INT8-VNNI instead.
+     *
+     * @param type The tensor type enum value
+     * @return true if the format is ≤6-bit and supported by native-VNNI kernels
+     */
+    inline bool isNativeVnniFormat(TensorType type)
+    {
+        switch (type)
+        {
+        case TensorType::Q4_0:
+        case TensorType::Q4_1:
+        case TensorType::Q5_0:
+        case TensorType::Q5_1:
+        case TensorType::Q6_K:
+        case TensorType::Q2_K:
+        case TensorType::Q3_K:
+        case TensorType::Q4_K:
+        case TensorType::Q5_K:
+        case TensorType::IQ4_NL:
+        case TensorType::IQ4_XS:
+        case TensorType::IQ3_S:
+        case TensorType::IQ3_XXS:
+        case TensorType::IQ2_S:
+        case TensorType::IQ2_XS:
+        case TensorType::IQ2_XXS:
+        case TensorType::IQ1_S:
+        case TensorType::IQ1_M:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /**
+     * @brief Check if tensor type is an INT8-VNNI format (7-8 bit quantization)
+     *
+     * These formats are requantized to symmetric INT8 with per-column scales
+     * and use INT8-VNNI GEMM/GEMV kernels.
+     *
+     * @param type The tensor type enum value
+     * @return true if the format is 8-bit and uses INT8-VNNI path
+     */
+    inline bool isInt8VnniFormat(TensorType type)
+    {
+        switch (type)
+        {
+        case TensorType::Q8_0:
+        case TensorType::Q8_1:
+        case TensorType::Q8_K:
+            return true;
+        default:
+            return false;
+        }
+    }
+
 } // namespace llaminar2
