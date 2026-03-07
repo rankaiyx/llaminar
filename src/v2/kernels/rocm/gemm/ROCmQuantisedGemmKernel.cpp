@@ -498,6 +498,42 @@ namespace llaminar2
                 int M, int N, int K,
                 int kt_select,
                 int device_id, void *stream);
+
+            // INT8 VNNI wide-tile V3 blockwise GEMM (activation scales baked in, FP32 output).
+            // KT=8 forced (1 block per tile). Caller applies weight-only epilogue.
+            // Defined in ROCmQuantisedGemmKernel_INT8_VNNI.hip.
+            bool rocmQuantGemm_int8_int8_fp32_vnni_prefill_wide_tile_v3_blockwise(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                float *d_C_fp32,
+                const float *d_scales_A_blockwise,
+                int M, int N, int K,
+                int device_id, void *stream);
+
+            // INT8 VNNI wide-tile V7 blockwise GEMM (activation scales baked in, FP32 output).
+            // KT=8 forced (1 block per tile). Caller applies weight-only epilogue.
+            // Defined in ROCmQuantisedGemmKernel_INT8_VNNI.hip.
+            bool rocmQuantGemm_int8_int8_fp32_vnni_prefill_wide_tile_v7_blockwise(
+                const int8_t *d_A_int8,
+                const int8_t *d_B_int8_vnni,
+                float *d_C_fp32,
+                const float *d_scales_A_blockwise,
+                int M, int N, int K,
+                int device_id, void *stream);
+
+            // Weight-only scaling epilogue for blockwise GEMM output.
+            // Input is FP32 (activation scales already applied by blockwise kernel).
+            // Applies: output = alpha * input * scale_B[n] + beta*existing + bias
+            // Defined in ROCmQuantisedGemmKernel.hip.
+            bool rocmQuantGemm_applyScaling_weightOnly(
+                const float *d_C_fp32_in,
+                float *d_output,
+                const float *d_scales_B,
+                int M, int N,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int rocm_device_id, void *stream);
         }
 
         // =====================================================================
@@ -1776,6 +1812,94 @@ namespace llaminar2
                 }
 
                 // Wide-tile path: covers all M-rows in one block (extreme-wide shapes)
+                //
+                // BLOCKWISE ACTIVATION SCALES: when d_scales_A_blockwise is provided,
+                // use blockwise V3/V7 kernels that apply per-block activation scales
+                // during accumulation, outputting FP32 directly. Then use weight-only
+                // epilogue (scale_B only). K must be a multiple of 32 for block alignment.
+                if (d_scales_A_blockwise != nullptr && (k % 32) == 0)
+                {
+                    // Reinterpret d_C_int32 buffer as float* — same 4-byte-per-element
+                    // layout, device memory, no reallocation needed.
+                    float* d_C_fp32_blockwise = reinterpret_cast<float*>(impl_->d_C_int32);
+
+                    if (k >= n)
+                    {
+                        native_ok = rocmQuantGemm_int8_int8_fp32_vnni_prefill_wide_tile_v3_blockwise(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            d_C_fp32_blockwise,
+                            d_scales_A_blockwise,
+                            m, n, k,
+                            rocm_device_id_, gpu_stream_);
+                    }
+                    else
+                    {
+                        native_ok = rocmQuantGemm_int8_int8_fp32_vnni_prefill_wide_tile_v7_blockwise(
+                            d_A_int8,
+                            impl_->d_weights_int8_vnni,
+                            d_C_fp32_blockwise,
+                            d_scales_A_blockwise,
+                            m, n, k,
+                            rocm_device_id_, gpu_stream_);
+                    }
+
+                    if (native_ok)
+                    {
+                        if (profiling_enabled)
+                            kernel_end = std::chrono::high_resolution_clock::now();
+
+                        if (profiling_enabled)
+                        {
+                            record_kernel_ms(
+                                path,
+                                std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count());
+                        }
+
+                        const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
+
+                        std::chrono::high_resolution_clock::time_point epilogue_start{};
+                        if (profiling_enabled)
+                            epilogue_start = std::chrono::high_resolution_clock::now();
+
+                        if (!rocmQuantGemm_applyScaling_weightOnly(
+                                d_C_fp32_blockwise,
+                                d_output,
+                                d_scales_B,
+                                m, n,
+                                alpha, beta,
+                                d_existing,
+                                d_bias,
+                                rocm_device_id_, gpu_stream_))
+                        {
+                            logFallback("launch_error");
+                            return false;
+                        }
+
+                        if (profiling_enabled)
+                        {
+                            const auto epilogue_end = std::chrono::high_resolution_clock::now();
+                            record_epilogue_ms(
+                                path,
+                                std::chrono::duration<double, std::milli>(epilogue_end - epilogue_start).count());
+                        }
+
+                        return true;
+                    }
+                    else
+                    {
+                        // Blockwise kernel launch failed. Cannot fall through to row-wise
+                        // path because d_scales_A (row-wise) was not populated by the
+                        // blockwise quantization kernel.
+                        static std::once_flag bw_fallback_once;
+                        std::call_once(bw_fallback_once, [&]()
+                                       { LOG_ERROR("[" << callsite << "] Blockwise INT8 kernel failed (M=" << m
+                                                       << " N=" << n << " K=" << k << ")"); });
+                        logFallback("launch_error");
+                        return false;
+                    }
+                }
+
                 if (!has_manual_override && policy_cfg.use_wide_tile)
                 {
                     if (rocm_env.wide_tile_v7)
@@ -2806,13 +2930,17 @@ namespace llaminar2
             LOG_TRACE("[ROCmQuantisedGemmKernel::multiply_tensor] Now quantizing activations");
 
             // Quantize activations FP32 → INT8
-            // Blockwise quantization is only used when the kernel's weight format supports native-VNNI
-            // (Q4_0, IQ4_NL, etc.). INT8-VNNI and CK fallback paths require row-wise d_scales_A
-            // which is NOT populated by blockwise quantization.
+            // Blockwise quantization is used when the kernel's weight format supports it:
+            // - Native-VNNI (Q4_0, IQ4_NL): always supported
+            // - INT8-VNNI (Q8_0): supported for M>1 prefill via blockwise V3/V7 kernels
+            // M=1 decode uses the GEMV path above with its own row-wise quantization.
+            // CK debug fallback (LLAMINAR_ROCM_FORCE_CK=1) also needs row-wise d_scales_A,
+            // but it's only reachable via explicit debug override.
             if (phase_timing)
                 phase_start = std::chrono::high_resolution_clock::now();
             {
-                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) && impl_->has_native_vnni;
+                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE)
+                    && (impl_->has_native_vnni || impl_->d_weights_int8_vnni != nullptr);
                 if (blockwise)
                 {
                     if (!rocmQuantGemm_quantizeActivationsBlockwise(d_A_fp32_src, d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
@@ -3547,23 +3675,32 @@ namespace llaminar2
             // All M=1 paths now use INT8 scatter kernels which require pre-quantized
             // activations. For M>1, CK GEMM also uses pre-quantized activations.
             //
-            // Blockwise quantization is only safe when ALL projection kernels use
-            // native-VNNI dispatch. INT8-VNNI and CK paths require row-wise d_scales_A
-            // which blockwise quantization does not populate.
+            // Blockwise quantization is supported when ALL projection kernels support it.
+            // - Native-VNNI (Q4_0/IQ4_NL): blockwise at ANY M (GEMV handles blockwise scales)
+            // - INT8-VNNI (Q8_0): blockwise only for M>1 (GEMV scatter needs row-wise d_scales_A)
             bool all_projections_native_vnni = true;
+            bool all_projections_have_vnni_weights = true;
             for (size_t pi = 0; pi < projections.size(); ++pi)
             {
                 auto *rk = dynamic_cast<ROCmQuantisedGemmKernel *>(projections[pi].kernel);
                 if (!rk || !rk->impl_ || !rk->impl_->has_native_vnni)
                 {
                     all_projections_native_vnni = false;
-                    break;
                 }
+                if (!rk || !rk->impl_ || (!rk->impl_->has_native_vnni && !rk->impl_->d_weights_int8_vnni))
+                {
+                    all_projections_have_vnni_weights = false;
+                }
+                if (!all_projections_native_vnni && !all_projections_have_vnni_weights)
+                    break;
             }
             {
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
-                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) && all_projections_native_vnni;
+                // Native-VNNI GEMV handles blockwise scales natively (any M).
+                // INT8-VNNI GEMV scatter requires row-wise d_scales_A (M=1 only).
+                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE)
+                    && (all_projections_native_vnni || (all_projections_have_vnni_weights && m > 1));
                 if (blockwise)
                 {
                     if (!rocmQuantGemm_quantizeActivationsBlockwise(
@@ -3906,7 +4043,9 @@ namespace llaminar2
                 // PREFILL PATH: M>1 CK GEMM
                 // =========================================================================
 
-                const float *blockwise_ptr = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE && all_projections_native_vnni) ? impl_->d_scales_A_blockwise : nullptr;
+                const float *blockwise_ptr = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE
+                    && (all_projections_native_vnni || (all_projections_have_vnni_weights && m > 1)))
+                    ? impl_->d_scales_A_blockwise : nullptr;
 
                 if (rocm_kernel->tryPrefillNativeGemm(
                         impl_->d_A_int8,
@@ -5235,9 +5374,10 @@ namespace llaminar2
             }
 
             // Step 1: Quantize FP32 activations to INT8
-            // Blockwise only when native-VNNI (INT8-VNNI and CK need row-wise d_scales_A)
+            // Blockwise for native-VNNI and INT8-VNNI when m > 1 (prefill)
             {
-                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE) && impl_->has_native_vnni;
+                const bool blockwise = (activation_quant_mode_ == ActivationQuantMode::BLOCKWISE)
+                    && (impl_->has_native_vnni || impl_->d_weights_int8_vnni != nullptr);
                 if (blockwise)
                 {
                     if (!rocmQuantGemm_quantizeActivationsBlockwise(

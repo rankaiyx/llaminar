@@ -146,6 +146,151 @@ static constexpr int GEMV_M_THRESHOLD = 4;
 
 namespace
 {
+    static constexpr int BLOCKWISE_BLOCK_SIZE = 32; // Elements per quantization block
+    static constexpr int BLOCKWISE_DP4A_GROUPS = BLOCKWISE_BLOCK_SIZE / 4; // dp4a groups per block
+
+    /**
+     * @brief Quantize FP32 activations to INT8 with per-block scales
+     *
+     * Each thread processes one quantization block (BLOCKWISE_BLOCK_SIZE elements):
+     * 1. Find max_abs within the 32-element block
+     * 2. Compute scale = max_abs / 127
+     * 3. Quantize block elements to INT8
+     *
+     * Grid: (M, 1, 1) - one block per row
+     * Block: (min(num_blocks, 256), 1, 1)
+     */
+    __global__ void quantize_activations_blockwise_kernel(
+        const float *__restrict__ A_fp32,       // [M × K]
+        int8_t *__restrict__ A_int8,            // [M × K] output
+        float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
+        int M, int K)
+    {
+        const int row = blockIdx.x;
+        if (row >= M)
+            return;
+
+        const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
+        const float *row_fp32 = A_fp32 + row * K;
+        int8_t *row_int8 = A_int8 + row * K;
+        float *row_scales = scales_A_blockwise + row * num_blocks;
+
+        for (int b = threadIdx.x; b < num_blocks; b += blockDim.x)
+        {
+            const int k_start = b * BLOCKWISE_BLOCK_SIZE;
+
+            // Find max_abs in this 32-element block
+            float max_abs = 0.0f;
+            for (int k = 0; k < BLOCKWISE_BLOCK_SIZE; k++)
+            {
+                max_abs = fmaxf(max_abs, fabsf(row_fp32[k_start + k]));
+            }
+
+            float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+            float inv_scale = 1.0f / scale;
+            row_scales[b] = scale;
+
+            // Quantize the 32-element block
+            for (int k = 0; k < BLOCKWISE_BLOCK_SIZE; k++)
+            {
+                float val = row_fp32[k_start + k] * inv_scale;
+                row_int8[k_start + k] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, val))));
+            }
+        }
+    }
+
+    /**
+     * @brief Blockwise INT8 GEMM with dp4a and FP32 accumulation
+     *
+     * Custom GEMM kernel that applies per-block activation scales during
+     * accumulation, avoiding the precision loss of full-K INT32 accumulation.
+     *
+     * For each output element C[m][n]:
+     *   C[m][n] = alpha * sum_b(dp4a_block(A[m], B[n], block_b) * scale_A[m][b]) * scale_B[n]
+     *           + beta * C_existing[m][n] + bias[n]
+     *
+     * A block at b is 32 INT8 elements = 8 dp4a groups of 4.
+     * Uses shared memory for A (broadcast to all threads in block).
+     *
+     * Grid: (ceil(N/N_TILE), M) where N_TILE = blockDim.x
+     * Block: (N_TILE, 1, 1) - each thread computes one N output
+     */
+    __global__ void blockwise_gemm_dp4a_kernel(
+        const int8_t *__restrict__ A_int8,           // [M × K] row-major
+        const int8_t *__restrict__ B_int8,           // [K × N] col-major (stored as [N][K])
+        float *__restrict__ C_fp32,                  // [M × N] row-major output
+        const float *__restrict__ scales_A_blockwise, // [M × num_blocks]
+        const float *__restrict__ scales_B,          // [N]
+        int M, int N, int K,
+        float alpha, float beta,
+        const float *__restrict__ C_existing, // For beta != 0
+        const float *__restrict__ bias)       // [N] optional
+    {
+        const int m = blockIdx.y;
+        const int n = blockIdx.x * blockDim.x + threadIdx.x;
+
+        if (m >= M)
+            return;
+
+        const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
+
+        // Shared memory for current A block (32 bytes, broadcast to all threads)
+        __shared__ int8_t smem_A[BLOCKWISE_BLOCK_SIZE];
+
+        float acc = 0.0f;
+        float comp = 0.0f; // Kahan compensation for FP32 accumulation
+
+        for (int b = 0; b < num_blocks; b++)
+        {
+            const int k_start = b * BLOCKWISE_BLOCK_SIZE;
+
+            // Load A[m, k_start:k_start+32] into shared memory
+            if (threadIdx.x < BLOCKWISE_BLOCK_SIZE)
+            {
+                smem_A[threadIdx.x] = A_int8[m * K + k_start + threadIdx.x];
+            }
+            __syncthreads();
+
+            // Each thread computes dp4a dot product for its N column
+            int32_t partial = 0;
+            if (n < N)
+            {
+                // dp4a groups per block (BLOCKWISE_BLOCK_SIZE/4 groups of 4 elements)
+                for (int g = 0; g < BLOCKWISE_DP4A_GROUPS; g++)
+                {
+                    int32_t a_pack = *reinterpret_cast<const int32_t *>(&smem_A[g * 4]);
+                    int32_t b_pack = *reinterpret_cast<const int32_t *>(&B_int8[n * K + k_start + g * 4]);
+                    partial = __dp4a(a_pack, b_pack, partial);
+                }
+
+                // Apply per-block activation scale with Kahan compensated summation
+                float term = static_cast<float>(partial) * scales_A_blockwise[m * num_blocks + b] - comp;
+                float new_acc = acc + term;
+                comp = (new_acc - acc) - term;
+                acc = new_acc;
+            }
+
+            __syncthreads();
+        }
+
+        // Write output with weight scale, alpha/beta, and bias
+        if (n < N)
+        {
+            float result = alpha * acc * scales_B[n];
+
+            if (beta != 0.0f && C_existing != nullptr)
+            {
+                result += beta * C_existing[m * N + n];
+            }
+
+            if (bias != nullptr)
+            {
+                result += bias[n];
+            }
+
+            C_fp32[m * N + n] = result;
+        }
+    }
 
     /**
      * @brief Quantize FP32 activations to INT8 (symmetric per-row quantization)
@@ -543,6 +688,107 @@ extern "C"
         }
 
         // Note: No sync - CUDA stream ordering handles dependencies
+        return true;
+    }
+
+    /**
+     * @brief Quantize FP32 activations to INT8 with per-block-of-32 scales
+     */
+    bool cudaQuantGemm_quantizeActivationsBlockwise(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_A_blockwise,
+        int M, int K,
+        int cuda_device_id,
+        void *stream)
+    {
+        if (!d_A_fp32 || !d_A_int8 || !d_scales_A_blockwise)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm::quantizeActivationsBlockwise] Null pointer: "
+                << "d_A_fp32=" << (void *)d_A_fp32
+                << " d_A_int8=" << (void *)d_A_int8
+                << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise;
+            throw std::runtime_error(oss.str());
+        }
+
+        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
+
+        const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
+        dim3 grid(M);
+        dim3 block(std::min(num_blocks, 256));
+
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        quantize_activations_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
+            d_A_fp32, d_A_int8, d_scales_A_blockwise, M, K);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm] blockwise quantize kernel launch failed: "
+                << cudaGetErrorString(err)
+                << " (M=" << M << ", K=" << K << ")";
+            throw std::runtime_error(oss.str());
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Execute blockwise INT8 GEMM with dp4a and FP32 accumulation
+     *
+     * Custom GEMM that applies per-block activation scales inline during
+     * K-accumulation, producing final FP32 output (no separate epilogue needed).
+     */
+    bool cudaQuantGemm_blockwiseGemm(
+        const int8_t *d_A_int8,
+        const int8_t *d_weights_int8,
+        float *d_C_fp32,
+        const float *d_scales_A_blockwise,
+        const float *d_scales_B,
+        int M, int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        int cuda_device_id,
+        void *stream)
+    {
+        if (!d_A_int8 || !d_weights_int8 || !d_C_fp32 || !d_scales_A_blockwise || !d_scales_B)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm::blockwiseGemm] Null pointer: "
+                << "d_A_int8=" << (void *)d_A_int8
+                << " d_weights_int8=" << (void *)d_weights_int8
+                << " d_C_fp32=" << (void *)d_C_fp32
+                << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise
+                << " d_scales_B=" << (void *)d_scales_B;
+            throw std::runtime_error(oss.str());
+        }
+
+        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
+
+        const int N_TILE = 128;
+        dim3 block(N_TILE);
+        dim3 grid((N + N_TILE - 1) / N_TILE, M);
+
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        blockwise_gemm_dp4a_kernel<<<grid, block, 0, cuda_stream>>>(
+            d_A_int8, d_weights_int8, d_C_fp32,
+            d_scales_A_blockwise, d_scales_B,
+            M, N, K,
+            alpha, beta, d_C_existing, d_bias);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm] blockwise GEMM dp4a kernel launch failed: "
+                << cudaGetErrorString(err)
+                << " (M=" << M << ", N=" << N << ", K=" << K << ")";
+            throw std::runtime_error(oss.str());
+        }
+
         return true;
     }
 

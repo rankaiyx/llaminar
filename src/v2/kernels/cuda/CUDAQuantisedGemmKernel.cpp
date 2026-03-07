@@ -102,6 +102,29 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream = nullptr);
 
+            // Quantize FP32 activations to INT8 with per-block-of-32 scales
+            bool cudaQuantGemm_quantizeActivationsBlockwise(
+                const float *d_A_fp32,          // [M x K]
+                int8_t *d_A_int8,               // [M x K] output
+                float *d_scales_A_blockwise,    // [M x (K/32)] output
+                int M, int K,
+                int cuda_device_id,
+                void *stream = nullptr);
+
+            // Execute blockwise INT8 GEMM with dp4a and FP32 accumulation
+            bool cudaQuantGemm_blockwiseGemm(
+                const int8_t *d_A_int8,             // [M x K] row-major
+                const int8_t *d_weights_int8,       // [K x N] col-major
+                float *d_C_fp32,                    // [M x N] output
+                const float *d_scales_A_blockwise,  // [M x (K/32)]
+                const float *d_scales_B,            // [N]
+                int M, int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int cuda_device_id,
+                void *stream = nullptr);
+
             // Free device memory
             void cudaQuantGemm_freeDevice(void *d_ptr);
 
@@ -544,10 +567,17 @@ namespace llaminar2
                     "[CUDAQuantisedGemmKernel] Workspace missing required buffer: " +
                     std::string(GemmWorkspaceBuffers::ACC_INT32));
             }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE))
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Workspace missing required buffer: " +
+                    std::string(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+            }
 
             LOG_TRACE("[CUDAQuantisedGemmKernel::validateWorkspace] Workspace validated"
                       << " A_int8=" << workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A)
                       << " scales_A=" << workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A)
+                      << " scales_A_blockwise=" << workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)
                       << " C_int32=" << workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
         }
 
@@ -1034,16 +1064,38 @@ namespace llaminar2
             // Use this kernel's workspace for quantized activations (shared across all projections)
             validateWorkspace();
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
-            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
 
-            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
+            // Use blockwise quantization for prefill (M>1) when K is block-aligned.
+            // For M=1 decode, CUTLASS Tensor Cores are faster than our custom dp4a kernel.
+            const bool use_blockwise = (m > 1 && k % 32 == 0);
+            float *d_scales_A = nullptr;
+            float *d_scales_A_blockwise = nullptr;
 
-            // Step 3: Quantize activations ONCE (shared across all projections)
-            if (!cudaQuantGemm_quantizeActivations(
-                    d_input, d_A_int8, d_scales_A, m, k, cuda_device_id_, gpu_stream_))
+            if (use_blockwise)
             {
-                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Activation quantization failed");
-                return false;
+                d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise quantizing activations once, m=" << m << " k=" << k);
+
+                // Step 3a: Blockwise quantize activations ONCE (shared across all projections)
+                if (!cudaQuantGemm_quantizeActivationsBlockwise(
+                        d_input, d_A_int8, d_scales_A_blockwise, m, k, cuda_device_id_, gpu_stream_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise activation quantization failed");
+                    return false;
+                }
+            }
+            else
+            {
+                d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Row-wise quantizing activations once, m=" << m << " k=" << k);
+
+                // Step 3b: Row-wise quantize activations ONCE (shared across all projections)
+                if (!cudaQuantGemm_quantizeActivations(
+                        d_input, d_A_int8, d_scales_A, m, k, cuda_device_id_, gpu_stream_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Activation quantization failed");
+                    return false;
+                }
             }
 
             // Step 4: Execute each projection using the SHARED quantized activations
@@ -1106,22 +1158,7 @@ namespace llaminar2
                     break;
                 }
 
-                // Execute CUTLASS INT8 GEMM using SHARED quantized activations and this kernel's weights
-                {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
-                    if (!cudaQuantGemm_execute(
-                            d_A_int8,                           // SHARED quantized activations (from this kernel's workspace)
-                            cuda_kernel->impl_->d_weights_int8, // This projection's weights
-                            proj_d_C_int32,                     // This projection's INT32 work buffer (from its workspace)
-                            m, n, k, cuda_device_id_, gpu_stream_))
-                    {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] CUTLASS GEMM failed for projection " << i);
-                        all_success = false;
-                        break;
-                    }
-                }
-
-                // Get bias pointer if present
+                // Get bias pointer if present (needed for both CUTLASS and blockwise paths)
                 const float *d_bias = nullptr;
                 if (proj.bias)
                 {
@@ -1206,18 +1243,53 @@ namespace llaminar2
                                                                                              << " using bias ptr=" << static_cast<const void *>(d_bias));
                 }
 
-                // Apply scaling: output = int32_accum * scales_A * scales_B + bias
-                // Note: Use the SHARED scales_A from the quantized activations (from this kernel's workspace)
-                if (!cudaQuantGemm_applyScaling(
-                        proj_d_C_int32,                 // This projection's INT32 result
-                        d_output,                       // Output FP32
-                        d_scales_A,                     // SHARED activation scales (from this kernel's workspace)
-                        cuda_kernel->impl_->d_scales_B, // This projection's weight scales
-                        m, n, 1.0f, 0.0f, nullptr, d_bias, cuda_device_id_, gpu_stream_))
+                if (use_blockwise)
                 {
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Scaling failed for projection " << i);
-                    all_success = false;
-                    break;
+                    // Blockwise GEMM: produces final FP32 output directly (includes per-block scales, weight scales, bias)
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
+                    if (!cudaQuantGemm_blockwiseGemm(
+                            d_A_int8,                           // SHARED blockwise-quantized activations
+                            cuda_kernel->impl_->d_weights_int8, // This projection's weights
+                            d_output,                           // Output FP32 (direct)
+                            d_scales_A_blockwise,               // SHARED blockwise activation scales
+                            cuda_kernel->impl_->d_scales_B,     // This projection's weight scales
+                            m, n, k, 1.0f, 0.0f, nullptr, d_bias, cuda_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise GEMM failed for projection " << i);
+                        all_success = false;
+                        break;
+                    }
+                }
+                else
+                {
+                    // CUTLASS INT8 GEMM → INT32 accumulator, then separate scaling epilogue
+                    {
+                        CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
+                        if (!cudaQuantGemm_execute(
+                                d_A_int8,                           // SHARED quantized activations (from this kernel's workspace)
+                                cuda_kernel->impl_->d_weights_int8, // This projection's weights
+                                proj_d_C_int32,                     // This projection's INT32 work buffer (from its workspace)
+                                m, n, k, cuda_device_id_, gpu_stream_))
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] CUTLASS GEMM failed for projection " << i);
+                            all_success = false;
+                            break;
+                        }
+                    }
+
+                    // Apply scaling: output = int32_accum * scales_A * scales_B + bias
+                    // Note: Use the SHARED scales_A from the quantized activations (from this kernel's workspace)
+                    if (!cudaQuantGemm_applyScaling(
+                            proj_d_C_int32,                 // This projection's INT32 result
+                            d_output,                       // Output FP32
+                            d_scales_A,                     // SHARED activation scales (from this kernel's workspace)
+                            cuda_kernel->impl_->d_scales_B, // This projection's weight scales
+                            m, n, 1.0f, 0.0f, nullptr, d_bias, cuda_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Scaling failed for projection " << i);
+                        all_success = false;
+                        break;
+                    }
                 }
 
 #ifdef LLAMINAR_DEBUG_GEMM_VALUES
@@ -1277,11 +1349,47 @@ namespace llaminar2
 
             // Get workspace buffer pointers
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
-            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
-            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
             // Ensure weights converted
             ensureWeightsConverted();
+
+            // Use blockwise quantization for prefill (M>1) when K is block-aligned.
+            // For M=1 decode, CUTLASS Tensor Cores are faster than our custom dp4a kernel.
+            const bool use_blockwise = (m > 1 && k % 32 == 0);
+
+            if (use_blockwise)
+            {
+                float *d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+
+                // Step 1: Blockwise quantize activations
+                if (!cudaQuantGemm_quantizeActivationsBlockwise(
+                        d_A, d_A_int8, d_scales_A_blockwise, m, k, cuda_device_id_, gpu_stream_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise activation quantization failed");
+                    return false;
+                }
+
+                // Step 2: Blockwise GEMM (produces FP32 directly, includes scaling)
+                const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+                {
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
+                    if (!cudaQuantGemm_blockwiseGemm(
+                            d_A_int8, impl_->d_weights_int8, d_C,
+                            d_scales_A_blockwise, impl_->d_scales_B,
+                            m, n, k, alpha, beta, d_C_existing, nullptr, cuda_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise GEMM failed");
+                        return false;
+                    }
+                }
+
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (blockwise)");
+                return true;
+            }
+
+            // Row-wise CUTLASS path (fallback when K not divisible by 32)
+            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
+            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
 #ifdef LLAMINAR_DEBUG_GEMM_VALUES
             // Debug: Sample scales_B (weight scales) - EXPENSIVE, guarded by compile flag
@@ -1400,11 +1508,49 @@ namespace llaminar2
 
             // Get workspace buffer pointers
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
-            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
-            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
             // Ensure weights converted
             ensureWeightsConverted();
+
+            // Use blockwise quantization for prefill (M>1) when K is block-aligned.
+            // For M=1 decode, CUTLASS Tensor Cores are faster than our custom dp4a kernel.
+            const bool use_blockwise = (m > 1 && k % 32 == 0);
+
+            if (use_blockwise)
+            {
+                float *d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+
+                // Step 1: Blockwise quantize activations
+                {
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::QUANTIZE_ACTIVATIONS);
+                    if (!cudaQuantGemm_quantizeActivationsBlockwise(
+                            d_A, d_A_int8, d_scales_A_blockwise, m, k, cuda_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise activation quantization failed");
+                        return false;
+                    }
+                }
+
+                // Step 2: Blockwise GEMM (produces FP32 directly, includes scaling + bias)
+                const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+                {
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
+                    if (!cudaQuantGemm_blockwiseGemm(
+                            d_A_int8, impl_->d_weights_int8, d_C,
+                            d_scales_A_blockwise, impl_->d_scales_B,
+                            m, n, k, alpha, beta, d_C_existing, d_bias, cuda_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise GEMM with bias failed");
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            // Row-wise CUTLASS path (fallback when K not divisible by 32)
+            float *d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
+            int32_t *d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
             // Step 1: Quantize activations
             {
@@ -1544,6 +1690,11 @@ namespace llaminar2
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
 
+            // Blockwise activation quantization scales: one float per 32-element block
+            size_t num_blocks_per_row = static_cast<size_t>((k + 31) / 32);
+            size_t scales_a_blockwise_bytes = static_cast<size_t>(m) * num_blocks_per_row * sizeof(float);
+            reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
+
             // FP32 output workspace for mapped memory redirect
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
             // This buffer provides an HBM target; we bulk-DMA to mapped memory after.
@@ -1553,6 +1704,7 @@ namespace llaminar2
             LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
                       << "scales_a=" << (scales_a_bytes) << "B, "
+                      << "scales_a_blockwise=" << (scales_a_blockwise_bytes) << "B, "
                       << "acc=" << (acc_int32_bytes / 1024) << "KB"
                       << ", temp_c_fp32=" << (temp_c_fp32_bytes / 1024) << "KB");
 

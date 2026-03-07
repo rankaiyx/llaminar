@@ -1853,6 +1853,108 @@ extern "C"
     }
 
     // =========================================================================
+    // WEIGHT-ONLY SCALING EPILOGUE (for blockwise activation-scaled GEMM)
+    // =========================================================================
+    //
+    // When the GEMM kernel has already applied per-block activation scales,
+    // the epilogue only needs to apply weight scales:
+    //   output[m,n] = alpha * C_fp32[m,n] * scale_B[n] + beta * existing + bias
+    //
+    // Input is FP32 (not INT32) because the blockwise kernel converts to float.
+
+    __global__ void applyScaling_weightOnly_vec4_flat_kernel(
+        const float* __restrict__ d_C_fp32_in,  // [M×N] FP32 with act-scales applied
+        float* __restrict__ d_output,            // [M×N] FP32 final output
+        const float* __restrict__ d_scale_B,     // [N] per-column weight scales
+        int M, int N, int total_vec4,
+        float alpha, float beta,
+        const float* __restrict__ d_C_existing,
+        const float* __restrict__ d_bias)
+    {
+        const int N4 = N / 4;
+
+        for (int vi = blockIdx.x * blockDim.x + threadIdx.x;
+             vi < total_vec4;
+             vi += gridDim.x * blockDim.x)
+        {
+            const int row = vi / N4;
+            const int col4 = (vi - row * N4) * 4;
+            const int idx = row * N + col4;
+
+            const float4 vals = *reinterpret_cast<const float4*>(d_C_fp32_in + idx);
+            const float4 sb = *reinterpret_cast<const float4*>(d_scale_B + col4);
+
+            float4 out;
+            out.x = alpha * vals.x * sb.x;
+            out.y = alpha * vals.y * sb.y;
+            out.z = alpha * vals.z * sb.z;
+            out.w = alpha * vals.w * sb.w;
+
+            if (beta != 0.0f && d_C_existing != nullptr)
+            {
+                const float4 ex = *reinterpret_cast<const float4*>(d_C_existing + idx);
+                out.x += beta * ex.x;
+                out.y += beta * ex.y;
+                out.z += beta * ex.z;
+                out.w += beta * ex.w;
+            }
+
+            if (d_bias != nullptr)
+            {
+                const float4 b = *reinterpret_cast<const float4*>(d_bias + col4);
+                out.x += b.x;
+                out.y += b.y;
+                out.z += b.z;
+                out.w += b.w;
+            }
+
+            *reinterpret_cast<float4*>(d_output + idx) = out;
+        }
+    }
+
+    bool rocmQuantGemm_applyScaling_weightOnly(
+        const float *d_C_fp32_in,    // [M×N] FP32 with activation scales applied
+        float *d_output,              // [M×N] FP32 final output
+        const float *d_scales_B,      // [N] per-column weight scales
+        int M, int N,
+        float alpha, float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_C_fp32_in || !d_output || !d_scales_B)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyScaling_weightOnly] Null pointer\n");
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        constexpr int BLOCK_X = 256;
+        const int total_vec4 = M * (N / 4);
+        constexpr int MAX_BLOCKS = 480;
+        const int natural_blocks = (total_vec4 + BLOCK_X - 1) / BLOCK_X;
+        const int grid_size = (natural_blocks < MAX_BLOCKS) ? natural_blocks : MAX_BLOCKS;
+
+        hipLaunchKernelGGL(
+            applyScaling_weightOnly_vec4_flat_kernel,
+            dim3(grid_size), dim3(BLOCK_X), 0, static_cast<hipStream_t>(stream),
+            d_C_fp32_in, d_output, d_scales_B,
+            M, N, total_vec4, alpha, beta, d_C_existing, d_bias);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyScaling_weightOnly] Launch failed: %s (M=%d, N=%d)\n",
+                    hipGetErrorString(err), M, N);
+            return false;
+        }
+
+        return true;
+    }
+
+    // =========================================================================
     // IN-PLACE BIAS ADDITION KERNEL
     // =========================================================================
 

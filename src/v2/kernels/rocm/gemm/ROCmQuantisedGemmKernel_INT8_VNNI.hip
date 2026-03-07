@@ -2661,4 +2661,920 @@ extern "C"
         return true;
     }
 
+} // extern "C" (close before blockwise kernel templates - they need C++ linkage)
+
+// ============================================================================
+// BLOCKWISE V3: LDS Double-Buffered Pipeline with Per-Block Activation Scales
+// ============================================================================
+//
+// Variant of V3 GEMM kernel that applies per-K-block activation scales during
+// accumulation instead of a single row-wise scale in the epilogue.
+//
+// Key differences from V3:
+// - Forces KT=8 (8 k-groups = 32 elements = 1 activation block)
+// - Uses FP32 running accumulators (fp32_acc) alongside INT32 per-tile accs
+// - After each K-tile compute: cast INT32→FP32, multiply by blockwise scale,
+//   accumulate to fp32_acc, reset INT32 acc
+// - Outputs FP32 (with activation scales applied)
+// - Epilogue only needs to apply weight scale_B[n]
+//
+// Register budget: +M_PER_THREAD×N_PER_THREAD FP32 regs (~32 for M_TILE=128)
+//   V3 base: ~66 VGPRs → blockwise: ~98 VGPRs → 2 waves/SIMD, 0 spills
+//
+template <int N_TILE, int M_TILE = 128>
+__global__ __launch_bounds__(256, 0)
+void qgemm_int8_vnni_wide_tile_v3_blockwise_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    int M, int N, int K)
+{
+    constexpr int KT = 8; // forced: 1 block per tile
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int M_PER_THREAD = 4;
+    constexpr int THREADS_M = M_TILE / M_PER_THREAD;
+    constexpr int THREADS_N = BLOCK_SIZE / THREADS_M;
+    constexpr int N_PER_THREAD = N_TILE / THREADS_N;
+
+    static_assert(M_TILE == 16 || M_TILE == 32 || M_TILE == 64 || M_TILE == 128);
+    static_assert(THREADS_M * THREADS_N == BLOCK_SIZE);
+    static_assert(N_TILE % THREADS_N == 0);
+
+    const int n_block = blockIdx.x * N_TILE;
+    const int m_block = blockIdx.y * M_TILE;
+    const int t_m = threadIdx.x % THREADS_M;
+    const int t_n = threadIdx.x / THREADS_M;
+    const int m_base = t_m * M_PER_THREAD;
+    const int n_base = n_block + t_n * N_PER_THREAD;
+
+    __shared__ int32_t a_lds[2][KT * M_TILE];
+    __shared__ int32_t b_lds[2][KT * N_TILE];
+
+    // INT32 per-tile accumulators (reset after each tile)
+    int32_t acc[M_PER_THREAD][N_PER_THREAD];
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        #pragma unroll
+        for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            acc[mm][nn] = 0;
+
+    // FP32 running accumulators (accumulate scaled partial sums across tiles)
+    float fp32_acc[M_PER_THREAD][N_PER_THREAD];
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        #pragma unroll
+        for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            fp32_acc[mm][nn] = 0.0f;
+
+    const int total_k_groups = K / 4;
+    const int blocks_per_row = total_k_groups / KT; // K/32 blocks per row
+    const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
+    const int32_t* b_global = reinterpret_cast<const int32_t*>(d_B_int8_vnni);
+    const int a_row_stride = K / 4;
+
+    // A cooperative load geometry
+    constexpr int A_K_CHUNKS = KT / 4;
+    constexpr int A_ROWS_PER_PASS = BLOCK_SIZE / A_K_CHUNKS;
+    constexpr int A_NUM_PASSES = (M_TILE + A_ROWS_PER_PASS - 1) / A_ROWS_PER_PASS;
+
+    const int a_kg = (threadIdx.x % A_K_CHUNKS) * 4;
+    const int a_thread_mi_base = threadIdx.x / A_K_CHUNKS;
+
+    int a_mi[A_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+        a_mi[p] = a_thread_mi_base + p * A_ROWS_PER_PASS;
+
+    // B cooperative load geometry
+    constexpr int B_N_CHUNKS = N_TILE / 4;
+    constexpr int B_ACTIVE_THREADS = KT * B_N_CHUNKS;
+    static_assert(B_ACTIVE_THREADS <= BLOCK_SIZE);
+
+    const int b_kk_local = threadIdx.x / B_N_CHUNKS;
+    const int b_nl = (threadIdx.x % B_N_CHUNKS) * 4;
+    const int b_gn = n_block + b_nl;
+    const int b_lds_off = b_kk_local * N_TILE + b_nl;
+
+    const int num_tiles = (total_k_groups + KT - 1) / KT;
+    if (num_tiles == 0) return;
+
+    uint4 a_staging[A_NUM_PASSES];
+    uint4 b_staging;
+
+    // Blockwise scale+accumulate+reset helper (called after each tile compute)
+    auto blockwise_accumulate = [&](int block_idx) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        {
+            const int gm = m_block + m_base + mm;
+            const float s = (gm < M)
+                ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + block_idx]
+                : 0.0f;
+            #pragma unroll
+            for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            {
+                fp32_acc[mm][nn] += static_cast<float>(acc[mm][nn]) * s;
+                acc[mm][nn] = 0;
+            }
+        }
+    };
+
+    // PRELOAD tile 0 → buf[0]
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+    {
+        const int mi = a_mi[p];
+        if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+        const int gm = m_block + mi;
+        const int gkg = a_kg;
+        if (__builtin_expect(gm < M && gkg + 3 < total_k_groups, 1))
+        {
+            a_staging[p] = *reinterpret_cast<const uint4*>(
+                a_global + static_cast<int64_t>(gm) * a_row_stride + gkg);
+        }
+        else
+        {
+            a_staging[p].x = (gm < M && gkg + 0 < total_k_groups)
+                ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 0] : 0;
+            a_staging[p].y = (gm < M && gkg + 1 < total_k_groups)
+                ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 1] : 0;
+            a_staging[p].z = (gm < M && gkg + 2 < total_k_groups)
+                ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 2] : 0;
+            a_staging[p].w = (gm < M && gkg + 3 < total_k_groups)
+                ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 3] : 0;
+        }
+    }
+
+    b_staging = make_uint4(0, 0, 0, 0);
+    if (threadIdx.x < B_ACTIVE_THREADS)
+    {
+        const int gkk = b_kk_local;
+        if (__builtin_expect(b_gn + 3 < N && gkk < total_k_groups, 1))
+        {
+            b_staging = *reinterpret_cast<const uint4*>(
+                b_global + static_cast<int64_t>(gkk) * N + b_gn);
+        }
+        else
+        {
+            b_staging.x = (b_gn + 0 < N && gkk < total_k_groups)
+                ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 0] : 0;
+            b_staging.y = (b_gn + 1 < N && gkk < total_k_groups)
+                ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 1] : 0;
+            b_staging.z = (b_gn + 2 < N && gkk < total_k_groups)
+                ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 2] : 0;
+            b_staging.w = (b_gn + 3 < N && gkk < total_k_groups)
+                ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 3] : 0;
+        }
+    }
+
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+    {
+        const int mi = a_mi[p];
+        if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+        a_lds[0][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+        a_lds[0][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+        a_lds[0][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+        a_lds[0][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+    }
+    if (threadIdx.x < B_ACTIVE_THREADS)
+    {
+        *reinterpret_cast<uint4*>(&b_lds[0][b_lds_off]) = b_staging;
+    }
+
+    __syncthreads();
+
+    // MAIN LOOP: double-buffered pipeline
+    for (int tile = 1; tile < num_tiles; ++tile)
+    {
+        const int cur_buf = (tile - 1) & 1;
+        const int nxt_buf = tile & 1;
+        const int kt_base = tile * KT;
+
+        // 1. Issue global loads for next tile
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+            const int gm = m_block + mi;
+            const int gkg = kt_base + a_kg;
+            if (__builtin_expect(gm < M && gkg + 3 < total_k_groups, 1))
+            {
+                a_staging[p] = *reinterpret_cast<const uint4*>(
+                    a_global + static_cast<int64_t>(gm) * a_row_stride + gkg);
+            }
+            else
+            {
+                a_staging[p].x = (gm < M && gkg + 0 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 0] : 0;
+                a_staging[p].y = (gm < M && gkg + 1 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 1] : 0;
+                a_staging[p].z = (gm < M && gkg + 2 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 2] : 0;
+                a_staging[p].w = (gm < M && gkg + 3 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 3] : 0;
+            }
+        }
+
+        if (threadIdx.x < B_ACTIVE_THREADS)
+        {
+            const int gkk = kt_base + b_kk_local;
+            if (__builtin_expect(b_gn + 3 < N && gkk < total_k_groups, 1))
+            {
+                b_staging = *reinterpret_cast<const uint4*>(
+                    b_global + static_cast<int64_t>(gkk) * N + b_gn);
+            }
+            else
+            {
+                b_staging = make_uint4(0, 0, 0, 0);
+                b_staging.x = (b_gn + 0 < N && gkk < total_k_groups)
+                    ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 0] : 0;
+                b_staging.y = (b_gn + 1 < N && gkk < total_k_groups)
+                    ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 1] : 0;
+                b_staging.z = (b_gn + 2 < N && gkk < total_k_groups)
+                    ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 2] : 0;
+                b_staging.w = (b_gn + 3 < N && gkk < total_k_groups)
+                    ? b_global[static_cast<int64_t>(gkk) * N + b_gn + 3] : 0;
+            }
+        }
+
+        // 2. Compute on current buffer
+        #pragma unroll
+        for (int kk = 0; kk < KT; ++kk)
+        {
+            int32_t a_reg[M_PER_THREAD];
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                a_reg[mm] = a_lds[cur_buf][kk * M_TILE + m_base + mm];
+
+            int32_t b_reg[N_PER_THREAD];
+            #pragma unroll
+            for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                b_reg[nn] = b_lds[cur_buf][kk * N_TILE + t_n * N_PER_THREAD + nn];
+
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+        }
+
+        // 2b. BLOCKWISE: Scale partial sums and accumulate to FP32
+        blockwise_accumulate(tile - 1);
+
+        // 3. Barrier
+        __syncthreads();
+
+        // 4. Write staged data to next buffer
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+            a_lds[nxt_buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+            a_lds[nxt_buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+            a_lds[nxt_buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+            a_lds[nxt_buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+        }
+        if (threadIdx.x < B_ACTIVE_THREADS)
+        {
+            *reinterpret_cast<uint4*>(&b_lds[nxt_buf][b_lds_off]) = b_staging;
+        }
+
+        // 5. Barrier
+        __syncthreads();
+    }
+
+    // FINAL TILE
+    {
+        const int last_buf = (num_tiles - 1) & 1;
+
+        #pragma unroll
+        for (int kk = 0; kk < KT; ++kk)
+        {
+            int32_t a_reg[M_PER_THREAD];
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                a_reg[mm] = a_lds[last_buf][kk * M_TILE + m_base + mm];
+
+            int32_t b_reg[N_PER_THREAD];
+            #pragma unroll
+            for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                b_reg[nn] = b_lds[last_buf][kk * N_TILE + t_n * N_PER_THREAD + nn];
+
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+        }
+
+        // BLOCKWISE: Scale partial sums for the final tile
+        blockwise_accumulate(num_tiles - 1);
+    }
+
+    // STORE FP32 RESULTS (activation scales already applied)
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+    {
+        const int m_idx = m_block + m_base + mm;
+        if (m_idx < M)
+        {
+            if constexpr (N_PER_THREAD >= 4)
+            {
+                if (n_base + N_PER_THREAD - 1 < N)
+                {
+                    const int64_t row_off = static_cast<int64_t>(m_idx) * N + n_base;
+                    #pragma unroll
+                    for (int chunk = 0; chunk < N_PER_THREAD; chunk += 4)
+                    {
+                        *reinterpret_cast<float4*>(d_C_fp32 + row_off + chunk) =
+                            make_float4(fp32_acc[mm][chunk + 0],
+                                        fp32_acc[mm][chunk + 1],
+                                        fp32_acc[mm][chunk + 2],
+                                        fp32_acc[mm][chunk + 3]);
+                    }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    {
+                        const int n_idx = n_base + nn;
+                        if (n_idx < N)
+                            d_C_fp32[static_cast<int64_t>(m_idx) * N + n_idx] = fp32_acc[mm][nn];
+                    }
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                {
+                    const int n_idx = n_base + nn;
+                    if (n_idx < N)
+                        d_C_fp32[static_cast<int64_t>(m_idx) * N + n_idx] = fp32_acc[mm][nn];
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+// BLOCKWISE V7: Safe-Tile Split with Per-Block Activation Scales
+// ============================================================================
+//
+// Variant of V7 GEMM kernel with blockwise activation scale accumulation.
+// Same structure as V7 (safe loop + boundary loop + final tile) but with
+// FP32 running accumulators and per-tile blockwise scale application.
+//
+template <int N_TILE, int M_TILE = 128>
+__global__ __launch_bounds__(256, 2)
+void qgemm_int8_vnni_wide_tile_v7_blockwise_kernel(
+    const int8_t* __restrict__ d_A_int8,
+    const int8_t* __restrict__ d_B_int8_vnni,
+    float* __restrict__ d_C_fp32,
+    const float* __restrict__ d_scales_A_blockwise,
+    int M, int N, int K)
+{
+    constexpr int KT = 8; // forced: 1 block per tile
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int M_PER_THREAD = 4;
+    constexpr int THREADS_M = M_TILE / M_PER_THREAD;
+    constexpr int THREADS_N = BLOCK_SIZE / THREADS_M;
+    constexpr int N_PER_THREAD = N_TILE / THREADS_N;
+
+    static_assert(M_TILE == 16 || M_TILE == 32 || M_TILE == 64 || M_TILE == 128);
+    static_assert(THREADS_M * THREADS_N == BLOCK_SIZE);
+    static_assert(N_TILE % THREADS_N == 0);
+    static_assert(M_PER_THREAD == 4);
+
+    const int n_block = blockIdx.x * N_TILE;
+    const int m_block = blockIdx.y * M_TILE;
+    const int t_m = threadIdx.x % THREADS_M;
+    const int t_n = threadIdx.x / THREADS_M;
+    const int m_base = t_m * M_PER_THREAD;
+    const int n_base = n_block + t_n * N_PER_THREAD;
+
+    __shared__ int32_t a_lds[2][KT * M_TILE];
+    __shared__ int32_t b_lds[2][KT * N_TILE];
+
+    int32_t acc[M_PER_THREAD][N_PER_THREAD];
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        #pragma unroll
+        for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            acc[mm][nn] = 0;
+
+    float fp32_acc[M_PER_THREAD][N_PER_THREAD];
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        #pragma unroll
+        for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            fp32_acc[mm][nn] = 0.0f;
+
+    const int total_k_groups = K / 4;
+    const int blocks_per_row = total_k_groups / KT;
+    const int32_t* a_global = reinterpret_cast<const int32_t*>(d_A_int8);
+    const int32_t* b_global = reinterpret_cast<const int32_t*>(d_B_int8_vnni);
+    const int a_row_stride = K / 4;
+
+    constexpr int A_K_CHUNKS = KT / 4;
+    constexpr int A_ROWS_PER_PASS = BLOCK_SIZE / A_K_CHUNKS;
+    constexpr int A_NUM_PASSES = (M_TILE + A_ROWS_PER_PASS - 1) / A_ROWS_PER_PASS;
+
+    const int a_kg = (threadIdx.x % A_K_CHUNKS) * 4;
+    const int a_thread_mi_base = threadIdx.x / A_K_CHUNKS;
+
+    int a_mi[A_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < A_NUM_PASSES; ++p)
+        a_mi[p] = a_thread_mi_base + p * A_ROWS_PER_PASS;
+
+    constexpr int B_N_CHUNKS = N_TILE / 4;
+    constexpr int B_TOTAL_GROUPS = KT * B_N_CHUNKS;
+    constexpr int B_NUM_PASSES = (B_TOTAL_GROUPS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    struct BLoadCoord {
+        int kk_local;
+        int nl;
+        int gn;
+        int lds_off;
+        bool active;
+    };
+    BLoadCoord b_coords[B_NUM_PASSES];
+    #pragma unroll
+    for (int p = 0; p < B_NUM_PASSES; ++p)
+    {
+        const int flat = p * BLOCK_SIZE + threadIdx.x;
+        if (flat < B_TOTAL_GROUPS)
+        {
+            b_coords[p].kk_local = flat / B_N_CHUNKS;
+            b_coords[p].nl = (flat % B_N_CHUNKS) * 4;
+            b_coords[p].gn = n_block + b_coords[p].nl;
+            b_coords[p].lds_off = b_coords[p].kk_local * N_TILE + b_coords[p].nl;
+            b_coords[p].active = true;
+        }
+        else
+        {
+            b_coords[p] = {0, 0, 0, 0, false};
+        }
+    }
+
+    const int num_tiles = (total_k_groups + KT - 1) / KT;
+    if (num_tiles == 0) return;
+
+    uint4 a_staging[A_NUM_PASSES];
+    uint4 b_staging[B_NUM_PASSES];
+
+    // Pre-compute safe tile count
+    const bool a_m_safe = (m_block + M_TILE <= M);
+    const bool b_n_safe = (n_block + N_TILE <= N);
+    const int safe_k = total_k_groups / KT;
+    const int num_safe = (a_m_safe && b_n_safe) ? (safe_k < num_tiles ? safe_k : num_tiles) : 0;
+
+    // Blockwise scale+accumulate helper
+    auto blockwise_accumulate = [&](int block_idx) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int mm = 0; mm < M_PER_THREAD; ++mm)
+        {
+            const int gm = m_block + m_base + mm;
+            const float s = (gm < M)
+                ? d_scales_A_blockwise[static_cast<int64_t>(gm) * blocks_per_row + block_idx]
+                : 0.0f;
+            #pragma unroll
+            for (int nn = 0; nn < N_PER_THREAD; ++nn)
+            {
+                fp32_acc[mm][nn] += static_cast<float>(acc[mm][nn]) * s;
+                acc[mm][nn] = 0;
+            }
+        }
+    };
+
+    // Safe load lambdas
+    auto safe_issue_a_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            if constexpr (A_ROWS_PER_PASS > M_TILE) { if (a_mi[p] >= M_TILE) continue; }
+            a_staging[p] = *reinterpret_cast<const uint4*>(
+                a_global + static_cast<int64_t>(m_block + a_mi[p]) * a_row_stride + kt_base + a_kg);
+        }
+    };
+
+    auto safe_issue_b_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                b_staging[p] = *reinterpret_cast<const uint4*>(
+                    b_global + static_cast<int64_t>(kt_base + b_coords[p].kk_local) * N + b_coords[p].gn);
+            }
+        }
+    };
+
+    // Boundary load lambdas
+    auto boundary_issue_a_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+            const int gm = m_block + mi;
+            const int gkg = kt_base + a_kg;
+            if (__builtin_expect(gm < M && gkg + 3 < total_k_groups, 1))
+            {
+                a_staging[p] = *reinterpret_cast<const uint4*>(
+                    a_global + static_cast<int64_t>(gm) * a_row_stride + gkg);
+            }
+            else
+            {
+                a_staging[p].x = (gm < M && gkg + 0 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 0] : 0;
+                a_staging[p].y = (gm < M && gkg + 1 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 1] : 0;
+                a_staging[p].z = (gm < M && gkg + 2 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 2] : 0;
+                a_staging[p].w = (gm < M && gkg + 3 < total_k_groups)
+                    ? a_global[static_cast<int64_t>(gm) * a_row_stride + gkg + 3] : 0;
+            }
+        }
+    };
+
+    auto boundary_issue_b_loads = [&](int kt_base) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                const int gkk = kt_base + b_coords[p].kk_local;
+                const int gn = b_coords[p].gn;
+                if (__builtin_expect(gn + 3 < N && gkk < total_k_groups, 1))
+                {
+                    b_staging[p] = *reinterpret_cast<const uint4*>(
+                        b_global + static_cast<int64_t>(gkk) * N + gn);
+                }
+                else
+                {
+                    b_staging[p] = make_uint4(0, 0, 0, 0);
+                    b_staging[p].x = (gn + 0 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 0] : 0;
+                    b_staging[p].y = (gn + 1 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 1] : 0;
+                    b_staging[p].z = (gn + 2 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 2] : 0;
+                    b_staging[p].w = (gn + 3 < N && gkk < total_k_groups)
+                        ? b_global[static_cast<int64_t>(gkk) * N + gn + 3] : 0;
+                }
+            }
+        }
+    };
+
+    auto write_a_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < A_NUM_PASSES; ++p)
+        {
+            const int mi = a_mi[p];
+            if constexpr (A_ROWS_PER_PASS > M_TILE) { if (mi >= M_TILE) continue; }
+            a_lds[buf][(a_kg + 0) * M_TILE + mi] = a_staging[p].x;
+            a_lds[buf][(a_kg + 1) * M_TILE + mi] = a_staging[p].y;
+            a_lds[buf][(a_kg + 2) * M_TILE + mi] = a_staging[p].z;
+            a_lds[buf][(a_kg + 3) * M_TILE + mi] = a_staging[p].w;
+        }
+    };
+
+    auto write_b_to_lds = [&](int buf) __attribute__((always_inline))
+    {
+        #pragma unroll
+        for (int p = 0; p < B_NUM_PASSES; ++p)
+        {
+            if (b_coords[p].active)
+            {
+                *reinterpret_cast<uint4*>(&b_lds[buf][b_coords[p].lds_off]) = b_staging[p];
+            }
+        }
+    };
+
+    auto compute_tile = [&](int buf) __attribute__((always_inline))
+    {
+        const int32_t* __restrict__ a_ptr = &a_lds[buf][m_base];
+        const int32_t* __restrict__ b_ptr = &b_lds[buf][t_n * N_PER_THREAD];
+
+        #pragma clang loop unroll(disable)
+        for (int kk = 0; kk < KT; ++kk)
+        {
+            int32_t a_reg[M_PER_THREAD];
+            int32_t b_reg[N_PER_THREAD];
+
+            *reinterpret_cast<uint4*>(&a_reg[0]) =
+                *reinterpret_cast<const uint4*>(&a_ptr[kk * M_TILE]);
+
+            if constexpr (N_PER_THREAD >= 4)
+            {
+                #pragma unroll
+                for (int c = 0; c < N_PER_THREAD; c += 4)
+                    *reinterpret_cast<uint4*>(&b_reg[c]) =
+                        *reinterpret_cast<const uint4*>(&b_ptr[kk * N_TILE + c]);
+            }
+            else if constexpr (N_PER_THREAD == 2)
+            {
+                *reinterpret_cast<uint2*>(&b_reg[0]) =
+                    *reinterpret_cast<const uint2*>(&b_ptr[kk * N_TILE]);
+            }
+            else
+            {
+                b_reg[0] = b_ptr[kk * N_TILE];
+            }
+
+            #pragma unroll
+            for (int mm = 0; mm < M_PER_THREAD; ++mm)
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    acc[mm][nn] = __builtin_amdgcn_sdot4(
+                        a_reg[mm], b_reg[nn], acc[mm][nn], false);
+        }
+    };
+
+    // PRELOAD tile 0
+    if (num_safe > 0)
+    {
+        safe_issue_a_loads(0);
+        safe_issue_b_loads(0);
+    }
+    else
+    {
+        boundary_issue_a_loads(0);
+        boundary_issue_b_loads(0);
+    }
+    write_a_to_lds(0);
+    write_b_to_lds(0);
+    __syncthreads();
+
+    // SAFE LOOP
+    for (int tile = 1; tile < num_safe; ++tile)
+    {
+        const int cur_buf = (tile - 1) & 1;
+        const int nxt_buf = tile & 1;
+        const int kt_base = tile * KT;
+
+        safe_issue_a_loads(kt_base);
+        safe_issue_b_loads(kt_base);
+
+        compute_tile(cur_buf);
+        blockwise_accumulate(tile - 1);
+
+        __syncthreads();
+
+        write_a_to_lds(nxt_buf);
+        write_b_to_lds(nxt_buf);
+
+        __syncthreads();
+    }
+
+    // BOUNDARY LOOP
+    {
+        const int boundary_start = (num_safe > 0) ? num_safe : 1;
+        for (int tile = boundary_start; tile < num_tiles; ++tile)
+        {
+            const int cur_buf = (tile - 1) & 1;
+            const int nxt_buf = tile & 1;
+            const int kt_base = tile * KT;
+
+            boundary_issue_a_loads(kt_base);
+            boundary_issue_b_loads(kt_base);
+
+            compute_tile(cur_buf);
+            blockwise_accumulate(tile - 1);
+
+            __syncthreads();
+
+            write_a_to_lds(nxt_buf);
+            write_b_to_lds(nxt_buf);
+
+            __syncthreads();
+        }
+    }
+
+    // FINAL TILE
+    compute_tile((num_tiles - 1) & 1);
+    blockwise_accumulate(num_tiles - 1);
+
+    // STORE FP32 RESULTS
+    #pragma unroll
+    for (int mm = 0; mm < M_PER_THREAD; ++mm)
+    {
+        const int m_idx = m_block + m_base + mm;
+        if (m_idx < M)
+        {
+            if constexpr (N_PER_THREAD >= 4)
+            {
+                if (n_base + N_PER_THREAD - 1 < N)
+                {
+                    const int64_t row_off = static_cast<int64_t>(m_idx) * N + n_base;
+                    #pragma unroll
+                    for (int chunk = 0; chunk < N_PER_THREAD; chunk += 4)
+                    {
+                        *reinterpret_cast<float4*>(d_C_fp32 + row_off + chunk) =
+                            make_float4(fp32_acc[mm][chunk + 0],
+                                        fp32_acc[mm][chunk + 1],
+                                        fp32_acc[mm][chunk + 2],
+                                        fp32_acc[mm][chunk + 3]);
+                    }
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                    {
+                        const int n_idx = n_base + nn;
+                        if (n_idx < N)
+                            d_C_fp32[static_cast<int64_t>(m_idx) * N + n_idx] = fp32_acc[mm][nn];
+                    }
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int nn = 0; nn < N_PER_THREAD; ++nn)
+                {
+                    const int n_idx = n_base + nn;
+                    if (n_idx < N)
+                        d_C_fp32[static_cast<int64_t>(m_idx) * N + n_idx] = fp32_acc[mm][nn];
+                }
+            }
+        }
+    }
+}
+
+extern "C"
+{
+
+// ============================================================================
+// BLOCKWISE LAUNCHER FUNCTIONS
+// ============================================================================
+
+    /**
+     * @brief Dispatch blockwise V3 INT8 GEMM (LDS double-buffered, KT=8 forced).
+     *
+     * Output is FP32 with per-block activation scales already applied.
+     * Caller must apply weight scales (scale_B) in a separate epilogue.
+     */
+    bool rocmQuantGemm_int8_int8_fp32_vnni_prefill_wide_tile_v3_blockwise(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        float* d_C_fp32,
+        const float* d_scales_A_blockwise,
+        int M, int N, int K,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_fp32 || !d_scales_A_blockwise ||
+            M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[v3_blockwise] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 32) != 0)
+        {
+            fprintf(stderr, "[v3_blockwise] K must be multiple of 32 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        constexpr int N_TILE = 64;
+        constexpr int BLOCK_SIZE = 256;
+        const auto s = static_cast<hipStream_t>(stream);
+
+        auto select_m_tile = [](int rows) -> int {
+            int best_mt = 128;
+            int best_waste = ((rows + 127) / 128) * 128 - rows;
+            for (int mt : {64, 32, 16}) {
+                int waste = ((rows + mt - 1) / mt) * mt - rows;
+                if (waste < best_waste) {
+                    best_waste = waste;
+                    best_mt = mt;
+                }
+            }
+            return best_mt;
+        };
+
+        const int m_tile = (M <= 128) ? select_m_tile(M) : 128;
+        const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
+        const unsigned m_tiles = static_cast<unsigned>((M + m_tile - 1) / m_tile);
+        const dim3 grid(n_tiles, m_tiles, 1);
+        const dim3 block(BLOCK_SIZE, 1, 1);
+
+#define LAUNCH_V3B(MT) \
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v3_blockwise_kernel<N_TILE, MT>), \
+                           grid, block, 0, s, d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, M, N, K)
+
+        switch (m_tile) {
+            case 16:  LAUNCH_V3B(16);  break;
+            case 32:  LAUNCH_V3B(32);  break;
+            case 64:  LAUNCH_V3B(64);  break;
+            default:  LAUNCH_V3B(128); break;
+        }
+#undef LAUNCH_V3B
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[v3_blockwise] Kernel launch failed: %s (M=%d N=%d K=%d)\n",
+                    hipGetErrorString(err), M, N, K);
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Dispatch blockwise V7 INT8 GEMM (safe-tile split, KT=8 forced).
+     *
+     * Output is FP32 with per-block activation scales already applied.
+     * Caller must apply weight scales (scale_B) in a separate epilogue.
+     */
+    bool rocmQuantGemm_int8_int8_fp32_vnni_prefill_wide_tile_v7_blockwise(
+        const int8_t* d_A_int8,
+        const int8_t* d_B_int8_vnni,
+        float* d_C_fp32,
+        const float* d_scales_A_blockwise,
+        int M, int N, int K,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_A_int8 || !d_B_int8_vnni || !d_C_fp32 || !d_scales_A_blockwise ||
+            M <= 0 || N <= 0 || K <= 0)
+        {
+            fprintf(stderr, "[v7_blockwise] Invalid arguments (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if ((K % 32) != 0)
+        {
+            fprintf(stderr, "[v7_blockwise] K must be multiple of 32 (M=%d N=%d K=%d)\n", M, N, K);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        constexpr int N_TILE = 128;
+        constexpr int BLOCK_SIZE = 256;
+        const auto s = static_cast<hipStream_t>(stream);
+
+        auto select_m_tile = [](int rows) -> int {
+            int best_mt = 128;
+            int best_waste = ((rows + 127) / 128) * 128 - rows;
+            for (int mt : {64, 32, 16}) {
+                int waste = ((rows + mt - 1) / mt) * mt - rows;
+                if (waste < best_waste) {
+                    best_waste = waste;
+                    best_mt = mt;
+                }
+            }
+            return best_mt;
+        };
+
+        const int m_tile = (M <= 128) ? select_m_tile(M) : 128;
+        const unsigned n_tiles = static_cast<unsigned>((N + N_TILE - 1) / N_TILE);
+        const unsigned m_tiles = static_cast<unsigned>((M + m_tile - 1) / m_tile);
+        const dim3 grid(n_tiles, m_tiles, 1);
+        const dim3 block(BLOCK_SIZE, 1, 1);
+
+#define LAUNCH_V7B(MT) \
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(qgemm_int8_vnni_wide_tile_v7_blockwise_kernel<N_TILE, MT>), \
+                           grid, block, 0, s, d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, M, N, K)
+
+        switch (m_tile) {
+            case 16:  LAUNCH_V7B(16);  break;
+            case 32:  LAUNCH_V7B(32);  break;
+            case 64:  LAUNCH_V7B(64);  break;
+            default:  LAUNCH_V7B(128); break;
+        }
+#undef LAUNCH_V7B
+
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[v7_blockwise] Kernel launch failed: %s (M=%d N=%d K=%d)\n",
+                    hipGetErrorString(err), M, N, K);
+            return false;
+        }
+
+        return true;
+    }
+
 } // extern "C"
