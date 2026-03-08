@@ -43,6 +43,7 @@
 #include <type_traits>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../utils/DebugEnv.h"
 
 // ============================================================================
 // Format tags — full set matching ROCmGemvKernel_native_VNNI.hip
@@ -628,7 +629,7 @@ __device__ __forceinline__ void decode_block(
 // in safe/boundary/final loops.
 // ============================================================================
 
-template <int N_TILE, int BPT, int M_TILE, NativeVNNIGemmFormat FMT,
+template <int N_TILE, int BPT, int M_TILE, NativeVNNIGemmFormat FMT, int UNROLL_G = 4,
           int BLOCK_SIZE_ = 256, int M_PER_THREAD_ = 4>
 __device__ __forceinline__ void accumulate_block_gemm(
     int bp,
@@ -985,25 +986,39 @@ __device__ __forceinline__ void accumulate_block_gemm(
             for (int nn = 0; nn < N_PER_THREAD; ++nn)
                 block_acc[mm][nn] = 0;
 
-        #pragma clang loop unroll_count(4)
-        for (int g = 0; g < 8; ++g)
-        {
-            const int kk = bp * 8 + g;
-            int32_t a_reg[M_PER_THREAD];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                a_reg[mm] = a_buf[kk * M_TILE + m_base + mm];
-            int32_t b_reg[N_PER_THREAD];
-            #pragma unroll
-            for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + nn];
-            #pragma unroll
-            for (int mm = 0; mm < M_PER_THREAD; ++mm)
-                #pragma unroll
-                for (int nn = 0; nn < N_PER_THREAD; ++nn)
-                    block_acc[mm][nn] = __builtin_amdgcn_sdot4(
-                        a_reg[mm], b_reg[nn], block_acc[mm][nn], false);
+        // UNROLL_G controls the inner group loop unroll for tuning.
+        // Default (4) matches original behavior: #pragma clang loop unroll_count(4).
+#define NVNNI_PATTERN_S_G_BODY \
+        { \
+            const int kk = bp * 8 + g; \
+            int32_t a_reg[M_PER_THREAD]; \
+            _Pragma("unroll") \
+            for (int mm = 0; mm < M_PER_THREAD; ++mm) \
+                a_reg[mm] = a_buf[kk * M_TILE + m_base + mm]; \
+            int32_t b_reg[N_PER_THREAD]; \
+            _Pragma("unroll") \
+            for (int nn = 0; nn < N_PER_THREAD; ++nn) \
+                b_reg[nn] = b_buf[kk * N_TILE + t_n * N_PER_THREAD + nn]; \
+            _Pragma("unroll") \
+            for (int mm = 0; mm < M_PER_THREAD; ++mm) \
+                _Pragma("unroll") \
+                for (int nn = 0; nn < N_PER_THREAD; ++nn) \
+                    block_acc[mm][nn] = __builtin_amdgcn_sdot4( \
+                        a_reg[mm], b_reg[nn], block_acc[mm][nn], false); \
         }
+        if constexpr (UNROLL_G == 0) {
+            for (int g = 0; g < 8; ++g) NVNNI_PATTERN_S_G_BODY
+        } else if constexpr (UNROLL_G == 2) {
+            #pragma clang loop unroll_count(2)
+            for (int g = 0; g < 8; ++g) NVNNI_PATTERN_S_G_BODY
+        } else if constexpr (UNROLL_G == 1) {
+            #pragma unroll
+            for (int g = 0; g < 8; ++g) NVNNI_PATTERN_S_G_BODY
+        } else { // UNROLL_G == 4 (default)
+            #pragma clang loop unroll_count(4)
+            for (int g = 0; g < 8; ++g) NVNNI_PATTERN_S_G_BODY
+        }
+#undef NVNNI_PATTERN_S_G_BODY
         // FMA: acc += block_acc * scale
         float block_scale[N_PER_THREAD];
         #pragma unroll
@@ -1021,7 +1036,7 @@ __device__ __forceinline__ void accumulate_block_gemm(
     }
 }
 
-template <int N_TILE, int BPT, int M_TILE, NativeVNNIGemmFormat FMT, int MIN_BLOCKS = 2>
+template <int N_TILE, int BPT, int M_TILE, NativeVNNIGemmFormat FMT, int MIN_BLOCKS = 2, int UNROLL_G = 4>
 __global__ __launch_bounds__(256, MIN_BLOCKS)
 void native_vnni_gemm_kernel(
     const int8_t*    __restrict__ d_A_int8,       // [M × K] INT8 activations, row-major
@@ -1354,7 +1369,7 @@ void native_vnni_gemm_kernel(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     sa_blk[mm] = 1.0f;
             }
-            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT>(
+            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT, UNROLL_G>(
                 bp, a_lds[cur_buf], b_lds[cur_buf],
                 scale_lds[cur_buf], aux_lds[cur_buf],
                 emin_lo_lds[cur_buf], emin_hi_lds[cur_buf],
@@ -1496,7 +1511,7 @@ void native_vnni_gemm_kernel(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     sa_blk[mm] = 1.0f;
             }
-            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT>(
+            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT, UNROLL_G>(
                 bp, a_lds[cur_buf], b_lds[cur_buf],
                 scale_lds[cur_buf], aux_lds[cur_buf],
                 emin_lo_lds[cur_buf], emin_hi_lds[cur_buf],
@@ -1575,7 +1590,7 @@ void native_vnni_gemm_kernel(
                 for (int mm = 0; mm < M_PER_THREAD; ++mm)
                     sa_blk[mm] = 1.0f;
             }
-            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT>(
+            accumulate_block_gemm<N_TILE, BPT, M_TILE, FMT, UNROLL_G>(
                 bp, a_lds[last_buf], b_lds[last_buf],
                 scale_lds[last_buf], aux_lds[last_buf],
                 emin_lo_lds[last_buf], emin_hi_lds[last_buf],
@@ -2204,6 +2219,129 @@ static bool launch_native_vnni_gemm(
     // Below this, 3-wave occupancy provides the biggest speedup over INT8.
     // Above this, M32 tile efficiency wins despite lower occupancy.
     const bool use_n128 = (N > K);
+
+    // =========================================================================
+    // ENV VAR OVERRIDE DISPATCH (for tuning sweeps)
+    //
+    // When any LLAMINAR_ROCM_NVNNI_* override is set, bypass the default
+    // heuristic and launch the exact kernel variant specified.  This generates
+    // extra template instantiations only for Pattern S formats (Q4_0, IQ4_NL)
+    // to keep compile time reasonable.
+    // =========================================================================
+    if constexpr (FMT == NVNNI_GEMM_Q4_0 || FMT == NVNNI_GEMM_IQ4_NL) {
+        const auto& env = llaminar2::debugEnv().rocm;
+        const bool has_overrides = (env.nvnni_mt > 0 || env.nvnni_unroll >= 0 ||
+                                    env.nvnni_min_blocks > 0 ||
+                                    env.nvnni_force_n64 || env.nvnni_force_n128);
+        if (has_overrides) {
+            const int eff_mt = (env.nvnni_mt > 0) ? env.nvnni_mt : m_tile;
+            const int eff_unroll = (env.nvnni_unroll >= 0) ? env.nvnni_unroll : 4;
+            const int eff_min_blocks = (env.nvnni_min_blocks > 0) ? env.nvnni_min_blocks : 2;
+            const bool eff_n128 = env.nvnni_force_n128 ? true :
+                                  env.nvnni_force_n64 ? false : use_n128;
+
+#define NVNNI_LAUNCH(NT, MT, MB, UG) \
+            { \
+                dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1); \
+                dim3 block(BLOCK_SIZE, 1, 1); \
+                native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, UG> \
+                    <<<grid, block, 0, hip_stream>>>( \
+                        d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins, \
+                        d_output, d_scales_A, M, N, K, d_scales_A_blockwise); \
+                return hipGetLastError() == hipSuccess; \
+            }
+
+#define NVNNI_LAUNCH_UG(NT, MT, MB) \
+            switch (eff_unroll) { \
+                case 0:  NVNNI_LAUNCH(NT, MT, MB, 0) \
+                case 1:  NVNNI_LAUNCH(NT, MT, MB, 1) \
+                case 2:  NVNNI_LAUNCH(NT, MT, MB, 2) \
+                default: NVNNI_LAUNCH(NT, MT, MB, 4) \
+            }
+
+#define NVNNI_LAUNCH_MB(NT, MT) \
+            switch (eff_min_blocks) { \
+                case 1:  NVNNI_LAUNCH_UG(NT, MT, 1) \
+                case 3:  NVNNI_LAUNCH_UG(NT, MT, 3) \
+                default: NVNNI_LAUNCH_UG(NT, MT, 2) \
+            }
+
+#define NVNNI_LAUNCH_MT(NT) \
+            switch (eff_mt) { \
+                case 16: NVNNI_LAUNCH_MB(NT, 16) \
+                case 64: NVNNI_LAUNCH_MB(NT, 64) \
+                default: NVNNI_LAUNCH_MB(NT, 32) \
+            }
+
+            if (eff_n128) {
+                NVNNI_LAUNCH_MT(128)
+            } else {
+                NVNNI_LAUNCH_MT(64)
+            }
+
+#undef NVNNI_LAUNCH_MT
+#undef NVNNI_LAUNCH_MB
+#undef NVNNI_LAUNCH_UG
+#undef NVNNI_LAUNCH
+        }
+    }
+
+    // =========================================================================
+    // PATTERN S OPTIMIZED DISPATCH (Q4_0, IQ4_NL)
+    //
+    // Sweep results (gfx906, MI50/60) show N128/MT32/MB1/UG2 wins 41/45
+    // shape×M combinations across Qwen2.5-0.5B/3B/7B.  MIN_BLOCKS=1
+    // eliminates VGPR spills (same insight as INT8-VNNI), and UNROLL_G=2
+    // reduces register pressure vs the default UG=4.
+    //
+    // Exceptions at small N (≤1024) / low M:
+    //   - 0.5B_AttnOut (N=896):  N64/MT16/MB2 wins at M=128 (+19%)
+    //   - 0.5B_FFN_Dn (N=896):  N64/MT32/MB1 wins at M=128 (+24%)
+    // These shapes have too few N128-tiles to saturate the GPU.
+    //
+    // Cooperative N128/MT32/MB1/UG2 also beats streaming for LM_Head shapes
+    // (verified: 7B_LM_Head +13% vs streaming Auto).
+    // =========================================================================
+    if constexpr (!NVNNIGemmTraits<FMT>::is_dual_scale &&
+                  !NVNNIGemmTraits<FMT>::is_dual_scale_asym &&
+                  !NVNNIGemmTraits<FMT>::is_asymmetric) {
+        // Pattern S: simple symmetric (Q4_0, IQ4_NL, Q5_0, IQ3_S, IQ3_XXS, IQ2_XXS)
+        // Use MB1/UG2 always for these formats.
+        auto launch_mb1_ug2 = [&](auto n_tile_tag, auto m_tile_tag) -> bool
+        {
+            constexpr int NT = decltype(n_tile_tag)::value;
+            constexpr int MT = decltype(m_tile_tag)::value;
+            dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
+            dim3 block(BLOCK_SIZE, 1, 1);
+
+            native_vnni_gemm_kernel<NT, BPT, MT, FMT, 1, 2>
+                <<<grid, block, 0, hip_stream>>>(
+                    d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
+                    d_output, d_scales_A, M, N, K, d_scales_A_blockwise);
+
+            return hipGetLastError() == hipSuccess;
+        };
+
+        using N64_  = std::integral_constant<int, 64>;
+        using N128_ = std::integral_constant<int, 128>;
+        using M16_  = std::integral_constant<int, 16>;
+        using M32_  = std::integral_constant<int, 32>;
+
+        // Small-N exception: N≤1024 with few rows → N64 tiles better
+        if (N <= 1024 && M <= 128) {
+            // At small N, N128 tiles produce too few WGs.
+            // N64/MT16 or MT32 depending on waste
+            const int n64_mt = (m_tile <= 16) ? 16 : 32;
+            if (n64_mt <= 16) {
+                return launch_mb1_ug2(N64_{}, M16_{});
+            } else {
+                return launch_mb1_ug2(N64_{}, M32_{});
+            }
+        }
+
+        // Default: N128/MT32/MB1/UG2
+        return launch_mb1_ug2(N128_{}, M32_{});
+    }
 
     // Dispatch tags for (N_TILE, M_TILE) combinations
     using N64  = std::integral_constant<int, 64>;

@@ -8167,6 +8167,29 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added Native-VNNI GEMM benchmark (Q4_0 + IQ4_NL)")
 
+    # Performance Test: Native-VNNI Q4_0 Sweep
+    # Per-shape tuning sweep over N_TILE, M_TILE, MIN_BLOCKS, UNROLL_G.
+    # Outputs best variant per shape for dispatch heuristic tuning.
+    add_executable(v2_perf_native_vnni_sweep
+        performance/kernels/rocm/Perf__NativeVNNI_Sweep.cpp
+        performance/kernels/rocm/GpuVerification.hip
+    )
+    target_link_libraries(v2_perf_native_vnni_sweep
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        OpenMP::OpenMP_CXX
+        roc::hipblas
+    )
+    target_compile_options(v2_perf_native_vnni_sweep PRIVATE -fopenmp)
+    target_link_options(v2_perf_native_vnni_sweep PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_NativeVNNI_Sweep
+        COMMAND $<TARGET_FILE:v2_perf_native_vnni_sweep>
+        LABELS "V2;Performance;ROCm;GEMM;NativeVNNI;Quantized;gfx906;Benchmark;Prefill;Sweep"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added Native-VNNI Q4_0 sweep benchmark")
+
     # Performance Microbenchmark: IQ Decode Strategy Lab
     # Isolated decode-only benchmark for IQ grid-index quantization formats.
     # Tests multiple decode strategies (baseline, vsub4, LDS cache, ksigns64)

@@ -2243,6 +2243,11 @@ namespace llaminar2
         bool blockwise_force_v3 = false;       ///< Force V3 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V3)
         bool blockwise_force_v7 = false;       ///< Force V7 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V7)
         int blockwise_quant_variant = 0;       ///< Blockwise quant kernel variant (0=auto, 1-5=manual) (LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT)
+        int nvnni_mt = -1;                     ///< Native-VNNI M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_NVNNI_MT)
+        int nvnni_unroll = -1;                 ///< Native-VNNI UNROLL_G override (-1=auto, 0=none, 1=full, 2/4=partial) (LLAMINAR_ROCM_NVNNI_UNROLL)
+        int nvnni_min_blocks = -1;             ///< Native-VNNI MIN_BLOCKS override (-1=auto, 1=bare, 2=2-wave, 3=3-wave) (LLAMINAR_ROCM_NVNNI_MIN_BLOCKS)
+        bool nvnni_force_n64 = false;          ///< Force N64 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N64)
+        bool nvnni_force_n128 = false;         ///< Force N128 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N128)
         int ratio_prefill_variant = -1;        ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;              ///< Ratio prefill split-K blocks override (0=auto)
         int ratio_prefill_linear_variant = -1; ///< Linear codebook ratio prefill tile override (-1=use global/auto)
@@ -2292,6 +2297,11 @@ namespace llaminar2
             blockwise_force_v3 = false;
             blockwise_force_v7 = false;
             blockwise_quant_variant = 0;
+            nvnni_mt = -1;
+            nvnni_unroll = -1;
+            nvnni_min_blocks = -1;
+            nvnni_force_n64 = false;
+            nvnni_force_n128 = false;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -2500,6 +2510,36 @@ namespace llaminar2
             if (bw_quant_var_env)
             {
                 blockwise_quant_variant = std::clamp(std::atoi(bw_quant_var_env), 0, 5);
+            }
+
+            const char *nvnni_mt_env = std::getenv("LLAMINAR_ROCM_NVNNI_MT");
+            if (nvnni_mt_env)
+            {
+                nvnni_mt = std::atoi(nvnni_mt_env);
+            }
+
+            const char *nvnni_unroll_env = std::getenv("LLAMINAR_ROCM_NVNNI_UNROLL");
+            if (nvnni_unroll_env)
+            {
+                nvnni_unroll = std::clamp(std::atoi(nvnni_unroll_env), -1, 8);
+            }
+
+            const char *nvnni_min_blocks_env = std::getenv("LLAMINAR_ROCM_NVNNI_MIN_BLOCKS");
+            if (nvnni_min_blocks_env)
+            {
+                nvnni_min_blocks = std::clamp(std::atoi(nvnni_min_blocks_env), -1, 3);
+            }
+
+            const char *nvnni_force_n64_env = std::getenv("LLAMINAR_ROCM_NVNNI_FORCE_N64");
+            if (nvnni_force_n64_env)
+            {
+                nvnni_force_n64 = (std::atoi(nvnni_force_n64_env) != 0);
+            }
+
+            const char *nvnni_force_n128_env = std::getenv("LLAMINAR_ROCM_NVNNI_FORCE_N128");
+            if (nvnni_force_n128_env)
+            {
+                nvnni_force_n128 = (std::atoi(nvnni_force_n128_env) != 0);
             }
 
             const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");
