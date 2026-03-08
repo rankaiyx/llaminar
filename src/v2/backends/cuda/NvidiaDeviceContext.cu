@@ -608,4 +608,102 @@ namespace llaminar2
         return std::make_unique<CUDAGraphCapture>(static_cast<cudaStream_t>(stream));
     }
 
+    void NvidiaDeviceContext::clearLastError()
+    {
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            LOG_DEBUG("[NvidiaDeviceContext] Cleared sticky CUDA error on device "
+                      << device_ordinal_ << ": " << cudaGetErrorString(err));
+        }
+    }
+
+    PointerValidationResult NvidiaDeviceContext::validatePointerDevice(const void *gpu_ptr, int expected_ordinal)
+    {
+        if (!gpu_ptr)
+        {
+            return {};
+        }
+
+        cudaPointerAttributes attr{};
+        const cudaError_t err = cudaPointerGetAttributes(&attr, gpu_ptr);
+        if (err != cudaSuccess)
+        {
+            cudaGetLastError();
+            std::ostringstream oss;
+            oss << "cudaPointerGetAttributes failed: " << cudaGetErrorString(err);
+            return {false, -1, oss.str()};
+        }
+
+        const bool device_ok =
+            (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged) &&
+            attr.device == expected_ordinal;
+        if (device_ok)
+        {
+            return {true, attr.device, ""};
+        }
+
+        std::ostringstream oss;
+        oss << "attr.device=" << attr.device
+            << " expected=" << expected_ordinal
+            << " attr.type=" << static_cast<int>(attr.type);
+        if (attr.devicePointer)
+        {
+            oss << " device_ptr=" << attr.devicePointer;
+        }
+        if (attr.hostPointer)
+        {
+            oss << " host_ptr=" << attr.hostPointer;
+        }
+
+        return {false, attr.device, oss.str()};
+    }
+
+    PointerInspectionResult NvidiaDeviceContext::inspectPointer(const void *gpu_ptr) const
+    {
+        PointerInspectionResult result;
+        if (!gpu_ptr)
+        {
+            return result;
+        }
+
+        cudaPointerAttributes attr{};
+        const cudaError_t err = cudaPointerGetAttributes(&attr, gpu_ptr);
+        if (err != cudaSuccess)
+        {
+            cudaGetLastError();
+            return result;
+        }
+
+        result.known = true;
+        result.actual_device = attr.device;
+        result.base_ptr = attr.devicePointer ? attr.devicePointer : gpu_ptr;
+
+        std::ostringstream oss;
+        oss << "attr.device=" << attr.device
+            << " attr.type=" << static_cast<int>(attr.type);
+        if (attr.devicePointer)
+        {
+            oss << " device_ptr=" << attr.devicePointer;
+        }
+        if (attr.hostPointer)
+        {
+            oss << " host_ptr=" << attr.hostPointer;
+        }
+        result.details = oss.str();
+        return result;
+    }
+
+    bool NvidiaDeviceContext::debugSynchronize()
+    {
+        const cudaError_t err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaDeviceSynchronize failed during debug sync: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
 } // namespace llaminar2

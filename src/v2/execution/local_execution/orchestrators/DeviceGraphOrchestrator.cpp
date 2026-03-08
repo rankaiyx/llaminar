@@ -715,31 +715,13 @@ namespace llaminar2
 
             if (capture_policy.allow_segmented_capture && !forward_cache.gpu_stream)
             {
-                // Ensure backend factories are registered
                 DeviceId dev_id = ctx->deviceId();
-#ifdef HAVE_ROCM
-                if (dev_id.is_rocm())
-                    ensureAMDFactoryRegistered();
-#endif
-#ifdef HAVE_CUDA
-                if (dev_id.is_cuda())
-                    ensureNvidiaFactoryRegistered();
-#endif
-
-                auto &pool = GPUDeviceContextPool::instance();
-                IWorkerGPUContext *gpu_ctx = nullptr;
-                if (dev_id.is_rocm())
+                if (dev_id.is_gpu())
                 {
-                    gpu_ctx = &pool.getAMDContext(dev_id.rocm_ordinal());
-                }
-                else if (dev_id.is_cuda())
-                {
-                    gpu_ctx = &pool.getNvidiaContext(dev_id.cuda_ordinal());
-                }
-                if (gpu_ctx)
-                {
-                    forward_cache.gpu_stream = gpu_ctx->defaultStream();
-                    forward_cache.gpu_ctx = gpu_ctx;
+                    auto &pool = GPUDeviceContextPool::instance();
+                    IWorkerGPUContext &gpu_ctx = pool.getContext(dev_id);
+                    forward_cache.gpu_stream = gpu_ctx.defaultStream();
+                    forward_cache.gpu_ctx = &gpu_ctx;
                 }
             }
 

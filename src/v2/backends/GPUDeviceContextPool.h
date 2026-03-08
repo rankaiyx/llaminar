@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include "DeviceId.h"
 #include "IWorkerGPUContext.h"
 #include <memory>
 #include <mutex>
@@ -164,6 +165,14 @@ namespace llaminar2
          * @thread_safety Thread-safe
          */
         IWorkerGPUContext &getContext(const std::string &device_type, int device_ordinal);
+
+        /**
+         * @brief Get context by type-safe DeviceId
+         *
+         * Auto-registers the corresponding GPU backend factory on first use when
+         * that backend is compiled in.
+         */
+        IWorkerGPUContext &getContext(const DeviceId &device);
 
         // =========================================================================
         // Availability Queries (thread-safe)

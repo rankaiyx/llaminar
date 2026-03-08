@@ -1,6 +1,8 @@
 #pragma once
 
 #include "IGPUGraphCapture.h"
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>
@@ -8,6 +10,25 @@
 
 namespace llaminar2
 {
+
+    struct PointerValidationResult
+    {
+        bool valid = true;
+        int actual_device = -1;
+        std::string details;
+    };
+
+    struct PointerInspectionResult
+    {
+        bool known = false;
+        bool active = false;
+        int actual_device = -1;
+        const void *base_ptr = nullptr;
+        size_t size_bytes = 0;
+        uint64_t sequence = 0;
+        uint64_t thread_hash = 0;
+        std::string details;
+    };
 
     /**
      * @brief Abstract interface for GPU device contexts
@@ -325,6 +346,32 @@ namespace llaminar2
          * is created locally rather than using the device context's default stream.
          */
         virtual std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) = 0;
+
+        // =========================================================================
+        // Diagnostics and Debug Utilities
+        // =========================================================================
+
+        virtual void clearLastError() {}
+
+        virtual PointerValidationResult validatePointerDevice(const void *gpu_ptr, int expected_ordinal)
+        {
+            (void)gpu_ptr;
+            return {true, expected_ordinal, ""};
+        }
+
+        virtual PointerInspectionResult inspectPointer(const void *gpu_ptr) const
+        {
+            (void)gpu_ptr;
+            return {};
+        }
+
+        virtual void dumpRecentPointerEvents(size_t max_events) { (void)max_events; }
+
+        virtual bool debugSynchronize()
+        {
+            synchronize();
+            return true;
+        }
 
         // =========================================================================
         // Graph Capture State

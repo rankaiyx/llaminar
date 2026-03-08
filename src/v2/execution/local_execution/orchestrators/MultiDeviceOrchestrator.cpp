@@ -659,36 +659,16 @@ namespace llaminar2
         {
             const auto &devices = tp_ctx_->devices();
 
-            // Ensure GPU backend factories are registered before accessing contexts.
-            // Factory registration is deferred (not done at static init time) to avoid
-            // ~500-800ms CUDA enumeration cost when GPU backends are not needed.
-            // MultiDeviceOrchestrator needs contexts for compute stream registration
-            // before any DeviceGraphOrchestrator has had a chance to register them.
-            for (const auto &dev : devices)
-            {
-#ifdef HAVE_ROCM
-                if (dev.device_type == DeviceType::ROCm)
-                    ensureAMDFactoryRegistered();
-#endif
-#ifdef HAVE_CUDA
-                if (dev.device_type == DeviceType::CUDA)
-                    ensureNvidiaFactoryRegistered();
-#endif
-            }
-
             auto &pool = GPUDeviceContextPool::instance();
             std::vector<void *> compute_streams;
             compute_streams.reserve(devices.size());
 
             for (const auto &dev : devices)
             {
-                if (dev.device_type == DeviceType::ROCm)
+                if (dev.device_type == DeviceType::ROCm || dev.device_type == DeviceType::CUDA)
                 {
-                    compute_streams.push_back(pool.getAMDContext(dev.device_ordinal).defaultStream());
-                }
-                else if (dev.device_type == DeviceType::CUDA)
-                {
-                    compute_streams.push_back(pool.getNvidiaContext(dev.device_ordinal).defaultStream());
+                    compute_streams.push_back(
+                        pool.getContext(DeviceId(dev.device_type, dev.device_ordinal)).defaultStream());
                 }
                 else
                 {

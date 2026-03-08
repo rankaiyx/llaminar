@@ -147,6 +147,10 @@ namespace llaminar2
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override;
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) override;
+        void clearLastError() override;
+        PointerValidationResult validatePointerDevice(const void *gpu_ptr, int expected_ordinal) override;
+        PointerInspectionResult inspectPointer(const void *gpu_ptr) const override;
+        bool debugSynchronize() override;
 
     private:
         // =========================================================================

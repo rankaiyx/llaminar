@@ -14,6 +14,7 @@
 
 #include "AMDDeviceContext.h"
 #include "HIPGraphCapture.h"
+#include "ROCmBackend.h"
 #include "../../utils/Logger.h"
 #include <sstream>
 #include <stdexcept>
@@ -597,6 +598,141 @@ namespace llaminar2
     std::unique_ptr<IGPUGraphCapture> AMDDeviceContext::createGraphCapture(void *stream)
     {
         return std::make_unique<HIPGraphCapture>(static_cast<hipStream_t>(stream));
+    }
+
+    void AMDDeviceContext::clearLastError()
+    {
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            LOG_DEBUG("[AMDDeviceContext] Cleared sticky HIP error on device "
+                      << device_ordinal_ << ": " << hipGetErrorString(err));
+        }
+    }
+
+    PointerValidationResult AMDDeviceContext::validatePointerDevice(const void *gpu_ptr, int expected_ordinal)
+    {
+        if (!gpu_ptr)
+        {
+            return {};
+        }
+
+        hipPointerAttribute_t attr{};
+        const hipError_t err = hipPointerGetAttributes(&attr, gpu_ptr);
+        if (err != hipSuccess)
+        {
+            ROCmPointerOwnerInfo owner;
+            const bool has_owner = ROCmBackend::queryPointerOwner(gpu_ptr, owner);
+
+            std::ostringstream oss;
+            oss << "hipPointerGetAttributes failed: " << hipGetErrorString(err);
+            if (has_owner)
+            {
+                oss << " owner.dev=" << owner.device_id
+                    << " owner.bytes=" << owner.size_bytes
+                    << " owner.seq=" << owner.sequence;
+            }
+            else
+            {
+                oss << " owner=unknown";
+            }
+            return {false, -1, oss.str()};
+        }
+
+        if (attr.device == expected_ordinal)
+        {
+            return {true, attr.device, ""};
+        }
+
+        ROCmPointerOwnerInfo owner;
+        const bool has_owner = ROCmBackend::queryPointerOwner(gpu_ptr, owner);
+
+        std::ostringstream oss;
+        oss << "attr.device=" << attr.device
+            << " expected=" << expected_ordinal;
+        if (has_owner)
+        {
+            oss << " owner.base=" << owner.base_ptr
+                << " owner.dev=" << owner.device_id
+                << " owner.bytes=" << owner.size_bytes
+                << " owner.seq=" << owner.sequence
+                << " owner.thread=" << owner.thread_hash
+                << " owner.active=" << owner.active;
+        }
+        else
+        {
+            oss << " owner=unknown";
+        }
+
+        return {false, attr.device, oss.str()};
+    }
+
+    PointerInspectionResult AMDDeviceContext::inspectPointer(const void *gpu_ptr) const
+    {
+        PointerInspectionResult result;
+        if (!gpu_ptr)
+        {
+            return result;
+        }
+
+        ROCmPointerOwnerInfo owner;
+        if (ROCmBackend::queryPointerOwner(gpu_ptr, owner))
+        {
+            result.known = true;
+            result.active = owner.active;
+            result.actual_device = owner.device_id;
+            result.base_ptr = owner.base_ptr;
+            result.size_bytes = owner.size_bytes;
+            result.sequence = owner.sequence;
+            result.thread_hash = owner.thread_hash;
+
+            std::ostringstream oss;
+            oss << "owner_base=" << owner.base_ptr
+                << " owner_bytes=" << owner.size_bytes
+                << " owner_device=" << owner.device_id
+                << " owner_seq=" << owner.sequence
+                << " owner_thread=" << owner.thread_hash;
+            result.details = oss.str();
+            return result;
+        }
+
+        hipPointerAttribute_t attr{};
+        const hipError_t err = hipPointerGetAttributes(&attr, gpu_ptr);
+        if (err == hipSuccess)
+        {
+            result.known = true;
+            result.actual_device = attr.device;
+
+            std::ostringstream oss;
+            oss << "attr.device=" << attr.device;
+            result.details = oss.str();
+        }
+
+        return result;
+    }
+
+    void AMDDeviceContext::dumpRecentPointerEvents(size_t max_events)
+    {
+        ROCmBackend::dumpRecentPointerEvents(max_events);
+    }
+
+    bool AMDDeviceContext::debugSynchronize()
+    {
+        if (capture_active_.load(std::memory_order_acquire))
+        {
+            return true;
+        }
+
+        const hipError_t sync_err = hipDeviceSynchronize();
+        if (sync_err != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipDeviceSynchronize failed during debug sync: "
+                      << hipGetErrorString(sync_err));
+            ROCmBackend::dumpRecentPointerEvents(96);
+            return false;
+        }
+
+        return true;
     }
 
 } // namespace llaminar2

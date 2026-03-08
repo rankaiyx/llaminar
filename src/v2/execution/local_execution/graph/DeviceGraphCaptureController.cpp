@@ -5,9 +5,6 @@
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
-#ifdef HAVE_ROCM
-#include <hip/hip_runtime.h>
-#endif
 
 #include <algorithm>
 #include <cmath>
@@ -1168,9 +1165,7 @@ namespace llaminar2
                 // operations on this stream. Without this, the first kernel
                 // launch after beginCapture would see the stale error and fail
                 // with "operation failed due to a previous error during capture".
-#ifdef HAVE_ROCM
-                hipGetLastError();
-#endif
+                gpu_ctx->clearLastError();
 
                 if (!seg.capture->beginCapture())
                 {
@@ -1214,10 +1209,7 @@ namespace llaminar2
                     gpu_ctx->synchronizeStream(capture_stream);
                     void *default_stream = gpu_ctx->defaultStream();
                     gpu_ctx->synchronizeStream(default_stream);
-#ifdef HAVE_ROCM
-                    // hipGetLastError() consumes the sticky error from the failed capture.
-                    hipGetLastError();
-#endif
+                    gpu_ctx->clearLastError();
                     // Re-execute the remaining un-completed stages of this segment
                     // without capture. Stages that completed before the failure already
                     // ran (capture mode executes AND records), so skip those.

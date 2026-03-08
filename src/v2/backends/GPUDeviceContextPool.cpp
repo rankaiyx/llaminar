@@ -168,6 +168,42 @@ namespace llaminar2
         }
     }
 
+    IWorkerGPUContext &GPUDeviceContextPool::getContext(const DeviceId &device)
+    {
+        if (!device.is_gpu())
+        {
+            throw std::invalid_argument("[GPUDeviceContextPool] Device is not a GPU: '" + device.to_string() + "'");
+        }
+
+        if (device.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            if (!hasNvidiaSupport())
+            {
+                ensureNvidiaFactoryRegistered();
+            }
+            return getNvidiaContext(device.cuda_ordinal());
+#else
+            throw std::runtime_error("[GPUDeviceContextPool] CUDA support not compiled in");
+#endif
+        }
+
+        if (device.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            if (!hasAMDSupport())
+            {
+                ensureAMDFactoryRegistered();
+            }
+            return getAMDContext(device.rocm_ordinal());
+#else
+            throw std::runtime_error("[GPUDeviceContextPool] ROCm support not compiled in");
+#endif
+        }
+
+        throw std::invalid_argument("[GPUDeviceContextPool] Unsupported GPU device: '" + device.to_string() + "'");
+    }
+
     // =============================================================================
     // Availability Queries
     // =============================================================================
@@ -210,6 +246,10 @@ namespace llaminar2
         // Clear all contexts (destructors handle cleanup)
         nvidia_contexts_.clear();
         amd_contexts_.clear();
+
+        LOG_DEBUG("[GPUDeviceContextPool] Shutdown cleared " << nvidia_count
+                                                              << " NVIDIA and " << amd_count
+                                                              << " AMD contexts");
     }
 
 } // namespace llaminar2
