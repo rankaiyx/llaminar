@@ -8308,6 +8308,31 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added blockwise VNNI GEMM per-shape tuning benchmark")
 
+    # Performance Test: Blockwise Native-VNNI (sub-Q8) correctness & throughput
+    # Compares blockwise activation quantization native-VNNI (Q4_0 through IQ1_M)
+    # against INT8-VNNI baseline across all Qwen shapes for decode (GEMV M=1) and
+    # prefill (GEMM M=32..256). Reports correctness (cosine vs FP32 hipBLAS ref),
+    # throughput (μs), and speedup.
+    add_executable(v2_perf_blockwise_native_vnni
+        performance/kernels/rocm/Perf__BlockwiseNativeVNNI.cpp
+        performance/kernels/rocm/GpuVerification.hip
+    )
+    target_link_libraries(v2_perf_blockwise_native_vnni
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        OpenMP::OpenMP_CXX
+        roc::hipblas
+    )
+    target_compile_options(v2_perf_blockwise_native_vnni PRIVATE -fopenmp)
+    target_link_options(v2_perf_blockwise_native_vnni PRIVATE -fopenmp)
+    add_v2_test(V2_Perf_BlockwiseNativeVNNI
+        COMMAND $<TARGET_FILE:v2_perf_blockwise_native_vnni>
+        LABELS "V2;Performance;ROCm;GEMV;GEMM;NativeVNNI;Blockwise;Quantized;gfx906;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added blockwise native-VNNI correctness & throughput benchmark")
+
     # Performance Test: Blockwise activation quantization kernel tuning
     # Benchmarks 5 kernel variants for FP32->INT8 blockwise quantization
     # across all Qwen activation sizes with correctness gate.
