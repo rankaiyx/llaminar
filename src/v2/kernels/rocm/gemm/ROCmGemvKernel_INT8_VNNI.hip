@@ -172,35 +172,117 @@ static inline int select_blockwise_qwo_outer_splits(int grid_n, int act_blocks, 
     // Small K (Q/Wo: act_blocks=112, acts_per_wave_single=14):
     //   Each wave has little work at KB=1. Maximize CU parallelism by splitting
     //   to ~1 act_block per wave → KB = act_blocks/wk (= 14 for Q/Wo).
+    //   Exception: when grid_n alone saturates bandwidth (grid_n >= 2×NUM_CUS),
+    //   additional KB splits only add atomicAdd overhead without benefit.
+    //   Verified by sweep: FFN Gate/Up TP=1 at grid_n=148 → KB=1 is 3.7% faster.
     //
-    // Large K (FFN Down: act_blocks=592, acts_per_wave_single=74):
-    //   Each wave has tons of work. Prefer FEWER splits for long memory-streaming
-    //   loops and fewer atomicAdd reductions. Target ~16 acts per wave.
+    // Large K (FFN Down: act_blocks=296-592, acts_per_wave_single=37-74):
+    //   Three-branch approach based on CU occupancy at KB=1:
+    //   - High grid_n (≥3 blocks/CU): K-walk is the bottleneck, not occupancy.
+    //     Target 5 acts/shard to reduce critical path.
+    //     Verified: 32B FFN Gate TP=1 grid_n=216 → KB=4 is 12.5% faster than KB=1.
+    //   - Moderate grid_n (≥1.5 blocks/CU): conservative target of 16 acts/shard
+    //     avoids over-splitting where KB=1 is near-optimal.
+    //     Verified: 14B FFN Gate TP=1 grid_n=108 → KB=1 is optimal.
+    //   - Low grid_n (<1.5 blocks/CU): aggressive splits targeting ~2.5 acts/shard
+    //     to fill underutilized CUs.
+    //     Verified: FFN Down 7B TP=2→KB=14, TP=4→KB=7.
     //
     // Occupancy floor: ensure at least 8 waves per CU (480 total on 60 CUs)
     // to avoid leaving CUs idle on smaller grid_n shapes.
-    //
-    // Verified by sweep: Q/Wo 7B=14, FFN Down 7B=4, FFN Down 3B=4.
-    constexpr int TARGET_ACTS_PER_WAVE = 16;
+    constexpr int SMALL_K_THRESHOLD = 16;
     constexpr int MIN_WAVES_PER_CU = 8;
     constexpr int NUM_CUS = 60;
 
     const int acts_per_wave_single_kb = act_blocks / wk;
 
     int ideal_kb;
-    if (acts_per_wave_single_kb <= TARGET_ACTS_PER_WAVE)
+    if (acts_per_wave_single_kb <= SMALL_K_THRESHOLD)
     {
-        ideal_kb = acts_per_wave_single_kb;
+        // Small K: maximize splits to fill CUs
+        if (grid_n >= NUM_CUS * 2)
+        {
+            // Very large grid_n — KB=1 already provides 2+ blocks/CU.
+            // Additional splits only increase atomicAdd contention.
+            ideal_kb = 1;
+        }
+        else
+        {
+            // Target walk ≈ 1 act_block per wave-shard → KB ≈ acts_per_wave.
+            // Use ceiling division to avoid pathological KB values where
+            // act_blocks isn't evenly divisible by wk. E.g. 14B FFN Down TP=4:
+            //   act_blocks=108, wk=8: floor=13 (45.8µs), ceil=14 (35.2µs, -23%).
+            //   KB=13 creates uneven shard sizes causing work imbalance.
+            // Also fixes 7B Wo TP=4 (28/8: floor=3→20µs, ceil=4→18.7µs).
+            ideal_kb = (act_blocks + wk - 1) / wk;
+        }
     }
     else
     {
-        ideal_kb = act_blocks / (wk * TARGET_ACTS_PER_WAVE);
+        // Large K: three-branch approach based on CU occupancy at KB=1.
+        const float blocks_per_cu_at_kb1 = static_cast<float>(grid_n) / NUM_CUS;
+
+        if (blocks_per_cu_at_kb1 >= 3.0f)
+        {
+            // High N-parallelism: grid_n fills CUs well but K-walk is long.
+            // Moderate splitting reduces the critical path through K-dimension.
+            // Target ~5 act_blocks per wave-shard.
+            // E.g. 32B FFN Gate TP=1: grid_n=216, apw=20 → KB=4, 12.5% faster.
+            ideal_kb = max(1, acts_per_wave_single_kb / 5);
+        }
+        else
+        {
+            // Moderate/low N-parallelism: conservative → aggressive two-tier.
+            // Tier 1: conservative splits with each wave-shard doing ~16 act_blocks.
+            int conservative_kb = max(1, acts_per_wave_single_kb / SMALL_K_THRESHOLD);
+
+            // For very large K (apw > 64), cap conservative KB to limit atomic
+            // contention. At these K sizes, each shard is already bandwidth-saturated;
+            // more splits just add atomicAdd overhead without improving throughput.
+            // Verified: 32B FFN Down TP=1 (apw=108): KB=6→4 saves 10.2%.
+            if (acts_per_wave_single_kb > 64)
+            {
+                conservative_kb = min(conservative_kb, 4);
+            }
+
+            int conservative_blocks = grid_n * conservative_kb;
+
+            if (conservative_blocks >= NUM_CUS * 3 / 2)
+            {
+                // Tier 1 already fills CUs (≥1.5 blocks/CU). Use it.
+                // E.g. 14B FFN Gate TP=1: KB=1, blocks=108, 1.8/CU → near-optimal.
+                // E.g. FFN Down TP=1: KB=6, blocks=240, 4.0/CU → good.
+                ideal_kb = conservative_kb;
+            }
+            else
+            {
+                // Tier 2: conservative splits leave CUs underutilized.
+                // Target ~2.5 act_blocks per wave-shard for maximum CU parallelism.
+                // E.g. FFN Down TP=2: conservative KB=2, blocks=56, only 0.93/CU → bad.
+                //       Aggressive KB=14, blocks=392, 6.5/CU → good.
+                ideal_kb = (act_blocks * 2) / (wk * 5);
+            }
+        }
     }
 
-    // Floor: fill CUs with enough waves for memory latency hiding
-    const int min_total_waves = MIN_WAVES_PER_CU * NUM_CUS;
-    const int min_kb = (min_total_waves + grid_n * wk - 1) / (grid_n * wk);
-    ideal_kb = max(ideal_kb, min_kb);
+    // Floor: fill CUs with enough waves for memory latency hiding.
+    // ONLY for small-K shapes where individual blocks lack sufficient work.
+    // For large-K (apw > SMALL_K_THRESHOLD), each block is bandwidth-saturated;
+    // the occupancy floor just adds atomic contention without improving utilization.
+    // Verified: 14B/32B KV TP=2 (grid_n=4, apw=20): KB=15→8 saves 6-8%.
+    if (acts_per_wave_single_kb <= SMALL_K_THRESHOLD)
+    {
+        const int min_total_waves = MIN_WAVES_PER_CU * NUM_CUS;
+        const int min_kb = (min_total_waves + grid_n * wk - 1) / (grid_n * wk);
+        ideal_kb = max(ideal_kb, min_kb);
+    }
+
+    // Cap: ensure each wave-shard gets ≥1 act_block of work on average.
+    // Use ceiling division so fractional remainders (e.g. 28/8=3.5) round up
+    // to allow one extra split. Without this, Wo TP=4 (act_blocks=28, wk=8)
+    // would cap at KB=3 instead of the sweep-optimal KB=4 (7.3% faster).
+    const int kb_max = max(1, (act_blocks + wk - 1) / wk);  // ceil(act_blocks / wk)
+    ideal_kb = min(ideal_kb, kb_max);
 
     return max(1, min(ideal_kb, act_blocks));
 }
@@ -2113,7 +2195,7 @@ void gemv_int8_int8_lds_kreduce_kernel_t(
     int N, int K, int kb_outer)
 {
     static_assert(CPT == 2 || CPT == 4, "CPT must be 2 or 4");
-    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    static_assert(WK >= 2 && WK <= 16, "WK must be 2-16");
     constexpr int THREADS_PER_WAVE = TILE_N / CPT;
     static_assert(THREADS_PER_WAVE == 64, "TILE_N/CPT must equal 64 (one wavefront)");
 
@@ -2261,7 +2343,7 @@ void gemv_int8_int8_lds_kreduce_blockwise_scaled_kernel_t(
     float alpha)
 {
     static_assert(CPT == 2 || CPT == 4, "CPT must be 2 or 4");
-    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    static_assert(WK >= 2 && WK <= 16, "WK must be 2-16");
     constexpr int THREADS_PER_WAVE = TILE_N / CPT;
     static_assert(THREADS_PER_WAVE == 64, "TILE_N/CPT must equal 64 (one wavefront)");
 
@@ -2372,7 +2454,7 @@ void gemv_int8_int8_lds_kreduce_pair_blockwise_scaled_kernel_t(
     float alpha)
 {
     static_assert(CPT == 2 || CPT == 4, "CPT must be 2 or 4");
-    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    static_assert(WK >= 2 && WK <= 16, "WK must be 2-16");
     constexpr int THREADS_PER_WAVE = TILE_N / CPT;
     static_assert(THREADS_PER_WAVE == 64, "TILE_N/CPT must equal 64 (one wavefront)");
 
@@ -2483,7 +2565,7 @@ void gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t(
     int kb_outer,
     float alpha)
 {
-    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    static_assert(WK >= 2 && WK <= 16, "WK must be 2-16");
 
     constexpr int TILE_N = 256;
     constexpr int CPT = 4;
@@ -2649,7 +2731,7 @@ void gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t(
     int kb_outer,
     float alpha)
 {
-    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    static_assert(WK >= 2 && WK <= 16, "WK must be 2-16");
 
     constexpr int TILE_N = 256;
     constexpr int CPT = 4;
@@ -2873,7 +2955,7 @@ void gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t(
     int kb_outer,
     float alpha)
 {
-    static_assert(WK >= 2 && WK <= 8, "WK must be 2-8");
+    static_assert(WK >= 2 && WK <= 16, "WK must be 2-16");
     static_assert(ACT_BK == 32 || ACT_BK == 64 || ACT_BK == 128, "ACT_BK must be 32, 64, or 128");
     constexpr int KGROUPS_PER_ACT = ACT_BK / 4;
 
@@ -4466,7 +4548,10 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
     const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
 
     const int int8_kb_override = g_int8_vnni_kb_override.load(std::memory_order_relaxed);
-    const int kb_outer = select_blockwise_tiny_kv_outer_splits(total_grid_n, act_blocks, int8_kb_override);
+    // Phase 3: Use unified KB selector (two-regime + occupancy floor + KB cap)
+    // instead of legacy tiny-KV selector. Aligns pair dispatch with Phase 1
+    // individual dispatch tuning.
+    const int kb_outer = select_blockwise_qwo_outer_splits(total_grid_n, act_blocks, int8_kb_override, WK);
 
     // Zero outputs when KB > 1 (kernel uses atomicAdd)
     if (kb_outer > 1)
@@ -4566,69 +4651,34 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
     const int int8_kb_override = g_int8_vnni_kb_override.load(std::memory_order_relaxed);
     const int qwo_tn = (int8_tn_override == 128 || int8_tn_override == 256) ? int8_tn_override : 128;
 
-    const bool use_tiny_kv_lds_kreduce_blockwise = !use_wide_vec4
-        && use_vec4
-        && (N <= 512)
-        && (K >= 2048);
-    const bool use_qwo_lds_kreduce_blockwise = !use_wide_vec4
-        && !use_tiny_kv_lds_kreduce_blockwise
-        && use_vec4
-        && (N >= 2048);
-    const bool use_grid_kpar = !use_wide_vec4 && !use_qwo_lds_kreduce_blockwise && use_vec4 && (N >= GEMV_INT8_VNNI_GRID_KPAR_TILE_N);
+    // Unified LDS k-reduce path: routes all vec4-aligned shapes through the
+    // high-performance LDS k-reduce kernel. The kernel has N bounds checking
+    // (n_base < N guard on all reads/writes), so it handles N < TN=128 correctly
+    // with grid_n=1 — excess threads simply skip. Previously gated on N >= 128,
+    // but that caused TP-sharded K/V projections (N=32-64) to fall through to the
+    // slow fallback kernel (TILE_N=256, no KB splitting, 2-4x slower).
+    // The occupancy selector adapts KB to fill CUs at any grid_n.
+    const bool use_lds_kreduce_blockwise = !use_wide_vec4
+        && use_vec4;  // Any vec4-aligned shape (N % 4 == 0)
+    const bool use_grid_kpar = !use_wide_vec4 && !use_lds_kreduce_blockwise && use_vec4 && (N >= GEMV_INT8_VNNI_GRID_KPAR_TILE_N);
     const bool use_square = !use_wide_vec4 && !use_grid_kpar && (N >= GEMV_INT8_VNNI_SQUARE_TILE_N);
 
-    if (use_tiny_kv_lds_kreduce_blockwise)
-    {
-        constexpr int TN = GEMV_INT8_VNNI_GRID_KPAR_TILE_N;
-        constexpr int CPT = GEMV_INT8_VNNI_GRID_KPAR_CPT;
-        constexpr int WK = 8;
-
-        const int grid_n = (N + TN - 1) / TN;
-        const int act_blocks = K / GEMV_INT8_VNNI_ACT_BLOCK_K;
-        const int kb_outer = select_blockwise_tiny_kv_outer_splits(grid_n, act_blocks, int8_kb_override);
-
-        // When kb_outer == 1, kernel does direct write (no atomicAdd),
-        // so no memset/init needed for the beta==0 && no-bias path.
-        if (kb_outer > 1 && beta == 0.0f && d_bias == nullptr)
-        {
-            hipMemsetAsync(d_C_fp32, 0, static_cast<size_t>(N) * sizeof(float), static_cast<hipStream_t>(stream));
-        }
-        else if (beta != 0.0f || d_bias != nullptr)
-        {
-            hipLaunchKernelGGL(
-                HIP_KERNEL_NAME(gemv_init_output_kernel_t<TN, CPT>),
-                dim3(grid_n), dim3(TN / CPT), 0, static_cast<hipStream_t>(stream),
-                d_C_fp32, d_C_existing, d_bias, N, beta);
-        }
-
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_int8_int8_lds_kreduce_blockwise_scaled_kernel_t<TN, CPT, WK>),
-            dim3(grid_n, kb_outer), dim3((TN / CPT) * WK), 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_B_int8_vnni, d_C_fp32, d_scales_A_blockwise, d_scale_B,
-            N, K, kb_outer, alpha);
-
-        hipError_t err = hipGetLastError();
-        if (err != hipSuccess)
-        {
-            fprintf(stderr, "[rocmGemv_int8_int8_fp32_vnni_blockwise_scaled] tiny-kv lds_kreduce launch failed: %s (N=%d K=%d kb_outer=%d)\n",
-                    hipGetErrorString(err), N, K, kb_outer);
-            return false;
-        }
-
-        return true;
-    }
-
-    if (use_qwo_lds_kreduce_blockwise)
+    if (use_lds_kreduce_blockwise)
     {
         // Unified Q/Wo dispatch with WK, unroll, and act_block overrides
         const int wk_ov = g_int8_vnni_wk_override.load(std::memory_order_relaxed);
         const int unroll_ov = g_int8_vnni_unroll_override.load(std::memory_order_relaxed);
         const int tn = qwo_tn;  // 128 or 256
-        const int wk = (wk_ov >= 2 && wk_ov <= 8) ? wk_ov : 8;  // default WK=8 (tuned)
+        const int grid_n = (N + tn - 1) / tn;
+
+        // WK=8 default (tuned). WK=16 infrastructure available via override for future
+        // tuning — static_asserts and switch cases support WK up to 16, but auto-select
+        // stays at 8 since atomicAdd is not the bottleneck for small-grid_n shapes
+        // (latency floor dominates; total wave count is unchanged since WK×KB = const).
+        const int wk = (wk_ov >= 2 && wk_ov <= 16) ? wk_ov : 8;
         const bool use_unroll2 = (unroll_ov == -1) ? true : (unroll_ov == 2);  // default: unroll=2 (tuned)
         const int act_bk = rocmGemv_int8_vnni_get_act_block_k();  // 32, 64, or 128
 
-        const int grid_n = (N + tn - 1) / tn;
         const int act_blocks = K / act_bk;
         const int kb_outer = select_blockwise_qwo_outer_splits(grid_n, act_blocks, int8_kb_override, wk);
 
@@ -4686,6 +4736,7 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
             case 3: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 3); break;
             case 6: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 6); break;
             case 8: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 8); break;
+            case 16: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 16); break;
             default: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_lds_kreduce_blockwise_scaled_kernel_t, 4); break;
             }
         }
@@ -4697,6 +4748,7 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
             case 3: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 3); break;
             case 6: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 6); break;
             case 8: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 8); break;
+            case 16: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 16); break;
             default: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_lds_kreduce_blockwise_scaled_kernel_t, 4); break;
             }
         }
@@ -4711,6 +4763,7 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                 case 3: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 3, 128); break;
                 case 6: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 6, 128); break;
                 case 8: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 8, 128); break;
+                case 16: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 16, 128); break;
                 default: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 4, 128); break;
                 }
             }
@@ -4722,6 +4775,7 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                 case 3: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 3, 64); break;
                 case 6: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 6, 64); break;
                 case 8: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 8, 64); break;
+                case 16: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 16, 64); break;
                 default: LAUNCH_QWO_KERNEL_ABK(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 4, 64); break;
                 }
             }
@@ -4733,6 +4787,7 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                 case 3: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 3); break;
                 case 6: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 6); break;
                 case 8: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 8); break;
+                case 16: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 16); break;
                 default: LAUNCH_QWO_KERNEL(gemv_int8_int8_qwo_unroll2_128_lds_kreduce_blockwise_scaled_kernel_t, 4); break;
                 }
             }
@@ -4748,6 +4803,7 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
             case 3: LAUNCH_LDS_KERNEL(TN, CPT, 3); break;
             case 6: LAUNCH_LDS_KERNEL(TN, CPT, 6); break;
             case 8: LAUNCH_LDS_KERNEL(TN, CPT, 8); break;
+            case 16: LAUNCH_LDS_KERNEL(TN, CPT, 16); break;
             default: LAUNCH_LDS_KERNEL(TN, CPT, 4); break;
             }
         }
@@ -5101,12 +5157,14 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
         // Fast path: LDS K-reduce pair kernel for tiny K/V projections.
         // Provides ~1.75x speedup over 2× individual tiny_kv launches by
         // doubling CU occupancy and eliminating launch overhead.
+        // Phase 3: Removed K>=2048 gate — pair kernel works for all K values
+        // (including 0.5B models with K=896). The unified KB selector handles
+        // occupancy tuning for any K.
         const bool is_tiny_kv_pair =
             (family == GemvBatchKernelFamily::Generic) &&
             ((end_idx - start_idx) == 2) &&
             (N_per_proj[start_idx] <= 512) &&
             (N_per_proj[start_idx + 1] <= 512) &&
-            (K >= 2048) &&
             (beta == 0.0f) &&
             (d_bias_ptrs[start_idx] == nullptr) &&
             (d_bias_ptrs[start_idx + 1] == nullptr);

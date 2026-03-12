@@ -29,6 +29,10 @@
 #include "../../../backends/GPUDeviceContextPool.h" // Compute stream registration for event-based collective sync
 #include "../../../utils/Logger.h"
 #include "../../../utils/Sampler.h"                    // SamplingParams for sampleOnDevice()
+#include "../../../utils/KernelProfiler.h"             // Phase propagation to worker threads
+#include "../../../utils/ROCmKernelProfiler.h"         // Phase propagation to worker threads
+#include "../../../utils/CUDAKernelProfiler.h"         // Phase propagation to worker threads
+#include "../../../utils/KVCacheProfiler.h"            // Phase propagation to worker threads
 #include "../../mpi_orchestration/RankExecutionPlan.h" // For Config::fromPlan()
 #include <algorithm>
 #include <future>
@@ -1289,12 +1293,27 @@ namespace llaminar2
                     aggregated_stats_->total_flops += stats->total_flops;
                     aggregated_stats_->total_time_ms += stats->total_time_ms;
                     aggregated_stats_->total_execute_ms += stats->total_execute_ms;
+                    aggregated_stats_->total_collective_ms += stats->total_collective_ms;
+                    aggregated_stats_->total_collective_calls += stats->total_collective_calls;
 
                     // Merge stage times
                     for (const auto &[stage_name, time_ms] : stats->stage_times_ms)
                     {
                         aggregated_stats_->stage_times_ms[stage_name] += time_ms;
                     }
+
+                    // Merge stage type execution times and counts
+                    for (const auto &[type_name, time_ms] : stats->stage_type_execute_ms)
+                    {
+                        aggregated_stats_->stage_type_execute_ms[type_name] += time_ms;
+                    }
+                    for (const auto &[type_name, count] : stats->stage_type_counts)
+                    {
+                        aggregated_stats_->stage_type_counts[type_name] += count;
+                    }
+
+                    // Merge overhead breakdown
+                    aggregated_stats_->overhead += stats->overhead;
                 }
             }
         }
@@ -1303,12 +1322,34 @@ namespace llaminar2
         if (!device_runners_.empty())
         {
             size_t count = device_runners_.size();
-            aggregated_stats_->total_time_ms /= static_cast<double>(count);
-            aggregated_stats_->total_execute_ms /= static_cast<double>(count);
+            double dcount = static_cast<double>(count);
+            aggregated_stats_->total_time_ms /= dcount;
+            aggregated_stats_->total_execute_ms /= dcount;
+            aggregated_stats_->total_collective_ms /= dcount;
+            aggregated_stats_->total_collective_calls /= count;
             for (auto &[stage_name, time_ms] : aggregated_stats_->stage_times_ms)
             {
-                time_ms /= static_cast<double>(count);
+                time_ms /= dcount;
             }
+            for (auto &[type_name, time_ms] : aggregated_stats_->stage_type_execute_ms)
+            {
+                time_ms /= dcount;
+            }
+            for (auto &[type_name, cnt] : aggregated_stats_->stage_type_counts)
+            {
+                cnt /= count;
+            }
+
+            // Average overhead (each device incurs its own overhead in parallel)
+            aggregated_stats_->overhead.input_cohere_ms /= dcount;
+            aggregated_stats_->overhead.weight_cohere_ms /= dcount;
+            aggregated_stats_->overhead.output_alloc_ms /= dcount;
+            aggregated_stats_->overhead.mark_dirty_ms /= dcount;
+            aggregated_stats_->overhead.dump_input_ms /= dcount;
+            aggregated_stats_->overhead.dump_output_ms /= dcount;
+            aggregated_stats_->overhead.verify_ms /= dcount;
+            aggregated_stats_->overhead.callback_ms /= dcount;
+            aggregated_stats_->overhead.get_dump_info_ms /= dcount;
         }
 
         stats_dirty_ = false;
@@ -1429,9 +1470,30 @@ namespace llaminar2
             // Dispatch parallel forward passes to persistent worker threads.
             // dispatch() wakes all workers via condition_variable and returns
             // immediately — no thread creation, no pthread_create syscall.
+            //
+            // Capture profiler phases from the caller thread and propagate to
+            // workers. All profilers use thread-local phase storage, so worker
+            // threads must explicitly set their phase to match the caller.
+            auto kernel_phase = KernelProfiler::getCurrentPhase();
+            auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+            auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+            auto kv_phase = KVCacheProfiler::getCurrentPhase();
+
             tp_worker_pool_->dispatch(
-                [this, tokens, seq_len](size_t i) -> bool
+                [this, tokens, seq_len, kernel_phase, rocm_phase, cuda_phase, kv_phase](size_t i) -> bool
                 {
+                    // Propagate profiler phases from caller thread
+                    KernelProfiler::setCurrentPhase(kernel_phase);
+                    ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                    CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                    KVCacheProfiler::setCurrentPhase(kv_phase);
+
+                    // Set per-device profiler context so ROCm/CUDA profilers
+                    // can attribute kernel times to specific GPUs
+                    auto device_id = device_runners_[i]->inferenceState().device_id;
+                    ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                    CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
                     IInferenceRunner *runner_iface = device_runners_[i].get();
                     return runner_iface->forward(tokens, seq_len);
                 });

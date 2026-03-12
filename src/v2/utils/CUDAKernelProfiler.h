@@ -225,6 +225,11 @@ namespace llaminar2
         }
 
         /**
+         * @brief Get the current inference phase (for propagation to worker threads)
+         */
+        static Phase getCurrentPhase() { return current_phase(); }
+
+        /**
          * @brief Check if CUDA profiling is enabled
          */
         static bool isEnabled()

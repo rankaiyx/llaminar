@@ -33,6 +33,7 @@
 #include "../device/DeviceContext.h"
 #include "../../mpi_orchestration/WorkDistributor.h"
 #include "DeviceGraphBufferManager.h"
+#include "StageTimeline.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/DebugEnv.h" // For LLAMINAR_ASSERTIONS_ACTIVE
 #include "../../../interfaces/ICollectiveContext.h"
@@ -418,6 +419,16 @@ namespace llaminar2
          * @param collective_nodes Pre-computed set of node names that are collective stages (optional, for TP>1)
          * @return true on success
          */
+        /**
+         * @brief Get the stage timeline for external collection/printing
+         *
+         * The timeline is populated during executeFastDecode() when
+         * LLAMINAR_GPU_STAGE_TIMING=1. The caller is responsible for calling
+         * collect() and printSummary() after the forward pass completes.
+         */
+        StageTimeline &stageTimeline() { return stage_timeline_; }
+        const StageTimeline &stageTimeline() const { return stage_timeline_; }
+
         bool executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx,
                                const std::unordered_set<std::string> *collective_nodes = nullptr);
 
@@ -627,6 +638,7 @@ namespace llaminar2
         DeviceGraphBufferManager *buffer_manager_ = nullptr; ///< Optional buffer manager (not owned)
         ICollectiveContext *collective_ctx_ = nullptr;       ///< Optional collective context (not owned)
         BufferArena *arena_ = nullptr;                       ///< Optional arena for contract coherence (not owned)
+        StageTimeline stage_timeline_;                       ///< GPU event-based per-stage timeline profiler
 
         // Internal execution helpers
         bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);

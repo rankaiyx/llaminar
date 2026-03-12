@@ -168,7 +168,8 @@ namespace
         return 256;
     }
 
-    inline int chooseDecodeSplitsAuto(int kv_len, int head_dim, int max_allowed)
+    inline int chooseDecodeSplitsAuto(int kv_len, int head_dim, int max_allowed,
+                                      int n_heads = 0, int num_cus = 0)
     {
         const int safe_head_dim = std::max(head_dim, 1);
         const int64_t total_elements = static_cast<int64_t>(kv_len) * safe_head_dim;
@@ -200,19 +201,34 @@ namespace
         // Prefer power-of-two split counts for predictable reduction behavior.
         int auto_splits = roundUpPow2Clamped(base_splits, max_allowed);
 
+        // CU-aware occupancy floor: when n_heads * splits is too low to fill
+        // the GPU, increase splits to target ~75% CU occupancy.  This is
+        // critical for TP configurations where per-rank head count drops.
+        if (n_heads > 0 && num_cus > 0)
+        {
+            const int target_blocks = (num_cus * 3) / 4; // 75% occupancy
+            if (n_heads * auto_splits < target_blocks)
+            {
+                int occ_splits = (target_blocks + n_heads - 1) / n_heads;
+                occ_splits = roundUpPow2Clamped(occ_splits, max_allowed);
+                auto_splits = std::max(auto_splits, occ_splits);
+            }
+        }
+
         const int min_splits = clampInt(FD_MIN_SPLITS, 1, max_allowed);
         auto_splits = clampInt(auto_splits, min_splits, max_allowed);
         return auto_splits;
     }
 
-    inline int chooseEffectiveDecodeSplits(int kv_len, int head_dim, int requested_num_splits)
+    inline int chooseEffectiveDecodeSplits(int kv_len, int head_dim, int requested_num_splits,
+                                           int n_heads = 0, int num_cus = 0)
     {
         const int workspace_limit = (requested_num_splits > 0)
             ? requested_num_splits
             : FD_MAX_SPLITS_SUPPORTED;
         const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
 
-        const int auto_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed);
+        const int auto_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed, n_heads, num_cus);
         return std::max(1, std::min(auto_splits, max_allowed));
     }
 
@@ -271,19 +287,22 @@ namespace
         return 6;
     }
 
-    inline uint32_t makeDecodeAutotuneKey(int kv_len, int head_dim, int max_allowed_splits)
+    inline uint32_t makeDecodeAutotuneKey(int kv_len, int head_dim, int max_allowed_splits,
+                                          int n_heads = 0)
     {
         const int64_t total_elements = static_cast<int64_t>(std::max(kv_len, 1)) * std::max(head_dim, 1);
         const int elem_bucket = clampInt(ilog2Floor(static_cast<int>(std::min<int64_t>(total_elements, INT32_MAX))), 0, 31);
         const int aspect_bucket = bucketAspectRatio(kv_len, head_dim); // 0..6
         const int hd_bucket = clampInt(ilog2Floor(std::max(head_dim, 1)), 0, 15);
         const int split_cap_bucket = clampInt(ilog2Floor(std::max(max_allowed_splits, 1)), 0, 15);
+        const int heads_bucket = clampInt(ilog2Floor(std::max(n_heads, 1)), 0, 15);
 
         return static_cast<uint32_t>(
             (elem_bucket & 0x1F) |
             ((aspect_bucket & 0x07) << 5) |
             ((hd_bucket & 0x0F) << 8) |
-            ((split_cap_bucket & 0x0F) << 12));
+            ((split_cap_bucket & 0x0F) << 12) |
+            ((heads_bucket & 0x0F) << 16));
     }
 
     inline void addSplitCandidate(std::vector<int> &splits, int value, int max_allowed)
@@ -296,20 +315,34 @@ namespace
         }
     }
 
-    inline std::vector<DecodeLaunchConfig> buildDecodeAutotuneCandidates(int kv_len, int head_dim, int max_allowed)
+    inline std::vector<DecodeLaunchConfig> buildDecodeAutotuneCandidates(int kv_len, int head_dim, int max_allowed,
+                                                                         int n_heads = 0, int num_cus = 0)
     {
         const int min_splits = clampInt(FD_MIN_SPLITS, 1, max_allowed);
 
-        const int base_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed);
+        const int base_splits = chooseDecodeSplitsAuto(kv_len, head_dim, max_allowed, n_heads, num_cus);
 
         std::vector<int> split_candidates;
-        split_candidates.reserve(6);
+        split_candidates.reserve(12);
         addSplitCandidate(split_candidates, min_splits, max_allowed);
         addSplitCandidate(split_candidates, base_splits / 2, max_allowed);
         addSplitCandidate(split_candidates, base_splits, max_allowed);
         addSplitCandidate(split_candidates, base_splits * 2, max_allowed);
         addSplitCandidate(split_candidates, 1, max_allowed);
         addSplitCandidate(split_candidates, max_allowed, max_allowed);
+
+        // Occupancy-aware candidates: when the base heuristic has already been
+        // bumped by the CU floor, also explore splits that hit 50% and 100%
+        // occupancy so the autotuner can bracket the sweet spot.
+        if (n_heads > 0 && num_cus > 0)
+        {
+            for (int pct : {50, 100})
+            {
+                int target = (num_cus * pct) / 100;
+                int s = (target + n_heads - 1) / n_heads;
+                addSplitCandidate(split_candidates, s, max_allowed);
+            }
+        }
 
         std::sort(split_candidates.begin(), split_candidates.end());
 
@@ -354,11 +387,12 @@ namespace
         return lock;
     }
 
-    inline DecodeAutotuneSelection chooseDecodeLaunchConfig(int kv_len, int head_dim, int requested_num_splits)
+    inline DecodeAutotuneSelection chooseDecodeLaunchConfig(int kv_len, int head_dim, int requested_num_splits,
+                                                             int n_heads = 0, int num_cus = 0)
     {
         DecodeAutotuneSelection selection;
 
-        const int heuristic_splits = chooseEffectiveDecodeSplits(kv_len, head_dim, requested_num_splits);
+        const int heuristic_splits = chooseEffectiveDecodeSplits(kv_len, head_dim, requested_num_splits, n_heads, num_cus);
         const int heuristic_tpb = chooseDecodeThreadsPerBlock(head_dim, kv_len, heuristic_splits);
         selection.config = {heuristic_splits, heuristic_tpb};
 
@@ -367,7 +401,7 @@ namespace
             : FD_MAX_SPLITS_SUPPORTED;
         const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
 
-        const uint32_t key = makeDecodeAutotuneKey(kv_len, head_dim, max_allowed);
+        const uint32_t key = makeDecodeAutotuneKey(kv_len, head_dim, max_allowed, n_heads);
 
         std::lock_guard<std::mutex> guard(decodeAutotuneMutex());
         auto &states = decodeAutotuneMap();
@@ -375,7 +409,7 @@ namespace
 
         if (state.candidates.empty())
         {
-            state.candidates = buildDecodeAutotuneCandidates(kv_len, head_dim, max_allowed);
+            state.candidates = buildDecodeAutotuneCandidates(kv_len, head_dim, max_allowed, n_heads, num_cus);
             const int max_trials_env = clampInt(FD_AUTOTUNE_MAX_TRIALS, 1, 24);
             state.max_trials = std::min<int>(max_trials_env, static_cast<int>(state.candidates.size()));
             state.next_trial = 0;
@@ -445,6 +479,7 @@ namespace
         int gcn_arch = 0;      // e.g., 906 for gfx906
         int max_lds = 0;       // Max LDS per block
         int max_vgprs = 0;     // Max VGPRs per wavefront
+        int num_cus = 60;      // Number of compute units
         bool initialized = false;
     };
 
@@ -473,6 +508,7 @@ namespace
             }
             cfg.max_lds = static_cast<int>(prop.sharedMemPerBlock);
             cfg.max_vgprs = MAX_VGPRS_PER_WAVEFRONT; // Could query via rocm-smi
+            cfg.num_cus = prop.multiProcessorCount;
             cfg.initialized = true;
         }
         return cfg;
@@ -1935,13 +1971,21 @@ namespace
         const float *mask,
         hipStream_t hip_stream)
     {
-        int tile_q = 32;  // Optimal for head_dim=128
+        // Adaptive tile_q heuristic: tq=4 for low occupancy, tq=8 at saturation.
+        // When tq=8 already generates ≥1024 blocks, the GPU is fully saturated
+        // across multiple CU waves. tq=4's 2× block count then adds scheduling
+        // overhead without improving utilization. Below the threshold, tq=4's
+        // extra blocks improve CU saturation significantly (up to 1.45×).
+        // Threshold of 1024 validated across 0.5B-32B, TP={1,2,4}, seq={128..1024}:
+        //   predicts optimal choice in 58/60 benchmark configurations (misses <0.5%).
+        const int tq8_blocks = n_heads * ((seq_len + 7) / 8);
+        int tile_q = (tq8_blocks >= 1024) ? 8 : 4;
 
         // Allow override via environment
         const char *tq_env = getenv("LLAMINAR_FA2_COOPERATIVE_TILE_Q");
         if (tq_env) {
             int tq_override = atoi(tq_env);
-            if (tq_override == 16 || tq_override == 32 || tq_override == 64)
+            if (tq_override == 4 || tq_override == 8 || tq_override == 16 || tq_override == 32 || tq_override == 64)
                 tile_q = tq_override;
         }
 
@@ -1971,13 +2015,17 @@ namespace
         bool dispatched = false;
         if (dims_per_lane == 2) {
             // head_dim 65-128 (most common: 128)
-            if (q_per_wave == 8) { LAUNCH_COOP_KV(8, 2); dispatched = true; }
+            if (q_per_wave == 1) { LAUNCH_COOP_KV(1, 2); dispatched = true; }
+            else if (q_per_wave == 2) { LAUNCH_COOP_KV(2, 2); dispatched = true; }
             else if (q_per_wave == 4) { LAUNCH_COOP_KV(4, 2); dispatched = true; }
+            else if (q_per_wave == 8) { LAUNCH_COOP_KV(8, 2); dispatched = true; }
             else if (q_per_wave == 16) { LAUNCH_COOP_KV(16, 2); dispatched = true; }
         } else if (dims_per_lane == 1) {
             // head_dim 1-64
-            if (q_per_wave == 8) { LAUNCH_COOP_KV(8, 1); dispatched = true; }
+            if (q_per_wave == 1) { LAUNCH_COOP_KV(1, 1); dispatched = true; }
+            else if (q_per_wave == 2) { LAUNCH_COOP_KV(2, 1); dispatched = true; }
             else if (q_per_wave == 4) { LAUNCH_COOP_KV(4, 1); dispatched = true; }
+            else if (q_per_wave == 8) { LAUNCH_COOP_KV(8, 1); dispatched = true; }
             else if (q_per_wave == 16) { LAUNCH_COOP_KV(16, 1); dispatched = true; }
         }
         #undef LAUNCH_COOP_KV
@@ -2023,7 +2071,11 @@ static int launch_decode(
 
     float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
-    const DecodeAutotuneSelection tuned = chooseDecodeLaunchConfig(kv_len, head_dim, num_splits);
+    int current_device = 0;
+    hipGetDevice(&current_device);
+    const int num_cus = getDeviceConfig(current_device).num_cus;
+
+    const DecodeAutotuneSelection tuned = chooseDecodeLaunchConfig(kv_len, head_dim, num_splits, n_heads, num_cus);
     const int effective_num_splits = tuned.config.splits;
     const int decode_threads_per_block = tuned.config.tpb;
 

@@ -173,11 +173,12 @@ namespace llaminar2
             // ==============================================================
             // TP Allreduce Precision Policy
             // ==============================================================
-            // First 6 layers use FP32 allreduce to preserve early-layer precision.
-            // Deeper layers can tolerate FP16 since individual errors have less
-            // compounding effect on final output quality.
+            // All layers use FP16 allreduce. The FP16 round-trip precision
+            // loss (~1e-3) is negligible compared to Q8_0 weight quantization
+            // noise, and halving transfer size reduces RCCL latency for the
+            // small messages in decode (3584 × 4 → 3584 × 2 bytes).
             schema.tp_allreduce_default_precision = "fp16";
-            schema.tp_allreduce_fp32_layer_count = 6;
+            schema.tp_allreduce_fp32_layer_count = 0;
 
             schema.required_params = {
                 "n_layers", "d_model", "n_heads", "n_kv_heads",

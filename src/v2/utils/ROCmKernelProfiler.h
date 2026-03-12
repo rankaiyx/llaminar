@@ -185,6 +185,8 @@ namespace llaminar2
         struct DeviceStats
         {
             std::array<KernelStats, COUNT> stats;
+            std::array<KernelStats, COUNT> prefill_stats;
+            std::array<KernelStats, COUNT> decode_stats;
         };
 
         /**
@@ -201,6 +203,11 @@ namespace llaminar2
          * @brief Set the current inference phase for phase-separated profiling
          */
         static void setCurrentPhase(Phase phase) { current_phase() = phase; }
+
+        /**
+         * @brief Get the current inference phase (for propagation to worker threads)
+         */
+        static Phase getCurrentPhase() { return current_phase(); }
 
         /**
          * @brief Check if ROCm profiling is enabled
@@ -276,11 +283,30 @@ namespace llaminar2
             int dev_id = current_device_id();
             if (dev_id >= 0)
             {
-                auto &dev_stats = inst.device_stats_[dev_id].stats[idx];
+                auto &dev = inst.device_stats_[dev_id];
+                auto &dev_stats = dev.stats[idx];
                 dev_stats.total_us += elapsed_us;
                 dev_stats.call_count++;
                 dev_stats.max_us = std::max(dev_stats.max_us, elapsed_us);
                 dev_stats.min_us = std::min(dev_stats.min_us, elapsed_us);
+
+                // Update per-device phase stats
+                if (phase == Phase::PREFILL)
+                {
+                    auto &dps = dev.prefill_stats[idx];
+                    dps.total_us += elapsed_us;
+                    dps.call_count++;
+                    dps.max_us = std::max(dps.max_us, elapsed_us);
+                    dps.min_us = std::min(dps.min_us, elapsed_us);
+                }
+                else if (phase == Phase::DECODE)
+                {
+                    auto &dds = dev.decode_stats[idx];
+                    dds.total_us += elapsed_us;
+                    dds.call_count++;
+                    dds.max_us = std::max(dds.max_us, elapsed_us);
+                    dds.min_us = std::min(dds.min_us, elapsed_us);
+                }
             }
         }
 
@@ -329,11 +355,30 @@ namespace llaminar2
             // Update per-device stats
             if (device_id >= 0)
             {
-                auto &dev_stats = inst.device_stats_[device_id].stats[idx];
+                auto &dev = inst.device_stats_[device_id];
+                auto &dev_stats = dev.stats[idx];
                 dev_stats.total_us += elapsed_us;
                 dev_stats.call_count++;
                 dev_stats.max_us = std::max(dev_stats.max_us, elapsed_us);
                 dev_stats.min_us = std::min(dev_stats.min_us, elapsed_us);
+
+                // Update per-device phase stats
+                if (phase == Phase::PREFILL)
+                {
+                    auto &dps = dev.prefill_stats[idx];
+                    dps.total_us += elapsed_us;
+                    dps.call_count++;
+                    dps.max_us = std::max(dps.max_us, elapsed_us);
+                    dps.min_us = std::min(dps.min_us, elapsed_us);
+                }
+                else if (phase == Phase::DECODE)
+                {
+                    auto &dds = dev.decode_stats[idx];
+                    dds.total_us += elapsed_us;
+                    dds.call_count++;
+                    dds.max_us = std::max(dds.max_us, elapsed_us);
+                    dds.min_us = std::min(dds.min_us, elapsed_us);
+                }
             }
         }
 
@@ -550,14 +595,162 @@ namespace llaminar2
                 oss << table.to_string();
             };
 
-            // Render phase-separated or combined tables
-            if ((has_prefill || has_decode) && device_count <= 1)
+            // Helper lambda to render a multi-device phase table with per-device columns
+            auto renderMultiDevicePhaseTable = [&](const std::string &phase_label,
+                                                   const std::array<KernelStats, COUNT> &phase_stats,
+                                                   uint64_t phase_tokens,
+                                                   double wall_clock_ms)
             {
-                // Phase-separated output for single device
-                if (has_prefill)
-                    renderPhaseTable("PREFILL", inst.prefill_stats_, prefill_tokens, wall_clock_prefill_ms);
-                if (has_decode)
-                    renderPhaseTable("DECODE", inst.decode_stats_, decode_tokens, wall_clock_decode_ms);
+                // Calculate total for this phase
+                double phase_total_us = 0.0;
+                for (size_t i = 0; i < COUNT; ++i)
+                    phase_total_us += phase_stats[i].total_us;
+
+                if (phase_total_us == 0.0)
+                    return;
+
+                // Sort by total time (descending) for this phase
+                std::array<size_t, COUNT> phase_indices;
+                for (size_t i = 0; i < phase_indices.size(); ++i)
+                    phase_indices[i] = i;
+                std::sort(phase_indices.begin(), phase_indices.end(), [&](size_t a, size_t b)
+                          { return phase_stats[a].total_us > phase_stats[b].total_us; });
+
+                // Title
+                {
+                    fort::utf8_table title;
+                    title.set_border_style(FT_DOUBLE2_STYLE);
+                    std::ostringstream title_ss;
+                    title_ss << "ROCm KERNEL PROFILING — " << phase_label
+                             << " (" << device_count << " GPUs";
+                    if (phase_tokens > 0)
+                        title_ss << ", " << phase_tokens << " tokens";
+                    title_ss << ")";
+                    title << title_ss.str() << fort::endr;
+                    title[0][0].set_cell_text_align(fort::text_align::center);
+                    title.row(0).set_cell_row_type(fort::row_type::header);
+                    oss << "\n"
+                        << title.to_string();
+                }
+
+                // Determine which DeviceStats phase array to use
+                auto getDevicePhaseStats = [&](int dev_id, size_t idx) -> double
+                {
+                    auto it = inst.device_stats_.find(dev_id);
+                    if (it == inst.device_stats_.end())
+                        return 0.0;
+                    if (phase_label == "PREFILL")
+                        return it->second.prefill_stats[idx].total_us / 1000.0;
+                    else
+                        return it->second.decode_stats[idx].total_us / 1000.0;
+                };
+
+                fort::utf8_table table;
+                table.set_border_style(FT_DOUBLE2_STYLE);
+
+                // Multi-device header
+                table << fort::header << "Kernel Type" << "Total (ms)";
+                for (int dev : devices)
+                {
+                    std::ostringstream dev_ss;
+                    dev_ss << "rocm:" << dev;
+                    table << dev_ss.str();
+                }
+                table << "Balance" << fort::endr;
+
+                table.column(0).set_cell_text_align(fort::text_align::left);
+                table.column(1).set_cell_text_align(fort::text_align::right);
+                for (size_t i = 0; i < devices.size(); ++i)
+                {
+                    table.column(2 + i).set_cell_text_align(fort::text_align::right);
+                }
+                table.column(2 + devices.size()).set_cell_text_align(fort::text_align::right);
+
+                for (size_t idx : phase_indices)
+                {
+                    const auto &stats = phase_stats[idx];
+                    if (stats.call_count == 0)
+                        continue;
+
+                    double total_ms = stats.total_us / 1000.0;
+
+                    // Collect per-device times for this phase
+                    std::vector<double> dev_times;
+                    double max_time = 0.0, min_time = 1e12;
+                    for (int dev : devices)
+                    {
+                        double dev_ms = getDevicePhaseStats(dev, idx);
+                        dev_times.push_back(dev_ms);
+                        if (dev_ms > 0)
+                        {
+                            max_time = std::max(max_time, dev_ms);
+                            min_time = std::min(min_time, dev_ms);
+                        }
+                    }
+
+                    double balance = (max_time > 0) ? (min_time / max_time * 100.0) : 100.0;
+
+                    std::ostringstream total_ss, balance_ss;
+                    total_ss << std::fixed << std::setprecision(2) << total_ms;
+                    balance_ss << static_cast<int>(balance) << "%";
+
+                    table << rocmKernelTypeName(static_cast<ROCmKernelType>(idx)) << total_ss.str();
+                    for (double t : dev_times)
+                    {
+                        std::ostringstream dev_time_ss;
+                        dev_time_ss << std::fixed << std::setprecision(2) << t;
+                        table << dev_time_ss.str();
+                    }
+                    table << balance_ss.str() << fort::endr;
+                }
+
+                // Separator and total row
+                table << fort::separator;
+                {
+                    double display_total_ms = (wall_clock_ms > 0) ? wall_clock_ms : (phase_total_us / 1000.0);
+                    std::ostringstream total_ss;
+                    total_ss << std::fixed << std::setprecision(2) << display_total_ms << " ms";
+
+                    if (phase_tokens > 0)
+                    {
+                        double toks_per_sec = (phase_tokens * 1000.0) / display_total_ms;
+                        std::ostringstream throughput_ss;
+                        throughput_ss << std::fixed << std::setprecision(2) << toks_per_sec << " tok/s";
+                        table << "TOTAL" << total_ss.str();
+                        for (size_t i = 0; i < devices.size(); ++i)
+                            table << "";
+                        table << throughput_ss.str() << fort::endr;
+                    }
+                    else
+                    {
+                        table << "TOTAL" << total_ss.str();
+                        for (size_t i = 0; i < devices.size(); ++i)
+                            table << "";
+                        table << "" << fort::endr;
+                    }
+                }
+
+                oss << table.to_string();
+            };
+
+            // Render phase-separated or combined tables
+            if (has_prefill || has_decode)
+            {
+                // Phase-separated output
+                if (device_count <= 1)
+                {
+                    if (has_prefill)
+                        renderPhaseTable("PREFILL", inst.prefill_stats_, prefill_tokens, wall_clock_prefill_ms);
+                    if (has_decode)
+                        renderPhaseTable("DECODE", inst.decode_stats_, decode_tokens, wall_clock_decode_ms);
+                }
+                else
+                {
+                    if (has_prefill)
+                        renderMultiDevicePhaseTable("PREFILL", inst.prefill_stats_, prefill_tokens, wall_clock_prefill_ms);
+                    if (has_decode)
+                        renderMultiDevicePhaseTable("DECODE", inst.decode_stats_, decode_tokens, wall_clock_decode_ms);
+                }
             }
             else
             {

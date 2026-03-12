@@ -140,7 +140,9 @@ namespace llaminar2
         size_t total_stages_executed = 0;
         size_t total_flops = 0;
         double total_time_ms = 0.0;
-        double total_execute_ms = 0.0; ///< Time in actual kernel/stage execution
+        double total_execute_ms = 0.0;     ///< Time in actual kernel/stage execution (compute + collective)
+        double total_collective_ms = 0.0;  ///< Time in collective operations (allreduce, allgather) — subset of total_execute_ms
+        size_t total_collective_calls = 0; ///< Number of collective operations executed
         std::unordered_map<std::string, double> stage_times_ms;
         std::unordered_map<std::string, double> stage_type_execute_ms;
         std::unordered_map<std::string, size_t> stage_type_counts;
@@ -154,6 +156,8 @@ namespace llaminar2
             total_flops = 0;
             total_time_ms = 0.0;
             total_execute_ms = 0.0;
+            total_collective_ms = 0.0;
+            total_collective_calls = 0;
             stage_times_ms.clear();
             stage_type_execute_ms.clear();
             stage_type_counts.clear();

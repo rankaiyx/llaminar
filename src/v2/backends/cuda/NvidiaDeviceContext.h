@@ -122,6 +122,7 @@ namespace llaminar2
         void recordEvent(void *event, void *stream) override;
         void waitEvent(void *event, void *stream) override;
         void synchronizeEvent(void *event) override;
+        float eventElapsedTime(void *start, void *stop) override;
 
         // =========================================================================
         // IWorkerGPUContext Interface - Library Handles (worker-thread-only)

@@ -615,6 +615,11 @@ namespace llaminar2
         }
 
         /**
+         * @brief Get the current inference phase (for propagation to worker threads)
+         */
+        static Phase getCurrentPhase() { return current_phase(); }
+
+        /**
          * @brief Check if profiling is enabled (from DebugEnv)
          */
         static bool isEnabled()

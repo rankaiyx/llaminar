@@ -250,8 +250,11 @@ namespace llaminar2
             return false;
         }
 
-        // Sync and D2H the tiny result (8 bytes total)
-        hipDeviceSynchronize();
+        // Sync the default stream (where the kernel was launched) and D2H
+        // the tiny result (8 bytes total).  hipStreamSynchronize(nullptr)
+        // waits only for the default stream instead of the device-wide
+        // hipDeviceSynchronize, avoiding a redundant barrier on other streams.
+        hipStreamSynchronize(nullptr);
         hipMemcpy(out_value, bufs.value_ptr, sizeof(float), hipMemcpyDeviceToHost);
         hipMemcpy(out_index, bufs.index_ptr, sizeof(int), hipMemcpyDeviceToHost);
 
@@ -317,8 +320,8 @@ namespace llaminar2
             return false;
         }
 
-        // Sync and D2H the result (k * 8 bytes total)
-        hipDeviceSynchronize();
+        // Sync the default stream and D2H the result (k * 8 bytes total)
+        hipStreamSynchronize(nullptr);
         hipMemcpy(out_values, bufs.values_ptr, k * sizeof(float), hipMemcpyDeviceToHost);
         hipMemcpy(out_indices, bufs.indices_ptr, k * sizeof(int), hipMemcpyDeviceToHost);
 

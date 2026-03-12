@@ -234,6 +234,18 @@ namespace llaminar2
          */
         virtual void synchronizeEvent(void *event) = 0;
 
+        /**
+         * @brief Compute elapsed time in milliseconds between two recorded events
+         * @param start Event recorded before the operation
+         * @param stop Event recorded after the operation
+         * @return Elapsed time in milliseconds, or -1.0f on error
+         * @thread_safety Must be called from worker thread after both events have completed
+         *
+         * @note Both events must have been recorded on the same device.
+         *       The stop event must have completed (synchronize first).
+         */
+        virtual float eventElapsedTime(void *start, void *stop) = 0;
+
         // =========================================================================
         // Library Handles (worker-thread-only)
         // =========================================================================

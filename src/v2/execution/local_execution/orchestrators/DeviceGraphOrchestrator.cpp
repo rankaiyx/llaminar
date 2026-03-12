@@ -821,40 +821,55 @@ namespace llaminar2
 
             bool success;
             const bool has_collective_nodes = !forward_cache.collective_nodes.empty();
-            const auto capture_policy = buildDecodeCapturePolicy(
-                has_collective_nodes,
-                ctx,
-                forward_cache.segment_cache.consecutive_failures);
-            if (capture_policy.collective_segmented_enabled)
-            {
-                LOG_INFO("[DeviceGraphOrchestrator] Experimental collective segmented GPU-graph replay enabled");
-            }
 
-            if (capture_policy.allow_segmented_capture && !forward_cache.gpu_stream)
-            {
-                DeviceId dev_id = ctx->deviceId();
-                if (dev_id.is_gpu())
-                {
-                    auto &pool = GPUDeviceContextPool::instance();
-                    IWorkerGPUContext &gpu_ctx = pool.getContext(dev_id);
-                    forward_cache.gpu_stream = gpu_ctx.defaultStream();
-                    forward_cache.gpu_ctx = &gpu_ctx;
-                }
-            }
-
+            // Graph capture (segmented/monolithic) is only beneficial for decode
+            // graphs (seq_len=1) where the same fixed-shape graph replays thousands
+            // of times. For prefill (seq_len>1), graph capture adds ~550ms one-shot
+            // overhead (HIP graph capture + instantiation) that is never amortized
+            // because prefill shapes change per prompt. Use executeFastDecode directly.
             bool used_segmented_capture = false;
 
             auto exec_t0 = std::chrono::high_resolution_clock::now();
 
-            success = executor_.executeDecodeWithCapturePolicy(
-                *forward_cache.graph,
-                ctx,
-                &forward_cache.segment_cache,
-                forward_cache.gpu_stream,
-                forward_cache.gpu_ctx,
-                &forward_cache.collective_nodes,
-                capture_policy,
-                &used_segmented_capture);
+            if (!is_decode)
+            {
+                // Prefill: fast path without graph capture overhead
+                success = executor_.executeFastDecode(
+                    *forward_cache.graph, ctx, &forward_cache.collective_nodes);
+            }
+            else
+            {
+                const auto capture_policy = buildDecodeCapturePolicy(
+                    has_collective_nodes,
+                    ctx,
+                    forward_cache.segment_cache.consecutive_failures);
+                if (capture_policy.collective_segmented_enabled)
+                {
+                    LOG_INFO("[DeviceGraphOrchestrator] Experimental collective segmented GPU-graph replay enabled");
+                }
+
+                if (capture_policy.allow_segmented_capture && !forward_cache.gpu_stream)
+                {
+                    DeviceId dev_id = ctx->deviceId();
+                    if (dev_id.is_gpu())
+                    {
+                        auto &pool = GPUDeviceContextPool::instance();
+                        IWorkerGPUContext &gpu_ctx = pool.getContext(dev_id);
+                        forward_cache.gpu_stream = gpu_ctx.defaultStream();
+                        forward_cache.gpu_ctx = &gpu_ctx;
+                    }
+                }
+
+                success = executor_.executeDecodeWithCapturePolicy(
+                    *forward_cache.graph,
+                    ctx,
+                    &forward_cache.segment_cache,
+                    forward_cache.gpu_stream,
+                    forward_cache.gpu_ctx,
+                    &forward_cache.collective_nodes,
+                    capture_policy,
+                    &used_segmented_capture);
+            }
 
             auto exec_t1 = std::chrono::high_resolution_clock::now();
 
@@ -878,7 +893,41 @@ namespace llaminar2
             // when the sampler reads logits.
             if (success)
             {
-                syncLogitsAtBoundary(ctx);
+                if (forward_cache.phase3_active)
+                {
+                    // Phase 3 replay already synchronized both capture_stream
+                    // and defaultStream at the end of executeReplayPhase().
+                    // Skip the redundant device-wide hipDeviceSynchronize and
+                    // just mark the mapped logits as host-visible.
+                    if (state_.logits && state_.logits->isMapped())
+                    {
+                        state_.logits->markMappedSynced();
+                    }
+                }
+                else
+                {
+                    syncLogitsAtBoundary(ctx);
+                }
+
+                // Stage timeline: GPU is now synced, collect and print event timings
+                if (debugEnv().gpu_stage_timing && ctx->deviceId().is_gpu())
+                {
+                    auto &timeline = executor_.stageTimeline();
+                    auto &pool = GPUDeviceContextPool::instance();
+                    IWorkerGPUContext &gpu_ctx = pool.getContext(ctx->deviceId());
+                    timeline.collect(&gpu_ctx);
+                    double wall_ms = std::chrono::duration<double, std::milli>(
+                                         std::chrono::high_resolution_clock::now() - start)
+                                         .count();
+                    const char *phase = is_decode ? "DECODE" : "PREFILL";
+                    int tokens = is_decode ? 1 : (input.batch_size * input.seq_len);
+                    std::string dev_str = ctx->deviceId().toString();
+                    const char *dev_name = dev_str.c_str();
+                    timeline.printSummary(phase, tokens, wall_ms, dev_name);
+                    if (debugEnv().gpu_stage_timing_detail)
+                        timeline.printDetailedTimeline(phase, dev_name);
+                    timeline.resetTimings();
+                }
             }
 
             auto end = std::chrono::high_resolution_clock::now();
@@ -1080,6 +1129,28 @@ namespace llaminar2
             if (sync_ctx)
             {
                 syncLogitsAtBoundary(sync_ctx);
+            }
+
+            // GPU stage timing for cache-miss path
+            if (debugEnv().gpu_stage_timing && input.device.is_gpu())
+            {
+                auto &timeline = executor_.stageTimeline();
+                if (timeline.isInitialized())
+                {
+                    auto &pool = GPUDeviceContextPool::instance();
+                    IWorkerGPUContext &gpu_ctx = pool.getContext(input.device);
+                    timeline.collect(&gpu_ctx);
+                    double wall_ms = std::chrono::duration<double, std::milli>(
+                                         std::chrono::high_resolution_clock::now() - start)
+                                         .count();
+                    const char *phase = is_decode ? "DECODE" : "PREFILL";
+                    int tokens = is_decode ? 1 : (input.batch_size * input.seq_len);
+                    std::string dev_str = input.device.toString();
+                    timeline.printSummary(phase, tokens, wall_ms, dev_str.c_str());
+                    if (debugEnv().gpu_stage_timing_detail)
+                        timeline.printDetailedTimeline(phase, dev_str.c_str());
+                    timeline.resetTimings();
+                }
             }
         }
 

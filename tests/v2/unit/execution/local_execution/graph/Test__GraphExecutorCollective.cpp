@@ -61,6 +61,7 @@ namespace
         void recordEvent(void * /*event*/, void * /*stream*/) override {}
         void waitEvent(void * /*event*/, void * /*stream*/) override {}
         void synchronizeEvent(void * /*event*/) override {}
+        float eventElapsedTime(void * /*start*/, void * /*stop*/) override { return 0.0f; }
 
         void *blasHandle() override { return reinterpret_cast<void *>(0x11111111); }
         void *blasLtHandle() override { return reinterpret_cast<void *>(0x22222222); }

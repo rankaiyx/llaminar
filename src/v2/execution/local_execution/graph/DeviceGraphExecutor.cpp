@@ -282,8 +282,26 @@ namespace llaminar2
         table.column(2).set_cell_text_align(fort::text_align::right);
         table.column(3).set_cell_text_align(fort::text_align::right);
 
-        // Kernel execution
+        // Kernel execution (total)
         table << "Kernel Execution" << fmt(total_execute_ms, 2) << per_tok(total_execute_ms) << pct(total_execute_ms) << fort::endr;
+
+        // Collective vs Compute breakdown (only when there are collectives)
+        if (total_collective_calls > 0)
+        {
+            double compute_ms = total_execute_ms - total_collective_ms;
+            double avg_collective_us = total_collective_calls > 0
+                                           ? (total_collective_ms / total_collective_calls) * 1000.0
+                                           : 0.0;
+
+            table << "  Compute (kernels)" << fmt(compute_ms, 2) << per_tok(compute_ms) << pct(compute_ms) << fort::endr;
+
+            {
+                std::ostringstream label;
+                label << "  Collective (" << total_collective_calls << " calls, "
+                      << fmt(avg_collective_us, 1) << " us avg)";
+                table << label.str() << fmt(total_collective_ms, 2) << per_tok(total_collective_ms) << pct(total_collective_ms) << fort::endr;
+            }
+        }
 
         if (!stage_type_execute_ms.empty())
         {
@@ -352,6 +370,20 @@ namespace llaminar2
             oss << "Kernel Efficiency: " << fmt(efficiency, 1) << "%  (higher = less overhead)";
             if (decode_tokens > 0)
                 oss << "  |  Overhead per token: " << fmt(overhead_per_token, 3) << " ms";
+            table << oss.str() << "" << "" << "" << fort::endr;
+            table[table.row_count() - 1][0].set_cell_span(4);
+        }
+
+        // Compute-only efficiency (excluding collective wait time)
+        if (total_collective_calls > 0)
+        {
+            double compute_ms = total_execute_ms - total_collective_ms;
+            double compute_efficiency = total_all > 0 ? (compute_ms / total_all) * 100.0 : 0;
+            std::ostringstream oss;
+            oss << "Compute Efficiency: " << fmt(compute_efficiency, 1)
+                << "%  (excluding " << fmt(total_collective_ms, 1) << " ms collective wait)";
+            if (decode_tokens > 0)
+                oss << "  |  Collective per token: " << fmt(total_collective_ms / decode_tokens, 3) << " ms";
             table << oss.str() << "" << "" << "" << fort::endr;
             table[table.row_count() - 1][0].set_cell_span(4);
         }
@@ -738,6 +770,26 @@ namespace llaminar2
         const bool multi_gpu_sync = collective_ctx_ && ctx->isGPU();
         [[maybe_unused]] const int device_ordinal = ctx->isGPU() ? ctx->deviceId().toKernelDeviceIndex() : -1;
 
+        // GPU stage timing instrumentation for cache-miss path
+        const bool timeline_active = debugEnv().gpu_stage_timing && ctx->isGPU();
+        IWorkerGPUContext *timeline_gpu_ctx = nullptr;
+        void *timeline_stream = nullptr;
+        if (timeline_active)
+        {
+            timeline_gpu_ctx = tryGetWorkerContext(ctx->deviceId());
+            if (timeline_gpu_ctx)
+            {
+                timeline_stream = timeline_gpu_ctx->defaultStream();
+                stage_timeline_.ensureCapacity(timeline_gpu_ctx, order.size());
+                for (size_t i = 0; i < order.size(); ++i)
+                {
+                    auto *nd = graph.getNode(order[i]);
+                    if (nd && nd->stage)
+                        stage_timeline_.setStageInfo(i, order[i].c_str(), nd->stage->type());
+                }
+            }
+        }
+
         auto total_start = std::chrono::high_resolution_clock::now();
 
         int stage_idx = 0;
@@ -785,11 +837,17 @@ namespace llaminar2
                     check_ptr("weight", w.name, const_cast<ITensor *>(w.tensor));
             }
 
+            if (timeline_active && timeline_gpu_ctx)
+                stage_timeline_.recordStart(stage_idx, timeline_gpu_ctx, timeline_stream);
+
             if (!executeNode(*node, ctx))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << name);
                 return false;
             }
+
+            if (timeline_active && timeline_gpu_ctx)
+                stage_timeline_.recordStop(stage_idx, timeline_gpu_ctx, timeline_stream);
 
             auto stage_end = std::chrono::high_resolution_clock::now();
             double stage_ms = std::chrono::duration<double, std::milli>(stage_end - stage_start).count();
@@ -838,6 +896,34 @@ namespace llaminar2
         const bool profile_full_node_path = config_.enable_profiling;
 
         // =====================================================================
+        // GPU Stage Timing: event-based per-stage profiling on the fast path.
+        // Gated by LLAMINAR_GPU_STAGE_TIMING=1. ~1μs CPU overhead per event record.
+        // =====================================================================
+        const bool timeline_enabled = debugEnv().gpu_stage_timing && ctx->isGPU();
+        IWorkerGPUContext *timeline_gpu_ctx = nullptr;
+        void *timeline_stream = nullptr;
+        if (timeline_enabled)
+        {
+            timeline_gpu_ctx = tryGetWorkerContext(ctx->deviceId());
+            if (timeline_gpu_ctx)
+            {
+                timeline_stream = timeline_gpu_ctx->defaultStream();
+                stage_timeline_.ensureCapacity(timeline_gpu_ctx, order.size());
+
+                // Pre-populate stage metadata
+                for (size_t i = 0; i < order.size(); ++i)
+                {
+                    auto *node = graph.getNode(order[i]);
+                    if (node && node->stage)
+                    {
+                        stage_timeline_.setStageInfo(i, order[i], node->stage->type());
+                    }
+                }
+            }
+        }
+        size_t timeline_idx = 0;
+
+        // =====================================================================
         // Mark the last stage as needing event-based dirty marking (same
         // rationale as executeSequential — see comment there).
         // =====================================================================
@@ -867,27 +953,6 @@ namespace llaminar2
             // No-op: coordinator handles collective→compute sync via host-side stream sync
         };
 
-        bool collective_graph = (collective_nodes && !collective_nodes->empty());
-        if (!collective_graph)
-        {
-            for (const auto &name : order)
-            {
-                auto *node = graph.getNode(name);
-                if (!node || !node->stage)
-                {
-                    continue;
-                }
-                const auto t = node->stage->type();
-                if (t == ComputeStageType::ALLREDUCE ||
-                    t == ComputeStageType::ALLGATHER ||
-                    t == ComputeStageType::ALLGATHER_V)
-                {
-                    collective_graph = true;
-                    break;
-                }
-            }
-        }
-
         for (const auto &name : order)
         {
             auto *node = graph.getNode(name);
@@ -906,6 +971,13 @@ namespace llaminar2
             const bool is_collective_node =
                 (collective_nodes ? collective_nodes->count(name) > 0 : is_collective_type);
 
+            // Timeline: record start event before any execution path
+            const size_t cur_tl_idx = timeline_idx++;
+            if (timeline_enabled && timeline_gpu_ctx)
+            {
+                stage_timeline_.recordStart(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
+            }
+
             // Profiling mode: always route through executeNode() so stage timing,
             // coherence overhead, transfer attribution, and callbacks are captured.
             // Fast-path bypass remains unchanged when profiling is disabled.
@@ -918,6 +990,8 @@ namespace llaminar2
                     return false;
                 }
                 post_stage_sync();
+                if (timeline_enabled && timeline_gpu_ctx)
+                    stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
                 graph.markCompleted(name);
                 continue;
             }
@@ -934,6 +1008,8 @@ namespace llaminar2
                         return false;
                     }
                     post_stage_sync();
+                    if (timeline_enabled && timeline_gpu_ctx)
+                        stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
                     graph.markCompleted(name);
                     continue;
                 }
@@ -944,43 +1020,41 @@ namespace llaminar2
                     if (executeCollectiveStridedAllgather(*node, ctx))
                     {
                         post_stage_sync();
+                        if (timeline_enabled && timeline_gpu_ctx)
+                            stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
                         graph.markCompleted(name);
                         continue;
                     }
                     post_stage_sync();
                 }
 
-                // Collective-aware safe fallback:
-                // Route collective stages through executeNode() so they use the normal
-                // coherence/intercept path instead of raw stage->execute().
+                // LOCAL TP fast path: When collective_ctx_ is nullptr (LOCAL TP),
+                // the stage itself handles the collective via its ITPContext
+                // (e.g., TPAllreduceStage → LocalTPContext → RCCL on-stream).
+                // Bypass executeNode() to eliminate the CPU-side overhead of
+                // contract construction, arena coherence, getDumpInfo() etc.
+                // that creates a GPU pipeline bubble between compute and collective.
+                // This matches the non-collective fast path below.
                 pre_stage_sync();
-                if (!executeNode(*node, ctx))
+                ensureStageGPUStreamBound(*node, ctx);
+                if (!node->stage->execute(ctx))
                 {
-                    LOG_ERROR("[DeviceGraphExecutor] Fast decode collective stage fallback failed: " << name);
+                    LOG_ERROR("[DeviceGraphExecutor] Fast decode collective stage failed: " << name);
                     return false;
                 }
                 post_stage_sync();
+                if (timeline_enabled && timeline_gpu_ctx)
+                    stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
                 graph.markCompleted(name);
                 continue;
             }
 
-            if (collective_graph)
-            {
-                // Collective graph safety mode:
-                // keep fast topological traversal, but execute nodes through the
-                // normal node path to preserve coherence/intercept semantics.
-                pre_stage_sync();
-                if (!executeNode(*node, ctx))
-                {
-                    LOG_ERROR("[DeviceGraphExecutor] Fast decode collective-graph node failed: " << name);
-                    return false;
-                }
-                post_stage_sync();
-                graph.markCompleted(name);
-                continue;
-            }
-
-            // Non-collective graph: maximal fast path
+            // Maximal fast path for non-collective stages (both single-GPU and TP graphs).
+            // All collective stages are already handled above by the is_collective_node checks.
+            // In steady-state decode, arena buffers are already on-device and weights are
+            // cohered, so the full executeNode() path (contract building, arena coherence
+            // checks, vector allocations) is unnecessary overhead. In TP=2 this overhead
+            // is amplified by thread contention on the heap allocator.
             pre_stage_sync();
             if (!node->stage->execute(ctx))
             {
@@ -988,6 +1062,8 @@ namespace llaminar2
                 return false;
             }
             post_stage_sync();
+            if (timeline_enabled && timeline_gpu_ctx)
+                stage_timeline_.recordStop(cur_tl_idx, timeline_gpu_ctx, timeline_stream);
 
             graph.markCompleted(name);
         }
@@ -2178,6 +2254,27 @@ namespace llaminar2
             stats_.stage_type_execute_ms[stage_type_name] += execute_ms;
             stats_.stage_type_counts[stage_type_name]++;
 
+            // Track collective time separately (for stages that went through
+            // stage->execute() rather than the executeCollectiveAllreduce intercept,
+            // e.g. local TP where collective_ctx_ is null)
+            const auto stype = node.stage->type();
+            if (stype == ComputeStageType::ALLREDUCE ||
+                stype == ComputeStageType::ALLGATHER ||
+                stype == ComputeStageType::ALLGATHER_V)
+            {
+                stats_.total_collective_ms += execute_ms;
+                stats_.total_collective_calls++;
+
+                if (KernelProfiler::isEnabled())
+                {
+                    auto ktype = (stype == ComputeStageType::ALLREDUCE)
+                                     ? KernelType::ALLREDUCE
+                                     : KernelType::ALLGATHER;
+                    uint64_t ns = static_cast<uint64_t>(execute_ms * 1'000'000.0);
+                    KernelProfiler::record(ktype, ns);
+                }
+            }
+
             // Accumulate overhead breakdown
             stats_.overhead.input_cohere_ms += input_cohere_ms;
             stats_.overhead.weight_cohere_ms += weight_cohere_ms;
@@ -2723,11 +2820,20 @@ namespace llaminar2
         {
             stats_.stage_times_ms[node.name] = ms;
             stats_.total_execute_ms += ms;
+            stats_.total_collective_ms += ms;
+            stats_.total_collective_calls++;
             stats_.total_stages_executed++;
             const std::string stage_type_name = computeStageTypeName(node.stage->type());
             stats_.stage_type_execute_ms[stage_type_name] += ms;
             stats_.stage_type_counts[stage_type_name]++;
             LOG_DEBUG("[DeviceGraphExecutor] ALLREDUCE '" << node.name << "' via CollectiveContext took " << ms << " ms");
+        }
+
+        // Record to KernelProfiler so allreduce appears in kernel timing summaries
+        if (KernelProfiler::isEnabled())
+        {
+            uint64_t ns = static_cast<uint64_t>(ms * 1'000'000.0);
+            KernelProfiler::record(KernelType::ALLREDUCE, ns);
         }
 
         if (!success)
@@ -2821,11 +2927,20 @@ namespace llaminar2
         {
             stats_.stage_times_ms[node.name] = ms;
             stats_.total_execute_ms += ms;
+            stats_.total_collective_ms += ms;
+            stats_.total_collective_calls++;
             stats_.total_stages_executed++;
             const std::string stage_type_name = computeStageTypeName(node.stage->type());
             stats_.stage_type_execute_ms[stage_type_name] += ms;
             stats_.stage_type_counts[stage_type_name]++;
             LOG_DEBUG("[DeviceGraphExecutor] ALLGATHER '" << node.name << "' via CollectiveContext took " << ms << " ms");
+        }
+
+        // Record to KernelProfiler so allgather appears in kernel timing summaries
+        if (KernelProfiler::isEnabled())
+        {
+            uint64_t ns = static_cast<uint64_t>(ms * 1'000'000.0);
+            KernelProfiler::record(KernelType::ALLGATHER, ns);
         }
 
         if (!success)
@@ -2892,10 +3007,18 @@ namespace llaminar2
             {
                 stats_.stage_times_ms[node.name] = ms;
                 stats_.total_execute_ms += ms;
+                stats_.total_collective_ms += ms;
+                stats_.total_collective_calls++;
                 stats_.total_stages_executed++;
                 const std::string stage_type_name = computeStageTypeName(node.stage->type());
                 stats_.stage_type_execute_ms[stage_type_name] += ms;
                 stats_.stage_type_counts[stage_type_name]++;
+            }
+            // Record to KernelProfiler so strided allgather appears in kernel timing summaries
+            if (KernelProfiler::isEnabled())
+            {
+                uint64_t ns = static_cast<uint64_t>(ms * 1'000'000.0);
+                KernelProfiler::record(KernelType::ALLGATHER, ns);
             }
             LOG_DEBUG("[DeviceGraphExecutor] Strided ALLGATHER '" << node.name << "' via NCCL took " << ms << " ms");
         }

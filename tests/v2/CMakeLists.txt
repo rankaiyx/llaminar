@@ -8153,6 +8153,79 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm GEMV kernel performance benchmarks")
 
+    # Performance Test: ROCm TP Scaling Analysis
+    # Benchmarks GEMV (decode M=1) and GEMM (prefill) at TP-sharded dimensions
+    # for 2-way and 4-way tensor parallelism to identify dispatch/tiling regressions
+    add_executable(v2_perf_rocm_tp_scaling
+        performance/kernels/rocm/Perf__ROCmTPScaling.cpp
+    )
+    target_link_libraries(v2_perf_rocm_tp_scaling
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmTPScaling
+        COMMAND $<TARGET_FILE:v2_perf_rocm_tp_scaling>
+        LABELS "V2;Performance;ROCm;GEMV;GEMM;INT8;TP;Scaling;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm TP scaling performance analysis")
+
+    # Performance Test: ROCm Flash Attention Decode — TP-sliced head count sweep
+    # Measures flash decoding latency and CU occupancy across TP=1/2/4 head counts.
+    # Includes split-K sweep to find optimal parallelism for low-head scenarios.
+    add_executable(v2_perf_rocm_flash_attention_decode
+        performance/kernels/rocm/Perf__ROCmFlashAttentionDecode.cpp
+    )
+    target_link_libraries(v2_perf_rocm_flash_attention_decode
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmFlashAttentionDecode
+        COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_decode>
+        LABELS "V2;Performance;ROCm;Attention;FlashAttention;FlashDecode;TP;Scaling;SplitK;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Flash Attention decode TP scaling benchmarks")
+
+    # Performance Test: ROCm Flash Attention Prefill — tile_q, KV type, and TP scaling sweep
+    # Measures prefill attention latency across tile_q={16,32,64}, KV types (FP32/FP16/Q8_1),
+    # and TP head count configurations. Unlike decode, prefill has no split-K; occupancy
+    # comes from n_heads × num_q_tiles.
+    add_executable(v2_perf_rocm_flash_attention_prefill
+        performance/kernels/rocm/Perf__ROCmFlashAttentionPrefill.cpp
+    )
+    target_link_libraries(v2_perf_rocm_flash_attention_prefill
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmFlashAttentionPrefill
+        COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
+        LABELS "V2;Performance;ROCm;Attention;FlashAttention;Prefill;TP;Scaling;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Flash Attention prefill TP scaling benchmarks")
+
+    # Performance Test: ROCm GEMV KB Scaling — KB (K-parallel split) sweep for decode GEMV
+    # Measures INT8 VNNI GEMV latency across forced KB values and TP-derived N sizes.
+    # Used to tune select_blockwise_qwo_outer_splits heuristic for TP configurations.
+    add_executable(v2_perf_rocm_gemv_kb_scaling
+        performance/kernels/rocm/Perf__ROCmGemvKBScaling.cpp
+    )
+    target_link_libraries(v2_perf_rocm_gemv_kb_scaling
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Perf_ROCmGemvKBScaling
+        COMMAND $<TARGET_FILE:v2_perf_rocm_gemv_kb_scaling>
+        LABELS "V2;Performance;ROCm;GEMV;INT8;VNNI;KB;SplitK;TP;Scaling;Benchmark"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm GEMV KB scaling benchmarks")
+
     # Performance Test: ROCm IQ4_NL Decode Microbenchmark
     # Isolates IQ4_NL decode+dot strategy costs to compare kernel approach variants.
     set_source_files_properties(

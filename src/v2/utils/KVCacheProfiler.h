@@ -108,6 +108,11 @@ namespace llaminar2
             current_phase() = phase;
         }
 
+        /**
+         * @brief Get the current inference phase (for propagation to worker threads)
+         */
+        static Phase getCurrentPhase() { return current_phase(); }
+
         static void clearCurrentPhase()
         {
             current_phase() = Phase::UNKNOWN;

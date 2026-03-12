@@ -1171,6 +1171,7 @@ add_library(llaminar2_core STATIC
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
     execution/local_execution/graph/DeviceGraphExecutor.cpp
     execution/local_execution/graph/DeviceGraphBufferManager.cpp
+    execution/local_execution/graph/StageTimeline.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
     execution/local_execution/graph/LivenessAnalyzer.cpp

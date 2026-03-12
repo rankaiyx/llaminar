@@ -656,7 +656,9 @@ namespace llaminar2
             return false;
         }
 
-        cudaDeviceSynchronize();
+        // Sync only the default stream (where the kernel launched) instead
+        // of device-wide cudaDeviceSynchronize to avoid stalling other streams.
+        cudaStreamSynchronize(nullptr);
         cudaMemcpy(out_value, bufs.value_ptr, sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(out_index, bufs.index_ptr, sizeof(int), cudaMemcpyDeviceToHost);
 
@@ -714,7 +716,7 @@ namespace llaminar2
             return false;
         }
 
-        cudaDeviceSynchronize();
+        cudaStreamSynchronize(nullptr);
         cudaMemcpy(out_values, bufs.values_ptr, k * sizeof(float), cudaMemcpyDeviceToHost);
         cudaMemcpy(out_indices, bufs.indices_ptr, k * sizeof(int), cudaMemcpyDeviceToHost);
 

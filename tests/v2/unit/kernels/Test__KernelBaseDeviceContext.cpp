@@ -64,6 +64,7 @@ public:
     void recordEvent(void * /*event*/, void * /*stream*/) override {}
     void waitEvent(void * /*event*/, void * /*stream*/) override {}
     void synchronizeEvent(void * /*event*/) override {}
+    float eventElapsedTime(void * /*start*/, void * /*stop*/) override { return 0.0f; }
 
     // Library Handles - return mock pointers
     void *blasHandle() override { return mock_blas_handle_; }

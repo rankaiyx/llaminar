@@ -502,6 +502,26 @@ namespace llaminar2
         CUDA_CHECK_VOID(cudaEventSynchronize(cuda_event));
     }
 
+    float NvidiaDeviceContext::eventElapsedTime(void *start, void *stop)
+    {
+        if (!start || !stop)
+        {
+            LOG_WARN("[NvidiaDeviceContext] eventElapsedTime called with null event");
+            return -1.0f;
+        }
+
+        cudaEvent_t cuda_start = static_cast<cudaEvent_t>(start);
+        cudaEvent_t cuda_stop = static_cast<cudaEvent_t>(stop);
+        float ms = 0.0f;
+        cudaError_t err = cudaEventElapsedTime(&ms, cuda_start, cuda_stop);
+        if (err != cudaSuccess)
+        {
+            LOG_WARN("[NvidiaDeviceContext] cudaEventElapsedTime failed: " << cudaGetErrorString(err));
+            return -1.0f;
+        }
+        return ms;
+    }
+
     // ============================================================================
     // Library Handles (Worker-Thread-Only)
     // ============================================================================

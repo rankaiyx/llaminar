@@ -1,0 +1,899 @@
+/**
+ * @file Perf__ROCmFlashAttentionPrefill.cpp
+ * @brief Performance benchmarks for ROCm Flash Attention prefill kernel
+ *
+ * Measures prefill attention latency across configurations that mirror
+ * tensor-parallel slicing scenarios (TP=1, TP=2, TP=4).
+ *
+ * **Tuning Vectors**:
+ * - tile_q: 16, 32, 64 (via LLAMINAR_FA2_COOPERATIVE_TILE_Q env override)
+ * - KV type: FP32, FP16 (fdot2), Q8_1 (inline dequant)
+ * - n_heads: TP-sliced head counts
+ * - seq_len: 128, 256, 512, 1024 (typical prefill lengths)
+ *
+ * **Key insight**: Unlike decode (split-K), the prefill kernel has NO KV splitting.
+ * Grid = (n_heads, num_q_tiles, batch). Occupancy comes from q-tiles × heads.
+ * At TP=2 with Qwen-7B (14 heads), shorter seq_len may under-saturate CUs.
+ *
+ * @date June 2026
+ */
+
+#include <gtest/gtest.h>
+
+#ifdef HAVE_ROCM
+#include <hip/hip_runtime.h>
+#endif
+
+#include <vector>
+#include <cmath>
+#include <random>
+#include <algorithm>
+#include <numeric>
+#include <string>
+#include <cstdio>
+#include <cstdlib>
+
+#include "fort.hpp"
+
+// Extern C wrappers from ROCmFlashAttentionKernels.hip
+extern "C"
+{
+    int hipFlashAttn_prefill_fa2(
+        const float *Q, const float *K, const float *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const void *device_params,
+        const float *mask,
+        void *stream);
+
+    int hipFlashAttn_prefill_fa2_fp16(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const void *device_params,
+        const float *mask,
+        void *stream);
+
+    int hipFlashAttn_prefill_fa2_q8_1(
+        const float *Q, const void *K, const void *V, float *O,
+        int batch_size, int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int window_size, int position_offset,
+        const void *device_params,
+        const float *mask,
+        void *stream);
+}
+
+namespace
+{
+
+    // ============================================================================
+    // Constants
+    // ============================================================================
+
+    constexpr int WARMUP_ITERS = 10;
+    constexpr int BENCH_ITERS = 50;
+
+    // Q8_1Block layout: 36 bytes per 32 elements
+    constexpr int Q8_1_BLOCK_SIZE = 32;
+    constexpr int Q8_1_BLOCK_BYTES = 36;
+
+    // ============================================================================
+    // Model configurations
+    // ============================================================================
+
+    struct ModelConfig
+    {
+        const char *name;
+        int n_heads;
+        int n_kv_heads;
+        int head_dim;
+    };
+
+    static constexpr ModelConfig kQwen05B = {"Qwen2.5-0.5B", 14, 2, 64};
+    static constexpr ModelConfig kQwen3B = {"Qwen2.5-3B", 16, 2, 128};
+    static constexpr ModelConfig kQwen7B = {"Qwen2.5-7B", 28, 4, 128};
+    static constexpr ModelConfig kQwen14B = {"Qwen2.5-14B", 40, 8, 128};
+    static constexpr ModelConfig kQwen32B = {"Qwen2.5-32B", 40, 8, 128};
+
+    static constexpr ModelConfig kAllModels[] = {
+        kQwen05B, kQwen3B, kQwen7B, kQwen14B, kQwen32B};
+
+    // ============================================================================
+    // KV type enumeration
+    // ============================================================================
+
+    enum class KVType
+    {
+        FP32,
+        FP16,
+        Q8_1
+    };
+
+    const char *kvTypeName(KVType t)
+    {
+        switch (t)
+        {
+        case KVType::FP32:
+            return "FP32";
+        case KVType::FP16:
+            return "FP16";
+        case KVType::Q8_1:
+            return "Q8_1";
+        }
+        return "?";
+    }
+
+    // ============================================================================
+    // TP shape derivation
+    // ============================================================================
+
+    struct TPConfig
+    {
+        const char *label;
+        int tp_degree;
+        int n_heads;
+        int n_kv_heads;
+        int head_dim;
+    };
+
+    static std::vector<TPConfig> getTPConfigs(const ModelConfig &model, const std::vector<int> &tp_degrees)
+    {
+        std::vector<TPConfig> configs;
+        for (int tp : tp_degrees)
+        {
+            int local_heads = model.n_heads / tp;
+            int local_kv_heads = std::max(1, model.n_kv_heads / tp);
+            if (local_heads < 1)
+                continue;
+
+            char label[64];
+            snprintf(label, sizeof(label), "TP=%d (%dh/%dkv)", tp, local_heads, local_kv_heads);
+            configs.push_back({strdup(label), tp, local_heads, local_kv_heads, model.head_dim});
+        }
+        return configs;
+    }
+
+    // ============================================================================
+    // Benchmark result
+    // ============================================================================
+
+    struct PrefillResult
+    {
+        double median_us;
+        double min_us;
+        double max_us;
+        bool success;
+    };
+
+    // ============================================================================
+    // Test fixture
+    // ============================================================================
+
+    class ROCmFlashAttentionPrefillPerf : public ::testing::Test
+    {
+    protected:
+        int device_id_ = 0;
+        int num_cus_ = 0;
+        std::string device_name_;
+        bool has_device_ = false;
+
+        void SetUp() override
+        {
+#ifdef HAVE_ROCM
+            int count = 0;
+            hipError_t err = hipGetDeviceCount(&count);
+            has_device_ = (err == hipSuccess && count > 0);
+            if (has_device_)
+            {
+                hipSetDevice(device_id_);
+                hipDeviceProp_t props;
+                hipGetDeviceProperties(&props, device_id_);
+                device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
+                num_cus_ = props.multiProcessorCount;
+            }
+#endif
+        }
+
+        // =========================================================================
+        // Core benchmark: runs flash prefill with specified tile_q and KV type
+        // =========================================================================
+        PrefillResult benchmarkPrefill(
+            int n_heads, int n_kv_heads, int head_dim,
+            int seq_len, int kv_len,
+            int tile_q, KVType kv_type)
+        {
+            PrefillResult result{};
+#ifndef HAVE_ROCM
+            return result;
+#else
+            const int batch_size = 1;
+            const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+            const size_t out_size = q_size;
+
+            // KV size depends on type
+            const size_t kv_elements = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+            size_t k_bytes = 0, v_bytes = 0;
+            switch (kv_type)
+            {
+            case KVType::FP32:
+                k_bytes = kv_elements * sizeof(float);
+                v_bytes = kv_elements * sizeof(float);
+                break;
+            case KVType::FP16:
+                k_bytes = kv_elements * sizeof(uint16_t);
+                v_bytes = kv_elements * sizeof(uint16_t);
+                break;
+            case KVType::Q8_1:
+            {
+                // Q8_1: 36 bytes per 32 elements
+                size_t blocks_per_row = (head_dim + Q8_1_BLOCK_SIZE - 1) / Q8_1_BLOCK_SIZE;
+                size_t total_blocks = static_cast<size_t>(kv_len) * n_kv_heads * blocks_per_row;
+                k_bytes = total_blocks * Q8_1_BLOCK_BYTES;
+                v_bytes = total_blocks * Q8_1_BLOCK_BYTES;
+                break;
+            }
+            }
+
+            // Allocate device memory
+            float *d_Q = nullptr, *d_O = nullptr;
+            void *d_K = nullptr, *d_V = nullptr;
+
+            hipMalloc(&d_Q, q_size * sizeof(float));
+            hipMalloc(&d_K, k_bytes);
+            hipMalloc(&d_V, v_bytes);
+            hipMalloc(&d_O, out_size * sizeof(float));
+
+            // Initialize Q with random data
+            {
+                std::vector<float> h_Q(q_size);
+                std::mt19937 rng(42);
+                std::normal_distribution<float> dist(0.0f, 0.1f);
+                for (auto &v : h_Q)
+                    v = dist(rng);
+                hipMemcpy(d_Q, h_Q.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+            }
+
+            // Initialize KV with random data (appropriate format)
+            if (kv_type == KVType::FP32)
+            {
+                std::vector<float> h_KV(kv_elements);
+                std::mt19937 rng(123);
+                std::normal_distribution<float> dist(0.0f, 0.1f);
+                for (auto &v : h_KV)
+                    v = dist(rng);
+                hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
+                for (auto &v : h_KV)
+                    v = dist(rng);
+                hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
+            }
+            else if (kv_type == KVType::FP16)
+            {
+                // Fill with random uint16_t (FP16 bit patterns)
+                std::vector<uint16_t> h_KV(kv_elements);
+                std::mt19937 rng(123);
+                // Generate small FP16 values: exponent=14 (bias-1), mantissa random
+                // This gives values in [-1, 1] range approximately
+                for (auto &v : h_KV)
+                {
+                    int sign = rng() & 1;
+                    int exp = 14; // bias=15, so this is 2^(14-15) = 0.5 range
+                    int mantissa = rng() & 0x3FF;
+                    v = static_cast<uint16_t>((sign << 15) | (exp << 10) | mantissa);
+                }
+                hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
+                for (auto &v : h_KV)
+                {
+                    int sign = rng() & 1;
+                    int exp = 14;
+                    int mantissa = rng() & 0x3FF;
+                    v = static_cast<uint16_t>((sign << 15) | (exp << 10) | mantissa);
+                }
+                hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
+            }
+            else
+            {
+                // Q8_1: fill with random block data
+                std::vector<uint8_t> h_KV(k_bytes);
+                std::mt19937 rng(123);
+                for (auto &v : h_KV)
+                    v = static_cast<uint8_t>(rng() & 0xFF);
+                hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
+                h_KV.resize(v_bytes);
+                for (auto &v : h_KV)
+                    v = static_cast<uint8_t>(rng() & 0xFF);
+                hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
+            }
+            hipDeviceSynchronize();
+
+            // Set tile_q override via environment variable
+            char tile_q_str[16];
+            snprintf(tile_q_str, sizeof(tile_q_str), "%d", tile_q);
+            setenv("LLAMINAR_FA2_COOPERATIVE_TILE_Q", tile_q_str, 1);
+
+            // Lambda to dispatch based on KV type
+            auto launch = [&]() -> int
+            {
+                switch (kv_type)
+                {
+                case KVType::FP32:
+                    return hipFlashAttn_prefill_fa2(
+                        d_Q, static_cast<float *>(d_K), static_cast<float *>(d_V), d_O,
+                        batch_size, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        /*causal=*/true, /*window_size=*/-1, /*position_offset=*/0,
+                        nullptr, nullptr, nullptr);
+                case KVType::FP16:
+                    return hipFlashAttn_prefill_fa2_fp16(
+                        d_Q, d_K, d_V, d_O,
+                        batch_size, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        /*causal=*/true, /*window_size=*/-1, /*position_offset=*/0,
+                        nullptr, nullptr, nullptr);
+                case KVType::Q8_1:
+                    return hipFlashAttn_prefill_fa2_q8_1(
+                        d_Q, d_K, d_V, d_O,
+                        batch_size, seq_len, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        /*causal=*/true, /*window_size=*/-1, /*position_offset=*/0,
+                        nullptr, nullptr, nullptr);
+                }
+                return -1;
+            };
+
+            // Warmup
+            for (int i = 0; i < WARMUP_ITERS; ++i)
+            {
+                int rc = launch();
+                if (rc != 0)
+                {
+                    result.success = false;
+                    goto cleanup;
+                }
+            }
+            hipDeviceSynchronize();
+
+            // Benchmark with HIP events
+            {
+                hipEvent_t ev_start, ev_stop;
+                hipEventCreate(&ev_start);
+                hipEventCreate(&ev_stop);
+
+                std::vector<double> times_us;
+                times_us.reserve(BENCH_ITERS);
+
+                for (int i = 0; i < BENCH_ITERS; ++i)
+                {
+                    hipDeviceSynchronize();
+                    hipEventRecord(ev_start, nullptr);
+
+                    int rc = launch();
+                    if (rc != 0)
+                    {
+                        result.success = false;
+                        (void)hipEventDestroy(ev_start);
+                        (void)hipEventDestroy(ev_stop);
+                        goto cleanup;
+                    }
+
+                    hipEventRecord(ev_stop, nullptr);
+                    hipEventSynchronize(ev_stop);
+
+                    float ms = 0.0f;
+                    hipEventElapsedTime(&ms, ev_start, ev_stop);
+                    times_us.push_back(static_cast<double>(ms) * 1000.0);
+                }
+
+                hipEventDestroy(ev_start);
+                hipEventDestroy(ev_stop);
+
+                std::sort(times_us.begin(), times_us.end());
+                result.min_us = times_us.front();
+                result.max_us = times_us.back();
+                result.median_us = times_us[times_us.size() / 2];
+                result.success = true;
+            }
+
+        cleanup:
+            unsetenv("LLAMINAR_FA2_COOPERATIVE_TILE_Q");
+            (void)hipFree(d_Q);
+            (void)hipFree(d_K);
+            (void)hipFree(d_V);
+            (void)hipFree(d_O);
+
+            return result;
+#endif
+        }
+
+        // =========================================================================
+        // Table 1: tile_q sweep for a given model, TP config, and KV type
+        // =========================================================================
+        void runTileQSweep(
+            const ModelConfig &model,
+            const std::vector<int> &seq_lengths,
+            const std::vector<int> &tp_degrees,
+            const std::vector<int> &tile_q_values,
+            KVType kv_type)
+        {
+#ifndef HAVE_ROCM
+            GTEST_SKIP() << "No ROCm support";
+#else
+            if (!has_device_)
+                GTEST_SKIP() << "No ROCm device";
+
+            auto tp_configs = getTPConfigs(model, tp_degrees);
+
+            // For each TP config, run tile_q sweep across seq_lengths
+            for (const auto &tc : tp_configs)
+            {
+                // [tile_q_idx][seq_idx]
+                struct Cell
+                {
+                    PrefillResult result;
+                };
+                std::vector<std::vector<Cell>> grid(tile_q_values.size());
+
+                for (size_t ti = 0; ti < tile_q_values.size(); ++ti)
+                {
+                    grid[ti].resize(seq_lengths.size());
+                    for (size_t si = 0; si < seq_lengths.size(); ++si)
+                    {
+                        int seq = seq_lengths[si];
+                        auto r = benchmarkPrefill(
+                            tc.n_heads, tc.n_kv_heads, tc.head_dim,
+                            seq, seq, // kv_len = seq_len for self-attention prefill
+                            tile_q_values[ti], kv_type);
+                        ASSERT_TRUE(r.success)
+                            << model.name << " " << tc.label
+                            << " tile_q=" << tile_q_values[ti]
+                            << " seq=" << seq << " kv=" << kvTypeName(kv_type);
+                        grid[ti][si] = {r};
+                    }
+                }
+
+                // Render latency table
+                {
+                    fort::utf8_table table;
+                    table.set_border_style(FT_DOUBLE2_STYLE);
+
+                    table << fort::header << "tile_q";
+                    for (int s : seq_lengths)
+                    {
+                        char colhdr[32];
+                        snprintf(colhdr, sizeof(colhdr), "seq=%d", s);
+                        table << colhdr;
+                    }
+                    table << fort::endr;
+
+                    table.column(0).set_cell_text_align(fort::text_align::right);
+                    for (size_t i = 1; i <= seq_lengths.size(); ++i)
+                        table.column(i).set_cell_text_align(fort::text_align::right);
+
+                    for (size_t ti = 0; ti < tile_q_values.size(); ++ti)
+                    {
+                        table << tile_q_values[ti];
+                        for (size_t si = 0; si < seq_lengths.size(); ++si)
+                        {
+                            char cell[32];
+                            snprintf(cell, sizeof(cell), "%.1f", grid[ti][si].result.median_us);
+                            table << cell;
+                        }
+                        table << fort::endr;
+                    }
+
+                    // Best row
+                    table << fort::separator;
+                    table << "Best";
+                    for (size_t si = 0; si < seq_lengths.size(); ++si)
+                    {
+                        double best_us = 1e9;
+                        int best_tq = 0;
+                        for (size_t ti = 0; ti < tile_q_values.size(); ++ti)
+                        {
+                            if (grid[ti][si].result.median_us < best_us)
+                            {
+                                best_us = grid[ti][si].result.median_us;
+                                best_tq = tile_q_values[ti];
+                            }
+                        }
+                        char cell[32];
+                        snprintf(cell, sizeof(cell), "tq=%d", best_tq);
+                        table << cell;
+                    }
+                    table << fort::endr;
+
+                    // Heuristic row: show what the adaptive heuristic would pick
+                    table << "Heuristic";
+                    int heuristic_correct = 0, heuristic_total = 0;
+                    for (size_t si = 0; si < seq_lengths.size(); ++si)
+                    {
+                        int seq = seq_lengths[si];
+                        int tq8_blocks = tc.n_heads * ((seq + 7) / 8);
+                        int heuristic_tq = (tq8_blocks >= 1024) ? 8 : 4;
+
+                        // Find actual best
+                        double best_us = 1e9;
+                        int best_tq = 0;
+                        for (size_t ti = 0; ti < tile_q_values.size(); ++ti)
+                        {
+                            if (grid[ti][si].result.median_us < best_us)
+                            {
+                                best_us = grid[ti][si].result.median_us;
+                                best_tq = tile_q_values[ti];
+                            }
+                        }
+                        bool correct = (heuristic_tq == best_tq);
+                        heuristic_total++;
+                        if (correct)
+                            heuristic_correct++;
+
+                        char cell[32];
+                        snprintf(cell, sizeof(cell), "tq=%d %s", heuristic_tq, correct ? "✓" : "✗");
+                        table << cell;
+                    }
+                    table << fort::endr;
+
+                    fprintf(stderr,
+                            "\n%s %s KV=%s — Prefill Latency (μs), head_dim=%d  [Heuristic: %d/%d correct]\n"
+                            "Device: %s (%d CUs)\n%s\n",
+                            model.name, tc.label, kvTypeName(kv_type),
+                            tc.head_dim, heuristic_correct, heuristic_total,
+                            device_name_.c_str(), num_cus_,
+                            table.to_string().c_str());
+                }
+
+                // Occupancy table
+                if (num_cus_ > 0)
+                {
+                    fort::utf8_table table;
+                    table.set_border_style(FT_DOUBLE2_STYLE);
+
+                    table << fort::header << "tile_q";
+                    for (int s : seq_lengths)
+                    {
+                        char colhdr[32];
+                        snprintf(colhdr, sizeof(colhdr), "seq=%d", s);
+                        table << colhdr;
+                    }
+                    table << fort::endr;
+
+                    table.column(0).set_cell_text_align(fort::text_align::right);
+                    for (size_t i = 1; i <= seq_lengths.size(); ++i)
+                        table.column(i).set_cell_text_align(fort::text_align::right);
+
+                    for (int tq : tile_q_values)
+                    {
+                        table << tq;
+                        for (int s : seq_lengths)
+                        {
+                            int num_q_tiles = (s + tq - 1) / tq;
+                            int total_blocks = tc.n_heads * num_q_tiles;
+                            // launch_bounds(256, 3) caps at 3 blocks/CU
+                            int max_concurrent = num_cus_ * 3;
+                            double occupancy = std::min(1.0, static_cast<double>(total_blocks) / max_concurrent);
+
+                            char cell[48];
+                            snprintf(cell, sizeof(cell), "%d×%d=%d (%.0f%%)",
+                                     tc.n_heads, num_q_tiles, total_blocks,
+                                     occupancy * 100.0);
+                            table << cell;
+                        }
+                        table << fort::endr;
+                    }
+
+                    fprintf(stderr,
+                            "\n%s %s — CU Occupancy (heads × q_tiles = blocks / %d×3=%d max)\n%s\n",
+                            model.name, tc.label, num_cus_, num_cus_ * 3,
+                            table.to_string().c_str());
+                }
+            }
+#endif
+        }
+
+        // =========================================================================
+        // Table 2: KV type comparison for a given model and tile_q
+        // =========================================================================
+        void runKVTypeSweep(
+            const ModelConfig &model,
+            const std::vector<int> &seq_lengths,
+            const std::vector<int> &tp_degrees,
+            int tile_q,
+            const std::vector<KVType> &kv_types)
+        {
+#ifndef HAVE_ROCM
+            GTEST_SKIP() << "No ROCm support";
+#else
+            if (!has_device_)
+                GTEST_SKIP() << "No ROCm device";
+
+            // Skip Q8_1 and FP16 for head_dim < 64
+            std::vector<KVType> valid_types;
+            for (auto t : kv_types)
+            {
+                if (t == KVType::FP16 && model.head_dim < 64)
+                    continue;
+                if (t == KVType::Q8_1 && (model.head_dim < 64 || model.head_dim % 32 != 0))
+                    continue;
+                valid_types.push_back(t);
+            }
+
+            auto tp_configs = getTPConfigs(model, tp_degrees);
+
+            for (const auto &tc : tp_configs)
+            {
+                // [kv_idx][seq_idx]
+                std::vector<std::vector<PrefillResult>> grid(valid_types.size());
+                for (size_t ki = 0; ki < valid_types.size(); ++ki)
+                {
+                    grid[ki].resize(seq_lengths.size());
+                    for (size_t si = 0; si < seq_lengths.size(); ++si)
+                    {
+                        int seq = seq_lengths[si];
+                        auto r = benchmarkPrefill(
+                            tc.n_heads, tc.n_kv_heads, tc.head_dim,
+                            seq, seq, tile_q, valid_types[ki]);
+                        ASSERT_TRUE(r.success)
+                            << model.name << " " << tc.label
+                            << " kv=" << kvTypeName(valid_types[ki])
+                            << " seq=" << seq;
+                        grid[ki][si] = r;
+                    }
+                }
+
+                // Render comparison table
+                fort::utf8_table table;
+                table.set_border_style(FT_DOUBLE2_STYLE);
+
+                table << fort::header << "KV Type";
+                for (int s : seq_lengths)
+                {
+                    char colhdr[32];
+                    snprintf(colhdr, sizeof(colhdr), "seq=%d", s);
+                    table << colhdr;
+                }
+                table << fort::endr;
+
+                table.column(0).set_cell_text_align(fort::text_align::left);
+                for (size_t i = 1; i <= seq_lengths.size(); ++i)
+                    table.column(i).set_cell_text_align(fort::text_align::right);
+
+                for (size_t ki = 0; ki < valid_types.size(); ++ki)
+                {
+                    table << kvTypeName(valid_types[ki]);
+                    for (size_t si = 0; si < seq_lengths.size(); ++si)
+                    {
+                        char cell[32];
+                        snprintf(cell, sizeof(cell), "%.1f", grid[ki][si].median_us);
+                        table << cell;
+                    }
+                    table << fort::endr;
+                }
+
+                // Speedup vs FP32 row(s)
+                if (valid_types.size() > 1)
+                {
+                    table << fort::separator;
+                    for (size_t ki = 1; ki < valid_types.size(); ++ki)
+                    {
+                        char label[32];
+                        snprintf(label, sizeof(label), "%s vs FP32", kvTypeName(valid_types[ki]));
+                        table << label;
+                        for (size_t si = 0; si < seq_lengths.size(); ++si)
+                        {
+                            double speedup = grid[0][si].median_us / grid[ki][si].median_us;
+                            char cell[32];
+                            snprintf(cell, sizeof(cell), "%.2f×", speedup);
+                            table << cell;
+                        }
+                        table << fort::endr;
+                    }
+                }
+
+                fprintf(stderr,
+                        "\n%s %s tile_q=%d — KV Type Comparison (μs)\n"
+                        "Device: %s (%d CUs)\n%s\n",
+                        model.name, tc.label, tile_q,
+                        device_name_.c_str(), num_cus_,
+                        table.to_string().c_str());
+            }
+#endif
+        }
+
+        // =========================================================================
+        // Table 3: TP scaling efficiency
+        // =========================================================================
+        void runTPScalingSweep(
+            const ModelConfig &model,
+            const std::vector<int> &seq_lengths,
+            const std::vector<int> &tp_degrees,
+            int tile_q, KVType kv_type)
+        {
+#ifndef HAVE_ROCM
+            GTEST_SKIP() << "No ROCm support";
+#else
+            if (!has_device_)
+                GTEST_SKIP() << "No ROCm device";
+
+            auto tp_configs = getTPConfigs(model, tp_degrees);
+
+            // [tp_idx][seq_idx]
+            std::vector<std::vector<PrefillResult>> grid(tp_configs.size());
+            for (size_t ti = 0; ti < tp_configs.size(); ++ti)
+            {
+                grid[ti].resize(seq_lengths.size());
+                for (size_t si = 0; si < seq_lengths.size(); ++si)
+                {
+                    int seq = seq_lengths[si];
+                    auto r = benchmarkPrefill(
+                        tp_configs[ti].n_heads, tp_configs[ti].n_kv_heads,
+                        tp_configs[ti].head_dim,
+                        seq, seq, tile_q, kv_type);
+                    ASSERT_TRUE(r.success)
+                        << model.name << " " << tp_configs[ti].label << " seq=" << seq;
+                    grid[ti][si] = r;
+                }
+            }
+
+            // Latency table
+            {
+                fort::utf8_table table;
+                table.set_border_style(FT_DOUBLE2_STYLE);
+
+                table << fort::header << "Config" << "Heads";
+                for (int s : seq_lengths)
+                {
+                    char colhdr[32];
+                    snprintf(colhdr, sizeof(colhdr), "seq=%d", s);
+                    table << colhdr;
+                }
+                table << fort::endr;
+
+                table.column(0).set_cell_text_align(fort::text_align::left);
+                table.column(1).set_cell_text_align(fort::text_align::right);
+                for (size_t i = 2; i <= seq_lengths.size() + 1; ++i)
+                    table.column(i).set_cell_text_align(fort::text_align::right);
+
+                for (size_t ti = 0; ti < tp_configs.size(); ++ti)
+                {
+                    table << tp_configs[ti].label << tp_configs[ti].n_heads;
+                    for (size_t si = 0; si < seq_lengths.size(); ++si)
+                    {
+                        char cell[32];
+                        snprintf(cell, sizeof(cell), "%.1f", grid[ti][si].median_us);
+                        table << cell;
+                    }
+                    table << fort::endr;
+                }
+
+                fprintf(stderr,
+                        "\n%s tile_q=%d KV=%s — Prefill Latency (μs)\n"
+                        "Device: %s (%d CUs)\n%s\n",
+                        model.name, tile_q, kvTypeName(kv_type),
+                        device_name_.c_str(), num_cus_,
+                        table.to_string().c_str());
+            }
+
+            // TP scaling efficiency table
+            if (tp_configs.size() > 1)
+            {
+                fort::utf8_table table;
+                table.set_border_style(FT_DOUBLE2_STYLE);
+
+                table << fort::header << "Config" << "Heads";
+                for (int s : seq_lengths)
+                {
+                    char colhdr[32];
+                    snprintf(colhdr, sizeof(colhdr), "seq=%d", s);
+                    table << colhdr;
+                }
+                table << fort::endr;
+
+                table.column(0).set_cell_text_align(fort::text_align::left);
+                table.column(1).set_cell_text_align(fort::text_align::right);
+                for (size_t i = 2; i <= seq_lengths.size() + 1; ++i)
+                    table.column(i).set_cell_text_align(fort::text_align::right);
+
+                // TP=1 baseline
+                table << tp_configs[0].label << tp_configs[0].n_heads;
+                for (size_t si = 0; si < seq_lengths.size(); ++si)
+                    table << "baseline";
+                table << fort::endr;
+
+                // TP>1 scaling efficiency
+                for (size_t ti = 1; ti < tp_configs.size(); ++ti)
+                {
+                    table << tp_configs[ti].label << tp_configs[ti].n_heads;
+                    for (size_t si = 0; si < seq_lengths.size(); ++si)
+                    {
+                        double base_us = grid[0][si].median_us;
+                        double tp_us = grid[ti][si].median_us;
+                        double ideal_us = base_us / static_cast<double>(tp_configs[ti].tp_degree);
+                        double efficiency = (ideal_us / tp_us) * 100.0;
+
+                        char cell[32];
+                        snprintf(cell, sizeof(cell), "%.0f%%", efficiency);
+                        table << cell;
+                    }
+                    table << fort::endr;
+                }
+
+                fprintf(stderr,
+                        "\n%s tile_q=%d KV=%s — TP Scaling Efficiency\n%s\n",
+                        model.name, tile_q, kvTypeName(kv_type),
+                        table.to_string().c_str());
+            }
+#endif
+        }
+    };
+
+    // ============================================================================
+    // Test Cases
+    // ============================================================================
+
+    // ---------------------------------------------------------------------------
+    // PRIMARY: tile_q sweep across ALL model sizes with FP32 KV
+    // This is the definitive test for whether tile_q=16 wins universally or
+    // needs to be adaptive based on head count / model size.
+    // ---------------------------------------------------------------------------
+    TEST_F(ROCmFlashAttentionPrefillPerf, AllModels_TileQ_FP32)
+    {
+        for (const auto &model : kAllModels)
+        {
+            runTileQSweep(
+                model,
+                /*seq_lengths=*/{128, 256, 512, 1024},
+                /*tp_degrees=*/{1, 2, 4},
+                /*tile_q_values=*/{4, 8, 16, 32, 64},
+                KVType::FP32);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // PRIMARY: tile_q sweep across ALL model sizes with FP16 KV
+    // ---------------------------------------------------------------------------
+    TEST_F(ROCmFlashAttentionPrefillPerf, AllModels_TileQ_FP16)
+    {
+        for (const auto &model : kAllModels)
+        {
+            runTileQSweep(
+                model,
+                /*seq_lengths=*/{128, 256, 512, 1024},
+                /*tp_degrees=*/{1, 2, 4},
+                /*tile_q_values=*/{4, 8, 16, 32, 64},
+                KVType::FP16);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // KV type comparison at tile_q=16 (new default) for 7B reference
+    // ---------------------------------------------------------------------------
+    TEST_F(ROCmFlashAttentionPrefillPerf, Qwen7B_KVComparison)
+    {
+        runKVTypeSweep(
+            kQwen7B,
+            /*seq_lengths=*/{128, 256, 512, 1024},
+            /*tp_degrees=*/{1, 2, 4},
+            /*tile_q=*/16,
+            {KVType::FP32, KVType::FP16, KVType::Q8_1});
+    }
+
+    // ---------------------------------------------------------------------------
+    // TP scaling efficiency across all model sizes (FP32, tile_q=16)
+    // Shows how head count affects TP scaling for the attention kernel
+    // ---------------------------------------------------------------------------
+    TEST_F(ROCmFlashAttentionPrefillPerf, AllModels_TPScaling_FP32)
+    {
+        for (const auto &model : kAllModels)
+        {
+            runTPScalingSweep(
+                model,
+                /*seq_lengths=*/{128, 256, 512, 1024},
+                /*tp_degrees=*/{1, 2, 4},
+                /*tile_q=*/16,
+                KVType::FP32);
+        }
+    }
+
+} // anonymous namespace

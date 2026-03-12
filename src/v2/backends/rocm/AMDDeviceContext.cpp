@@ -452,6 +452,26 @@ namespace llaminar2
         HIP_CHECK_VOID(hipEventSynchronize(hip_event));
     }
 
+    float AMDDeviceContext::eventElapsedTime(void *start, void *stop)
+    {
+        if (!start || !stop)
+        {
+            LOG_WARN("[AMDDeviceContext] eventElapsedTime called with null event");
+            return -1.0f;
+        }
+
+        hipEvent_t hip_start = static_cast<hipEvent_t>(start);
+        hipEvent_t hip_stop = static_cast<hipEvent_t>(stop);
+        float ms = 0.0f;
+        hipError_t err = hipEventElapsedTime(&ms, hip_start, hip_stop);
+        if (err != hipSuccess)
+        {
+            LOG_WARN("[AMDDeviceContext] hipEventElapsedTime failed: " << hipGetErrorString(err));
+            return -1.0f;
+        }
+        return ms;
+    }
+
     // ============================================================================
     // Library Handles (Worker-Thread-Only)
     // ============================================================================

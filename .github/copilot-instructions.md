@@ -301,7 +301,7 @@ LLAMINAR_PROFILING=1 ./build_v2_release/llaminar2 --benchmark -m model.gguf -n 5
 
 **Profiled Operations**: `GEMM_Q8`, `ATTENTION`, `FFN_DOWN`, `FFN_GATE`, `FFN_UP`, `LM_HEAD`, `QUANTIZE_Q8`, `RMS_NORM`, `SWIGLU`, `ROPE`, `RESIDUAL_ADD`, `EMBEDDING`
 
-**Note**: `LLAMINAR_PROFILING=1` enables both kernel timing and executor overhead profiling in a single flag.
+**Note**: `LLAMINAR_PROFILING=1` enables kernel timing, executor overhead profiling, and GPU stage timing in a single flag.
 
 ---
 
@@ -1553,9 +1553,11 @@ std::cout << "║" << std::setw(10) << "Name" << " ║"
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `LLAMINAR_LOG_LEVEL` | Logging verbosity (ERROR/WARN/INFO/DEBUG/TRACE) | INFO |
-| `LLAMINAR_PROFILING` | Enable all profiling (kernel timing + executor overhead) | Disabled |
+| `LLAMINAR_PROFILING` | Enable all profiling (kernel timing + executor overhead + GPU stage timing) | Disabled |
 | `LLAMINAR_PROFILE_KERNELS` | (Legacy) Enable per-kernel timing in benchmark mode | Disabled |
 | `LLAMINAR_EXECUTOR_PROFILING` | (Legacy) Enable per-stage profiling in DeviceGraphExecutor | Disabled |
+| `LLAMINAR_GPU_STAGE_TIMING` | GPU event-based per-stage timing (also enabled by LLAMINAR_PROFILING=1) | Disabled |
+| `LLAMINAR_GPU_STAGE_TIMING_DETAIL` | Print per-stage detail in GPU stage timing (implies GPU_STAGE_TIMING) | Disabled |
 | `LLAMINAR_VALIDATE_BUFFERS` | Enable buffer validation after stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_VALIDATE_INPUTS` | Enable input validation before stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_FAIL_ON_ZERO` | Fail on zero tensors during validation | Disabled |
