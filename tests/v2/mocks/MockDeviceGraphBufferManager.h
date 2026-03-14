@@ -16,8 +16,7 @@
 
 #include "execution/local_execution/graph/IGraphBufferManager.h"
 #include "execution/debug/BufferRole.h"
-#include "execution/local_execution/graph/LivenessAnalyzer.h"       // For AliasingGroup
-#include "execution/local_execution/graph/DeviceGraphExecutor.h"          // For ComputeGraph
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"    // For ComputeGraph
 #include "execution/local_execution/collective/CollectiveContext.h" // For CollectiveContext (Phase 3)
 #include "tensors/Tensors.h"
 #include <memory>
@@ -68,13 +67,12 @@ namespace llaminar2::test
          */
         struct Config
         {
-            bool track_calls = true;                     ///< Record call counts for verification
-            bool allocate_for_graph_succeeds = true;     ///< Return value for allocateForGraph()
-            bool allocate_buffer_succeeds = true;        ///< Return value for allocateBuffer()
-            bool allocate_with_aliasing_succeeds = true; ///< Return value for allocateWithAliasing()
-            bool bind_buffer_succeeds = true;            ///< Return value for bindBuffer()
-            double aliasing_savings_percent = 0.0;       ///< Simulated aliasing savings
-            size_t aliasing_group_count = 0;             ///< Simulated aliasing groups
+            bool track_calls = true;                 ///< Record call counts for verification
+            bool allocate_for_graph_succeeds = true; ///< Return value for allocateForGraph()
+            bool allocate_buffer_succeeds = true;    ///< Return value for allocateBuffer()
+            bool bind_buffer_succeeds = true;        ///< Return value for bindBuffer()
+            double aliasing_savings_percent = 0.0;   ///< Simulated aliasing savings
+            size_t aliasing_group_count = 0;         ///< Simulated aliasing groups
         };
 
         // =========================================================================
@@ -144,19 +142,6 @@ namespace llaminar2::test
                 return allocate_buffer_callback_(node_name, desc);
             }
             return config_.allocate_buffer_succeeds;
-        }
-
-        bool allocateWithAliasing(ComputeGraph &graph) override
-        {
-            if (config_.track_calls)
-            {
-                allocate_with_aliasing_calls_.fetch_add(1, std::memory_order_relaxed);
-            }
-            if (allocate_with_aliasing_callback_)
-            {
-                return allocate_with_aliasing_callback_(graph);
-            }
-            return config_.allocate_with_aliasing_succeeds;
         }
 
         void releaseAll() override
@@ -420,14 +405,6 @@ namespace llaminar2::test
         }
 
         /**
-         * @brief Set callback for allocateWithAliasing
-         */
-        void setAllocateWithAliasingCallback(std::function<bool(ComputeGraph &)> callback)
-        {
-            allocate_with_aliasing_callback_ = std::move(callback);
-        }
-
-        /**
          * @brief Set whether allocateForGraph should succeed
          */
         void setAllocateForGraphSucceeds(bool succeeds)
@@ -441,14 +418,6 @@ namespace llaminar2::test
         void setAllocateBufferSucceeds(bool succeeds)
         {
             config_.allocate_buffer_succeeds = succeeds;
-        }
-
-        /**
-         * @brief Set whether allocateWithAliasing should succeed
-         */
-        void setAllocateWithAliasingSucceeds(bool succeeds)
-        {
-            config_.allocate_with_aliasing_succeeds = succeeds;
         }
 
         /**
@@ -514,14 +483,6 @@ namespace llaminar2::test
         }
 
         /**
-         * @brief Get the number of allocateWithAliasing() calls
-         */
-        size_t allocateWithAliasing_call_count() const
-        {
-            return allocate_with_aliasing_calls_.load(std::memory_order_relaxed);
-        }
-
-        /**
          * @brief Get the number of releaseAll() calls
          */
         size_t releaseAll_call_count() const
@@ -583,7 +544,7 @@ namespace llaminar2::test
         size_t total_call_count() const
         {
             return allocateForGraph_call_count() + allocateBuffer_call_count() +
-                   allocateWithAliasing_call_count() + releaseAll_call_count() +
+                   releaseAll_call_count() +
                    getBuffer_call_count() + getBufferByKey_call_count() +
                    hasBuffer_call_count() + getAllBufferKeys_call_count() +
                    bindBuffer_call_count() + dumpBufferInventory_call_count();
@@ -596,7 +557,6 @@ namespace llaminar2::test
         {
             allocate_for_graph_calls_.store(0, std::memory_order_relaxed);
             allocate_buffer_calls_.store(0, std::memory_order_relaxed);
-            allocate_with_aliasing_calls_.store(0, std::memory_order_relaxed);
             release_all_calls_.store(0, std::memory_order_relaxed);
             get_buffer_calls_.store(0, std::memory_order_relaxed);
             get_buffer_by_key_calls_.store(0, std::memory_order_relaxed);
@@ -627,12 +587,10 @@ namespace llaminar2::test
         // Callbacks for customizing behavior
         std::function<bool(ComputeGraph &)> allocate_for_graph_callback_;
         std::function<bool(const std::string &, const BufferDescriptor &)> allocate_buffer_callback_;
-        std::function<bool(ComputeGraph &)> allocate_with_aliasing_callback_;
 
         // Atomic call counters (thread-safe)
         mutable std::atomic<size_t> allocate_for_graph_calls_{0};
         mutable std::atomic<size_t> allocate_buffer_calls_{0};
-        mutable std::atomic<size_t> allocate_with_aliasing_calls_{0};
         mutable std::atomic<size_t> release_all_calls_{0};
         mutable std::atomic<size_t> get_buffer_calls_{0};
         mutable std::atomic<size_t> get_buffer_by_key_calls_{0};
@@ -667,7 +625,6 @@ namespace llaminar2::test
         Config config;
         config.allocate_for_graph_succeeds = true;
         config.allocate_buffer_succeeds = true;
-        config.allocate_with_aliasing_succeeds = true;
         config.bind_buffer_succeeds = true;
         return std::make_shared<MockGraphBufferManager>(config);
     }
@@ -677,7 +634,6 @@ namespace llaminar2::test
         Config config;
         config.allocate_for_graph_succeeds = false;
         config.allocate_buffer_succeeds = false;
-        config.allocate_with_aliasing_succeeds = false;
         config.bind_buffer_succeeds = false;
         return std::make_shared<MockGraphBufferManager>(config);
     }
@@ -727,15 +683,6 @@ namespace llaminar2::test
         MockGraphBufferManagerBuilder &setAllocateBufferSucceeds(bool succeeds)
         {
             config_.allocate_buffer_succeeds = succeeds;
-            return *this;
-        }
-
-        /**
-         * @brief Set whether allocateWithAliasing should succeed
-         */
-        MockGraphBufferManagerBuilder &setAllocateWithAliasingSucceeds(bool succeeds)
-        {
-            config_.allocate_with_aliasing_succeeds = succeeds;
             return *this;
         }
 

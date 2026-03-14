@@ -50,7 +50,6 @@
 #include "../../../config/PipelineConfig.h"            // For unified PP+TP configuration (Phase 6)
 #include "../../../collective/ILocalPPContext.h"       // For unique_ptr<ILocalPPContext> in maps
 #include "../../../collective/ILocalTPContext.h"       // For unique_ptr<ILocalTPContext> in maps
-#include "../device/PerStageBufferPool.h"              // For PP stage buffer management (Phase 6)
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -780,31 +779,6 @@ namespace llaminar2
          */
         bool initializeTPContexts();
 
-        /**
-         * @brief Initialize per-stage buffer pool for PP execution
-         *
-         * Allocates ActivationBuffers for each PP stage, placing buffers
-         * on each stage's primary device. Must be called after setPipelineConfig()
-         * and requires a valid PipelineConfig with PP stages.
-         *
-         * @param spec Buffer specification (shapes, dtypes) for allocation
-         * @param mpi_ctx Optional MPI context for NUMA-aware allocation
-         * @return true if initialization succeeded
-         */
-        bool initializeBufferPool(const PPStageBufferSpec &spec, const MPIContext *mpi_ctx = nullptr);
-
-        /**
-         * @brief Get the per-stage buffer pool (if initialized)
-         * @return Pointer to PerStageBufferPool, or nullptr if not initialized
-         */
-        PerStageBufferPool *bufferPool() { return buffer_pool_.has_value() ? &buffer_pool_.value() : nullptr; }
-        const PerStageBufferPool *bufferPool() const { return buffer_pool_.has_value() ? &buffer_pool_.value() : nullptr; }
-
-        /**
-         * @brief Check if per-stage buffer pool is initialized
-         */
-        bool hasBufferPool() const { return buffer_pool_.has_value() && buffer_pool_->isInitialized(); }
-
         // =====================================================================
         // Hidden State API (for Pipeline Parallelism)
         // =====================================================================
@@ -1125,7 +1099,6 @@ namespace llaminar2
             GraphBuildSession &withWeights(const ModelWeights &weights);
             GraphBuildSession &withBuffers(const ModelBuffers &buffers);
             GraphBuildSession &withKVCache(IKVCache *kv_cache);
-            GraphBuildSession &withBufferPool(PerStageBufferPool *pool);
 
             // Build methods (terminal operations)
             [[nodiscard]] GraphBuildResult buildForward();
@@ -1156,7 +1129,6 @@ namespace llaminar2
             std::optional<ModelWeights> weights_;
             std::optional<ModelBuffers> buffers_;
             IKVCache *kv_cache_ = nullptr;
-            PerStageBufferPool *buffer_pool_ = nullptr;
 
             Qwen2ForwardInput prepareInput() const;
             void applyConfiguration();
@@ -2326,14 +2298,6 @@ namespace llaminar2
 
         /// Whether TP contexts have been initialized
         bool tp_contexts_initialized_ = false;
-
-        // =========================================================================
-        // Per-Stage Buffer Pool (Phase 6.4 - PP+TP Buffer Management)
-        // =========================================================================
-
-        /// Per-PP-stage activation buffer pool
-        /// When initialized, provides stage-specific buffers for heterogeneous PP execution
-        std::optional<PerStageBufferPool> buffer_pool_;
     };
 
 } // namespace llaminar2

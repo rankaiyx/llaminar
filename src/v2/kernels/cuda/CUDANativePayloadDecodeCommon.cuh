@@ -12,12 +12,12 @@ namespace llaminar2::cuda_native_payload
 {
     extern __device__ __constant__ int8_t d_iq4nl_values[16];
 
-    extern __device__ __constant__ uint32_t d_iq3s_grid[512];
+    extern __device__ uint32_t d_iq3s_grid[512];
     extern __device__ uint32_t d_iq3xxs_grid[256];
-    extern __device__ __constant__ uint64_t d_iq2s_grid[1024];
-    extern __device__ __constant__ uint64_t d_iq2xs_grid[512];
+    extern __device__ uint64_t d_iq2s_grid[1024];
+    extern __device__ uint64_t d_iq2xs_grid[512];
     extern __device__ uint64_t d_iq2xxs_grid[256];
-    extern __device__ __constant__ uint64_t d_iq1s_grid[2048];
+    extern __device__ uint64_t d_iq1s_grid[2048];
 
     template <typename T, size_t N>
     inline bool copyHostArrayToDeviceSymbol(T (&symbol)[N], const T *src, size_t count)
@@ -36,21 +36,19 @@ namespace llaminar2::cuda_native_payload
 
     inline bool initIQGridTables()
     {
-        cudaError_t err = cudaMemcpyToSymbol(d_iq3s_grid, iq3s_grid, sizeof(iq3s_grid));
-        if (err != cudaSuccess)
+        if (!copyHostArrayToDeviceSymbol(d_iq3s_grid, iq3s_grid, std::size(iq3s_grid)))
             return false;
         if (!copyHostArrayToDeviceSymbol(d_iq3xxs_grid, iq3xxs_grid, std::size(iq3xxs_grid)))
             return false;
-        err = cudaMemcpyToSymbol(d_iq2s_grid, iq2s_grid, sizeof(iq2s_grid));
-        if (err != cudaSuccess)
+        if (!copyHostArrayToDeviceSymbol(d_iq2s_grid, iq2s_grid, std::size(iq2s_grid)))
             return false;
-        err = cudaMemcpyToSymbol(d_iq2xs_grid, iq2xs_grid, sizeof(iq2xs_grid));
-        if (err != cudaSuccess)
+        if (!copyHostArrayToDeviceSymbol(d_iq2xs_grid, iq2xs_grid, std::size(iq2xs_grid)))
             return false;
         if (!copyHostArrayToDeviceSymbol(d_iq2xxs_grid, iq2xxs_grid, std::size(iq2xxs_grid)))
             return false;
-        err = cudaMemcpyToSymbol(d_iq1s_grid, iq1s_grid, sizeof(iq1s_grid));
-        return err == cudaSuccess;
+        if (!copyHostArrayToDeviceSymbol(d_iq1s_grid, iq1s_grid, std::size(iq1s_grid)))
+            return false;
+        return true;
     }
 
     template <uint8_t CODEBOOK_ID>
@@ -66,16 +64,15 @@ namespace llaminar2::cuda_native_payload
         static constexpr bool is_dual_scale_asym = (CODEBOOK_ID == 10);
         static constexpr bool is_iq1_m = (CODEBOOK_ID == 17);
         static constexpr int payload_bytes =
-            (CODEBOOK_ID == 6 || CODEBOOK_ID == 7) ? 20 :
-            (CODEBOOK_ID == 8) ? 24 :
-            (CODEBOOK_ID == 9) ? 12 :
-            (CODEBOOK_ID == 10) ? 8 :
-            (CODEBOOK_ID == 11) ? 13 :
-            (CODEBOOK_ID == 12) ? 12 :
-            (CODEBOOK_ID == 13 || CODEBOOK_ID == 14) ? 9 :
-            (CODEBOOK_ID == 15) ? 8 :
-            (CODEBOOK_ID == 16 || CODEBOOK_ID == 17) ? 6 :
-            16;
+            (CODEBOOK_ID == 6 || CODEBOOK_ID == 7) ? 20 : (CODEBOOK_ID == 8)                     ? 24
+                                                      : (CODEBOOK_ID == 9)                       ? 12
+                                                      : (CODEBOOK_ID == 10)                      ? 8
+                                                      : (CODEBOOK_ID == 11)                      ? 13
+                                                      : (CODEBOOK_ID == 12)                      ? 12
+                                                      : (CODEBOOK_ID == 13 || CODEBOOK_ID == 14) ? 9
+                                                      : (CODEBOOK_ID == 15)                      ? 8
+                                                      : (CODEBOOK_ID == 16 || CODEBOOK_ID == 17) ? 6
+                                                                                                 : 16;
     };
 
     __device__ __forceinline__ float fp16_bits_to_float(uint16_t bits)
@@ -105,12 +102,56 @@ namespace llaminar2::cuda_native_payload
         return out.packed;
     }
 
+    __device__ __forceinline__ int8_t iq4nl_lookup_reg(uint32_t idx)
+    {
+        constexpr uint32_t kPack0 = 0xbfad9881u;
+        constexpr uint32_t kPack1 = 0xf6eaddcfu;
+        constexpr uint32_t kPack2 = 0x26190d01u;
+        constexpr uint32_t kPack3 = 0x71594535u;
+
+        uint32_t packed = kPack0;
+        switch ((idx >> 2) & 0x3u)
+        {
+        case 0:
+            packed = kPack0;
+            break;
+        case 1:
+            packed = kPack1;
+            break;
+        case 2:
+            packed = kPack2;
+            break;
+        default:
+            packed = kPack3;
+            break;
+        }
+
+        const uint32_t shift = (idx & 0x3u) * 8u;
+        return static_cast<int8_t>((packed >> shift) & 0xFFu);
+    }
+
     __device__ __forceinline__ uint32_t centered_sub_16(uint32_t value)
     {
         value ^= 0x80808080u;
         value -= 0x10101010u;
         value ^= 0x80808080u;
         return value;
+    }
+
+    __device__ __forceinline__ uint32_t centered_sub_4(uint32_t value)
+    {
+        value ^= 0x80808080u;
+        value -= 0x04040404u;
+        value ^= 0x80808080u;
+        return value;
+    }
+
+    __device__ __forceinline__ uint32_t q3k_highbit_pack(uint32_t hb4)
+    {
+        return ((hb4 & 0x1u) << 2) |
+               ((hb4 & 0x2u) << 9) |
+               ((hb4 & 0x4u) << 16) |
+               ((hb4 & 0x8u) << 23);
     }
 
     __device__ __forceinline__ uint32_t iq_apply_signs_4(uint32_t grid4, uint8_t sign_lo4)
@@ -127,7 +168,13 @@ namespace llaminar2::cuda_native_payload
     __device__ __forceinline__ uint32_t iq3_grid_lookup(int idx)
     {
         if constexpr (CODEBOOK_ID == 11)
+        {
+#if __CUDA_ARCH__ >= 350
+            return __ldg(&d_iq3s_grid[idx]);
+#else
             return d_iq3s_grid[idx];
+#endif
+        }
         else
             return d_iq3xxs_grid[idx];
     }
@@ -136,16 +183,32 @@ namespace llaminar2::cuda_native_payload
     __device__ __forceinline__ uint64_t iq2_grid_lookup(int idx)
     {
         if constexpr (CODEBOOK_ID == 13)
+        {
+#if __CUDA_ARCH__ >= 350
+            return __ldg(&d_iq2s_grid[idx]);
+#else
             return d_iq2s_grid[idx];
+#endif
+        }
         else if constexpr (CODEBOOK_ID == 14)
+        {
+#if __CUDA_ARCH__ >= 350
+            return __ldg(&d_iq2xs_grid[idx]);
+#else
             return d_iq2xs_grid[idx];
+#endif
+        }
         else
             return d_iq2xxs_grid[idx];
     }
 
     __device__ __forceinline__ uint64_t iq1_grid_lookup(int idx)
     {
+#if __CUDA_ARCH__ >= 350
+        return __ldg(&d_iq1s_grid[idx]);
+#else
         return d_iq1s_grid[idx];
+#endif
     }
 
     template <uint8_t CODEBOOK_ID>
@@ -162,16 +225,10 @@ namespace llaminar2::cuda_native_payload
             for (int g = 0; g < 4; ++g)
             {
                 const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
-                packed_groups[g] = pack_i8x4(
-                    static_cast<int8_t>((raw & 0x0F) - 8),
-                    static_cast<int8_t>(((raw >> 8) & 0x0F) - 8),
-                    static_cast<int8_t>(((raw >> 16) & 0x0F) - 8),
-                    static_cast<int8_t>(((raw >> 24) & 0x0F) - 8));
-                packed_groups[g + 4] = pack_i8x4(
-                    static_cast<int8_t>(((raw >> 4) & 0x0F) - 8),
-                    static_cast<int8_t>(((raw >> 12) & 0x0F) - 8),
-                    static_cast<int8_t>(((raw >> 20) & 0x0F) - 8),
-                    static_cast<int8_t>(((raw >> 28) & 0x0F) - 8));
+                const uint32_t lo = raw & 0x0F0F0F0Fu;
+                const uint32_t hi = (raw >> 4) & 0x0F0F0F0Fu;
+                packed_groups[g] = static_cast<int32_t>(__vsub4(lo, 0x08080808u));
+                packed_groups[g + 4] = static_cast<int32_t>(__vsub4(hi, 0x08080808u));
             }
         }
         else if constexpr (CODEBOOK_ID == 4)
@@ -180,15 +237,15 @@ namespace llaminar2::cuda_native_payload
             {
                 const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
                 packed_groups[g] = pack_i8x4(
-                    d_iq4nl_values[raw & 0x0F],
-                    d_iq4nl_values[(raw >> 8) & 0x0F],
-                    d_iq4nl_values[(raw >> 16) & 0x0F],
-                    d_iq4nl_values[(raw >> 24) & 0x0F]);
+                    iq4nl_lookup_reg(raw & 0x0F),
+                    iq4nl_lookup_reg((raw >> 8) & 0x0F),
+                    iq4nl_lookup_reg((raw >> 16) & 0x0F),
+                    iq4nl_lookup_reg((raw >> 24) & 0x0F));
                 packed_groups[g + 4] = pack_i8x4(
-                    d_iq4nl_values[(raw >> 4) & 0x0F],
-                    d_iq4nl_values[(raw >> 12) & 0x0F],
-                    d_iq4nl_values[(raw >> 20) & 0x0F],
-                    d_iq4nl_values[(raw >> 28) & 0x0F]);
+                    iq4nl_lookup_reg((raw >> 4) & 0x0F),
+                    iq4nl_lookup_reg((raw >> 12) & 0x0F),
+                    iq4nl_lookup_reg((raw >> 20) & 0x0F),
+                    iq4nl_lookup_reg((raw >> 28) & 0x0F));
             }
         }
         else if constexpr (CODEBOOK_ID == 5)
@@ -250,11 +307,8 @@ namespace llaminar2::cuda_native_payload
                 for (int g = 0; g < 4; ++g)
                 {
                     const uint32_t hb4 = (hbits >> ((half * 4 + g) * 4)) & 0xFu;
-                    packed_groups[half * 4 + g] = pack_i8x4(
-                        static_cast<int8_t>((((raw >> (g * 2 + 0)) & 0x03) | ((hb4 & 1u) << 2)) - 4),
-                        static_cast<int8_t>((((raw >> (g * 2 + 8)) & 0x03) | (((hb4 >> 1) & 1u) << 2)) - 4),
-                        static_cast<int8_t>((((raw >> (g * 2 + 16)) & 0x03) | (((hb4 >> 2) & 1u) << 2)) - 4),
-                        static_cast<int8_t>((((raw >> (g * 2 + 24)) & 0x03) | (((hb4 >> 3) & 1u) << 2)) - 4));
+                    const uint32_t packed = ((raw >> (g * 2)) & 0x03030303u) | q3k_highbit_pack(hb4);
+                    packed_groups[half * 4 + g] = static_cast<int32_t>(centered_sub_4(packed));
                 }
             }
         }
@@ -338,6 +392,73 @@ namespace llaminar2::cuda_native_payload
             grid8 = iq1_grid_lookup(idx3);
             packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
             packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+        }
+    }
+
+    // =====================================================================
+    // Vectorized variant: uses 128-bit (int4) loads for 16-byte codebooks.
+    // Reduces instruction count at the cost of software pipelining.
+    // Use for compute-bound kernels (kpar); prefer scalar decode_groups for
+    // memory-bound kernels (wide) where load-compute overlap matters.
+    // =====================================================================
+    template <uint8_t CODEBOOK_ID>
+    __device__ __forceinline__ void decode_groups_vec(const uint8_t *payload, int32_t (&packed_groups)[8])
+    {
+        if constexpr (CodebookTraits<CODEBOOK_ID>::payload_bytes == 16)
+        {
+            const int4 v = *reinterpret_cast<const int4 *>(payload);
+            const uint32_t raws[4] = {
+                static_cast<uint32_t>(v.x), static_cast<uint32_t>(v.y),
+                static_cast<uint32_t>(v.z), static_cast<uint32_t>(v.w)};
+
+            if constexpr (CODEBOOK_ID == 0)
+            {
+#pragma unroll
+                for (int g = 0; g < 4; ++g)
+                {
+                    const uint32_t raw = raws[g];
+                    const uint32_t lo = raw & 0x0F0F0F0Fu;
+                    const uint32_t hi = (raw >> 4) & 0x0F0F0F0Fu;
+                    packed_groups[g] = static_cast<int32_t>(__vsub4(lo, 0x08080808u));
+                    packed_groups[g + 4] = static_cast<int32_t>(__vsub4(hi, 0x08080808u));
+                }
+            }
+            else if constexpr (CODEBOOK_ID == 4)
+            {
+#pragma unroll
+                for (int g = 0; g < 4; ++g)
+                {
+                    const uint32_t raw = raws[g];
+                    packed_groups[g] = pack_i8x4(
+                        iq4nl_lookup_reg(raw & 0x0F),
+                        iq4nl_lookup_reg((raw >> 8) & 0x0F),
+                        iq4nl_lookup_reg((raw >> 16) & 0x0F),
+                        iq4nl_lookup_reg((raw >> 24) & 0x0F));
+                    packed_groups[g + 4] = pack_i8x4(
+                        iq4nl_lookup_reg((raw >> 4) & 0x0F),
+                        iq4nl_lookup_reg((raw >> 12) & 0x0F),
+                        iq4nl_lookup_reg((raw >> 20) & 0x0F),
+                        iq4nl_lookup_reg((raw >> 28) & 0x0F));
+                }
+            }
+            else if constexpr (CODEBOOK_ID == 5)
+            {
+#pragma unroll
+                for (int g = 0; g < 4; ++g)
+                {
+                    packed_groups[g] = static_cast<int32_t>(raws[g] & 0x0F0F0F0Fu);
+                    packed_groups[g + 4] = static_cast<int32_t>((raws[g] >> 4) & 0x0F0F0F0Fu);
+                }
+            }
+            else
+            {
+                decode_groups<CODEBOOK_ID>(payload, packed_groups);
+            }
+        }
+        else
+        {
+            // Non-16-byte codebooks: fall back to scalar decode
+            decode_groups<CODEBOOK_ID>(payload, packed_groups);
         }
     }
 }

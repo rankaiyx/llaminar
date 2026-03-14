@@ -224,7 +224,10 @@ if(HAVE_CUDA)
         kernels/cuda/CUDATensorCoreGemvKernels.cu    # per-shape DP4A GEMV family (Wide, GridKPar, LDSKReduce, Direct)
         kernels/cuda/CUDANativePayloadIQTables.cu    # shared IQ lookup table symbol definitions for native-payload decode
         kernels/cuda/CUDANativePayloadGemvKernels.cu # native-payload decode GEMV for Q4_0/Q4_1/IQ4_NL
-        kernels/cuda/CUDANativePayloadGemmKernels.cu # native-payload prefill GEMM for Q4_0/Q4_1/IQ4_NL
+        kernels/cuda/CUDANativePayloadGemvTuned.cu  # tuned shape-specific native-payload GEMV (Wide/KPar/Direct)
+        kernels/cuda/CUDANativePayloadPrefillKernels.cu  # custom native-payload prefill GEMM family (Q4_0 first)
+        kernels/cuda/CUDAFusedTCGemm.cu              # fused tensor-core GEMM: single-launch WMMA over full K (sm_75+)
+        kernels/cuda/CUDAFusedTCGemmV2.cu             # V2 fused TC GEMM: mma.sync m16n8k32 (sm_80+ Ampere)
         kernels/cuda/CUDATensorCoreGemmKernels.cu    # per-shape tensor-core GEMM family (SmallM, WideN, Balanced)
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
@@ -1174,7 +1177,6 @@ add_library(llaminar2_core STATIC
     execution/local_execution/graph/StageTimeline.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
-    execution/local_execution/graph/LivenessAnalyzer.cpp
     execution/local_execution/graph/SchemaFactoryRegistry.cpp
     execution/local_execution/model/LayerExecutor.cpp
     execution/local_execution/model/ModelExecutor.cpp
@@ -1252,8 +1254,6 @@ add_library(llaminar2_core STATIC
     loaders/PartialWeightLoader.cpp
     # Layer device placement (Phase 2 - multi-device graph building)
     execution/local_execution/device/LayerDevicePlacement.cpp
-    # Per-stage buffer pool (Phase 1 - PP+TP buffer management)
-    execution/local_execution/device/PerStageBufferPool.cpp
     # Qwen2 model and graph configuration
     models/qwen/Qwen2Graph.cpp
     models/qwen/Qwen2GraphConfigBuilder.cpp

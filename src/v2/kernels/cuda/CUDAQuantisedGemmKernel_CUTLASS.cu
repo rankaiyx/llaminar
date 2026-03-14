@@ -146,7 +146,7 @@ static constexpr int GEMV_M_THRESHOLD = 4;
 
 namespace
 {
-    static constexpr int BLOCKWISE_BLOCK_SIZE = 32; // Elements per quantization block
+    static constexpr int BLOCKWISE_BLOCK_SIZE = 32;                        // Elements per quantization block
     static constexpr int BLOCKWISE_DP4A_GROUPS = BLOCKWISE_BLOCK_SIZE / 4; // dp4a groups per block
 
     /**
@@ -216,11 +216,11 @@ namespace
      * Block: (N_TILE, 1, 1) - each thread computes one N output
      */
     __global__ void blockwise_gemm_dp4a_kernel(
-        const int8_t *__restrict__ A_int8,           // [M × K] row-major
-        const int8_t *__restrict__ B_int8,           // [K × N] col-major (stored as [N][K])
-        float *__restrict__ C_fp32,                  // [M × N] row-major output
+        const int8_t *__restrict__ A_int8,            // [M × K] row-major
+        const int8_t *__restrict__ B_int8,            // [K × N] col-major (stored as [N][K])
+        float *__restrict__ C_fp32,                   // [M × N] row-major output
         const float *__restrict__ scales_A_blockwise, // [M × num_blocks]
-        const float *__restrict__ scales_B,          // [N]
+        const float *__restrict__ scales_B,           // [N]
         int M, int N, int K,
         float alpha, float beta,
         const float *__restrict__ C_existing, // For beta != 0
@@ -800,15 +800,39 @@ extern "C"
     {
         if (d_ptr)
         {
+            cudaPointerAttributes attr;
+            cudaError_t pe = cudaPointerGetAttributes(&attr, d_ptr);
             cudaError_t err = cudaFree(d_ptr);
             // During static destruction at program exit, CUDA runtime may already
             // be torn down. These error codes indicate this harmless condition.
             if (err != cudaSuccess && err != cudaErrorCudartUnloading && err != cudaErrorNoDevice)
             {
                 // Only log actual errors, not shutdown-related ones
-                fprintf(stderr, "WARNING: cudaFree failed: %s\n", cudaGetErrorString(err));
+                fprintf(stderr, "WARNING: cudaFree failed: %s ptr=%p attr_err=%d type=%d device=%d\n",
+                        cudaGetErrorString(err), d_ptr, (int)pe, (int)attr.type, attr.device);
             }
         }
+    }
+
+    /**
+     * @brief Allocate raw bytes on device and copy from host
+     * @note Must be compiled by nvcc to ensure CUDA runtime context consistency
+     */
+    bool cudaQuantGemm_uploadRawBytes(
+        const void *h_src,
+        void **d_dst,
+        size_t bytes,
+        int cuda_device_id)
+    {
+        *d_dst = nullptr;
+        if (bytes == 0)
+        {
+            return true;
+        }
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        CUDA_CHECK(cudaMalloc(d_dst, bytes));
+        CUDA_CHECK(cudaMemcpy(*d_dst, h_src, bytes, cudaMemcpyHostToDevice));
+        return true;
     }
 
     /**

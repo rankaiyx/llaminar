@@ -16,8 +16,7 @@
 #include <gtest/gtest.h>
 #include "mocks/MockDeviceGraphBufferManager.h"
 #include "utils/TestTensorFactory.h"
-#include "execution/local_execution/graph/LivenessAnalyzer.h" // For AliasingGroup
-#include "execution/local_execution/graph/DeviceGraphExecutor.h"    // For ComputeGraph
+#include "execution/local_execution/graph/DeviceGraphExecutor.h" // For ComputeGraph
 #include <memory>
 #include <vector>
 #include <thread>
@@ -91,7 +90,6 @@ TEST_F(Test__MockGraphBufferManager, CreateSuccessfulPreset)
 
     EXPECT_TRUE(mock->config().allocate_for_graph_succeeds);
     EXPECT_TRUE(mock->config().allocate_buffer_succeeds);
-    EXPECT_TRUE(mock->config().allocate_with_aliasing_succeeds);
     EXPECT_TRUE(mock->config().bind_buffer_succeeds);
 }
 
@@ -101,7 +99,6 @@ TEST_F(Test__MockGraphBufferManager, CreateFailingPreset)
 
     EXPECT_FALSE(mock->config().allocate_for_graph_succeeds);
     EXPECT_FALSE(mock->config().allocate_buffer_succeeds);
-    EXPECT_FALSE(mock->config().allocate_with_aliasing_succeeds);
     EXPECT_FALSE(mock->config().bind_buffer_succeeds);
 }
 
@@ -249,20 +246,6 @@ TEST_F(Test__MockGraphBufferManager, AllocateBufferCanBeMadeFailing)
     EXPECT_FALSE(mock_->allocateBuffer("node", desc));
 }
 
-TEST_F(Test__MockGraphBufferManager, AllocateWithAliasingSucceedsByDefault)
-{
-    ComputeGraph graph; // Empty graph
-    EXPECT_TRUE(mock_->allocateWithAliasing(graph));
-}
-
-TEST_F(Test__MockGraphBufferManager, AllocateWithAliasingCanBeMadeFailing)
-{
-    mock_->setAllocateWithAliasingSucceeds(false);
-
-    ComputeGraph graph;
-    EXPECT_FALSE(mock_->allocateWithAliasing(graph));
-}
-
 TEST_F(Test__MockGraphBufferManager, BindBufferSucceedsByDefault)
 {
     mock_->registerBuffer("layer0", "output", tensor1_.get());
@@ -312,21 +295,6 @@ TEST_F(Test__MockGraphBufferManager, AllocateBufferCallback)
     EXPECT_FALSE(mock_->allocateBuffer("test_node", desc));
     EXPECT_EQ(captured_node, "test_node");
     EXPECT_EQ(captured_name, "test_buffer");
-}
-
-TEST_F(Test__MockGraphBufferManager, AllocateWithAliasingCallback)
-{
-    bool callback_called = false;
-
-    mock_->setAllocateWithAliasingCallback([&](ComputeGraph &)
-                                           {
-        callback_called = true;
-        return true; });
-
-    ComputeGraph graph;
-    mock_->allocateWithAliasing(graph);
-
-    EXPECT_TRUE(callback_called);
 }
 
 // =============================================================================
@@ -416,7 +384,6 @@ TEST_F(Test__MockGraphBufferManager, CallCountsInitiallyZero)
 {
     EXPECT_EQ(mock_->allocateForGraph_call_count(), 0);
     EXPECT_EQ(mock_->allocateBuffer_call_count(), 0);
-    EXPECT_EQ(mock_->allocateWithAliasing_call_count(), 0);
     EXPECT_EQ(mock_->releaseAll_call_count(), 0);
     EXPECT_EQ(mock_->getBuffer_call_count(), 0);
     EXPECT_EQ(mock_->hasBuffer_call_count(), 0);
@@ -603,7 +570,6 @@ TEST_F(Test__MockGraphBufferManager, BuilderAllOptions)
                     .setTrackCalls(true)
                     .setAllocateForGraphSucceeds(true)
                     .setAllocateBufferSucceeds(true)
-                    .setAllocateWithAliasingSucceeds(false)
                     .setBindBufferSucceeds(true)
                     .setAliasingSavingsPercent(30.0)
                     .addBuffer("stage1", "buf", tensor1_.get())
@@ -612,7 +578,6 @@ TEST_F(Test__MockGraphBufferManager, BuilderAllOptions)
 
     EXPECT_TRUE(mock->config().track_calls);
     EXPECT_TRUE(mock->config().allocate_for_graph_succeeds);
-    EXPECT_FALSE(mock->config().allocate_with_aliasing_succeeds);
     EXPECT_DOUBLE_EQ(mock->aliasingSavingsPercent(), 30.0);
     EXPECT_EQ(mock->bufferCount(), 1);
     EXPECT_EQ(mock->aliasingGroupCount(), 1);
@@ -636,7 +601,6 @@ TEST_F(Test__MockGraphBufferManager, InterfaceCompliance_AllMethodsAccessible)
 
     // Test all interface methods are accessible
     ComputeGraph graph;
-    iface->allocateWithAliasing(graph);
 
     BufferDescriptor desc;
     desc.name = "test";

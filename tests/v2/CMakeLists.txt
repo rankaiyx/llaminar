@@ -954,19 +954,6 @@ add_v2_test(V2_Unit_DeviceWorkspaceManager
     MPI_PROCS 1
 )
 
-# Test: PerStageBufferPool - Per-PP-stage buffer allocation for heterogeneous execution
-add_executable(v2_unit_per_stage_buffer_pool unit/execution/local_execution/device/Test__PerStageBufferPool.cpp)
-target_link_libraries(v2_unit_per_stage_buffer_pool 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_PerStageBufferPool 
-    COMMAND $<TARGET_FILE:v2_unit_per_stage_buffer_pool>
-    LABELS "V2;Unit;Execution;PerStageBufferPool;PP;Memory;Allocation"
-    MPI_PROCS 1
-)
-
 # Test: IWorkspaceConsumerStage - Mixin for stages that delegate workspace to kernels
 add_executable(v2_unit_workspace_consumer_stage unit/execution/compute_stages/Test__IWorkspaceConsumerStage.cpp)
 target_link_libraries(v2_unit_workspace_consumer_stage 
@@ -3982,6 +3969,22 @@ add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemm
     MPI_PROCS 1
 )
 
+add_executable(v2_perf_cuda_blockwise_tensorcore_gemm_sweep performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemmSweep.cpp)
+target_link_libraries(v2_perf_cuda_blockwise_tensorcore_gemm_sweep llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemmSweep
+    COMMAND $<TARGET_FILE:v2_perf_cuda_blockwise_tensorcore_gemm_sweep>
+    LABELS "V2;Performance;CUDA;GEMM;GEMV;TensorCore;BlockwiseQuantization;Qwen;Tuning;Sweep"
+    MPI_PROCS 1
+)
+
+add_executable(v2_perf_cuda_native_payload_gemm performance/kernels/cuda/gemm/Perf__CUDANativePayloadGemm.cpp)
+target_link_libraries(v2_perf_cuda_native_payload_gemm llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CUDANativePayloadGemm
+    COMMAND $<TARGET_FILE:v2_perf_cuda_native_payload_gemm>
+    LABELS "V2;Performance;CUDA;GEMM;NativePayload;Prefill;Qwen;Tuning"
+    MPI_PROCS 1
+)
+
 # Test: CUDA Ring Buffer KV Cache Parity
 # Tests ring buffer KV cache with O(1) eviction, wrap-around, batched gather, FP32/FP16/BF16
 if(HAVE_CUDA)
@@ -5239,17 +5242,6 @@ add_v2_test(V2_Unit_CrossBackendCoherence
     MPI_PROCS 1
 )
 
-# Test: LivenessAnalyzer (buffer lifetime analysis for memory optimization)
-# Tests buffer liveness tracking, aliasing group computation, memory savings calculation.
-# Part of Phase 4: Liveness Analysis for buffer management infrastructure
-add_executable(v2_test_liveness_analyzer unit/execution/local_execution/graph/Test__LivenessAnalyzer.cpp)
-target_link_libraries(v2_test_liveness_analyzer llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_LivenessAnalyzer
-    COMMAND $<TARGET_FILE:v2_test_liveness_analyzer>
-    LABELS "V2;Unit;Execution;LivenessAnalyzer;BufferAliasing;MemoryOptimization"
-    MPI_PROCS 1
-)
-
 # Test: Qwen2GraphBufferManagement (DeviceGraphBufferManager integration with DeviceGraphOrchestrator)
 # Tests setTensorFactory/initializeBuffers workflow, buffer allocation/binding,
 # statistics tracking, and release cleanup.
@@ -6228,23 +6220,6 @@ add_v2_test(V2_Integration_Phase6_HeterogeneousDomain
 )
 
 # Test: PP+TP Buffer Pool Integration
-# Integration tests for PP+TP buffer pool and backend selection infrastructure:
-# - PPStageBufferSpec buffer allocation specifications
-# - PerStageBufferPool per-PP-stage buffer management
-# - BackendSelector automatic backend selection
-# - PipelineConfig::autoSelectBackends() auto-completion
-add_executable(v2_integration_pptp_buffer_pool integration/execution/Test__PPTPBufferPoolIntegration.cpp)
-target_link_libraries(v2_integration_pptp_buffer_pool 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_PPTP_BufferPool 
-    COMMAND $<TARGET_FILE:v2_integration_pptp_buffer_pool>
-    MPI_PROCS 1
-    LABELS "V2;Unit;BufferPool;PipelineParallel;TensorParallel;BackendSelector;PipelineConfig"
-)
-
 # Test: Quantised GEMM Sliced Parity (verifies sliced GEMM across MPI ranks matches unsliced)
 add_executable(v2_test_quantised_gemm_sliced_parity integration/kernels/cpu/gemm/Test__QuantisedGemmSlicedParity.cpp)
 target_link_libraries(v2_test_quantised_gemm_sliced_parity 

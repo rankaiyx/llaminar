@@ -8,7 +8,6 @@
  * buffers used by compute stages within a graph. This enables:
  * - Zero-allocation hot paths during inference
  * - Memory planning based on stage requirements
- * - SCRATCH buffer aliasing via liveness analysis
  *
  * ## Design Philosophy
  *
@@ -16,25 +15,14 @@
  * DeviceGraphBufferManager collects these requirements, allocates all buffers
  * upfront, then binds them to stages before execution.
  *
- * ## Buffer Aliasing (Phase 4+)
- *
- * SCRATCH buffers with non-overlapping lifetimes can share memory:
- * @code
- * // Allocate with aliasing optimization
- * manager.allocateWithAliasing(graph);  // Uses LivenessAnalyzer
- *
- * // Check memory savings
- * LOG_INFO("Saved " << manager.aliasingSavingsPercent() << "% memory");
- * @endcode
- *
  * ## Typical Usage
  *
  * @code
  * // Create manager with tensor factory
  * DeviceGraphBufferManager manager(&tensor_factory, &mpi_ctx);
  *
- * // Allocate all buffers for a graph (with aliasing optimization)
- * manager.allocateWithAliasing(graph);
+ * // Allocate all buffers for a graph
+ * manager.allocateForGraph(graph);
  *
  * // Retrieve a specific buffer
  * auto* output = manager.getBuffer("attention", "output");
@@ -48,13 +36,11 @@
  *
  * @see BufferRole for buffer classification
  * @see StageBufferRequirements for stage declarations
- * @see LivenessAnalyzer for aliasing analysis
  */
 
 #pragma once
 
 #include "../../debug/BufferRole.h"
-#include "LivenessAnalyzer.h"
 #include "../collective/CollectiveContext.h"
 #include "../device/DeviceWorkspaceManager.h"
 #include "IGraphBufferManager.h"
@@ -322,7 +308,7 @@ namespace llaminar2
          * @param config Configuration for buffer allocation behavior
          */
         explicit DeviceGraphBufferManager(TensorFactory *factory, const MPIContext *mpi_ctx = nullptr,
-                                    const GraphBufferManagerConfig &config = GraphBufferManagerConfig{});
+                                          const GraphBufferManagerConfig &config = GraphBufferManagerConfig{});
 
         ~DeviceGraphBufferManager();
 
@@ -386,20 +372,6 @@ namespace llaminar2
          * @return true if allocation succeeded
          */
         bool allocateBuffer(const std::string &node_name, const BufferDescriptor &desc) override;
-
-        /**
-         * @brief Allocate all buffers with aliasing optimization
-         *
-         * Uses LivenessAnalyzer to find SCRATCH buffers with non-overlapping
-         * lifetimes and allocates them to shared physical memory.
-         *
-         * This is the recommended allocation method for graphs where memory
-         * efficiency matters. Falls back to allocateForGraph() if analysis fails.
-         *
-         * @param graph The compute graph to allocate for
-         * @return true if all allocations succeeded
-         */
-        bool allocateWithAliasing(ComputeGraph &graph) override;
 
         /**
          * @brief Release all managed buffers
@@ -640,7 +612,6 @@ namespace llaminar2
         // Internal helpers
         std::unique_ptr<TensorBase> createTensorFromDescriptor(const BufferDescriptor &desc);
         void updateStats(const BufferDescriptor &desc, size_t allocated_bytes);
-        bool allocateAliasingGroups(const std::vector<BufferLiveness> &lifetimes);
 
         /**
          * @brief Check if a buffer should use BAR allocation

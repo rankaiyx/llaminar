@@ -772,6 +772,64 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
         cudaFree(d_C);                                                                      \
     }
 
+/**
+ * @brief Helper macro for decode-size (M=1) quantized GEMV parity tests
+ *
+ * Exercises the NativePayload GEMV path (M=1 decode) for each codebook.
+ * K-quant formats use 256-element blocks, so K must be multiple of 256.
+ */
+#define DEFINE_QUANTIZED_DECODE_PARITY_TEST(TestName, TensorType, CreateMethod, BlockSize, Seed) \
+    TEST_F(Test__CUDAGemmParity, TestName)                                                       \
+    {                                                                                            \
+        const int M = 1;                                                                         \
+        const int N = 896;                                                                       \
+        const int K = (BlockSize == 256) ? 768 : 896;                                            \
+                                                                                                 \
+        auto weights = TestTensorFactory::CreateMethod({(size_t)N, (size_t)K}, Seed);            \
+                                                                                                 \
+        auto A_data = randomFP32(M * K);                                                         \
+                                                                                                 \
+        /* CPU Reference */                                                                      \
+        std::vector<float> C_cpu(M * N, 0.0f);                                                   \
+        auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                      \
+            weights.get(), KernelDeviceType::CPU);                                               \
+        ASSERT_NE(cpu_kernel, nullptr) << "Failed to create CPU kernel for " #TensorType;        \
+        ASSERT_TRUE(cpu_kernel->multiply(A_data.data(), C_cpu.data(), M, N, K));                 \
+        ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), M * N)) << "CPU result has NaN/Inf";              \
+                                                                                                 \
+        /* CUDA */                                                                               \
+        ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                       \
+        auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                     \
+            weights.get(), KernelDeviceType::CUDA);                                              \
+        ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType;      \
+                                                                                                 \
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                         \
+                                                                                                 \
+        float *d_A, *d_C;                                                                        \
+        ASSERT_EQ(cudaSuccess, cudaMalloc(&d_A, M * K * sizeof(float)));                         \
+        ASSERT_EQ(cudaSuccess, cudaMalloc(&d_C, M * N * sizeof(float)));                         \
+        ASSERT_EQ(cudaSuccess, cudaMemcpy(d_A, A_data.data(), M * K * sizeof(float),             \
+                                          cudaMemcpyHostToDevice));                              \
+        ASSERT_EQ(cudaSuccess, cudaMemset(d_C, 0, M * N * sizeof(float)));                       \
+                                                                                                 \
+        ASSERT_TRUE(cuda_kernel->multiply(d_A, d_C, M, N, K));                                   \
+                                                                                                 \
+        std::vector<float> C_cuda(M * N);                                                        \
+        ASSERT_EQ(cudaSuccess, cudaMemcpy(C_cuda.data(), d_C, M * N * sizeof(float),             \
+                                          cudaMemcpyDeviceToHost));                              \
+                                                                                                 \
+        auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.15);               \
+        result.print(#TensorType " Decode 1x" + std::to_string(N) + "x" + std::to_string(K));    \
+                                                                                                 \
+        EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";                      \
+        EXPECT_GE(result.cosine_similarity, 0.99)                                                \
+            << "Cosine similarity too low: " << result.cosine_similarity;                        \
+                                                                                                 \
+        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                             \
+        cudaFree(d_A);                                                                           \
+        cudaFree(d_C);                                                                           \
+    }
+
 // ============================================================================
 // Q8_0 Parity Tests
 // ============================================================================
@@ -1031,6 +1089,12 @@ DEFINE_QUANTIZED_PARITY_TEST(Q3_K_SmallMatrix, Q3_KTensor, createQ3_KRandom, 256
 DEFINE_QUANTIZED_PARITY_TEST(Q4_K_SmallMatrix, Q4_KTensor, createQ4_KRandom, 256, 204)
 DEFINE_QUANTIZED_PARITY_TEST(Q5_K_SmallMatrix, Q5_KTensor, createQ5_KRandom, 256, 205)
 
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(Q6_K_DecodeSize, Q6_KTensor, createQ6_KRandom, 256, 211)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(Q2_K_DecodeSize, Q2_KTensor, createQ2_KRandom, 256, 212)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(Q3_K_DecodeSize, Q3_KTensor, createQ3_KRandom, 256, 213)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(Q4_K_DecodeSize, Q4_KTensor, createQ4_KRandom, 256, 214)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(Q5_K_DecodeSize, Q5_KTensor, createQ5_KRandom, 256, 215)
+
 // ============================================================================
 // IQ (Importance Quantization) Parity Tests
 // ============================================================================
@@ -1043,6 +1107,15 @@ DEFINE_QUANTIZED_PARITY_TEST(IQ3_XXS_SmallMatrix, IQ3_XXSTensor, createIQ3_XXSRa
 DEFINE_QUANTIZED_PARITY_TEST(IQ3_S_SmallMatrix, IQ3_STensor, createIQ3_SRandom, 256, 306)
 DEFINE_QUANTIZED_PARITY_TEST(IQ1_S_SmallMatrix, IQ1_STensor, createIQ1_SRandom, 256, 307)
 DEFINE_QUANTIZED_PARITY_TEST(IQ1_M_SmallMatrix, IQ1_MTensor, createIQ1_MRandom, 256, 308)
+
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(IQ4_XS_DecodeSize, IQ4_XSTensor, createIQ4_XSRandom, 256, 311)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(IQ2_XXS_DecodeSize, IQ2_XXSTensor, createIQ2_XXSRandom, 256, 312)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(IQ2_XS_DecodeSize, IQ2_XSTensor, createIQ2_XSRandom, 256, 313)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(IQ2_S_DecodeSize, IQ2_STensor, createIQ2_SRandom, 256, 314)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(IQ3_XXS_DecodeSize, IQ3_XXSTensor, createIQ3_XXSRandom, 256, 315)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(IQ3_S_DecodeSize, IQ3_STensor, createIQ3_SRandom, 256, 316)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(IQ1_S_DecodeSize, IQ1_STensor, createIQ1_SRandom, 256, 317)
+DEFINE_QUANTIZED_DECODE_PARITY_TEST(IQ1_M_DecodeSize, IQ1_MTensor, createIQ1_MRandom, 256, 318)
 
 // ============================================================================
 // Real Model Weight Parity Tests

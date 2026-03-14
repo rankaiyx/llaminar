@@ -27,8 +27,20 @@ namespace llaminar2
     class TensorBase;
     struct BufferAllocationStats;
     struct BufferKey;
-    struct AliasingGroup;
     class CollectiveContext;
+
+    /**
+     * @brief Represents a group of buffers that can share memory
+     *
+     * All buffers in a group have non-overlapping lifetimes and compatible
+     * tensor types, allowing them to alias to a single physical buffer.
+     */
+    struct AliasingGroup
+    {
+        std::vector<std::string> buffer_names; ///< Buffers in this group
+        size_t max_size_bytes = 0;             ///< Size of largest buffer (allocation size)
+        BufferTensorType tensor_type;          ///< Common tensor type
+    };
 
     /**
      * @brief Abstract interface for graph buffer management operations
@@ -97,20 +109,6 @@ namespace llaminar2
          * @return true if allocation succeeded
          */
         virtual bool allocateBuffer(const std::string &node_name, const BufferDescriptor &desc) = 0;
-
-        /**
-         * @brief Allocate all buffers with aliasing optimization
-         *
-         * Uses LivenessAnalyzer to find SCRATCH buffers with non-overlapping
-         * lifetimes and allocates them to shared physical memory.
-         *
-         * This is the recommended allocation method for graphs where memory
-         * efficiency matters. Falls back to allocateForGraph() if analysis fails.
-         *
-         * @param graph The compute graph to allocate for
-         * @return true if all allocations succeeded
-         */
-        virtual bool allocateWithAliasing(ComputeGraph &graph) = 0;
 
         /**
          * @brief Release all managed buffers

@@ -3392,38 +3392,6 @@ namespace llaminar2
         return true;
     }
 
-    bool DeviceGraphOrchestrator::initializeBufferPool(const PPStageBufferSpec &spec, const MPIContext *mpi_ctx)
-    {
-        if (!pipeline_config_)
-        {
-            LOG_WARN("[DeviceGraphOrchestrator] Cannot initialize buffer pool without PipelineConfig");
-            return false;
-        }
-
-        if (!pipeline_config_->hasPP())
-        {
-            LOG_DEBUG("[DeviceGraphOrchestrator] No PP stages - buffer pool not needed");
-            return true;
-        }
-
-        LOG_INFO("[DeviceGraphOrchestrator] Initializing per-stage buffer pool for "
-                 << pipeline_config_->numStages() << " PP stages...");
-
-        // Initialize the buffer pool
-        buffer_pool_.emplace();
-        if (!buffer_pool_->initialize(*pipeline_config_, spec, mpi_ctx))
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize per-stage buffer pool");
-            buffer_pool_.reset();
-            return false;
-        }
-
-        LOG_INFO("[DeviceGraphOrchestrator] Per-stage buffer pool initialized: "
-                 << buffer_pool_->stats().total_bytes() << " bytes across "
-                 << buffer_pool_->numStages() << " stages");
-        return true;
-    }
-
     // =========================================================================
     // GraphBuildSession Implementation (nested class)
     // =========================================================================
@@ -3496,13 +3464,6 @@ namespace llaminar2
     DeviceGraphOrchestrator::GraphBuildSession::withKVCache(IKVCache *kv_cache)
     {
         kv_cache_ = kv_cache;
-        return *this;
-    }
-
-    DeviceGraphOrchestrator::GraphBuildSession &
-    DeviceGraphOrchestrator::GraphBuildSession::withBufferPool(PerStageBufferPool *pool)
-    {
-        buffer_pool_ = pool;
         return *this;
     }
 

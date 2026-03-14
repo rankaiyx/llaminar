@@ -98,6 +98,13 @@ namespace llaminar2
             static void setBlockwiseExecutionBackend(CUDABlockwiseExecutionBackend backend);
             static CUDABlockwiseExecutionBackend getBlockwiseExecutionBackend();
 
+            static void setNativePayloadEnabled(bool enabled);
+            static bool isNativePayloadEnabled();
+            static void setNativePayloadTunedGemvEnabled(bool enabled);
+            static bool isNativePayloadTunedGemvEnabled();
+            static void setForceCutlassFallback(bool enabled);
+            static bool isForceCutlassFallback();
+
             /**
              * @brief Construct kernel for quantized weight tensor (lazy conversion)
              *

@@ -7,7 +7,6 @@
 
 #include "DeviceGraphBufferManager.h"
 #include "DeviceGraphExecutor.h"
-#include "LivenessAnalyzer.h"
 #include "../collective/CollectiveContext.h"
 #include "../device/DeviceWorkspaceManager.h"
 #include "../../../collective/backends/PCIeBARBackend.h"
@@ -192,11 +191,11 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[BAR_ALLOC] '" << node_name << "." << desc.name
-                  << "' collective='" << desc.collective_id
-                  << "' bar_ptr=" << ptr
-                  << " offset=" << offset
-                  << " bytes=" << size_bytes
-                  << " device=" << desc.device.toString());
+                                  << "' collective='" << desc.collective_id
+                                  << "' bar_ptr=" << ptr
+                                  << " offset=" << offset
+                                  << " bytes=" << size_bytes
+                                  << " device=" << desc.device.toString());
 
         // Create a tensor wrapping the external BAR memory
         // Note: For now, we use the standard factory and rely on the caller
@@ -362,13 +361,13 @@ namespace llaminar2
 
         // Log pointer addresses for multi-GPU debugging
         LOG_DEBUG("[BUFFER_ALLOC] '" << node_name << "." << desc.name << "'"
-                  << " role=" << bufferRoleName(desc.role)
-                  << " host_ptr=" << static_cast<const void*>(tensor->raw_data())
-                  << " gpu_ptr=" << tensor->gpu_data_ptr()
-                  << " device=" << desc.device.toString()
-                  << " bytes=" << allocated_bytes
-                  << " tensor_obj=" << static_cast<void*>(tensor.get())
-                  << (desc.isCollectiveBuffer() ? " [COLLECTIVE]" : ""));
+                                     << " role=" << bufferRoleName(desc.role)
+                                     << " host_ptr=" << static_cast<const void *>(tensor->raw_data())
+                                     << " gpu_ptr=" << tensor->gpu_data_ptr()
+                                     << " device=" << desc.device.toString()
+                                     << " bytes=" << allocated_bytes
+                                     << " tensor_obj=" << static_cast<void *>(tensor.get())
+                                     << (desc.isCollectiveBuffer() ? " [COLLECTIVE]" : ""));
 
         // Store buffer and descriptor
         descriptors_[key] = desc;
@@ -390,183 +389,6 @@ namespace llaminar2
         aliasing_groups_.clear();
         aliasing_savings_percent_ = 0.0;
         stats_.reset();
-    }
-
-    // =========================================================================
-    // Aliasing-Aware Allocation
-    // =========================================================================
-
-    bool DeviceGraphBufferManager::allocateWithAliasing(ComputeGraph &graph)
-    {
-        if (!factory_)
-        {
-            LOG_ERROR("Cannot allocate buffers: TensorFactory is null");
-            return false;
-        }
-
-        LOG_DEBUG("DeviceGraphBufferManager: Allocating with aliasing optimization");
-
-        // Step 1: Run liveness analysis
-        LivenessAnalyzer analyzer;
-        auto lifetimes = analyzer.analyze(graph);
-
-        if (lifetimes.empty())
-        {
-            LOG_DEBUG("DeviceGraphBufferManager: No buffers to allocate (empty graph or no requirements)");
-            return true;
-        }
-
-        // Step 2: Compute aliasing groups
-        aliasing_groups_ = analyzer.computeAliasingGroups(lifetimes);
-
-        // Step 3: Calculate savings
-        auto [original_bytes, optimized_bytes] = analyzer.computeMemoryUsage(lifetimes, aliasing_groups_);
-        aliasing_savings_percent_ = analyzer.computeSavingsPercent(lifetimes, aliasing_groups_);
-
-        LOG_INFO("DeviceGraphBufferManager: Aliasing analysis complete - "
-                 << "original=" << (original_bytes / 1024.0 / 1024.0) << " MB, "
-                 << "optimized=" << (optimized_bytes / 1024.0 / 1024.0) << " MB, "
-                 << "savings=" << aliasing_savings_percent_ << "%, "
-                 << "groups=" << aliasing_groups_.size());
-
-        // Step 4: Allocate aliased SCRATCH buffers
-        if (!allocateAliasingGroups(lifetimes))
-        {
-            LOG_ERROR("DeviceGraphBufferManager: Failed to allocate aliasing groups");
-            return false;
-        }
-
-        // Step 5: Allocate non-SCRATCH buffers normally
-        auto execution_order = graph.getExecutionOrder();
-        for (const auto &node_name : execution_order)
-        {
-            auto *node = graph.getNode(node_name);
-            if (!node || !node->stage)
-            {
-                continue;
-            }
-
-            auto reqs = node->stage->getBufferRequirements();
-            for (const auto &desc : reqs.buffers)
-            {
-                // Skip INPUT and WEIGHT (external)
-                if (desc.role == BufferRole::INPUT || desc.role == BufferRole::WEIGHT)
-                {
-                    BufferKey key{node_name, desc.name};
-                    descriptors_[key] = desc;
-                    continue;
-                }
-
-                // SCRATCH buffers handled by aliasing groups
-                if (desc.role == BufferRole::SCRATCH)
-                {
-                    // Already allocated via aliasing groups
-                    continue;
-                }
-
-                // Allocate OUTPUT and INOUT normally
-                if (!allocateBuffer(node_name, desc))
-                {
-                    LOG_ERROR("DeviceGraphBufferManager: Failed to allocate buffer '"
-                              << desc.name << "' for node '" << node_name << "'");
-                    return false;
-                }
-            }
-        }
-
-        LOG_DEBUG("DeviceGraphBufferManager: Allocated " << buffers_.size() << " individual buffers + "
-                                                         << aliased_buffers_.size() << " aliased groups");
-
-        return true;
-    }
-
-    bool DeviceGraphBufferManager::allocateAliasingGroups(const std::vector<BufferLiveness> &lifetimes)
-    {
-        // Build map from full buffer name to its liveness info (for descriptor lookup)
-        std::unordered_map<std::string, const BufferLiveness *> liveness_map;
-        for (const auto &l : lifetimes)
-        {
-            liveness_map[l.buffer_name] = &l;
-        }
-
-        // Helper to extract short buffer name from full name (stage_name::buffer_name)
-        auto extractShortName = [](const std::string &full_name) -> std::string
-        {
-            size_t pos = full_name.find("::");
-            if (pos != std::string::npos && pos + 2 < full_name.size())
-            {
-                return full_name.substr(pos + 2);
-            }
-            return full_name; // Fallback: return as-is
-        };
-
-        // Allocate each aliasing group
-        for (size_t group_idx = 0; group_idx < aliasing_groups_.size(); ++group_idx)
-        {
-            const auto &group = aliasing_groups_[group_idx];
-
-            if (group.buffer_names.empty())
-            {
-                continue;
-            }
-
-            // Create physical buffer for the group (sized to max)
-            BufferDescriptor group_desc;
-            group_desc.name = "aliased_group_" + std::to_string(group_idx);
-            group_desc.role = BufferRole::SCRATCH;
-            group_desc.tensor_type = group.tensor_type;
-
-            // Infer shape from max size and first buffer's shape ratio
-            // For simplicity, use a 1D shape with max_size_bytes / element_size
-            size_t element_size = (group.tensor_type == BufferTensorType::FP32) ? 4 : (group.tensor_type == BufferTensorType::BF16 || group.tensor_type == BufferTensorType::FP16) ? 2
-                                                                                                                                                                                   : 4;
-            size_t num_elements = group.max_size_bytes / element_size;
-            group_desc.shape = {num_elements};
-            group_desc.device = DeviceId::cpu();
-
-            auto tensor = createTensorFromDescriptor(group_desc);
-            if (!tensor)
-            {
-                LOG_ERROR("DeviceGraphBufferManager: Failed to create aliased buffer for group " << group_idx);
-                return false;
-            }
-
-            // Track allocation in stats
-            stats_.total_bytes += tensor->size_bytes();
-            stats_.scratch_bytes += tensor->size_bytes();
-            stats_.scratch_buffers_aliased += group.buffer_names.size();
-
-            // Store the physical buffer
-            aliased_buffers_[group_idx] = std::move(tensor);
-
-            // Map each logical buffer to this group
-            // NOTE: buffer names in group.buffer_names are full names like "stage0::scratch_a"
-            for (const auto &full_name : group.buffer_names)
-            {
-                auto it = liveness_map.find(full_name);
-                if (it != liveness_map.end())
-                {
-                    const auto &liveness = *it->second;
-                    // Use stage_name from liveness + short buffer name for the key
-                    std::string short_name = extractShortName(full_name);
-                    BufferKey key{liveness.stage_name, short_name};
-                    buffer_to_group_[key] = group_idx;
-
-                    // Store descriptor for metadata
-                    BufferDescriptor desc;
-                    desc.name = short_name;
-                    desc.role = BufferRole::SCRATCH;
-                    desc.tensor_type = liveness.tensor_type;
-                    desc.shape = liveness.shape;
-                    descriptors_[key] = desc;
-
-                    LOG_TRACE("DeviceGraphBufferManager: Buffer '" << key.node_name << "." << short_name
-                                                                   << "' -> aliased group " << group_idx);
-                }
-            }
-        }
-
-        return true;
     }
 
     // =========================================================================

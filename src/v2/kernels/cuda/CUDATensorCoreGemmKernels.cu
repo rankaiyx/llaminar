@@ -19,6 +19,7 @@
 #include <cutlass/gemm/device/gemm.h>
 
 #include <atomic>
+#include <cstdint>
 #include <sstream>
 #include <stdexcept>
 
@@ -76,27 +77,30 @@ namespace
         3>;
 
     constexpr int kTensorCoreBlockK = 32;
-    constexpr uint64_t kModeratelyWideWorkThreshold = 4ull * 1000ull * 1000ull * 1000ull;
-    constexpr uint64_t kExtremelyWideWorkThreshold = 8ull * 1000ull * 1000ull * 1000ull;
+    constexpr uint64_t kModeratelyWideWorkThreshold = 512ull * 1000ull * 1000ull;
+    constexpr uint64_t kExtremelyWideWorkThreshold = 2ull * 1000ull * 1000ull * 1000ull;
     constexpr int kModeratelyWideAspectRatio = 4;
     constexpr int kExtremelyWideAspectRatio = 16;
+    constexpr int kSmallMThreshold = 32;
+    constexpr int kMaxPartialChunkBlocks = 8;
+    constexpr size_t kPartialScratchBudgetBytes = 256ull * 1024ull * 1024ull;
 
     std::atomic<int> g_cuda_gemm_force_small_m{0};
     std::atomic<int> g_cuda_gemm_force_wide_n{0};
     std::atomic<int> g_cuda_gemm_force_balanced{0};
 
-#define CUDA_GEMM_CHECK(call)                                                  \
-    do                                                                         \
-    {                                                                          \
-        cudaError_t err__ = (call);                                            \
-        if (err__ != cudaSuccess)                                              \
-        {                                                                      \
-            std::ostringstream oss__;                                          \
-            oss__ << "[CUDATensorCoreGemm] CUDA error: "                      \
-                  << cudaGetErrorString(err__) << " at " << __FILE__          \
-                  << ":" << __LINE__;                                         \
-            throw std::runtime_error(oss__.str());                             \
-        }                                                                      \
+#define CUDA_GEMM_CHECK(call)                                        \
+    do                                                               \
+    {                                                                \
+        cudaError_t err__ = (call);                                  \
+        if (err__ != cudaSuccess)                                    \
+        {                                                            \
+            std::ostringstream oss__;                                \
+            oss__ << "[CUDATensorCoreGemm] CUDA error: "             \
+                  << cudaGetErrorString(err__) << " at " << __FILE__ \
+                  << ":" << __LINE__;                                \
+            throw std::runtime_error(oss__.str());                   \
+        }                                                            \
     } while (0)
 
     __global__ void initialize_output_kernel(
@@ -113,6 +117,7 @@ namespace
         output[idx] = (beta == 0.0f) ? 0.0f : beta * base;
     }
 
+    template <int ChunkCount>
     __global__ void accumulate_partial_blockwise_kernel(
         const int32_t *__restrict__ partial,
         float *__restrict__ output,
@@ -121,7 +126,7 @@ namespace
         int M,
         int N,
         int blocks_per_row,
-        int block_idx,
+        int block_idx_base,
         float alpha)
     {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -131,9 +136,18 @@ namespace
 
         const int m = idx / N;
         const int n = idx % N;
-        const float scale_a = scales_A_blockwise[m * blocks_per_row + block_idx];
         const float scale_b = scales_B[n];
-        output[idx] += alpha * static_cast<float>(partial[idx]) * scale_a * scale_b;
+        const size_t partial_plane_stride = static_cast<size_t>(total);
+
+        float partial_sum = 0.0f;
+#pragma unroll
+        for (int chunk_idx = 0; chunk_idx < ChunkCount; ++chunk_idx)
+        {
+            const float scale_a = scales_A_blockwise[m * blocks_per_row + block_idx_base + chunk_idx];
+            partial_sum += static_cast<float>(partial[static_cast<size_t>(chunk_idx) * partial_plane_stride + idx]) * scale_a;
+        }
+
+        output[idx] += alpha * partial_sum * scale_b;
     }
 
     __global__ void add_bias_kernel(
@@ -200,15 +214,97 @@ namespace
         const bool extremely_wide = static_cast<uint64_t>(N) >= static_cast<uint64_t>(K) * kExtremelyWideAspectRatio;
         const bool moderately_wide = static_cast<uint64_t>(N) >= static_cast<uint64_t>(K) * kModeratelyWideAspectRatio;
 
-        // Auto dispatch is intentionally driven by only two shape properties:
-        // aspect ratio and total work. WideN only pays off once the matrix is
-        // both wide enough and large enough; otherwise the smaller tile is the
-        // more stable default across square and K-heavy projections.
         if ((extremely_wide && total_work >= kExtremelyWideWorkThreshold) ||
             (moderately_wide && total_work >= kModeratelyWideWorkThreshold))
             return GemmDispatchClass::WideN;
 
-        return GemmDispatchClass::SmallM;
+        if (M <= kSmallMThreshold)
+            return GemmDispatchClass::SmallM;
+
+        return GemmDispatchClass::Balanced;
+    }
+
+    static int selectPartialChunkBlocks(int M, int N, int K)
+    {
+        const int num_k_blocks = K / kTensorCoreBlockK;
+        if (num_k_blocks <= 1)
+            return 1;
+
+        const size_t partial_plane_bytes = static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(int32_t);
+        const int budget_limited_chunk_count = (partial_plane_bytes == 0)
+                                                   ? 1
+                                                   : static_cast<int>(kPartialScratchBudgetBytes / partial_plane_bytes);
+        const int max_chunk_count = std::max(1, std::min(kMaxPartialChunkBlocks, budget_limited_chunk_count));
+        const uint64_t total_output_elements = static_cast<uint64_t>(M) * static_cast<uint64_t>(N);
+        if (M >= 64 || N >= 16384 || total_output_elements >= (1ull << 20))
+            return std::min(num_k_blocks, max_chunk_count);
+        if (total_output_elements >= (1ull << 18))
+            return std::min(num_k_blocks, std::min(4, max_chunk_count));
+        return 1;
+    }
+
+    static void launchAccumulationChunk(
+        const int32_t *d_partial_int32,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        const float *d_scales_B,
+        int M,
+        int N,
+        int blocks_per_row,
+        int block_idx_base,
+        int chunk_count,
+        float alpha,
+        cudaStream_t cuda_stream)
+    {
+        const int total = M * N;
+        const int threads = 256;
+        const int blocks = (total + threads - 1) / threads;
+
+        switch (chunk_count)
+        {
+        case 8:
+            accumulate_partial_blockwise_kernel<8><<<blocks, threads, 0, cuda_stream>>>(
+                d_partial_int32, d_C_fp32, d_scales_A_block, d_scales_B,
+                M, N, blocks_per_row, block_idx_base, alpha);
+            break;
+        case 7:
+            accumulate_partial_blockwise_kernel<7><<<blocks, threads, 0, cuda_stream>>>(
+                d_partial_int32, d_C_fp32, d_scales_A_block, d_scales_B,
+                M, N, blocks_per_row, block_idx_base, alpha);
+            break;
+        case 6:
+            accumulate_partial_blockwise_kernel<6><<<blocks, threads, 0, cuda_stream>>>(
+                d_partial_int32, d_C_fp32, d_scales_A_block, d_scales_B,
+                M, N, blocks_per_row, block_idx_base, alpha);
+            break;
+        case 5:
+            accumulate_partial_blockwise_kernel<5><<<blocks, threads, 0, cuda_stream>>>(
+                d_partial_int32, d_C_fp32, d_scales_A_block, d_scales_B,
+                M, N, blocks_per_row, block_idx_base, alpha);
+            break;
+        case 4:
+            accumulate_partial_blockwise_kernel<4><<<blocks, threads, 0, cuda_stream>>>(
+                d_partial_int32, d_C_fp32, d_scales_A_block, d_scales_B,
+                M, N, blocks_per_row, block_idx_base, alpha);
+            break;
+        case 3:
+            accumulate_partial_blockwise_kernel<3><<<blocks, threads, 0, cuda_stream>>>(
+                d_partial_int32, d_C_fp32, d_scales_A_block, d_scales_B,
+                M, N, blocks_per_row, block_idx_base, alpha);
+            break;
+        case 2:
+            accumulate_partial_blockwise_kernel<2><<<blocks, threads, 0, cuda_stream>>>(
+                d_partial_int32, d_C_fp32, d_scales_A_block, d_scales_B,
+                M, N, blocks_per_row, block_idx_base, alpha);
+            break;
+        default:
+            accumulate_partial_blockwise_kernel<1><<<blocks, threads, 0, cuda_stream>>>(
+                d_partial_int32, d_C_fp32, d_scales_A_block, d_scales_B,
+                M, N, blocks_per_row, block_idx_base, alpha);
+            break;
+        }
+
+        CUDA_GEMM_CHECK(cudaGetLastError());
     }
 
     static cutlass::Status launchSelectedTensorCorePartial(
@@ -290,29 +386,40 @@ extern "C"
 
             const int num_k_blocks = K / kTensorCoreBlockK;
             const GemmDispatchClass dispatch_class = classifyGemmShape(M, N, K);
+            const int partial_chunk_blocks = selectPartialChunkBlocks(M, N, K);
+            const size_t partial_plane_stride = static_cast<size_t>(total);
 
-            for (int block_idx = 0; block_idx < num_k_blocks; ++block_idx)
+            for (int block_idx = 0; block_idx < num_k_blocks; block_idx += partial_chunk_blocks)
             {
-                const int8_t *a_block = d_A_int8 + block_idx * kTensorCoreBlockK;
-                const int8_t *b_block = d_weights_int8_tc_blocked + static_cast<size_t>(block_idx) * N * kTensorCoreBlockK;
+                const int chunk_count = ((block_idx + partial_chunk_blocks) <= num_k_blocks)
+                                            ? partial_chunk_blocks
+                                            : (num_k_blocks - block_idx);
 
-                cutlass::Status status = launchSelectedTensorCorePartial(
-                    dispatch_class,
-                    a_block,
-                    K,
-                    b_block,
-                    kTensorCoreBlockK,
-                    d_partial_int32,
-                    N,
-                    M,
-                    N,
-                    kTensorCoreBlockK,
-                    cuda_stream);
+                for (int chunk_idx = 0; chunk_idx < chunk_count; ++chunk_idx)
+                {
+                    const int block_offset = block_idx + chunk_idx;
+                    const int8_t *a_block = d_A_int8 + block_offset * kTensorCoreBlockK;
+                    const int8_t *b_block = d_weights_int8_tc_blocked + static_cast<size_t>(block_offset) * N * kTensorCoreBlockK;
+                    int32_t *d_partial_slot = d_partial_int32 + static_cast<size_t>(chunk_idx) * partial_plane_stride;
 
-                if (status != cutlass::Status::kSuccess)
-                    return false;
+                    cutlass::Status status = launchSelectedTensorCorePartial(
+                        dispatch_class,
+                        a_block,
+                        K,
+                        b_block,
+                        kTensorCoreBlockK,
+                        d_partial_slot,
+                        N,
+                        M,
+                        N,
+                        kTensorCoreBlockK,
+                        cuda_stream);
 
-                accumulate_partial_blockwise_kernel<<<blocks, threads, 0, cuda_stream>>>(
+                    if (status != cutlass::Status::kSuccess)
+                        return false;
+                }
+
+                launchAccumulationChunk(
                     d_partial_int32,
                     d_C_fp32,
                     d_scales_A_block,
@@ -321,8 +428,9 @@ extern "C"
                     N,
                     num_k_blocks,
                     block_idx,
-                    alpha);
-                CUDA_GEMM_CHECK(cudaGetLastError());
+                    chunk_count,
+                    alpha,
+                    cuda_stream);
             }
 
             if (d_bias)

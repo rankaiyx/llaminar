@@ -10,8 +10,10 @@
 #include <cuda_runtime.h>
 
 #include "kernels/cuda/CUDAQuantisedGemmKernel.h"
+#include "kernels/KernelFactory.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "backends/DeviceId.h"
 #include "../../../../utils/TestTensorFactory.h"
 
@@ -21,6 +23,7 @@
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -32,6 +35,7 @@
 using namespace llaminar2;
 using namespace llaminar2::cuda;
 using namespace llaminar2::test;
+using llaminar::v2::kernels::KernelFactory;
 
 extern "C"
 {
@@ -51,21 +55,36 @@ namespace
     };
 
     const std::vector<FormatSpec> kFormats = {
-        {"Q4_0", [](size_t n, size_t k) { return TestTensorFactory::createQ4_0Random({n, k}); }},
-        {"IQ4_NL", [](size_t n, size_t k) { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
-        {"Q4_1", [](size_t n, size_t k) { return TestTensorFactory::createQ4_1Random({n, k}); }},
-        {"Q5_0", [](size_t n, size_t k) { return TestTensorFactory::createQ5_0Random({n, k}); }},
-        {"Q5_1", [](size_t n, size_t k) { return TestTensorFactory::createQ5_1Random({n, k}); }},
-        {"Q6_K", [](size_t n, size_t k) { return TestTensorFactory::createQ6_KRandom({n, k}); }},
-        {"Q3_K", [](size_t n, size_t k) { return TestTensorFactory::createQ3_KRandom({n, k}); }},
-        {"Q2_K", [](size_t n, size_t k) { return TestTensorFactory::createQ2_KRandom({n, k}); }},
-        {"IQ3_S", [](size_t n, size_t k) { return TestTensorFactory::createIQ3_SRandom({n, k}); }},
-        {"IQ3_XXS", [](size_t n, size_t k) { return TestTensorFactory::createIQ3_XXSRandom({n, k}); }},
-        {"IQ2_S", [](size_t n, size_t k) { return TestTensorFactory::createIQ2_SRandom({n, k}); }},
-        {"IQ2_XS", [](size_t n, size_t k) { return TestTensorFactory::createIQ2_XSRandom({n, k}); }},
-        {"IQ2_XXS", [](size_t n, size_t k) { return TestTensorFactory::createIQ2_XXSRandom({n, k}); }},
-        {"IQ1_S", [](size_t n, size_t k) { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
-        {"IQ1_M", [](size_t n, size_t k) { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
+        {"Q4_0", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ4_0Random({n, k}); }},
+        {"IQ4_NL", [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+        {"Q4_1", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ4_1Random({n, k}); }},
+        {"Q5_0", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ5_0Random({n, k}); }},
+        {"Q5_1", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ5_1Random({n, k}); }},
+        {"Q6_K", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ6_KRandom({n, k}); }},
+        {"Q3_K", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ3_KRandom({n, k}); }},
+        {"Q2_K", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ2_KRandom({n, k}); }},
+        {"IQ3_S", [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ3_SRandom({n, k}); }},
+        {"IQ3_XXS", [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ3_XXSRandom({n, k}); }},
+        {"IQ2_S", [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ2_SRandom({n, k}); }},
+        {"IQ2_XS", [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ2_XSRandom({n, k}); }},
+        {"IQ2_XXS", [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ2_XXSRandom({n, k}); }},
+        {"IQ1_S", [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
+        {"IQ1_M", [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
     };
 
     struct Shape
@@ -76,18 +95,85 @@ namespace
     };
 
     const std::vector<Shape> kQwenShapes = {
+        // ================================================================
+        // Qwen2.5 0.5B  (hidden=896, intermediate=4864, vocab=151936)
+        // ================================================================
         {"0.5B_Attn", 896, 896},
         {"0.5B_FFN_Up", 4864, 896},
         {"0.5B_FFN_Down", 896, 4864},
         {"0.5B_LM_Head", 151936, 896},
+        // TP=2: ColPar N/2, RowPar K/2
+        {"0.5B_TP2_Attn_QKV", 448, 896}, // column-parallel
+        {"0.5B_TP2_Attn_Wo", 896, 448},  // row-parallel
+        {"0.5B_TP2_FFN_Up", 2432, 896},
+        {"0.5B_TP2_FFN_Down", 896, 2432},
+        {"0.5B_TP2_LM_Head", 75968, 896},
+        // TP=4
+        {"0.5B_TP4_Attn_QKV", 224, 896},
+        {"0.5B_TP4_Attn_Wo", 896, 224},
+        {"0.5B_TP4_FFN_Up", 1216, 896},
+        {"0.5B_TP4_FFN_Down", 896, 1216},
+        {"0.5B_TP4_LM_Head", 37984, 896},
+
+        // ================================================================
+        // Qwen2.5 3B  (hidden=2048, intermediate=11008, vocab=151936)
+        // ================================================================
         {"3B_Attn", 2048, 2048},
         {"3B_FFN_Up", 11008, 2048},
         {"3B_FFN_Down", 2048, 11008},
         {"3B_LM_Head", 151936, 2048},
+        // TP=2
+        {"3B_TP2_Attn_QKV", 1024, 2048},
+        {"3B_TP2_Attn_Wo", 2048, 1024},
+        {"3B_TP2_FFN_Up", 5504, 2048},
+        {"3B_TP2_FFN_Down", 2048, 5504},
+        {"3B_TP2_LM_Head", 75968, 2048},
+        // TP=4
+        {"3B_TP4_Attn_QKV", 512, 2048},
+        {"3B_TP4_Attn_Wo", 2048, 512},
+        {"3B_TP4_FFN_Up", 2752, 2048},
+        {"3B_TP4_FFN_Down", 2048, 2752},
+        {"3B_TP4_LM_Head", 37984, 2048},
+
+        // ================================================================
+        // Qwen2.5 7B  (hidden=3584, intermediate=18944, vocab=152064)
+        // ================================================================
         {"7B_Attn", 3584, 3584},
         {"7B_FFN_Up", 18944, 3584},
         {"7B_FFN_Down", 3584, 18944},
         {"7B_LM_Head", 152064, 3584},
+        // TP=2
+        {"7B_TP2_Attn_QKV", 1792, 3584},
+        {"7B_TP2_Attn_Wo", 3584, 1792},
+        {"7B_TP2_FFN_Up", 9472, 3584},
+        {"7B_TP2_FFN_Down", 3584, 9472},
+        {"7B_TP2_LM_Head", 76032, 3584},
+        // TP=4
+        {"7B_TP4_Attn_QKV", 896, 3584},
+        {"7B_TP4_Attn_Wo", 3584, 896},
+        {"7B_TP4_FFN_Up", 4736, 3584},
+        {"7B_TP4_FFN_Down", 3584, 4736},
+        {"7B_TP4_LM_Head", 38016, 3584},
+
+        // ================================================================
+        // Qwen2.5 14B  (hidden=5120, intermediate=13824, vocab=152064)
+        // ================================================================
+        {"14B_Attn", 5120, 5120},
+        {"14B_FFN_Up", 13824, 5120},
+        {"14B_FFN_Down", 5120, 13824},
+        {"14B_LM_Head", 152064, 5120},
+        // TP=2
+        {"14B_TP2_Attn_QKV", 2560, 5120},
+        {"14B_TP2_Attn_Wo", 5120, 2560},
+        {"14B_TP2_FFN_Up", 6912, 5120},
+        {"14B_TP2_FFN_Down", 5120, 6912},
+        {"14B_TP2_LM_Head", 76032, 5120},
+        // TP=4
+        {"14B_TP4_Attn_QKV", 1280, 5120},
+        {"14B_TP4_Attn_Wo", 5120, 1280},
+        {"14B_TP4_FFN_Up", 3456, 5120},
+        {"14B_TP4_FFN_Down", 5120, 3456},
+        {"14B_TP4_LM_Head", 38016, 5120},
     };
 
     const std::vector<int> kPrefillMValues = {32, 64, 128};
@@ -102,6 +188,8 @@ namespace
         std::set<std::string> shape_filters;
         int max_cases = std::numeric_limits<int>::max();
         bool smoke = false;
+        bool gemv_only = false;
+        bool tuned_gemv_enabled = true;
         std::string gemm_dispatch = "auto";
     };
 
@@ -211,6 +299,10 @@ namespace
         if (const auto value = getEnvInt("LLAMINAR_CUDA_TC_MAX_CASES"))
             cfg.max_cases = std::max(1, *value);
 
+        cfg.gemv_only = getEnvFlag("LLAMINAR_CUDA_TC_GEMV_ONLY");
+        if (const auto value = getEnvInt("LLAMINAR_CUDA_TC_TUNED_GEMV"))
+            cfg.tuned_gemv_enabled = (*value != 0);
+
         const auto format_filters = getEnvCsvSet("LLAMINAR_CUDA_TC_FORMATS");
         if (!format_filters.empty())
             cfg.format_filters = format_filters;
@@ -262,6 +354,57 @@ namespace
         return filters.empty() || filters.count(toLower(name)) > 0;
     }
 
+    int parseTPDegree(const std::string &name)
+    {
+        if (name.find("_TP2_") != std::string::npos)
+            return 2;
+        if (name.find("_TP4_") != std::string::npos)
+            return 4;
+        return 1;
+    }
+
+    std::string tpBaselineKey(const std::string &name)
+    {
+        std::string model;
+        std::string layer;
+
+        const auto tp_pos = name.find("_TP");
+        if (tp_pos != std::string::npos)
+        {
+            model = name.substr(0, tp_pos);
+            const auto after_tp = name.find('_', tp_pos + 3);
+            layer = (after_tp != std::string::npos) ? name.substr(after_tp + 1) : "";
+        }
+        else
+        {
+            const auto first = name.find('_');
+            model = (first != std::string::npos) ? name.substr(0, first) : name;
+            layer = (first != std::string::npos) ? name.substr(first + 1) : "";
+        }
+
+        // Map TP-sharded layer names back to their TP=1 base
+        if (layer == "Attn_QKV" || layer == "Attn_Wo")
+            layer = "Attn";
+
+        return model + "_" + layer;
+    }
+
+    // Theoretical peak HBM bandwidth from device properties.
+    // Uses: 2 * memoryClockRate (DDR) * busWidth_bytes.
+    // Example: RTX 3090 → 2 * 9.751 GHz * 48 bytes = 936 GB/s.
+    double measurePeakBandwidth()
+    {
+        int device = 0;
+        cudaGetDevice(&device);
+        int clockKHz = 0, busWidthBits = 0;
+        cudaDeviceGetAttribute(&clockKHz, cudaDevAttrMemoryClockRate, device);
+        cudaDeviceGetAttribute(&busWidthBits, cudaDevAttrGlobalMemoryBusWidth, device);
+        if (clockKHz <= 0 || busWidthBits <= 0)
+            return 0.0;
+        // memoryClockRate is in kHz, busWidth in bits; DDR factor of 2
+        return 2.0 * static_cast<double>(clockKHz) * 1e3 * static_cast<double>(busWidthBits / 8) / 1e9;
+    }
+
     struct RunResult
     {
         std::vector<float> output;
@@ -299,6 +442,9 @@ namespace
 
             ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
             device_ = DeviceId::cuda(0);
+
+            peak_bw_GB_s_ = measurePeakBandwidth();
+            std::fprintf(stderr, "[CUDABlockwiseTC] Measured peak HBM bandwidth: %.1f GB/s\n", peak_bw_GB_s_);
         }
 
         RunResult runKernel(
@@ -315,87 +461,132 @@ namespace
             else
                 cudaTCGemm_setTuningOverrides(0, 0, 0, 0, 0);
 
-            auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(m), static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
-            auto output = TestTensorFactory::createFP32Zeros({static_cast<size_t>(m), static_cast<size_t>(n)});
-
-            CUDAQuantisedGemmKernel kernel(weights, 0);
-            DeviceWorkspaceManager workspace(device_, 512ull * 1024ull * 1024ull);
-            const auto reqs = kernel.getWorkspaceRequirements(m, n, k);
-            if (!workspace.allocate(reqs))
+            // Create kernel via KernelFactory (same path as parity tests)
+            EXPECT_TRUE(weights->ensureOnDevice(device_));
+            auto kernel = KernelFactory::createGemm(weights, DeviceType::CUDA);
+            if (!kernel)
             {
-                throw std::runtime_error("Failed to allocate CUDA GEMM workspace");
+                throw std::runtime_error("KernelFactory::createGemm returned null");
             }
-            kernel.bindWorkspace(&workspace);
+
+            // Set up workspace via IWorkspaceConsumer interface
+            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+            std::unique_ptr<DeviceWorkspaceManager> workspace;
+            if (ws_consumer)
+            {
+                workspace = std::make_unique<DeviceWorkspaceManager>(device_, 512ull * 1024ull * 1024ull);
+                const auto reqs = ws_consumer->getWorkspaceRequirements(m, n, k);
+                if (!workspace->allocate(reqs))
+                {
+                    throw std::runtime_error("Failed to allocate CUDA GEMM workspace");
+                }
+                ws_consumer->bindWorkspace(workspace.get());
+            }
+
+            // Allocate device memory for activations and output (same as parity test)
+            auto h_input = TestTensorFactory::createFP32Random({static_cast<size_t>(m), static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
+            const float *h_input_data = h_input->data();
+
+            const size_t A_bytes = static_cast<size_t>(m) * k * sizeof(float);
+            const size_t C_bytes = static_cast<size_t>(m) * n * sizeof(float);
+            float *d_A = nullptr;
+            float *d_C = nullptr;
+            if (cudaMalloc(&d_A, A_bytes) != cudaSuccess)
+                throw std::runtime_error("cudaMalloc d_A failed");
+            if (cudaMalloc(&d_C, C_bytes) != cudaSuccess)
+            {
+                cudaFree(d_A);
+                throw std::runtime_error("cudaMalloc d_C failed");
+            }
+            if (cudaMemcpy(d_A, h_input_data, A_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+            {
+                cudaFree(d_A);
+                cudaFree(d_C);
+                throw std::runtime_error("cudaMemcpy d_A failed");
+            }
 
             std::vector<double> times_us;
             times_us.reserve(static_cast<size_t>(cfg.bench_runs));
 
-            const bool ok = with_gpu_coherence(
-                device_,
-                {input.get()},
-                {output.get()},
-                [&]() {
-                    for (int i = 0; i < cfg.warmup_runs; ++i)
-                    {
-                        if (!kernel.multiply_tensor(input.get(), output.get(), m, n, k, true, 1.0f, 0.0f, nullptr, nullptr, -1, &workspace))
-                        {
-                            return false;
-                        }
-                    }
-
-                    for (int i = 0; i < cfg.bench_runs; ++i)
-                    {
-                        cudaEvent_t start = nullptr;
-                        cudaEvent_t stop = nullptr;
-                        if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&stop) != cudaSuccess)
-                        {
-                            return false;
-                        }
-
-                        cudaEventRecord(start);
-                        const bool run_ok = kernel.multiply_tensor(input.get(), output.get(), m, n, k, true, 1.0f, 0.0f, nullptr, nullptr, -1, &workspace);
-                        cudaEventRecord(stop);
-                        cudaEventSynchronize(stop);
-
-                        float elapsed_ms = 0.0f;
-                        cudaEventElapsedTime(&elapsed_ms, start, stop);
-                        cudaEventDestroy(start);
-                        cudaEventDestroy(stop);
-
-                        if (!run_ok)
-                        {
-                            return false;
-                        }
-
-                        times_us.push_back(static_cast<double>(elapsed_ms) * 1000.0);
-                    }
-
-                    return true;
-                });
-            if (!ok)
+            // Warmup
+            for (int i = 0; i < cfg.warmup_runs; ++i)
             {
-                throw std::runtime_error("CUDA blockwise GEMM run failed");
+                if (!kernel->multiply(d_A, d_C, m, n, k))
+                {
+                    cudaFree(d_A);
+                    cudaFree(d_C);
+                    throw std::runtime_error("CUDA blockwise GEMM warmup failed");
+                }
             }
 
-            const float *host = output->data();
-            if (!host)
+            // Benchmark
+            for (int i = 0; i < cfg.bench_runs; ++i)
             {
-                throw std::runtime_error("CUDA blockwise GEMM output sync failed");
+                cudaEvent_t start = nullptr;
+                cudaEvent_t stop = nullptr;
+                if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&stop) != cudaSuccess)
+                {
+                    cudaFree(d_A);
+                    cudaFree(d_C);
+                    throw std::runtime_error("cudaEventCreate failed");
+                }
+
+                cudaEventRecord(start);
+                const bool run_ok = kernel->multiply(d_A, d_C, m, n, k);
+                cudaEventRecord(stop);
+                cudaEventSynchronize(stop);
+
+                float elapsed_ms = 0.0f;
+                cudaEventElapsedTime(&elapsed_ms, start, stop);
+                cudaEventDestroy(start);
+                cudaEventDestroy(stop);
+
+                if (!run_ok)
+                {
+                    cudaFree(d_A);
+                    cudaFree(d_C);
+                    throw std::runtime_error("CUDA blockwise GEMM bench run failed");
+                }
+
+                times_us.push_back(static_cast<double>(elapsed_ms) * 1000.0);
             }
 
+            // Download result
             RunResult result;
-            result.output.assign(host, host + static_cast<size_t>(m) * n);
+            result.output.resize(static_cast<size_t>(m) * n);
+            if (cudaMemcpy(result.output.data(), d_C, C_bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+            {
+                cudaFree(d_A);
+                cudaFree(d_C);
+                throw std::runtime_error("cudaMemcpy d_C readback failed");
+            }
+
+            cudaFree(d_A);
+            cudaFree(d_C);
+
+            if (ws_consumer)
+            {
+                ws_consumer->unbindWorkspace();
+            }
+
             result.min_us = *std::min_element(times_us.begin(), times_us.end());
             result.mean_us = std::accumulate(times_us.begin(), times_us.end(), 0.0) / static_cast<double>(times_us.size());
             return result;
         }
 
         DeviceId device_ = DeviceId::cpu();
+        double peak_bw_GB_s_ = 0;
     };
 
     TEST_F(CUDABlockwiseTensorCorePerf, Correctness_AllFormats_KeyShapes)
     {
         const SweepConfig cfg = loadSweepConfig();
+
+        // Correctness only needs one run per backend (no warmup, no timing)
+        SweepConfig correctness_cfg = cfg;
+        correctness_cfg.warmup_runs = 0;
+        correctness_cfg.bench_runs = 1;
+
         int executed_cases = 0;
 
         for (const auto &format : kFormats)
@@ -421,23 +612,23 @@ namespace
                 }
 
                 std::fprintf(stderr,
-                             "[CUDABlockwiseTC][Correctness] format=%s shape=%s decode_m=1 prefill_m=%d warmup=%d bench=%d gemm_dispatch=%s\n",
-                             format.name.c_str(), shape.name.c_str(), cfg.correctness_prefill_m, cfg.warmup_runs, cfg.bench_runs, cfg.gemm_dispatch.c_str());
+                             "[CUDABlockwiseTC][Correctness] format=%s shape=%s decode_m=1 prefill_m=%d\n",
+                             format.name.c_str(), shape.name.c_str(), correctness_cfg.correctness_prefill_m);
 
                 auto weights_decode = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                const RunResult legacy_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, cfg);
-                const RunResult tc_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::TensorCoreScaffold, cfg);
+                const RunResult legacy_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, correctness_cfg);
+                const RunResult tc_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::TensorCoreScaffold, correctness_cfg);
                 EXPECT_GE(cosineSimilarity(legacy_decode.output, tc_decode.output), kCosineGate) << format.name << " decode " << shape.name;
 
-                const RunResult tck_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, cfg);
+                const RunResult tck_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, correctness_cfg);
                 EXPECT_GE(cosineSimilarity(legacy_decode.output, tck_decode.output), kCosineGate) << format.name << " decode(kernels) " << shape.name;
 
                 auto weights_prefill = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                const RunResult legacy_prefill = runKernel(weights_prefill.get(), cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, cfg);
-                const RunResult tc_prefill = runKernel(weights_prefill.get(), cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::TensorCoreScaffold, cfg);
+                const RunResult legacy_prefill = runKernel(weights_prefill.get(), correctness_cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, correctness_cfg);
+                const RunResult tc_prefill = runKernel(weights_prefill.get(), correctness_cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::TensorCoreScaffold, correctness_cfg);
                 EXPECT_GE(cosineSimilarity(legacy_prefill.output, tc_prefill.output), kCosineGate) << format.name << " prefill " << shape.name;
 
-                const RunResult tck_prefill = runKernel(weights_prefill.get(), cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, cfg);
+                const RunResult tck_prefill = runKernel(weights_prefill.get(), correctness_cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, correctness_cfg);
                 EXPECT_GE(cosineSimilarity(legacy_prefill.output, tck_prefill.output), kCosineGate) << format.name << " prefill(kernels) " << shape.name;
                 ++executed_cases;
             }
@@ -450,6 +641,7 @@ namespace
     {
         const SweepConfig cfg = loadSweepConfig();
         int executed_cases = 0;
+        std::map<std::string, double> baseline_times; // "format_model_layer" -> tuned time_us at TP=1
 
         for (const auto &format : kFormats)
         {
@@ -474,19 +666,56 @@ namespace
                 }
 
                 auto weights_gemv = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                const RunResult legacy_gemv = runKernel(weights_gemv.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, cfg);
-                const RunResult tc_gemv = runKernel(weights_gemv.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::TensorCoreScaffold, cfg);
-                const RunResult tck_gemv = runKernel(weights_gemv.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, cfg);
+                const size_t weight_bytes = weights_gemv->size_bytes();
+
+                // NativePayload tuned GEMV (default path)
+                CUDAQuantisedGemmKernel::setNativePayloadEnabled(true);
+                CUDAQuantisedGemmKernel::setNativePayloadTunedGemvEnabled(cfg.tuned_gemv_enabled);
+                const RunResult np_tuned_gemv = runKernel(weights_gemv.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, cfg);
+
+                // -- HBM bandwidth metrics --
+                const size_t activation_bytes = static_cast<size_t>(shape.k) * sizeof(float);
+                const size_t output_bytes = static_cast<size_t>(shape.n) * sizeof(float);
+                const size_t total_bytes = weight_bytes + activation_bytes + output_bytes;
+                const double eff_bw = static_cast<double>(total_bytes) / (np_tuned_gemv.min_us * 1e-6) / 1e9;
+                const double pct_peak = (peak_bw_GB_s_ > 0) ? (eff_bw / peak_bw_GB_s_ * 100.0) : 0.0;
+
+                // -- TP scaling efficiency --
+                const int tp = parseTPDegree(shape.name);
+                const std::string base_key = format.name + "_" + tpBaselineKey(shape.name);
+                double tp_eff = -1.0;
+                if (tp == 1)
+                {
+                    baseline_times[base_key] = np_tuned_gemv.min_us;
+                }
+                else
+                {
+                    const auto it = baseline_times.find(base_key);
+                    if (it != baseline_times.end() && it->second > 0)
+                    {
+                        tp_eff = (it->second / np_tuned_gemv.min_us) / tp;
+                    }
+                }
+
+                // Build optional TP efficiency suffix
+                char tp_str[64] = "";
+                if (tp_eff >= 0)
+                {
+                    std::snprintf(tp_str, sizeof(tp_str), " tp_eff=%.3f", tp_eff);
+                }
 
                 std::fprintf(stderr,
-                             "[CUDABlockwiseTC][GEMV] format=%s shape=%s M=1 N=%d K=%d warmup=%d bench=%d "
-                             "legacy_min_us=%.3f tc_min_us=%.3f tck_min_us=%.3f "
-                             "scaffold_speedup=%.3fx kernels_speedup=%.3fx\n",
+                             "[CUDABlockwiseTC][GEMV] format=%s shape=%s M=1 N=%d K=%d warmup=%d bench=%d tuned=%d "
+                             "time_us=%.3f eff_bw=%.1fGB/s pct_peak=%.1f%%%s\n",
                              format.name.c_str(), shape.name.c_str(), shape.n, shape.k,
-                             cfg.warmup_runs, cfg.bench_runs,
-                             legacy_gemv.min_us, tc_gemv.min_us, tck_gemv.min_us,
-                             legacy_gemv.min_us / tc_gemv.min_us,
-                             legacy_gemv.min_us / tck_gemv.min_us);
+                             cfg.warmup_runs, cfg.bench_runs, cfg.tuned_gemv_enabled ? 1 : 0,
+                             np_tuned_gemv.min_us, eff_bw, pct_peak, tp_str);
+
+                if (cfg.gemv_only)
+                {
+                    ++executed_cases;
+                    continue;
+                }
 
                 for (int m : cfg.performance_prefill_m)
                 {
