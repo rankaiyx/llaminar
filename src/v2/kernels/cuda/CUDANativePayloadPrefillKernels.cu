@@ -666,19 +666,19 @@ extern "C"
             switch (split_k)
             {
             case 8:
-                return launchQ40TensorCoreVariant<128, 64, 2, 1, 8>(
+                return launchQ40TensorCoreVariant<128, 64, 2, 1, 8, true>(
                     d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
             case 4:
-                return launchQ40TensorCoreVariant<128, 64, 2, 1, 4>(
+                return launchQ40TensorCoreVariant<128, 64, 2, 1, 4, true>(
                     d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
             case 2:
-                return launchQ40TensorCoreVariant<128, 64, 2, 1, 2>(
+                return launchQ40TensorCoreVariant<128, 64, 2, 1, 2, true>(
                     d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
             default:
-                return launchQ40TensorCoreVariant<128, 64, 2, 1>(
+                return launchQ40TensorCoreVariant<128, 64, 2, 1, 1, true>(
                     d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
             }
@@ -715,19 +715,19 @@ extern "C"
             switch (split_k)
             {
             case 8:
-                return launchQ40TensorCoreVariant<128, 128, 2, 2, 8>(
+                return launchQ40TensorCoreVariant<128, 128, 2, 2, 8, true>(
                     d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
             case 4:
-                return launchQ40TensorCoreVariant<128, 128, 2, 2, 4>(
+                return launchQ40TensorCoreVariant<128, 128, 2, 2, 4, true>(
                     d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
             case 2:
-                return launchQ40TensorCoreVariant<128, 128, 2, 2, 2>(
+                return launchQ40TensorCoreVariant<128, 128, 2, 2, 2, true>(
                     d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
             default:
-                return launchQ40TensorCoreVariant<128, 128, 2, 2>(
+                return launchQ40TensorCoreVariant<128, 128, 2, 2, 1, true>(
                     d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
             }
