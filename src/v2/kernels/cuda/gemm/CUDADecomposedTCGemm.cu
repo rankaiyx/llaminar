@@ -1,5 +1,5 @@
 /**
- * @file CUDATensorCoreGemmKernels.cu
+ * @file CUDADecomposedTCGemm.cu
  * @brief CUDA blockwise INT8 GEMM family backed by tensor-core MMA kernels.
  *
  * This file implements the blockwise-activation GEMM contract using CUTLASS

@@ -1,5 +1,5 @@
 /**
- * @file CUDAFusedTCGemm.cu
+ * @file CUDAFusedTCGemm_Turing.cu
  * @brief Fused tensor-core GEMM for blockwise-quantized INT8 inference.
  *
  * Custom kernel that processes the *entire* K dimension in a single launch,

@@ -55,11 +55,7 @@ namespace llaminar2
     namespace cuda
     {
 
-        enum class CUDABlockwiseExecutionBackend
-        {
-            LegacyDP4A = 0,
-            SpecializedBlockwise = 2, // DP4A GEMV + tensor-core GEMM chosen by shape/M
-        };
+
 
         /**
          * @brief CUDA GEMM kernel for quantized weight tensors using CUDA packed weights
@@ -94,13 +90,8 @@ namespace llaminar2
         class CUDAQuantisedGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
-            static void setBlockwiseExecutionBackend(CUDABlockwiseExecutionBackend backend);
-            static CUDABlockwiseExecutionBackend getBlockwiseExecutionBackend();
-
             static void setNativeVNNIEnabled(bool enabled);
             static bool isNativeVNNIEnabled();
-            static void setNativeVNNITunedGemvEnabled(bool enabled);
-            static bool isNativeVNNITunedGemvEnabled();
             static void setForceCutlassFallback(bool enabled);
             static bool isForceCutlassFallback();
 

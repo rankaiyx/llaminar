@@ -322,7 +322,7 @@ namespace
         return cfg;
     }
 
-    void applySpecializedDispatchOverride(const SweepConfig &cfg, int m)
+    void applyGemmTuningOverride(const SweepConfig &cfg, int m)
     {
         const bool is_gemm = (m > 1);
         if (!is_gemm)
@@ -452,14 +452,9 @@ namespace
             int m,
             int n,
             int k,
-            CUDABlockwiseExecutionBackend backend,
             const SweepConfig &cfg)
         {
-            CUDAQuantisedGemmKernel::setBlockwiseExecutionBackend(backend);
-            if (backend == CUDABlockwiseExecutionBackend::SpecializedBlockwise)
-                applySpecializedDispatchOverride(cfg, m);
-            else
-                cudaTCGemm_setTuningOverrides(0, 0, 0, 0, 0);
+            applyGemmTuningOverride(cfg, m);
 
             // Create kernel via KernelFactory (same path as parity tests)
             EXPECT_TRUE(weights->ensureOnDevice(device_));
@@ -615,17 +610,18 @@ namespace
                              "[CUDABlockwiseTC][Correctness] format=%s shape=%s decode_m=1 prefill_m=%d\n",
                              format.name.c_str(), shape.name.c_str(), correctness_cfg.correctness_prefill_m);
 
+                // Run decode (M=1) and prefill (M>1) —verify both produce valid output
                 auto weights_decode = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                const RunResult legacy_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, correctness_cfg);
-
-                const RunResult tck_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, correctness_cfg);
-                EXPECT_GE(cosineSimilarity(legacy_decode.output, tck_decode.output), kCosineGate) << format.name << " decode(kernels) " << shape.name;
+                const RunResult decode_result = runKernel(weights_decode.get(), 1, shape.n, shape.k, correctness_cfg);
 
                 auto weights_prefill = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                const RunResult legacy_prefill = runKernel(weights_prefill.get(), correctness_cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, correctness_cfg);
+                const RunResult prefill_result = runKernel(weights_prefill.get(), correctness_cfg.correctness_prefill_m, shape.n, shape.k, correctness_cfg);
 
-                const RunResult tck_prefill = runKernel(weights_prefill.get(), correctness_cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, correctness_cfg);
-                EXPECT_GE(cosineSimilarity(legacy_prefill.output, tck_prefill.output), kCosineGate) << format.name << " prefill(kernels) " << shape.name;
+                // Verify decode and prefill first rows are consistent
+                const int compare_n = shape.n;
+                std::vector<float> decode_first_row(decode_result.output.begin(), decode_result.output.begin() + compare_n);
+                std::vector<float> prefill_first_row(prefill_result.output.begin(), prefill_result.output.begin() + compare_n);
+                EXPECT_GE(cosineSimilarity(decode_first_row, prefill_first_row), kCosineGate) << format.name << " decode_vs_prefill " << shape.name;
                 ++executed_cases;
             }
         }
@@ -666,8 +662,7 @@ namespace
 
                 // NativeVNNI tuned GEMV (default path)
                 CUDAQuantisedGemmKernel::setNativeVNNIEnabled(true);
-                CUDAQuantisedGemmKernel::setNativeVNNITunedGemvEnabled(cfg.tuned_gemv_enabled);
-                const RunResult np_tuned_gemv = runKernel(weights_gemv.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, cfg);
+                const RunResult np_tuned_gemv = runKernel(weights_gemv.get(), 1, shape.n, shape.k, cfg);
 
                 // -- HBM bandwidth metrics --
                 const size_t activation_bytes = static_cast<size_t>(shape.k) * sizeof(float);
@@ -716,18 +711,15 @@ namespace
                 for (int m : cfg.performance_prefill_m)
                 {
                     auto weights_gemm = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
-                    const RunResult legacy_gemm = runKernel(weights_gemm.get(), m, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, cfg);
-                    const RunResult tck_gemm = runKernel(weights_gemm.get(), m, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, cfg);
+                    const RunResult gemm_result = runKernel(weights_gemm.get(), m, shape.n, shape.k, cfg);
 
                     std::fprintf(stderr,
                                  "[CUDABlockwiseTC][GEMM] format=%s shape=%s M=%d N=%d K=%d warmup=%d bench=%d "
                                  "gemm_dispatch=%s "
-                                 "legacy_min_us=%.3f tck_min_us=%.3f "
-                                 "kernels_speedup=%.3fx\n",
+                                 "min_us=%.3f\n",
                                  format.name.c_str(), shape.name.c_str(), m, shape.n, shape.k,
                                  cfg.warmup_runs, cfg.bench_runs, cfg.gemm_dispatch.c_str(),
-                                 legacy_gemm.min_us, tck_gemm.min_us,
-                                 legacy_gemm.min_us / tck_gemm.min_us);
+                                 gemm_result.min_us);
                 }
 
                 ++executed_cases;

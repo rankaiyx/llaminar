@@ -545,9 +545,7 @@ namespace
             const SweepConfig &cfg,
             const TuneCandidate &candidate)
         {
-            CUDAQuantisedGemmKernel::setBlockwiseExecutionBackend(CUDABlockwiseExecutionBackend::LegacyDP4A);
             CUDAQuantisedGemmKernel::setNativeVNNIEnabled(true);
-            CUDAQuantisedGemmKernel::setNativeVNNITunedGemvEnabled(true);
 
             cudaNativeVNNIGemvSweep_setConfig(
                 static_cast<int>(candidate.family),

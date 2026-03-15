@@ -1,9 +1,9 @@
 /**
- * @file CUDAFusedTCGemmV2.cu
+ * @file CUDAFusedTCGemm_Ampere.cu
  * @brief Ampere+ fused tensor-core GEMM with mma.sync.m16n8k32 for INT8.
  *
  * V2 architecture targeting SM80+ (Ampere / Ada / Hopper).
- * Structural improvements over V1 (CUDAFusedTCGemm.cu, WMMA m16n16k16):
+ * Structural improvements over V1 (CUDAFusedTCGemm_Turing.cu, WMMA m16n16k16):
  *
  *   1. mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 inline PTX
  *      — one MMA instruction per K=32 quantisation block (vs 2 WMMA calls)

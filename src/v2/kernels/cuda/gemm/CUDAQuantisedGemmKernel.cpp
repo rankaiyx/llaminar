@@ -152,43 +152,13 @@ namespace llaminar2
             bool cudaQuantGemm_streamSync(int cuda_device_id, void *stream);
 
             // -----------------------------------------------------------------
-            // Per-shape tensor-core GEMV kernel family
-            // (CUDATensorCoreGemvKernels.cu)
+            // Per-shape tensor-core GEMM kernel family (decomposed, fallback)
+            // (CUDADecomposedTCGemm.cu)
             // -----------------------------------------------------------------
-            void cudaTCGemv_setTuningOverrides(int tn, int cpt, int kb, int wk);
 
-            bool cudaTCGemv_blockwiseGemv(
-                const int8_t *d_A_int8,
-                const int8_t *d_B_int8,
-                float *d_C_fp32,
-                const float *d_scales_A_block,
-                const float *d_scales_B,
-                int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                int cuda_device_id,
-                void *stream);
+            bool cudaNativeVNNIGemvTuned_supportsCodebook(uint8_t codebook_id);
 
-            bool cudaNativeVNNIGemv_supportsCodebook(uint8_t codebook_id);
-
-            bool cudaNativeVNNIInitIQGridTables();
-
-            bool cudaNativeVNNIGemv_fp32(
-                const int8_t *d_A_int8,
-                const uint8_t *d_payload,
-                const uint16_t *d_scales,
-                const uint16_t *d_mins,
-                const uint32_t *d_emins,
-                float *d_C_fp32,
-                const float *d_scales_A_block,
-                int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                uint8_t codebook_id,
-                int cuda_device_id,
-                void *stream);
+            bool cudaNativeVNNIInitIQGridTables_tuned();
 
             bool cudaNativeVNNIGemvTuned_fp32(
                 const int8_t *d_A_int8,
@@ -252,7 +222,7 @@ namespace llaminar2
                 void *stream);
 
             // -----------------------------------------------------------------
-            // V2 Fused tensor-core GEMM (CUDAFusedTCGemmV2.cu)
+            // V2 Fused tensor-core GEMM (CUDAFusedTCGemm_Ampere.cu)
             // mma.sync.m16n8k32 Ampere kernel. Returns false on sm_75.
             // -----------------------------------------------------------------
             bool cudaFusedTCGemmV2_blockwiseGemm(
@@ -270,7 +240,7 @@ namespace llaminar2
                 void *stream);
 
             // -----------------------------------------------------------------
-            // V1 Fused tensor-core GEMM (CUDAFusedTCGemm.cu)
+            // V1 Fused tensor-core GEMM (CUDAFusedTCGemm_Turing.cu)
             // Single-launch WMMA kernel, processes full K in-register.
             // Requires sm_75+. Returns false on older architectures.
             // -----------------------------------------------------------------
@@ -290,7 +260,7 @@ namespace llaminar2
 
             // -----------------------------------------------------------------
             // Per-shape tensor-core GEMM kernel family (CUTLASS-based)
-            // (CUDATensorCoreGemmKernels.cu) — fallback for sm_75 or
+            // (CUDADecomposedTCGemm.cu) — fallback for sm_75 or
             // shapes not yet covered by the fused path.
             // -----------------------------------------------------------------
             void cudaTCGemm_setTuningOverrides(int force_v3, int force_v7, int mt, int kt, int splitk);
@@ -368,9 +338,7 @@ namespace llaminar2
 
         namespace
         {
-            thread_local CUDABlockwiseExecutionBackend g_blockwise_backend = CUDABlockwiseExecutionBackend::LegacyDP4A;
             thread_local bool g_native_vnni_enabled = true;
-            thread_local bool g_native_vnni_tuned_gemv_enabled = true;
             thread_local bool g_force_cutlass_fallback = false;
             constexpr int kTensorCoreBlockwiseMaxPartialChunkBlocks = 8;
             constexpr size_t kTensorCoreBlockwisePartialScratchBudgetBytes = 256ull * 1024ull * 1024ull;
@@ -465,40 +433,6 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream)
             {
-                const auto backend = g_blockwise_backend;
-
-                // ── New per-shape kernel family (GEMV M=1, GEMM M>1) ──
-                if (backend == CUDABlockwiseExecutionBackend::SpecializedBlockwise)
-                {
-                    bool ok = false;
-                    if (m <= 1)
-                    {
-                        // GEMV path: d_A_int8 is [K], d_scales_A_blockwise is [K/32]
-                        ok = cudaTCGemv_blockwiseGemv(
-                            d_A_int8, d_weights_int8, d_C_fp32,
-                            d_scales_A_blockwise, d_scales_B,
-                            n, k,
-                            alpha, beta, d_C_existing, d_bias,
-                            cuda_device_id, stream);
-                    }
-                    else
-                    {
-                        // GEMM path: blocked weights + INT32 partial workspace.
-                        ok = d_weights_int8_tc_blocked && cudaTCGemm_blockwiseGemm(
-                                                              d_A_int8, d_weights_int8_tc_blocked, d_partial_int32, d_C_fp32,
-                                                              d_scales_A_blockwise, d_scales_B,
-                                                              m, n, k,
-                                                              alpha, beta, d_C_existing, d_bias,
-                                                              cuda_device_id, stream);
-                    }
-
-                    if (ok)
-                        return true;
-
-                    LOG_WARN("[CUDAQuantisedGemmKernel] SpecializedBlockwise path failed (M=" << m
-                                                                                              << "), falling back to legacy dp4a");
-                }
-
                 return cudaQuantGemm_blockwiseGemm(
                     d_A_int8,
                     d_weights_int8,
@@ -542,7 +476,7 @@ namespace llaminar2
                        impl->d_weights_native_vnni &&
                        impl->d_weights_native_scales &&
                        (m == 1
-                            ? cudaNativeVNNIGemv_supportsCodebook(impl->native_codebook_id)
+                            ? cudaNativeVNNIGemvTuned_supportsCodebook(impl->native_codebook_id)
                             : (nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id) ||
                                (impl->d_weights_int8_tc_blocked && impl->d_scales_B)));
             }
@@ -570,76 +504,28 @@ namespace llaminar2
                 if (needs_iq_tables)
                 {
                     static std::mutex iq_table_mutex;
-                    static std::unordered_set<int> gemv_init_devices;
-                    static std::unordered_set<int> gemv_tuned_init_devices;
-                    static std::unordered_set<int> prefill_init_devices;
+                    static std::unordered_set<int> iq_init_devices;
 
                     std::lock_guard<std::mutex> lock(iq_table_mutex);
-                    if (m == 1)
+                    if (!iq_init_devices.count(cuda_device_id))
                     {
-                        const bool use_tuned = g_native_vnni_tuned_gemv_enabled;
-                        auto &target_set = use_tuned ? gemv_tuned_init_devices : gemv_init_devices;
-                        if (!target_set.count(cuda_device_id))
+                        if (!cudaQuantGemm_setDevice(cuda_device_id))
                         {
-                            if (!cudaQuantGemm_setDevice(cuda_device_id))
-                            {
-                                LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to set CUDA device " << cuda_device_id
-                                                                                                 << " before IQ grid table initialization");
-                                return false;
-                            }
-                            const bool ok = use_tuned ? cudaNativeVNNIInitIQGridTables_tuned()
-                                                      : cudaNativeVNNIInitIQGridTables();
-                            if (!ok)
-                            {
-                                LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to initialize " << (use_tuned ? "tuned" : "original") << " IQ grid tables for CUDA device " << cuda_device_id);
-                                return false;
-                            }
-                            target_set.insert(cuda_device_id);
+                            LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to set CUDA device " << cuda_device_id
+                                                                                             << " before IQ grid table initialization");
+                            return false;
                         }
-                    }
-                    else
-                    {
-                        // Prefill (M>1) also needs IQ grid tables for IQ formats.
-                        // Prefill uses the same device symbols as the original (non-tuned) GEMV.
-                        if (!prefill_init_devices.count(cuda_device_id))
+                        if (!cudaNativeVNNIInitIQGridTables_tuned())
                         {
-                            if (!cudaQuantGemm_setDevice(cuda_device_id))
-                            {
-                                LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to set CUDA device " << cuda_device_id
-                                                                                                 << " before IQ grid table initialization for prefill");
-                                return false;
-                            }
-                            if (!cudaNativeVNNIInitIQGridTables())
-                            {
-                                LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to initialize IQ grid tables for prefill on CUDA device " << cuda_device_id);
-                                return false;
-                            }
-                            prefill_init_devices.insert(cuda_device_id);
+                            LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to initialize IQ grid tables for CUDA device " << cuda_device_id);
+                            return false;
                         }
+                        iq_init_devices.insert(cuda_device_id);
                     }
                 }
 
                 if (m == 1)
                 {
-                    if (!g_native_vnni_tuned_gemv_enabled)
-                    {
-                        return cudaNativeVNNIGemv_fp32(
-                            d_A_int8,
-                            impl->d_weights_native_vnni,
-                            impl->d_weights_native_scales,
-                            impl->d_weights_native_mins,
-                            impl->d_weights_native_emins,
-                            d_C_fp32,
-                            d_scales_A_blockwise,
-                            n, k,
-                            alpha, beta,
-                            d_C_existing,
-                            d_bias,
-                            impl->native_codebook_id,
-                            cuda_device_id,
-                            stream);
-                    }
-
                     static std::once_flag native_vnni_decode_once;
                     std::call_once(native_vnni_decode_once, [&]()
                                    { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI tuned GEMV decode enabled for supported CUDA codebooks"); });
@@ -820,16 +706,6 @@ namespace llaminar2
             }
         }
 
-        void CUDAQuantisedGemmKernel::setBlockwiseExecutionBackend(CUDABlockwiseExecutionBackend backend)
-        {
-            g_blockwise_backend = backend;
-        }
-
-        CUDABlockwiseExecutionBackend CUDAQuantisedGemmKernel::getBlockwiseExecutionBackend()
-        {
-            return g_blockwise_backend;
-        }
-
         void CUDAQuantisedGemmKernel::setNativeVNNIEnabled(bool enabled)
         {
             g_native_vnni_enabled = enabled;
@@ -838,16 +714,6 @@ namespace llaminar2
         bool CUDAQuantisedGemmKernel::isNativeVNNIEnabled()
         {
             return g_native_vnni_enabled;
-        }
-
-        void CUDAQuantisedGemmKernel::setNativeVNNITunedGemvEnabled(bool enabled)
-        {
-            g_native_vnni_tuned_gemv_enabled = enabled;
-        }
-
-        bool CUDAQuantisedGemmKernel::isNativeVNNITunedGemvEnabled()
-        {
-            return g_native_vnni_tuned_gemv_enabled;
         }
 
         void CUDAQuantisedGemmKernel::setForceCutlassFallback(bool enabled)
@@ -1020,7 +886,7 @@ namespace llaminar2
                         g_native_vnni_enabled &&
                         !g_force_cutlass_fallback &&
                         (packed_->K % 32) == 0 &&
-                        cudaNativeVNNIGemv_supportsCodebook(packed_->native_codebook_id) &&
+                        cudaNativeVNNIGemvTuned_supportsCodebook(packed_->native_codebook_id) &&
                         nativeVNNIPrefillSupportsCodebook(packed_->native_codebook_id) &&
                         [&]() {
                             cudaDeviceProp prop;
