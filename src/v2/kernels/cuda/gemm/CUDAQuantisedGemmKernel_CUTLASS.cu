@@ -152,13 +152,12 @@ namespace
     /**
      * @brief Quantize FP32 activations to INT8 with per-block scales
      *
-     * Each thread processes one quantization block (BLOCKWISE_BLOCK_SIZE elements):
-     * 1. Find max_abs within the 32-element block
-     * 2. Compute scale = max_abs / 127
-     * 3. Quantize block elements to INT8
+     * Warp-cooperative design: each warp of 32 threads processes one
+     * quantization block of 32 elements with fully coalesced access.
+     * Uses warp shuffle for max reduction (no shared memory needed).
      *
      * Grid: (M, 1, 1) - one block per row
-     * Block: (min(num_blocks, 256), 1, 1)
+     * Block: (256, 1, 1) - 8 warps per block
      */
     __global__ void quantize_activations_blockwise_kernel(
         const float *__restrict__ A_fp32,       // [M × K]
@@ -171,31 +170,38 @@ namespace
             return;
 
         const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
+        const int lane = threadIdx.x & 31;
+        const int warp_id = threadIdx.x >> 5;
+        constexpr int NUM_WARPS = 8;
+
         const float *row_fp32 = A_fp32 + row * K;
         int8_t *row_int8 = A_int8 + row * K;
         float *row_scales = scales_A_blockwise + row * num_blocks;
 
-        for (int b = threadIdx.x; b < num_blocks; b += blockDim.x)
+        for (int b = warp_id; b < num_blocks; b += NUM_WARPS)
         {
             const int k_start = b * BLOCKWISE_BLOCK_SIZE;
 
-            // Find max_abs in this 32-element block
-            float max_abs = 0.0f;
-            for (int k = 0; k < BLOCKWISE_BLOCK_SIZE; k++)
+            // Coalesced load: each lane reads one element
+            float val = row_fp32[k_start + lane];
+
+            // Warp-level max_abs reduction via shuffle
+            float abs_val = fabsf(val);
+            #pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1)
             {
-                max_abs = fmaxf(max_abs, fabsf(row_fp32[k_start + k]));
+                abs_val = fmaxf(abs_val, __shfl_xor_sync(0xFFFFFFFF, abs_val, mask));
             }
 
-            float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+            float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
             float inv_scale = 1.0f / scale;
-            row_scales[b] = scale;
 
-            // Quantize the 32-element block
-            for (int k = 0; k < BLOCKWISE_BLOCK_SIZE; k++)
-            {
-                float val = row_fp32[k_start + k] * inv_scale;
-                row_int8[k_start + k] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, val))));
-            }
+            if (lane == 0)
+                row_scales[b] = scale;
+
+            // Quantize and coalesced write
+            float qval = val * inv_scale;
+            row_int8[k_start + lane] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
         }
     }
 
@@ -716,7 +722,7 @@ extern "C"
 
         const int num_blocks = K / BLOCKWISE_BLOCK_SIZE;
         dim3 grid(M);
-        dim3 block(std::min(num_blocks, 256));
+        dim3 block(256); // 8 warps, each cooperatively processes one 32-element block
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         quantize_activations_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
