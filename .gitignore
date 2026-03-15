@@ -104,4 +104,8 @@ src/v2/kernels/cuda/*_heuristic_*.h
 *.sqlite
 *.nsys-rep
 *.lock
+*.cubin
+*.ptx
+*.fatbin
+gpucore.*
 *.lock-*

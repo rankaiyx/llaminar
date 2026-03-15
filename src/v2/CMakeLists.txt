@@ -219,8 +219,7 @@ if(HAVE_CUDA)
     # CUDA kernels
     set(CUDA_KERNEL_SOURCES
         kernels/cuda/CuBLASGemmKernel.cu              # cuBLAS wrapper for FP32/FP16/BF16 dense GEMM
-        kernels/cuda/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM implementation
-        kernels/cuda/CUDATensorCoreBlockwiseGemm.cu   # blockwise tensor-core GEMM/GEMV scaffold
+        kernels/cuda/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM + TC weight repacking
         kernels/cuda/CUDATensorCoreGemvKernels.cu    # per-shape DP4A GEMV family (Wide, GridKPar, LDSKReduce, Direct)
         kernels/cuda/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
         kernels/cuda/CUDANativeVNNIGemvKernels.cu # native-vnni decode GEMV for Q4_0/Q4_1/IQ4_NL

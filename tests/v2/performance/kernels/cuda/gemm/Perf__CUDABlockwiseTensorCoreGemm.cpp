@@ -617,16 +617,12 @@ namespace
 
                 auto weights_decode = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
                 const RunResult legacy_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, correctness_cfg);
-                const RunResult tc_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::TensorCoreScaffold, correctness_cfg);
-                EXPECT_GE(cosineSimilarity(legacy_decode.output, tc_decode.output), kCosineGate) << format.name << " decode " << shape.name;
 
                 const RunResult tck_decode = runKernel(weights_decode.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, correctness_cfg);
                 EXPECT_GE(cosineSimilarity(legacy_decode.output, tck_decode.output), kCosineGate) << format.name << " decode(kernels) " << shape.name;
 
                 auto weights_prefill = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
                 const RunResult legacy_prefill = runKernel(weights_prefill.get(), correctness_cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, correctness_cfg);
-                const RunResult tc_prefill = runKernel(weights_prefill.get(), correctness_cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::TensorCoreScaffold, correctness_cfg);
-                EXPECT_GE(cosineSimilarity(legacy_prefill.output, tc_prefill.output), kCosineGate) << format.name << " prefill " << shape.name;
 
                 const RunResult tck_prefill = runKernel(weights_prefill.get(), correctness_cfg.correctness_prefill_m, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, correctness_cfg);
                 EXPECT_GE(cosineSimilarity(legacy_prefill.output, tck_prefill.output), kCosineGate) << format.name << " prefill(kernels) " << shape.name;
@@ -721,18 +717,16 @@ namespace
                 {
                     auto weights_gemm = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
                     const RunResult legacy_gemm = runKernel(weights_gemm.get(), m, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, cfg);
-                    const RunResult tc_gemm = runKernel(weights_gemm.get(), m, shape.n, shape.k, CUDABlockwiseExecutionBackend::TensorCoreScaffold, cfg);
                     const RunResult tck_gemm = runKernel(weights_gemm.get(), m, shape.n, shape.k, CUDABlockwiseExecutionBackend::SpecializedBlockwise, cfg);
 
                     std::fprintf(stderr,
                                  "[CUDABlockwiseTC][GEMM] format=%s shape=%s M=%d N=%d K=%d warmup=%d bench=%d "
                                  "gemm_dispatch=%s "
-                                 "legacy_min_us=%.3f tc_min_us=%.3f tck_min_us=%.3f "
-                                 "scaffold_speedup=%.3fx kernels_speedup=%.3fx\n",
+                                 "legacy_min_us=%.3f tck_min_us=%.3f "
+                                 "kernels_speedup=%.3fx\n",
                                  format.name.c_str(), shape.name.c_str(), m, shape.n, shape.k,
                                  cfg.warmup_runs, cfg.bench_runs, cfg.gemm_dispatch.c_str(),
-                                 legacy_gemm.min_us, tc_gemm.min_us, tck_gemm.min_us,
-                                 legacy_gemm.min_us / tc_gemm.min_us,
+                                 legacy_gemm.min_us, tck_gemm.min_us,
                                  legacy_gemm.min_us / tck_gemm.min_us);
                 }
 

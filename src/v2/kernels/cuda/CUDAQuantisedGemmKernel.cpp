@@ -136,20 +136,6 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream = nullptr);
 
-            bool cudaQuantGemm_blockwiseTensorCoreGemm(
-                const int8_t *d_A_int8,
-                const int8_t *d_weights_int8_tc_blocked,
-                int32_t *d_partial_int32,
-                float *d_C_fp32,
-                const float *d_scales_A_blockwise,
-                const float *d_scales_B,
-                int M, int N, int K,
-                float alpha, float beta,
-                const float *d_C_existing,
-                const float *d_bias,
-                int cuda_device_id,
-                void *stream = nullptr);
-
             // Free device memory
             void cudaQuantGemm_freeDevice(void *d_ptr);
 
@@ -511,29 +497,6 @@ namespace llaminar2
 
                     LOG_WARN("[CUDAQuantisedGemmKernel] SpecializedBlockwise path failed (M=" << m
                                                                                               << "), falling back to legacy dp4a");
-                }
-
-                // ── Original tensor-core scaffold ──
-                if (backend == CUDABlockwiseExecutionBackend::TensorCoreScaffold && d_weights_int8_tc_blocked)
-                {
-                    if (cudaQuantGemm_blockwiseTensorCoreGemm(
-                            d_A_int8,
-                            d_weights_int8_tc_blocked,
-                            d_partial_int32,
-                            d_C_fp32,
-                            d_scales_A_blockwise,
-                            d_scales_B,
-                            m, n, k,
-                            alpha, beta,
-                            d_C_existing,
-                            d_bias,
-                            cuda_device_id,
-                            stream))
-                    {
-                        return true;
-                    }
-
-                    LOG_WARN("[CUDAQuantisedGemmKernel] TensorCore scaffold blockwise path failed, falling back to legacy dp4a");
                 }
 
                 return cudaQuantGemm_blockwiseGemm(

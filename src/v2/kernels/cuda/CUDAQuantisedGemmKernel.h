@@ -58,7 +58,6 @@ namespace llaminar2
         enum class CUDABlockwiseExecutionBackend
         {
             LegacyDP4A = 0,
-            TensorCoreScaffold = 1,
             SpecializedBlockwise = 2, // DP4A GEMV + tensor-core GEMM chosen by shape/M
         };
 

@@ -913,4 +913,75 @@ extern "C"
         return true;
     }
 
+    // ── Weight repacking: row-major → K-blocked tensor-core layout ──────────
+    // Moved from CUDATensorCoreBlockwiseGemm.cu (dead scaffold removed)
+
+    namespace
+    {
+        constexpr int kTCBlockK = 32;
+
+        __global__ void repack_weights_tc_blocked_kernel(
+            const int8_t *__restrict__ weights_col_major,
+            int8_t *__restrict__ weights_tc_blocked,
+            int K, int N)
+        {
+            const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            const int total = K * N;
+            if (idx >= total)
+                return;
+
+            const int k_block = idx / (N * kTCBlockK);
+            const int rem = idx % (N * kTCBlockK);
+            const int n = rem / kTCBlockK;
+            const int k_in_block = rem % kTCBlockK;
+            const int k = k_block * kTCBlockK + k_in_block;
+
+            weights_tc_blocked[idx] = weights_col_major[n * K + k];
+        }
+    } // namespace
+
+    bool cudaQuantGemm_prepareTensorCoreBlockedWeights(
+        const int8_t *d_weights_int8,
+        int8_t **d_weights_int8_tc_blocked,
+        int K, int N,
+        int cuda_device_id,
+        void *stream)
+    {
+        if (!d_weights_int8 || !d_weights_int8_tc_blocked || K <= 0 || N <= 0 || (K % kTCBlockK) != 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            CUDA_CHECK(cudaSetDevice(cuda_device_id));
+            cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+            if (*d_weights_int8_tc_blocked == nullptr)
+            {
+                CUDA_CHECK(cudaMalloc(d_weights_int8_tc_blocked, static_cast<size_t>(K) * N * sizeof(int8_t)));
+            }
+
+            const int total = K * N;
+            const int threads = 256;
+            const int blocks = (total + threads - 1) / threads;
+            repack_weights_tc_blocked_kernel<<<blocks, threads, 0, cuda_stream>>>(
+                d_weights_int8,
+                *d_weights_int8_tc_blocked,
+                K,
+                N);
+            CUDA_CHECK(cudaGetLastError());
+            return true;
+        }
+        catch (...)
+        {
+            if (d_weights_int8_tc_blocked && *d_weights_int8_tc_blocked)
+            {
+                cudaFree(*d_weights_int8_tc_blocked);
+                *d_weights_int8_tc_blocked = nullptr;
+            }
+            return false;
+        }
+    }
+
 } // extern "C"
