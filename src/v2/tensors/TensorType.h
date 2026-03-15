@@ -134,7 +134,6 @@ namespace llaminar2
         case TensorType::Q3_K:
         case TensorType::Q4_K:
         case TensorType::Q5_K:
-        case TensorType::Q8_0:
         case TensorType::IQ4_NL:
         case TensorType::IQ4_XS:
         case TensorType::IQ3_S:
@@ -153,8 +152,8 @@ namespace llaminar2
     /**
      * @brief Check if tensor type is an INT8-VNNI format (legacy 8-bit path)
      *
-     * Q8_1 is activation-only (never weights). Q8_K is legacy.
-     * Q8_0 weights now use native-VNNI (codebook 18) instead.
+     * Q8_0 and Q8_1 use INT8-VNNI (direct INT8 requantization).
+     * Q8_K is legacy.
      *
      * @param type The tensor type enum value
      * @return true if the format uses the INT8-VNNI path
@@ -163,6 +162,7 @@ namespace llaminar2
     {
         switch (type)
         {
+        case TensorType::Q8_0:
         case TensorType::Q8_1:
         case TensorType::Q8_K:
             return true;

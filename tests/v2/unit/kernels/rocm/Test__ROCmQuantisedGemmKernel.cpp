@@ -48,10 +48,9 @@ namespace
     // =============================================================================
 
     /**
-     * @test Verify packWeightsToROCm produces valid native-VNNI output for Q8_0
+     * @test Verify packWeightsToROCm produces valid INT8-VNNI output for Q8_0
      *
-     * Q8_0 uses native-VNNI packing (codebook 18) with per-block FP16 scales.
-     * No INT8 requantization is performed.
+     * Q8_0 uses the INT8-VNNI path (direct INT8 requantization with per-column scales).
      */
     TEST_F(ROCmQuantisedGemmKernelUnitTest, PackWeightsToROCm_Q8_0_CreatesValidOutput)
     {
@@ -64,17 +63,15 @@ namespace
         ROCmPackedWeights packed;
         ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
 
-        // Native-VNNI path populated
-        EXPECT_FALSE(packed.native_vnni_payload.empty());
-        EXPECT_FALSE(packed.native_vnni_scales.empty());
-        EXPECT_EQ(packed.native_vnni_codebook_id, 18);
-        EXPECT_GT(packed.native_vnni_blocks_per_row, 0u);
+        // INT8-VNNI path populated
+        EXPECT_FALSE(packed.int8_data.empty());
+        EXPECT_FALSE(packed.scales.empty());
         EXPECT_EQ(packed.N, static_cast<int>(N));
         EXPECT_EQ(packed.K, static_cast<int>(K));
 
-        // INT8 path must be empty
-        EXPECT_TRUE(packed.int8_data.empty());
-        EXPECT_TRUE(packed.int8_data_vnni.empty());
+        // Native-VNNI path must be empty
+        EXPECT_TRUE(packed.native_vnni_payload.empty());
+        EXPECT_TRUE(packed.native_vnni_scales.empty());
     }
 
     /**
@@ -567,17 +564,17 @@ namespace
     // =============================================================================
     //
     // These tests verify the format-conditional repack logic:
-    //   - Native-VNNI formats (including Q8_0) → native-VNNI packing ONLY
-    //   - INT8-VNNI formats (Q8_1, Q8_K) → INT8 requant + VNNI interleave ONLY
+    //   - Native-VNNI formats (≤6-bit) → native-VNNI packing ONLY
+    //   - INT8-VNNI formats (Q8_0, Q8_1, Q8_K) → INT8 requant + VNNI interleave ONLY
     //
     // The two paths are mutually exclusive: native-VNNI formats must NOT have
     // int8_data/scales populated, and INT8-VNNI formats must NOT have
     // native_vnni_payload/native_vnni_scales populated.
 
     /**
-     * @test Native-VNNI format (Q8_0) produces ONLY native packing, no INT8
+     * @test INT8-VNNI format (Q8_0) produces ONLY INT8 packing, no native-VNNI
      */
-    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q8_0_OnlyNativeVnniPath)
+    TEST_F(ROCmQuantisedGemmKernelUnitTest, Repack_Q8_0_OnlyInt8Path)
     {
         const size_t N = 32;
         const size_t K = 64;
@@ -586,21 +583,19 @@ namespace
         ROCmPackedWeights packed;
         ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
 
-        // Native-VNNI path populated
-        EXPECT_FALSE(packed.native_vnni_payload.empty())
-            << "Q8_0 must populate native-VNNI payload";
-        EXPECT_FALSE(packed.native_vnni_scales.empty())
-            << "Q8_0 must populate native-VNNI scales";
-        EXPECT_EQ(packed.native_vnni_codebook_id, 18)
-            << "Q8_0 codebook ID must be 18";
-        EXPECT_GT(packed.native_vnni_blocks_per_row, 0u)
-            << "Q8_0 must set blocks_per_row";
+        // INT8 path populated
+        EXPECT_FALSE(packed.int8_data.empty())
+            << "Q8_0 must populate int8_data";
+        EXPECT_FALSE(packed.scales.empty())
+            << "Q8_0 must populate scales";
+        EXPECT_FALSE(packed.int8_data_vnni.empty())
+            << "Q8_0 must populate VNNI layout";
 
-        // INT8 path empty
-        EXPECT_TRUE(packed.int8_data.empty())
-            << "Q8_0 must NOT populate int8_data";
-        EXPECT_TRUE(packed.int8_data_vnni.empty())
-            << "Q8_0 must NOT populate VNNI layout";
+        // Native-VNNI path empty
+        EXPECT_TRUE(packed.native_vnni_payload.empty())
+            << "Q8_0 must NOT populate native-VNNI payload";
+        EXPECT_TRUE(packed.native_vnni_scales.empty())
+            << "Q8_0 must NOT populate native-VNNI scales";
     }
 
     /**
@@ -760,7 +755,7 @@ namespace
              { return TestTensorFactory::createIQ1_MRandom({32, 256}); }},
 
             // INT8-VNNI formats (8-bit) → only INT8 packing
-            {"Q8_0", true, []
+            {"Q8_0", false, []
              { return TestTensorFactory::createQ8_0Random({32, 64}); }},
             {"Q8_1", false, []
              { return TestTensorFactory::createQ8_1Random({32, 64}); }},
