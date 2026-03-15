@@ -2214,6 +2214,12 @@ namespace
                 d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
                 M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
 
+        // --- 8-bit format (no decode overhead, single-scale) ---
+        case 18: // Q8_0
+            return launchGenericPrefillBK64<18>(
+                d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+
         default:
             return false;
         }

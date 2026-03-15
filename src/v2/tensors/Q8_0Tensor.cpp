@@ -7,6 +7,7 @@
 #include "TensorClasses.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorClasses.h"
+#include "VnniPackContext.h"
 #include "../utils/Logger.h"
 #include <algorithm>
 #include <cmath>
@@ -683,6 +684,14 @@ namespace llaminar2
 #endif
 
         return row_scale;
+    }
+
+    void Q8_0Tensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
+    {
+        const size_t linear = vnniLinearIdx(ctx, n, b);
+        const auto *blk = &typed_data()[static_cast<size_t>(n) * ctx.blocks_per_row + b];
+        std::memcpy(vnniPayloadDst(ctx, linear), blk->qs, 32);
+        ctx.scales_array[linear] = blk->d;
     }
 
 } // namespace llaminar2

@@ -293,6 +293,11 @@ namespace llaminar2
         // Reset pipeline state before warmup
         runner_->clear_cache();
 
+        // Suppress GPU stage timeline during warmup — warmup includes one-time costs
+        // (weight H2D transfers, buffer allocation, kernel JIT) that inflate overhead
+        // numbers and don't reflect steady-state performance.
+        runner_->setSuppressTimeline(true);
+
         // Skip D2H logits gather for prefill — prefill logits are never consumed
         // in the benchmark flow (sampling happens during decode via GPU-side argmax).
         // This eliminates ~405ms of PCIe traffic for TP=2 prefill.
@@ -342,6 +347,9 @@ namespace llaminar2
         }
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
+
+        // Re-enable GPU stage timeline for benchmark iterations
+        runner_->setSuppressTimeline(false);
 
         // ========================================================================
         // Benchmark Iterations - Run multiple times and average

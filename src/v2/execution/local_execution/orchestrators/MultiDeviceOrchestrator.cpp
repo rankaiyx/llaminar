@@ -3072,4 +3072,10 @@ namespace llaminar2
         }
     }
 
+    void MultiDeviceOrchestrator::setSuppressTimeline(bool suppress)
+    {
+        for (auto &runner : device_runners_)
+            runner->setSuppressTimeline(suppress);
+    }
+
 } // namespace llaminar2

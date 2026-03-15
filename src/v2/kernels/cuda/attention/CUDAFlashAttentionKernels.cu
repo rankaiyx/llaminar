@@ -72,12 +72,13 @@ namespace
     // Pipeline configuration
     constexpr int FA2_NUM_STAGES = 2;     // Double buffering
     constexpr int FA2_PRODUCER_WARPS = 2; // Warps dedicated to loading (fixed)
-    constexpr int FA2_TILE_KV = 64;       // KV tile size (constant for good K/V reuse)
-    // Shared-memory padding for the [tile_q, tile_kv] scores matrix.
-    // Note: WMMA store/load paths can have implicit alignment/stride constraints;
-    // keep the padded leading dimension a multiple of 16.
+    constexpr int FA2_TILE_KV_DEFAULT = 64; // Default KV tile size
+    // Shared-memory padding constants. QKV padding is critical for avoiding
+    // bank conflicts on WMMA load_matrix_sync: with head_dim=128, stride=128
+    // halves=256B maps ALL rows to bank 0 (32-way conflict). Padding 8
+    // shifts stride to 136 halves=272B giving 4-way conflicts instead.
     constexpr int FA2_SCORES_LD_PAD = 16;
-    constexpr int FA2_QKV_PAD = 8; // Pad Q/K/V leading dimension by 8 halves (16 bytes)
+    constexpr int FA2_QKV_PAD = 8;
 
     // =========================================================================
     // Cached Device Properties for Fast Kernel Launch
@@ -117,76 +118,34 @@ namespace
     }
 
     /**
-     * @brief Calculate optimal tile_q based on head_dim and available shared memory
-     *
-     * Shared memory layout:
-     *   Q_tile: [tile_q, head_dim] in FP16
-     *   KV double buffer: 2 stages * (K + V) * [tile_kv, head_dim] in FP16
-     *   Scores: [tile_q, tile_kv] in FP32
-     *
-     * Total = tile_q * head_dim * 2 + 2 * 2 * tile_kv * head_dim * 2 + tile_q * tile_kv * 4
+     * @brief Compute shared memory size for a given FA2 configuration
      */
-    inline int computeOptimalTileQ(int head_dim, int max_smem)
+    inline size_t computeFA2SmemSize(int tile_q, int tile_kv, int head_dim,
+                                     int qkv_pad, int scores_pad)
     {
-        const int tile_kv = FA2_TILE_KV;
-        const int scores_ld = tile_kv + FA2_SCORES_LD_PAD;
-        const int qkv_stride = head_dim + FA2_QKV_PAD;
-
-        // KV buffer is fixed size (doesn't depend on tile_q)
-        size_t kv_buffer_size = FA2_NUM_STAGES * 2 * tile_kv * qkv_stride * sizeof(half);
-
-        // Available for Q tile + scores
-        if (kv_buffer_size >= max_smem)
-            return 32;
-        size_t available = max_smem - kv_buffer_size;
-
-        // Q tile + scores = tile_q * (qkv_stride * sizeof(half) + scores_ld * sizeof(float))
-        // Note: scores_ld is padded to reduce shared-memory bank conflicts.
-        size_t bytes_per_q_row = qkv_stride * sizeof(half) + scores_ld * sizeof(float);
-
-        // Calculate tile_q candidates
-        auto get_smem_for_q = [&](int q)
-        {
-            return kv_buffer_size + q * bytes_per_q_row;
-        };
-
-        // We want to maximize a score:
-        // Score = OccupancyTier * 1000 + TileQ
-        // where OccupancyTier is 2 (fits 2 blocks) or 1 (fits 1 block)
-        int best_tile_q = 32;
-        int best_score = -1;
-
-        // Iterate standard tile sizes
-        // On RTX 3090, 64 is often the sweet spot for occupancy with padding
-        for (int q : {32, 64, 96, 128})
-        {
-            size_t used = get_smem_for_q(q);
-            if (used > max_smem)
-                continue;
-
-            // Occupancy check: assume 2 blocks if usage <= 50% of max
-            // Note: max_smem here is the opt-in limit (e.g. 100KB on Ampere)
-            int occupancy = (used <= max_smem / 2) ? 2 : 1;
-
-            // Score prefers higher occupancy first, then larger tile
-            int score = occupancy * 1000 + q;
-
-            if (score > best_score)
-            {
-                best_score = score;
-                best_tile_q = q;
-            }
-        }
-
-        return best_tile_q;
+        const int qkv_stride = head_dim + qkv_pad;
+        const int scores_ld = tile_kv + scores_pad;
+        size_t q_size = tile_q * qkv_stride * sizeof(half);
+        size_t kv_size = FA2_NUM_STAGES * 2 * tile_kv * qkv_stride * sizeof(half);
+        size_t sc_size = tile_q * scores_ld * sizeof(float);
+        return q_size + kv_size + sc_size;
     }
 
     /**
      * @brief Compute FA2 kernel configuration based on head_dim
      *
+     * Search strategy (preserving bank-conflict-free padding):
+     *   1. Try target tile_q with tile_kv=64,48,32 and full padding (qkv=8, scores=16)
+     *   2. Only drop padding as last resort if no tile_kv fits with padding
+     *
+     * QKV padding is critical: stride(head_dim=128)=256B → 32-way bank conflict.
+     * With qkv_pad=8: stride=272B → 4-way conflict (8x better).
+     *
+     * Override: set LLAMINAR_FA2_TILE_KV=N to force a specific tile_kv value.
+     *
      * Configurations:
-     *   - head_dim <= 64:  tile_q=96, 6 consumers, 256 threads (~70KB smem)
-     *   - head_dim <= 128: tile_q=64, 4 consumers, 192 threads (~98KB smem)
+     *   - head_dim <= 64:  tile_q=96, 6 consumers, 256 threads
+     *   - head_dim <= 128: tile_q=64, 4 consumers, 192 threads
      */
     struct FA2KernelConfig
     {
@@ -195,53 +154,102 @@ namespace
         int num_consumer_warps;
         int block_size;
         size_t smem_size;
+        int qkv_pad;
+        int scores_pad;
     };
 
     inline FA2KernelConfig computeFA2Config(int head_dim, int max_smem)
     {
         FA2KernelConfig cfg;
-        cfg.tile_kv = FA2_TILE_KV; // Always 64
 
+        // Target tile_q and consumer warps based on head_dim
+        int target_tile_q;
+        int target_consumer_warps;
         if (head_dim <= 64)
         {
-            // Default config: 6 consumer warps for smaller head_dim
-            cfg.tile_q = 96; // 6 * 16
-            cfg.num_consumer_warps = 6;
-            cfg.block_size = (FA2_PRODUCER_WARPS + 6) * WARP_SIZE; // 256
+            target_tile_q = 96; // 6 * 16
+            target_consumer_warps = 6;
         }
         else
         {
-            // Reduced config for head_dim=128: 4 consumer warps
-            cfg.tile_q = 64; // 4 * 16
-            cfg.num_consumer_warps = 4;
-            cfg.block_size = (FA2_PRODUCER_WARPS + 4) * WARP_SIZE; // 192
+            target_tile_q = 64; // 4 * 16
+            target_consumer_warps = 4;
         }
 
-        // Verify shared memory fits
-        int qkv_stride = head_dim + FA2_QKV_PAD;
-        size_t q_tile_size = cfg.tile_q * qkv_stride * sizeof(half);
-        size_t kv_buffer_size = FA2_NUM_STAGES * 2 * cfg.tile_kv * qkv_stride * sizeof(half);
-        // Pad scores leading dimension to mitigate shared-memory bank conflicts
-        size_t scores_size = cfg.tile_q * (cfg.tile_kv + FA2_SCORES_LD_PAD) * sizeof(float);
-        cfg.smem_size = q_tile_size + kv_buffer_size + scores_size;
+        // Check for env-var tile_kv override (for parameter sweeps)
+        int forced_tile_kv = 0;
+        const char *env_tkv = getenv("LLAMINAR_FA2_TILE_KV");
+        if (env_tkv)
+            forced_tile_kv = atoi(env_tkv);
 
-        // If still too large, fall back to even smaller tile_q
-        if ((int)cfg.smem_size > max_smem)
+        // tile_kv candidates: prefer larger (fewer iterations), must be multiple of WMMA_N=16.
+        // Skip 48: empirically 32 outperforms 48 on RTX 3090 (55ms vs 95ms for
+        // attention) because 63KB smem leaves 65KB L1 cache vs 86KB smem/42KB L1.
+        // On GPUs with ≥108KB smem, tile_kv=64 fits with full padding and is preferred.
+        const int tile_kv_options[] = {64, 32};
+        const int num_tile_kv_options = forced_tile_kv > 0 ? 1 : 2;
+
+        // Search: try each tile_kv with full padding first
+        bool found = false;
+        for (int ti = 0; ti < num_tile_kv_options && !found; ti++)
         {
-            cfg.tile_q = computeOptimalTileQ(head_dim, max_smem);
-            cfg.num_consumer_warps = cfg.tile_q / 16;
-            if (cfg.num_consumer_warps < 2)
-                cfg.num_consumer_warps = 2;
-            if (cfg.num_consumer_warps > 6)
-                cfg.num_consumer_warps = 6;
-            cfg.block_size = (FA2_PRODUCER_WARPS + cfg.num_consumer_warps) * WARP_SIZE;
-
-            // Recompute smem
-            q_tile_size = cfg.tile_q * head_dim * sizeof(half);
-            scores_size = cfg.tile_q * (cfg.tile_kv + FA2_SCORES_LD_PAD) * sizeof(float);
-            cfg.smem_size = q_tile_size + kv_buffer_size + scores_size;
+            int tkv = forced_tile_kv > 0 ? forced_tile_kv : tile_kv_options[ti];
+            size_t smem = computeFA2SmemSize(target_tile_q, tkv,
+                                             head_dim, FA2_QKV_PAD, FA2_SCORES_LD_PAD);
+            if ((int)smem <= max_smem)
+            {
+                cfg.tile_q = target_tile_q;
+                cfg.tile_kv = tkv;
+                cfg.num_consumer_warps = target_consumer_warps;
+                cfg.qkv_pad = FA2_QKV_PAD;
+                cfg.scores_pad = FA2_SCORES_LD_PAD;
+                cfg.smem_size = smem;
+                found = true;
+            }
         }
 
+        if (!found)
+        {
+            // Last resort: drop padding entirely to fit target tile_q
+            int tkv = forced_tile_kv > 0 ? forced_tile_kv : 32;
+            size_t smem = computeFA2SmemSize(target_tile_q, tkv, head_dim, 0, 0);
+            if ((int)smem <= max_smem)
+            {
+                cfg.tile_q = target_tile_q;
+                cfg.tile_kv = tkv;
+                cfg.num_consumer_warps = target_consumer_warps;
+                cfg.qkv_pad = 0;
+                cfg.scores_pad = 0;
+                cfg.smem_size = smem;
+                found = true;
+            }
+        }
+
+        if (!found)
+        {
+            // Even target tile_q doesn't fit — find largest that does
+            cfg.qkv_pad = FA2_QKV_PAD;
+            cfg.scores_pad = FA2_SCORES_LD_PAD;
+            cfg.tile_kv = 32;
+            cfg.tile_q = 32; // minimum
+            for (int q : {128, 96, 64, 32})
+            {
+                size_t smem = computeFA2SmemSize(q, 32, head_dim,
+                                                 FA2_QKV_PAD, FA2_SCORES_LD_PAD);
+                if ((int)smem <= max_smem)
+                {
+                    cfg.tile_q = q;
+                    break;
+                }
+            }
+            cfg.num_consumer_warps = cfg.tile_q / 16;
+            if (cfg.num_consumer_warps < 2) cfg.num_consumer_warps = 2;
+            if (cfg.num_consumer_warps > 6) cfg.num_consumer_warps = 6;
+            cfg.smem_size = computeFA2SmemSize(cfg.tile_q, cfg.tile_kv,
+                                               head_dim, cfg.qkv_pad, cfg.scores_pad);
+        }
+
+        cfg.block_size = (FA2_PRODUCER_WARPS + cfg.num_consumer_warps) * WARP_SIZE;
         return cfg;
     }
 
@@ -277,7 +285,9 @@ namespace
         const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
         const float *__restrict__ mask,
         int tile_q,
-        int tile_kv)
+        int tile_kv,
+        int qkv_pad,
+        int scores_pad)
     {
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
@@ -319,9 +329,9 @@ namespace
         // scores: [tile_q, tile_kv]
         extern __shared__ char smem[];
 
-        const int smem_stride = head_dim + FA2_QKV_PAD;
+        const int smem_stride = head_dim + qkv_pad;
         const int kv_tile_size = tile_kv * smem_stride;
-        const int scores_ld = tile_kv + FA2_SCORES_LD_PAD; // padded LD to reduce shared-memory bank conflicts
+        const int scores_ld = tile_kv + scores_pad; // padded LD to reduce shared-memory bank conflicts
 
         half *Q_tile_fp16 = reinterpret_cast<half *>(smem);
         half *KV_buffers = Q_tile_fp16 + tile_q * smem_stride;
@@ -337,22 +347,30 @@ namespace
             return KV_buffers + stage * 2 * kv_tile_size + kv_tile_size;
         };
 
-        // Consumer warps: per-row accumulators
+        // Consumer warps: warp-cooperative per-row accumulators
+        // 2 lanes per Q row: lanes 0-15 handle dims [0, head_dim/2),
+        //                    lanes 16-31 handle dims [head_dim/2, head_dim)
+        // This halves register pressure (O_acc[64] vs [128]) and doubles
+        // throughput of the P@V accumulation loop.
         const int q_tile_rows = min(tile_q, seq_len - q_block_start);
-        const int my_consumer_q_row = (is_active_consumer && lane_id < WMMA_M)
-                                          ? q_block_start + consumer_warp_id * WMMA_M + lane_id
+        const int row_in_warp = lane_id & (WMMA_M - 1);  // lane_id % 16
+        const int dim_half = lane_id >> 4;                 // 0 for lanes 0-15, 1 for 16-31
+        const int my_consumer_q_row = is_active_consumer
+                                          ? q_block_start + consumer_warp_id * WMMA_M + row_in_warp
                                           : -1;
         const bool owns_row = (my_consumer_q_row >= 0 &&
                                my_consumer_q_row < seq_len &&
                                (my_consumer_q_row - q_block_start) < q_tile_rows);
 
-        float O_acc[128];
+        const int dims_per_lane = head_dim >> 1;
+        const int dim_start = dim_half * dims_per_lane;
+        float O_acc[64];  // halved: each lane handles head_dim/2 dims
         float m_i = -FLT_MAX;
         float l_i = 0.0f;
 
         if (owns_row)
         {
-            for (int d = 0; d < head_dim; d++)
+            for (int d = 0; d < dims_per_lane; d++)
                 O_acc[d] = 0.0f;
         }
 
@@ -494,88 +512,112 @@ namespace
 
             // ----------------------------------------------------------------
             // CONSUMER WARPS: Apply softmax and accumulate P @ V
+            // Warp-cooperative: 2 lanes per row, primary (dim_half=0) does
+            // masking writes, then both lanes accumulate their dim half.
+            //
+            // CRITICAL: __syncwarp() and __shfl_sync() are placed at the
+            // is_active_consumer level (NOT inside owns_row) so that all 32
+            // lanes of the consumer warp participate. When the last Q tile
+            // has fewer rows than tile_q, some lanes have owns_row=false;
+            // placing warp-collective ops inside owns_row would deadlock.
             // ----------------------------------------------------------------
-            if (is_active_consumer && owns_row)
+            if (is_active_consumer)
             {
-                const int local_q_row = consumer_warp_id * WMMA_M + lane_id;
-                float *my_scores = scores + local_q_row * scores_ld;
-
                 float m_ij = -FLT_MAX;
 
-                // Apply scaling and masking
-                for (int j = 0; j < actual_tile_kv_len; j++)
+                // Only primary lane (dim_half==0) of rows that exist writes masking
+                if (owns_row && dim_half == 0)
                 {
-                    const int kv_pos = kv_start + j;
-                    bool masked = false;
+                    const int local_q_row = consumer_warp_id * WMMA_M + row_in_warp;
+                    float *my_scores = scores + local_q_row * scores_ld;
 
-                    if (causal && kv_pos > my_consumer_q_row + position_offset_runtime)
-                        masked = true;
-                    if (window_size > 0)
+                    for (int j = 0; j < actual_tile_kv_len; j++)
                     {
-                        int q_pos = my_consumer_q_row + position_offset_runtime;
-                        if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
+                        const int kv_pos = kv_start + j;
+                        bool masked = false;
+
+                        if (causal && kv_pos > my_consumer_q_row + position_offset_runtime)
                             masked = true;
-                    }
-
-                    if (mask)
-                    {
-                        float mask_val = mask[(batch_idx * seq_len + my_consumer_q_row) * mask_stride + kv_pos];
-                        if (mask_val <= -1.0e20f)
+                        if (window_size > 0)
                         {
-                            masked = true;
+                            int q_pos = my_consumer_q_row + position_offset_runtime;
+                            if (kv_pos < q_pos - window_size || kv_pos > q_pos + window_size)
+                                masked = true;
+                        }
+
+                        if (mask)
+                        {
+                            float mask_val = mask[(batch_idx * seq_len + my_consumer_q_row) * mask_stride + kv_pos];
+                            if (mask_val <= -1.0e20f)
+                            {
+                                masked = true;
+                            }
+                            else
+                            {
+                                my_scores[j] += mask_val;
+                            }
+                        }
+
+                        if (masked)
+                        {
+                            my_scores[j] = -FLT_MAX;
                         }
                         else
                         {
-                            my_scores[j] += mask_val;
+                            my_scores[j] *= softmax_scale;
+                            m_ij = fmaxf(m_ij, my_scores[j]);
                         }
-                    }
-
-                    if (masked)
-                    {
-                        my_scores[j] = -FLT_MAX;
-                    }
-                    else
-                    {
-                        my_scores[j] *= softmax_scale;
-                        m_ij = fmaxf(m_ij, my_scores[j]);
                     }
                 }
 
-                // Online softmax update
-                float m_i_new = fmaxf(m_i, m_ij);
-                float scale_old = expf(m_i - m_i_new);
+                // All 32 lanes reach here — safe for warp-collective ops
+                __syncwarp();
 
-                for (int d = 0; d < head_dim; d++)
-                    O_acc[d] *= scale_old;
-                l_i *= scale_old;
+                // Broadcast m_ij from primary lane to its secondary partner
+                // Lanes without rows shuffle -FLT_MAX harmlessly
+                m_ij = __shfl_sync(0xFFFFFFFF, m_ij, row_in_warp);
 
-                // Accumulate P @ V
-                float l_ij = 0.0f;
-                for (int j = 0; j < actual_tile_kv_len; j++)
+                if (owns_row)
                 {
-                    float s = my_scores[j];
-                    if (s > -FLT_MAX / 2)
-                    {
-                        float p = expf(s - m_i_new);
-                        l_ij += p;
+                    const int local_q_row = consumer_warp_id * WMMA_M + row_in_warp;
+                    float *my_scores = scores + local_q_row * scores_ld;
 
-                        const half *V_row = V_tile_fp16 + j * smem_stride;
-                        for (int d = 0; d < head_dim; d++)
+                    // Online softmax update
+                    float m_i_new = fmaxf(m_i, m_ij);
+                    float scale_old = __expf(m_i - m_i_new);
+
+                    for (int d = 0; d < dims_per_lane; d++)
+                        O_acc[d] *= scale_old;
+                    l_i *= scale_old;
+
+                    // Accumulate P @ V (each lane processes its half of head dims)
+                    float l_ij = 0.0f;
+                    for (int j = 0; j < actual_tile_kv_len; j++)
+                    {
+                        float s = my_scores[j];
+                        if (s > -FLT_MAX / 2)
                         {
-                            O_acc[d] += p * __half2float(V_row[d]);
+                            float p = __expf(s - m_i_new);
+                            l_ij += p;
+
+                            const half *V_row = V_tile_fp16 + j * smem_stride + dim_start;
+                            for (int d = 0; d < dims_per_lane; d++)
+                            {
+                                O_acc[d] += p * __half2float(V_row[d]);
+                            }
                         }
                     }
-                }
 
-                l_i += l_ij;
-                m_i = m_i_new;
+                    l_i += l_ij;
+                    m_i = m_i_new;
+                }
             }
 
             __syncthreads();
         }
 
         // =====================================================================
-        // Write final output
+        // Write final output (each lane writes its half of dims)
         // =====================================================================
         if (is_active_consumer && owns_row)
         {
@@ -584,9 +626,9 @@ namespace
             float *O_batch = O + batch_idx * seq_len * n_heads * head_dim;
             float *O_row = O_batch + my_consumer_q_row * n_heads * head_dim + head_idx * head_dim;
 
-            for (int d = 0; d < head_dim; d++)
+            for (int d = 0; d < dims_per_lane; d++)
             {
-                O_row[d] = O_acc[d] * inv_l;
+                O_row[dim_start + d] = O_acc[d] * inv_l;
             }
         }
     }
@@ -596,12 +638,12 @@ namespace
         const float *, const float *, const float *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int);
+        int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<4>(
         const float *, const float *, const float *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int);
+        int, int, int, int);
 
     // =========================================================================
     // Flash Decoding - Split-K Kernel (FP32)
@@ -1123,7 +1165,7 @@ extern "C"
                 n_heads, n_kv_heads, head_dim,
                 softmax_scale, causal, window_size, position_offset,
                 device_params, mask,
-                cfg.tile_q, cfg.tile_kv);
+                cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);
         }
         else
         {
@@ -1144,7 +1186,7 @@ extern "C"
                 n_heads, n_kv_heads, head_dim,
                 softmax_scale, causal, window_size, position_offset,
                 device_params, mask,
-                cfg.tile_q, cfg.tile_kv);
+                cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);
         }
 
         err = cudaGetLastError();
@@ -1152,9 +1194,9 @@ extern "C"
         if (err != cudaSuccess)
         {
             printf("[cudaFlashAttn_prefill_fa2] CUDA error: %s (smem=%zu bytes, tile_q=%d, tile_kv=%d, head_dim=%d, "
-                   "consumer_warps=%d, max_smem=%d, grid=(%d,%d,%d), block=%d)\n",
+                   "consumer_warps=%d, qkv_pad=%d, scores_pad=%d, max_smem=%d, grid=(%d,%d,%d), block=%d)\n",
                    cudaGetErrorString(err), cfg.smem_size, cfg.tile_q, cfg.tile_kv, head_dim,
-                   cfg.num_consumer_warps, dev_cfg.max_smem_optin,
+                   cfg.num_consumer_warps, cfg.qkv_pad, cfg.scores_pad, dev_cfg.max_smem_optin,
                    grid.x, grid.y, grid.z, cfg.block_size);
             return -1;
         }

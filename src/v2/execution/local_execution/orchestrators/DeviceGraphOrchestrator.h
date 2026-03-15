@@ -839,6 +839,8 @@ namespace llaminar2
          */
         void setPhase(InferencePhase phase) { current_phase_ = phase; }
 
+        void setSuppressTimeline(bool suppress) override { suppress_timeline_ = suppress; }
+
         /**
          * @brief Transition to a new inference phase with logging
          *
@@ -1986,6 +1988,9 @@ namespace llaminar2
 
         /// Last position offset (for cache validation)
         int last_pos_offset_ = -1;
+
+        /// When true, GPU stage timeline output is suppressed (warmup runs)
+        bool suppress_timeline_ = false;
 
         /// Inference state (Phase 5 - owned buffers)
         InferenceState state_;

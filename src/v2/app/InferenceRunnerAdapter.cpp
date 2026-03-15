@@ -81,4 +81,9 @@ namespace llaminar2
         orch_runner_->setSkipLogitsGatherPrefill(skip);
     }
 
+    void InferenceRunnerAdapter::setSuppressTimeline(bool suppress)
+    {
+        orch_runner_->setSuppressTimeline(suppress);
+    }
+
 } // namespace llaminar2

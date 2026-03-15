@@ -1369,6 +1369,14 @@ namespace llaminar2
         }
     }
 
+    void OrchestrationRunner::setSuppressTimeline(bool suppress)
+    {
+        if (runner_)
+        {
+            runner_->setSuppressTimeline(suppress);
+        }
+    }
+
     void OrchestrationRunner::setSamplingParams(const SamplingParams &params)
     {
         active_sampling_params_ = params;

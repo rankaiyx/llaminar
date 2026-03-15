@@ -64,7 +64,8 @@ namespace llaminar2::cuda_native_vnni
         static constexpr bool is_dual_scale_asym = (CODEBOOK_ID == 10);
         static constexpr bool is_iq1_m = (CODEBOOK_ID == 17);
         static constexpr int payload_bytes =
-            (CODEBOOK_ID == 6 || CODEBOOK_ID == 7) ? 20 : (CODEBOOK_ID == 8)                     ? 24
+            (CODEBOOK_ID == 18)                                       ? 32
+            : (CODEBOOK_ID == 6 || CODEBOOK_ID == 7) ? 20 : (CODEBOOK_ID == 8)                     ? 24
                                                       : (CODEBOOK_ID == 9)                       ? 12
                                                       : (CODEBOOK_ID == 10)                      ? 8
                                                       : (CODEBOOK_ID == 11)                      ? 13
@@ -435,6 +436,14 @@ namespace llaminar2::cuda_native_vnni
             packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
             packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
         }
+        else if constexpr (CODEBOOK_ID == 18) // Q8_0: 32 raw int8 values → direct copy
+        {
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+            {
+                packed_groups[g] = *reinterpret_cast<const int32_t *>(payload + g * 4);
+            }
+        }
     }
 
     // =====================================================================
@@ -496,6 +505,19 @@ namespace llaminar2::cuda_native_vnni
             {
                 decode_groups<CODEBOOK_ID>(payload, packed_groups);
             }
+        }
+        else if constexpr (CODEBOOK_ID == 18) // Q8_0: 32 bytes — two 128-bit loads
+        {
+            const int4 v0 = *reinterpret_cast<const int4 *>(payload);
+            const int4 v1 = *reinterpret_cast<const int4 *>(payload + 16);
+            packed_groups[0] = v0.x;
+            packed_groups[1] = v0.y;
+            packed_groups[2] = v0.z;
+            packed_groups[3] = v0.w;
+            packed_groups[4] = v1.x;
+            packed_groups[5] = v1.y;
+            packed_groups[6] = v1.z;
+            packed_groups[7] = v1.w;
         }
         else
         {

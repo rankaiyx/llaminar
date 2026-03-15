@@ -188,6 +188,16 @@ namespace llaminar2
         virtual void setSkipLogitsGatherPrefill(bool) {}
 
         /**
+         * @brief Suppress GPU stage timeline output
+         *
+         * When enabled, the GPU stage timeline summary is not printed after
+         * each forward pass. Used by BenchmarkRunner to exclude warmup runs
+         * from overhead reporting.
+         * Default: no-op (not all runners support this).
+         */
+        virtual void setSuppressTimeline(bool) {}
+
+        /**
          * @brief Get current position in cache
          */
         virtual int get_position() const = 0;

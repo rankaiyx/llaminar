@@ -910,7 +910,7 @@ namespace llaminar2
                 }
 
                 // Stage timeline: GPU is now synced, collect and print event timings
-                if (debugEnv().gpu_stage_timing && ctx->deviceId().is_gpu())
+                if (debugEnv().gpu_stage_timing && !suppress_timeline_ && ctx->deviceId().is_gpu())
                 {
                     auto &timeline = executor_.stageTimeline();
                     auto &pool = GPUDeviceContextPool::instance();
@@ -1132,7 +1132,7 @@ namespace llaminar2
             }
 
             // GPU stage timing for cache-miss path
-            if (debugEnv().gpu_stage_timing && input.device.is_gpu())
+            if (debugEnv().gpu_stage_timing && !suppress_timeline_ && input.device.is_gpu())
             {
                 auto &timeline = executor_.stageTimeline();
                 if (timeline.isInitialized())

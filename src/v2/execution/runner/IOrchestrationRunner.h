@@ -355,6 +355,8 @@ namespace llaminar2
          */
         virtual void setSkipLogitsGatherPrefill(bool /*skip*/) {}
 
+        virtual void setSuppressTimeline(bool /*suppress*/) {}
+
         /**
          * @brief Set active sampling parameters for use in decodeStep()
          *

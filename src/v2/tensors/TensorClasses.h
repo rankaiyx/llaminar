@@ -3403,6 +3403,14 @@ namespace llaminar2
 
         size_t superblock_size() const override { return 256; }
 
+        // NativeVNNI support: codebook 18, 32-byte payload (raw int8 blocks)
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{18, 32, false, false, false, 127.0f};
+            return &info;
+        }
+        void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
+
         /// Efficient override: reads Q8_0 blocks directly via typed_data()
         /// without virtual dispatch per block.
         float requantizeRowToInt8(size_t row_idx, size_t K, int8_t *output) const override;

@@ -44,6 +44,7 @@ namespace llaminar2
         int sampleOnDevice(const SamplingParams &params) override;
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
+        void setSuppressTimeline(bool suppress) override;
 
     private:
         IOrchestrationRunner *orch_runner_;
