@@ -9,7 +9,7 @@
  * - Primary entry point: multiply_tensor() with type introspection
  * - Supports any quantized weight type (IQ4_NL, Q8_0, Q4_0, Q4_K, etc.)
  * - Weights are packed once and cached with preferred and active execution families
- * - NativePayload-native formats keep compact payloads as the active execution family while
+ * - NativeVNNI-native formats keep compact payloads as the active execution family while
  *   still retaining an Int8Expanded fallback mirror in the cache
  * - Activations quantized on-the-fly or used directly if already Q8_1
  * - Uses CUTLASS INT8 Tensor Core GEMM (SM 8.0+ Ampere)
@@ -76,7 +76,7 @@ namespace llaminar2
          *
          * **Compute Path**:
          * 1. Weights: Pack once, recording preferred and active CUDA weight families
-         * 2. Current execution: active_family selects the primary path; NativePayload-native
+         * 2. Current execution: active_family selects the primary path; NativeVNNI-native
          *    formats still retain an Int8Expanded fallback mirror for fallback/tuning paths
          * 3. Activations: Q8_1 blocks used directly, or FP32→INT8 quantized
          * 4. GEMM: CUTLASS INT8×INT8→INT32 (Tensor Core mma.sync.m16n8k32)
@@ -98,10 +98,10 @@ namespace llaminar2
             static void setBlockwiseExecutionBackend(CUDABlockwiseExecutionBackend backend);
             static CUDABlockwiseExecutionBackend getBlockwiseExecutionBackend();
 
-            static void setNativePayloadEnabled(bool enabled);
-            static bool isNativePayloadEnabled();
-            static void setNativePayloadTunedGemvEnabled(bool enabled);
-            static bool isNativePayloadTunedGemvEnabled();
+            static void setNativeVNNIEnabled(bool enabled);
+            static bool isNativeVNNIEnabled();
+            static void setNativeVNNITunedGemvEnabled(bool enabled);
+            static bool isNativeVNNITunedGemvEnabled();
             static void setForceCutlassFallback(bool enabled);
             static bool isForceCutlassFallback();
 

@@ -618,7 +618,7 @@ namespace llaminar2
             int8_t *d_weights_int8_vnni = nullptr;       // [K/4 x N x 4] VNNI layout (sole device copy)
             int8_t *d_weights_int8_rowmajor = nullptr;   // [N x K] optional persistent CK row-major buffer (startup repack)
             float *d_scales_B = nullptr;                 // [N] per-column scales
-            uint8_t *d_weights_native_payload = nullptr; // [blocks_per_row × N × payload_bytes]
+            uint8_t *d_weights_native_vnni = nullptr; // [blocks_per_row × N × payload_bytes]
             void *d_weights_native_scales = nullptr;     // [blocks_per_row × N] __half*
             void *d_weights_native_mins = nullptr;       // [blocks_per_row × N] __half* (asymmetric only, else NULL)
             void *d_weights_native_emins = nullptr;      // [blocks_per_row × N] uint32_t* (Q2_K only, packed {lo,hi} FP16 emins)
@@ -631,7 +631,7 @@ namespace llaminar2
             bool startup_commit_event_pending = false;
             void *startup_h2d_pinned_scales = nullptr;
             void *startup_h2d_pinned_vnni = nullptr;
-            void *startup_h2d_pinned_native_payload = nullptr;
+            void *startup_h2d_pinned_native_vnni = nullptr;
             void *startup_h2d_pinned_native_scales = nullptr;
             void *startup_h2d_pinned_native_mins = nullptr;
             void *startup_h2d_pinned_native_emins = nullptr;
@@ -699,8 +699,8 @@ namespace llaminar2
                         rocmQuantGemm_freeDevice(d_weights_int8_rowmajor, rocm_device_id);
                     if (d_scales_B)
                         rocmQuantGemm_freeDevice(d_scales_B, rocm_device_id);
-                    if (d_weights_native_payload)
-                        rocmQuantGemm_freeDevice(d_weights_native_payload, rocm_device_id);
+                    if (d_weights_native_vnni)
+                        rocmQuantGemm_freeDevice(d_weights_native_vnni, rocm_device_id);
                     if (d_weights_native_scales)
                         rocmQuantGemm_freeDevice(d_weights_native_scales, rocm_device_id);
                     if (d_weights_native_mins)
@@ -728,7 +728,7 @@ namespace llaminar2
                     };
                     free_pinned(startup_h2d_pinned_scales);
                     free_pinned(startup_h2d_pinned_vnni);
-                    free_pinned(startup_h2d_pinned_native_payload);
+                    free_pinned(startup_h2d_pinned_native_vnni);
                     free_pinned(startup_h2d_pinned_native_scales);
                     free_pinned(startup_h2d_pinned_native_mins);
                     free_pinned(startup_h2d_pinned_native_emins);
@@ -1207,7 +1207,7 @@ namespace llaminar2
 
                 free_if_set(upload.startup_h2d_pinned_scales);
                 free_if_set(upload.startup_h2d_pinned_vnni);
-                free_if_set(upload.startup_h2d_pinned_native_payload);
+                free_if_set(upload.startup_h2d_pinned_native_vnni);
                 free_if_set(upload.startup_h2d_pinned_native_scales);
                 free_if_set(upload.startup_h2d_pinned_native_mins);
 #else
@@ -1784,7 +1784,7 @@ namespace llaminar2
                 LOG_TRACE("[" << callsite << "] Trying native-VNNI prefill (M=" << m
                               << " N=" << n << " K=" << k << ")");
 
-                if (!impl_->d_weights_native_payload || !impl_->d_weights_native_scales)
+                if (!impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
                 {
                     logFallback("buffers");
                     return false;
@@ -1792,7 +1792,7 @@ namespace llaminar2
 
                 native_ok = rocmGemm_native_vnni_fp32(
                     d_A_int8,
-                    impl_->d_weights_native_payload,
+                    impl_->d_weights_native_vnni,
                     impl_->d_weights_native_scales,
                     impl_->d_weights_native_mins,
                     impl_->d_weights_native_emins,
@@ -2668,7 +2668,7 @@ namespace llaminar2
 
                         if (!rocmGemv_native_vnni_fp32(
                                 impl_->d_A_int8,
-                                impl_->d_weights_native_payload,
+                                impl_->d_weights_native_vnni,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
                                 impl_->d_weights_native_emins,
@@ -3171,7 +3171,7 @@ namespace llaminar2
                     {
                         if (rocmGemm_native_vnni_fp32(
                                 d_A_int8,
-                                impl_->d_weights_native_payload,
+                                impl_->d_weights_native_vnni,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
                                 impl_->d_weights_native_emins,
@@ -4229,7 +4229,7 @@ namespace llaminar2
 
                             proj_ok = rocmGemv_native_vnni_fp32(
                                 impl_->d_A_int8,
-                                rocm_kernel->impl_->d_weights_native_payload,
+                                rocm_kernel->impl_->d_weights_native_vnni,
                                 rocm_kernel->impl_->d_weights_native_scales,
                                 rocm_kernel->impl_->d_weights_native_mins,
                                 rocm_kernel->impl_->d_weights_native_emins,
@@ -4508,7 +4508,7 @@ namespace llaminar2
 
                         if (!rocmGemv_native_vnni_fp32(
                                 impl_->d_A_int8,
-                                rocm_kernel->impl_->d_weights_native_payload,
+                                rocm_kernel->impl_->d_weights_native_vnni,
                                 rocm_kernel->impl_->d_weights_native_scales,
                                 rocm_kernel->impl_->d_weights_native_mins,
                                 rocm_kernel->impl_->d_weights_native_emins,
@@ -5255,7 +5255,7 @@ namespace llaminar2
                                     packed_->native_vnni_payload.size() * sizeof(uint8_t),
                                     async_upload_enabled,
                                     upload.startup_h2d_stream,
-                                    &upload.startup_h2d_pinned_native_payload,
+                                    &upload.startup_h2d_pinned_native_vnni,
                                     "ROCmQuantisedGemmKernel::ensureWeightsConverted",
                                     "native_vnni_payload");
                                 if (err != hipSuccess)
@@ -5484,7 +5484,7 @@ namespace llaminar2
                     impl_->d_weights_int8_vnni = upload.d_int8_data_vnni;
                     impl_->d_weights_int8_rowmajor = upload.d_int8_data_rowmajor;
                     impl_->d_scales_B = upload.d_scales;
-                    impl_->d_weights_native_payload = upload.d_native_vnni_payload;
+                    impl_->d_weights_native_vnni = upload.d_native_vnni_payload;
                     impl_->d_weights_native_scales = upload.d_native_vnni_scales;
                     impl_->d_weights_native_mins = upload.d_native_vnni_mins;
                     impl_->d_weights_native_emins = upload.d_native_vnni_emins;
@@ -5497,7 +5497,7 @@ namespace llaminar2
                     impl_->startup_commit_event_pending = upload.startup_commit_event_pending;
                     impl_->startup_h2d_pinned_scales = upload.startup_h2d_pinned_scales;
                     impl_->startup_h2d_pinned_vnni = upload.startup_h2d_pinned_vnni;
-                    impl_->startup_h2d_pinned_native_payload = upload.startup_h2d_pinned_native_payload;
+                    impl_->startup_h2d_pinned_native_vnni = upload.startup_h2d_pinned_native_vnni;
                     impl_->startup_h2d_pinned_native_scales = upload.startup_h2d_pinned_native_scales;
                     impl_->startup_h2d_pinned_native_mins = upload.startup_h2d_pinned_native_mins;
                     impl_->startup_h2d_pinned_native_emins = upload.startup_h2d_pinned_native_emins;
@@ -5605,7 +5605,7 @@ namespace llaminar2
             // Upload native-VNNI payload + metadata when present.
             if (!host_packed.native_vnni_payload.empty() && !host_packed.native_vnni_scales.empty())
             {
-                if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&impl_->d_weights_native_payload),
+                if (!rocmQuantGemm_allocInt8(reinterpret_cast<int8_t **>(&impl_->d_weights_native_vnni),
                                              host_packed.native_vnni_payload.size(),
                                              rocm_device_id_))
                 {
@@ -5613,7 +5613,7 @@ namespace llaminar2
                     return;
                 }
 
-                err = hipMemcpy(impl_->d_weights_native_payload,
+                err = hipMemcpy(impl_->d_weights_native_vnni,
                                 host_packed.native_vnni_payload.data(),
                                 host_packed.native_vnni_payload.size() * sizeof(uint8_t),
                                 hipMemcpyHostToDevice);
@@ -5694,7 +5694,7 @@ namespace llaminar2
                 impl_->native_vnni_blocks_per_row = host_packed.native_vnni_blocks_per_row;
             }
 
-            impl_->has_native_vnni = (impl_->d_weights_native_payload != nullptr &&
+            impl_->has_native_vnni = (impl_->d_weights_native_vnni != nullptr &&
                                       impl_->d_weights_native_scales != nullptr);
 
             impl_->owns_weight_memory = true; // We now own the device memory
@@ -5894,7 +5894,7 @@ namespace llaminar2
 
                         if (!rocmGemv_native_vnni_fp32(
                                 impl_->d_A_int8,
-                                impl_->d_weights_native_payload,
+                                impl_->d_weights_native_vnni,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
                                 impl_->d_weights_native_emins,
@@ -6027,7 +6027,7 @@ namespace llaminar2
                 const uint8_t cb_id = impl_->native_vnni_codebook_id;
                 if (rocmGemm_native_vnni_fp32(
                         impl_->d_A_int8,
-                        impl_->d_weights_native_payload,
+                        impl_->d_weights_native_vnni,
                         impl_->d_weights_native_scales,
                         impl_->d_weights_native_mins,
                         impl_->d_weights_native_emins,

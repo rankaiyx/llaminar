@@ -668,9 +668,9 @@ namespace
                 auto weights_gemv = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
                 const size_t weight_bytes = weights_gemv->size_bytes();
 
-                // NativePayload tuned GEMV (default path)
-                CUDAQuantisedGemmKernel::setNativePayloadEnabled(true);
-                CUDAQuantisedGemmKernel::setNativePayloadTunedGemvEnabled(cfg.tuned_gemv_enabled);
+                // NativeVNNI tuned GEMV (default path)
+                CUDAQuantisedGemmKernel::setNativeVNNIEnabled(true);
+                CUDAQuantisedGemmKernel::setNativeVNNITunedGemvEnabled(cfg.tuned_gemv_enabled);
                 const RunResult np_tuned_gemv = runKernel(weights_gemv.get(), 1, shape.n, shape.k, CUDABlockwiseExecutionBackend::LegacyDP4A, cfg);
 
                 // -- HBM bandwidth metrics --

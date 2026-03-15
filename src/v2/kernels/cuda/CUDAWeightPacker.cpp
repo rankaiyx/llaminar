@@ -18,7 +18,7 @@ namespace llaminar2::cuda
 
     namespace
     {
-        bool canPackNativePayloadCUDA(const TensorBase *tensor)
+        bool canPackNativeVNNICUDA(const TensorBase *tensor)
         {
             if (!tensor)
             {
@@ -96,12 +96,12 @@ namespace llaminar2::cuda
             return true;
         }
 
-        bool packNativePayloadCUDA(const TensorBase *tensor, CUDAPackedWeights &out)
+        bool packNativeVNNICUDA(const TensorBase *tensor, CUDAPackedWeights &out)
         {
             const auto *quant_accessor = dynamic_cast<const IINT8Unpackable *>(tensor);
             if (!quant_accessor)
             {
-                LOG_ERROR("[packNativePayloadCUDA] Tensor type "
+                LOG_ERROR("[packNativeVNNICUDA] Tensor type "
                           << tensorTypeName(tensor->native_type())
                           << " does not implement IINT8Unpackable");
                 return false;
@@ -110,7 +110,7 @@ namespace llaminar2::cuda
             const auto *info = quant_accessor->vnniFormatInfo();
             if (!info)
             {
-                LOG_ERROR("[packNativePayloadCUDA] Missing VNNI format info for tensor type "
+                LOG_ERROR("[packNativeVNNICUDA] Missing VNNI format info for tensor type "
                           << tensorTypeName(tensor->native_type()));
                 return false;
             }
@@ -119,13 +119,13 @@ namespace llaminar2::cuda
             const int K = static_cast<int>(tensor->cols());
             if ((K % 32) != 0)
             {
-                LOG_ERROR("[packNativePayloadCUDA] K=" << K << " not divisible by 32 for "
+                LOG_ERROR("[packNativeVNNICUDA] K=" << K << " not divisible by 32 for "
                                                        << tensorTypeName(tensor->native_type()));
                 return false;
             }
 
             const int blocks_per_row = K / 32;
-            out.native_payload.assign(static_cast<size_t>(blocks_per_row) * N * info->payload_bytes, uint8_t{0});
+            out.native_vnni.assign(static_cast<size_t>(blocks_per_row) * N * info->payload_bytes, uint8_t{0});
             out.native_scales.assign(static_cast<size_t>(blocks_per_row) * N, uint16_t{0});
             out.native_mins.clear();
             out.native_emins.clear();
@@ -146,7 +146,7 @@ namespace llaminar2::cuda
             ctx.K = K;
             ctx.blocks_per_row = blocks_per_row;
             ctx.payload_bytes = info->payload_bytes;
-            ctx.payload_array = out.native_payload.data();
+            ctx.payload_array = out.native_vnni.data();
             ctx.scales_array = out.native_scales.data();
             ctx.mins_array = info->is_asymmetric ? out.native_mins.data() : nullptr;
             ctx.emins_array = info->has_emins ? out.native_emins.data() : nullptr;
@@ -175,8 +175,8 @@ namespace llaminar2::cuda
                 cudaQuantGemm_freeDevice(upload.d_scales);
             if (upload.d_int8_data_tc_blocked)
                 cudaQuantGemm_freeDevice(upload.d_int8_data_tc_blocked);
-            if (upload.d_native_payload)
-                cudaQuantGemm_freeDevice(upload.d_native_payload);
+            if (upload.d_native_vnni)
+                cudaQuantGemm_freeDevice(upload.d_native_vnni);
             if (upload.d_native_scales)
                 cudaQuantGemm_freeDevice(upload.d_native_scales);
             if (upload.d_native_mins)
@@ -193,8 +193,8 @@ namespace llaminar2::cuda
                 cudaQuantGemm_freeDevice(d_scales);
             if (d_int8_data_tc_blocked)
                 cudaQuantGemm_freeDevice(d_int8_data_tc_blocked);
-            if (d_native_payload)
-                cudaQuantGemm_freeDevice(d_native_payload);
+            if (d_native_vnni)
+                cudaQuantGemm_freeDevice(d_native_vnni);
             if (d_native_scales)
                 cudaQuantGemm_freeDevice(d_native_scales);
             if (d_native_mins)
@@ -208,7 +208,7 @@ namespace llaminar2::cuda
     {
         if (isNativeVnniFormat(type))
         {
-            return CUDAPackedWeightFamily::NativePayload;
+            return CUDAPackedWeightFamily::NativeVNNI;
         }
 
         return CUDAPackedWeightFamily::Int8Expanded;
@@ -220,8 +220,8 @@ namespace llaminar2::cuda
         {
         case CUDAPackedWeightFamily::Int8Expanded:
             return "Int8Expanded";
-        case CUDAPackedWeightFamily::NativePayload:
-            return "NativePayload";
+        case CUDAPackedWeightFamily::NativeVNNI:
+            return "NativeVNNI";
         default:
             return "Unknown";
         }
@@ -237,7 +237,7 @@ namespace llaminar2::cuda
 
         out.preferred_family = classifyCUDAPackedWeightFamily(tensor->native_type());
         out.active_family = CUDAPackedWeightFamily::Int8Expanded;
-        out.native_payload.clear();
+        out.native_vnni.clear();
         out.native_scales.clear();
         out.native_mins.clear();
         out.native_emins.clear();
@@ -249,22 +249,22 @@ namespace llaminar2::cuda
         out.K = K;
         out.N = N;
 
-        if (out.preferred_family == CUDAPackedWeightFamily::NativePayload && canPackNativePayloadCUDA(tensor))
+        if (out.preferred_family == CUDAPackedWeightFamily::NativeVNNI && canPackNativeVNNICUDA(tensor))
         {
-            if (packNativePayloadCUDA(tensor, out))
+            if (packNativeVNNICUDA(tensor, out))
             {
-                out.active_family = CUDAPackedWeightFamily::NativePayload;
+                out.active_family = CUDAPackedWeightFamily::NativeVNNI;
             }
             else
             {
-                LOG_WARN("[packWeightsToCUDA] NativePayload packing unavailable for "
+                LOG_WARN("[packWeightsToCUDA] NativeVNNI packing unavailable for "
                          << tensorTypeName(tensor->native_type()) << " " << N << "x" << K
                          << "; falling back to Int8Expanded");
             }
         }
-        else if (out.preferred_family == CUDAPackedWeightFamily::NativePayload)
+        else if (out.preferred_family == CUDAPackedWeightFamily::NativeVNNI)
         {
-            LOG_DEBUG("[packWeightsToCUDA] NativePayload not eligible for "
+            LOG_DEBUG("[packWeightsToCUDA] NativeVNNI not eligible for "
                       << tensorTypeName(tensor->native_type()) << " " << N << "x" << K
                       << "; using Int8Expanded as active family");
         }
@@ -280,7 +280,7 @@ namespace llaminar2::cuda
                              << " weights with active_family=" << cudaPackedWeightFamilyName(out.active_family)
                              << " preferred_family=" << cudaPackedWeightFamilyName(out.preferred_family)
                              << " source_type=" << tensorTypeName(tensor->native_type())
-                             << " native_payload_bytes=" << out.native_payload.size()
+                             << " native_vnni_bytes=" << out.native_vnni.size()
                              << " int8_fallback_bytes=" << out.int8_data.size()
                              << ")");
         LOG_DEBUG("[packWeightsToCUDA] First 4 host scales: "

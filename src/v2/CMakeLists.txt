@@ -222,10 +222,10 @@ if(HAVE_CUDA)
         kernels/cuda/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM implementation
         kernels/cuda/CUDATensorCoreBlockwiseGemm.cu   # blockwise tensor-core GEMM/GEMV scaffold
         kernels/cuda/CUDATensorCoreGemvKernels.cu    # per-shape DP4A GEMV family (Wide, GridKPar, LDSKReduce, Direct)
-        kernels/cuda/CUDANativePayloadIQTables.cu    # shared IQ lookup table symbol definitions for native-payload decode
-        kernels/cuda/CUDANativePayloadGemvKernels.cu # native-payload decode GEMV for Q4_0/Q4_1/IQ4_NL
-        kernels/cuda/CUDANativePayloadGemvTuned.cu  # tuned shape-specific native-payload GEMV (Wide/KPar/Direct)
-        kernels/cuda/CUDANativePayloadPrefillKernels.cu  # custom native-payload prefill GEMM family (Q4_0 first)
+        kernels/cuda/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
+        kernels/cuda/CUDANativeVNNIGemvKernels.cu # native-vnni decode GEMV for Q4_0/Q4_1/IQ4_NL
+        kernels/cuda/CUDANativeVNNIGemvTuned.cu  # tuned shape-specific native-vnni GEMV (Wide/KPar/Direct)
+        kernels/cuda/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
         kernels/cuda/CUDAFusedTCGemm.cu              # fused tensor-core GEMM: single-launch WMMA over full K (sm_75+)
         kernels/cuda/CUDAFusedTCGemmV2.cu             # V2 fused TC GEMM: mma.sync m16n8k32 (sm_80+ Ampere)
         kernels/cuda/CUDATensorCoreGemmKernels.cu    # per-shape tensor-core GEMM family (SmallM, WideN, Balanced)

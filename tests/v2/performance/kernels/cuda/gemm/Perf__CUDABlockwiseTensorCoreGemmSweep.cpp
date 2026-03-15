@@ -1,6 +1,6 @@
 /**
  * @file Perf__CUDABlockwiseTensorCoreGemmSweep.cpp
- * @brief Parameterized GEMV dispatch sweep for CUDA native-payload tuned kernels.
+ * @brief Parameterized GEMV dispatch sweep for CUDA native-vnni tuned kernels.
  */
 
 #include <gtest/gtest.h>
@@ -42,11 +42,11 @@ using llaminar::v2::kernels::KernelFactory;
 
 extern "C"
 {
-    void cudaNativePayloadGemvSweep_setConfig(
+    void cudaNativeVNNIGemvSweep_setConfig(
         int kernel_family, int tile_n, int cpt,
         int target_waves, int mkg, int max_kb,
         int force_two_phase);
-    void cudaNativePayloadGemvSweep_clearConfig();
+    void cudaNativeVNNIGemvSweep_clearConfig();
 }
 
 namespace
@@ -546,10 +546,10 @@ namespace
             const TuneCandidate &candidate)
         {
             CUDAQuantisedGemmKernel::setBlockwiseExecutionBackend(CUDABlockwiseExecutionBackend::LegacyDP4A);
-            CUDAQuantisedGemmKernel::setNativePayloadEnabled(true);
-            CUDAQuantisedGemmKernel::setNativePayloadTunedGemvEnabled(true);
+            CUDAQuantisedGemmKernel::setNativeVNNIEnabled(true);
+            CUDAQuantisedGemmKernel::setNativeVNNITunedGemvEnabled(true);
 
-            cudaNativePayloadGemvSweep_setConfig(
+            cudaNativeVNNIGemvSweep_setConfig(
                 static_cast<int>(candidate.family),
                 candidate.tile_n,
                 candidate.cpt,
@@ -562,7 +562,7 @@ namespace
             auto kernel = KernelFactory::createGemm(weights, DeviceType::CUDA);
             if (!kernel)
             {
-                cudaNativePayloadGemvSweep_clearConfig();
+                cudaNativeVNNIGemvSweep_clearConfig();
                 throw std::runtime_error("KernelFactory::createGemm returned null");
             }
 
@@ -574,7 +574,7 @@ namespace
                 const auto reqs = ws_consumer->getWorkspaceRequirements(1, n, k);
                 if (!workspace->allocate(reqs))
                 {
-                    cudaNativePayloadGemvSweep_clearConfig();
+                    cudaNativeVNNIGemvSweep_clearConfig();
                     throw std::runtime_error("Failed to allocate CUDA GEMM workspace");
                 }
                 ws_consumer->bindWorkspace(workspace.get());
@@ -589,20 +589,20 @@ namespace
             float *d_C = nullptr;
             if (cudaMalloc(&d_A, A_bytes) != cudaSuccess)
             {
-                cudaNativePayloadGemvSweep_clearConfig();
+                cudaNativeVNNIGemvSweep_clearConfig();
                 throw std::runtime_error("cudaMalloc d_A failed");
             }
             if (cudaMalloc(&d_C, C_bytes) != cudaSuccess)
             {
                 cudaFree(d_A);
-                cudaNativePayloadGemvSweep_clearConfig();
+                cudaNativeVNNIGemvSweep_clearConfig();
                 throw std::runtime_error("cudaMalloc d_C failed");
             }
             if (cudaMemcpy(d_A, h_input_data, A_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
             {
                 cudaFree(d_A);
                 cudaFree(d_C);
-                cudaNativePayloadGemvSweep_clearConfig();
+                cudaNativeVNNIGemvSweep_clearConfig();
                 throw std::runtime_error("cudaMemcpy d_A failed");
             }
 
@@ -612,7 +612,7 @@ namespace
                 {
                     cudaFree(d_A);
                     cudaFree(d_C);
-                    cudaNativePayloadGemvSweep_clearConfig();
+                    cudaNativeVNNIGemvSweep_clearConfig();
                     throw std::runtime_error("CUDA native payload GEMV warmup failed");
                 }
             }
@@ -627,7 +627,7 @@ namespace
                 {
                     cudaFree(d_A);
                     cudaFree(d_C);
-                    cudaNativePayloadGemvSweep_clearConfig();
+                    cudaNativeVNNIGemvSweep_clearConfig();
                     throw std::runtime_error("cudaEventCreate failed");
                 }
 
@@ -645,7 +645,7 @@ namespace
                 {
                     cudaFree(d_A);
                     cudaFree(d_C);
-                    cudaNativePayloadGemvSweep_clearConfig();
+                    cudaNativeVNNIGemvSweep_clearConfig();
                     throw std::runtime_error("CUDA native payload GEMV bench run failed");
                 }
 
@@ -656,7 +656,7 @@ namespace
             cudaFree(d_C);
             if (ws_consumer)
                 ws_consumer->unbindWorkspace();
-            cudaNativePayloadGemvSweep_clearConfig();
+            cudaNativeVNNIGemvSweep_clearConfig();
 
             RunResult result;
             result.min_us = *std::min_element(times_us.begin(), times_us.end());

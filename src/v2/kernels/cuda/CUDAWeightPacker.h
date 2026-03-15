@@ -15,7 +15,7 @@ namespace llaminar2
         enum class CUDAPackedWeightFamily
         {
             Int8Expanded,
-            NativePayload,
+            NativeVNNI,
         };
 
         struct CUDAPackedWeights
@@ -25,7 +25,7 @@ namespace llaminar2
                 int8_t *d_int8_data = nullptr;
                 float *d_scales = nullptr;
                 int8_t *d_int8_data_tc_blocked = nullptr;
-                uint8_t *d_native_payload = nullptr;
+                uint8_t *d_native_vnni = nullptr;
                 uint16_t *d_native_scales = nullptr;
                 uint16_t *d_native_mins = nullptr;
                 uint32_t *d_native_emins = nullptr;
@@ -34,12 +34,12 @@ namespace llaminar2
             CUDAPackedWeightFamily preferred_family = CUDAPackedWeightFamily::Int8Expanded;
             CUDAPackedWeightFamily active_family = CUDAPackedWeightFamily::Int8Expanded;
 
-            // Int8Expanded fallback buffers remain populated even when NativePayload
+            // Int8Expanded fallback buffers remain populated even when NativeVNNI
             // is the active execution family.
             std::vector<int8_t> int8_data;
             std::vector<float> scales;
 
-            std::vector<uint8_t> native_payload;
+            std::vector<uint8_t> native_vnni;
             std::vector<uint16_t> native_scales;
             std::vector<uint16_t> native_mins;
             std::vector<uint32_t> native_emins;
@@ -55,7 +55,7 @@ namespace llaminar2
             int8_t *d_int8_data = nullptr;
             float *d_scales = nullptr;
             int8_t *d_int8_data_tc_blocked = nullptr;
-            uint8_t *d_native_payload = nullptr;
+            uint8_t *d_native_vnni = nullptr;
             uint16_t *d_native_scales = nullptr;
             uint16_t *d_native_mins = nullptr;
             uint32_t *d_native_emins = nullptr;
@@ -82,7 +82,7 @@ namespace llaminar2
                     active_family = other.active_family;
                     int8_data = std::move(other.int8_data);
                     scales = std::move(other.scales);
-                    native_payload = std::move(other.native_payload);
+                    native_vnni = std::move(other.native_vnni);
                     native_scales = std::move(other.native_scales);
                     native_mins = std::move(other.native_mins);
                     native_emins = std::move(other.native_emins);
@@ -94,7 +94,7 @@ namespace llaminar2
                     d_int8_data = other.d_int8_data;
                     d_scales = other.d_scales;
                     d_int8_data_tc_blocked = other.d_int8_data_tc_blocked;
-                    d_native_payload = other.d_native_payload;
+                    d_native_vnni = other.d_native_vnni;
                     d_native_scales = other.d_native_scales;
                     d_native_mins = other.d_native_mins;
                     d_native_emins = other.d_native_emins;
@@ -105,7 +105,7 @@ namespace llaminar2
                     other.d_int8_data = nullptr;
                     other.d_scales = nullptr;
                     other.d_int8_data_tc_blocked = nullptr;
-                    other.d_native_payload = nullptr;
+                    other.d_native_vnni = nullptr;
                     other.d_native_scales = nullptr;
                     other.d_native_mins = nullptr;
                     other.d_native_emins = nullptr;

@@ -184,11 +184,11 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream);
 
-            bool cudaNativePayloadGemv_supportsCodebook(uint8_t codebook_id);
+            bool cudaNativeVNNIGemv_supportsCodebook(uint8_t codebook_id);
 
-            bool cudaNativePayloadInitIQGridTables();
+            bool cudaNativeVNNIInitIQGridTables();
 
-            bool cudaNativePayloadGemv_fp32(
+            bool cudaNativeVNNIGemv_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const uint16_t *d_scales,
@@ -204,7 +204,7 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream);
 
-            bool cudaNativePayloadGemvTuned_fp32(
+            bool cudaNativeVNNIGemvTuned_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const uint16_t *d_scales,
@@ -220,9 +220,9 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream);
 
-            bool cudaNativePayloadInitIQGridTables_tuned();
+            bool cudaNativeVNNIInitIQGridTables_tuned();
 
-            bool cudaNativePayloadPrefillQ40_fp32(
+            bool cudaNativeVNNIPrefillQ40_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const uint16_t *d_scales,
@@ -232,6 +232,36 @@ namespace llaminar2
                 float alpha, float beta,
                 const float *d_C_existing,
                 const float *d_bias,
+                int cuda_device_id,
+                void *stream);
+
+            bool cudaNativeVNNIPrefillIQ4NL_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                int M, int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int cuda_device_id,
+                void *stream);
+
+            // Generic prefill dispatch for all formats
+            bool cudaNativeVNNIPrefill_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                int M, int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
                 int cuda_device_id,
                 void *stream);
 
@@ -304,7 +334,7 @@ namespace llaminar2
             int8_t *d_weights_int8 = nullptr;            // [K x N] ColumnMajor
             float *d_scales_B = nullptr;                 // [N] per-column scales
             int8_t *d_weights_int8_tc_blocked = nullptr; // [K/32][N][32] tensor-core layout
-            uint8_t *d_weights_native_payload = nullptr;
+            uint8_t *d_weights_native_vnni = nullptr;
             uint16_t *d_weights_native_scales = nullptr;
             uint16_t *d_weights_native_mins = nullptr;
             uint32_t *d_weights_native_emins = nullptr;
@@ -337,8 +367,8 @@ namespace llaminar2
                 }
                 if (owns_weight_memory)
                 {
-                    if (d_weights_native_payload)
-                        cudaQuantGemm_freeDevice(d_weights_native_payload);
+                    if (d_weights_native_vnni)
+                        cudaQuantGemm_freeDevice(d_weights_native_vnni);
                     if (d_weights_native_scales)
                         cudaQuantGemm_freeDevice(d_weights_native_scales);
                     if (d_weights_native_mins)
@@ -353,8 +383,8 @@ namespace llaminar2
         namespace
         {
             thread_local CUDABlockwiseExecutionBackend g_blockwise_backend = CUDABlockwiseExecutionBackend::LegacyDP4A;
-            thread_local bool g_native_payload_enabled = true;
-            thread_local bool g_native_payload_tuned_gemv_enabled = true;
+            thread_local bool g_native_vnni_enabled = true;
+            thread_local bool g_native_vnni_tuned_gemv_enabled = true;
             thread_local bool g_force_cutlass_fallback = false;
             constexpr int kTensorCoreBlockwiseMaxPartialChunkBlocks = 8;
             constexpr size_t kTensorCoreBlockwisePartialScratchBudgetBytes = 256ull * 1024ull * 1024ull;
@@ -402,8 +432,8 @@ namespace llaminar2
 
             void freeDeviceUploadNativeBuffers(CUDAPackedWeights::DeviceUpload &upload)
             {
-                if (upload.d_native_payload)
-                    cudaQuantGemm_freeDevice(upload.d_native_payload);
+                if (upload.d_native_vnni)
+                    cudaQuantGemm_freeDevice(upload.d_native_vnni);
                 if (upload.d_native_scales)
                     cudaQuantGemm_freeDevice(upload.d_native_scales);
                 if (upload.d_native_mins)
@@ -411,7 +441,7 @@ namespace llaminar2
                 if (upload.d_native_emins)
                     cudaQuantGemm_freeDevice(upload.d_native_emins);
 
-                upload.d_native_payload = nullptr;
+                upload.d_native_vnni = nullptr;
                 upload.d_native_scales = nullptr;
                 upload.d_native_mins = nullptr;
                 upload.d_native_emins = nullptr;
@@ -422,7 +452,7 @@ namespace llaminar2
                 CUDAPackedWeights::DeviceUpload &upload,
                 int cuda_device_id)
             {
-                if (!uploadHostArrayToDevice(packed.native_payload, &upload.d_native_payload, cuda_device_id) ||
+                if (!uploadHostArrayToDevice(packed.native_vnni, &upload.d_native_vnni, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_scales, &upload.d_native_scales, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_mins, &upload.d_native_mins, cuda_device_id) ||
                     !uploadHostArrayToDevice(packed.native_emins, &upload.d_native_emins, cuda_device_id))
@@ -520,24 +550,42 @@ namespace llaminar2
                     stream);
             }
 
-            template <typename ImplT>
-            bool canUseNativePayloadBlockwise(const ImplT *impl, int m, int k)
+            // Returns true if a codebook has native VNNI tensor-core prefill support.
+            // Single-scale: 0 (Q4_0), 4 (IQ4_NL), 6 (Q5_0), 11 (IQ3_S), 12 (IQ3_XXS), 15 (IQ2_XXS)
+            // Asymmetric:   5 (Q4_1/Q4_K/Q5_K), 7 (Q5_1), 16 (IQ1_S)
+            // Dual-scale:   8 (Q6_K), 9 (Q3_K), 10 (Q2_K), 13 (IQ2_S), 14 (IQ2_XS), 17 (IQ1_M)
+            bool nativeVNNIPrefillSupportsCodebook(uint8_t cb)
             {
-                if (!g_native_payload_enabled || g_force_cutlass_fallback)
+                switch (cb)
+                {
+                case 0: case 4: case 5: case 6: case 7:
+                case 8: case 9: case 10: case 11: case 12:
+                case 13: case 14: case 15: case 16: case 17:
+                    return true;
+                default:
+                    return false;
+                }
+            }
+
+            template <typename ImplT>
+            bool canUseNativeVNNIBlockwise(const ImplT *impl, int m, int k)
+            {
+                if (!g_native_vnni_enabled || g_force_cutlass_fallback)
                     return false;
                 return impl &&
                        m > 0 &&
                        k > 0 &&
                        (k % 32) == 0 &&
-                       impl->d_weights_native_payload &&
+                       impl->d_weights_native_vnni &&
                        impl->d_weights_native_scales &&
                        (m == 1
-                            ? cudaNativePayloadGemv_supportsCodebook(impl->native_codebook_id)
-                            : (impl->native_codebook_id == 0 || (impl->d_weights_int8_tc_blocked && impl->d_scales_B)));
+                            ? cudaNativeVNNIGemv_supportsCodebook(impl->native_codebook_id)
+                            : (nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id) ||
+                               (impl->d_weights_int8_tc_blocked && impl->d_scales_B)));
             }
 
             template <typename ImplT>
-            bool runNativePayloadBlockwiseIfSupported(
+            bool runNativeVNNIBlockwiseIfSupported(
                 const ImplT *impl,
                 const int8_t *d_A_int8,
                 int32_t *d_partial_int32,
@@ -550,7 +598,7 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream)
             {
-                if (!canUseNativePayloadBlockwise(impl, m, k))
+                if (!canUseNativeVNNIBlockwise(impl, m, k))
                 {
                     return false;
                 }
@@ -561,11 +609,12 @@ namespace llaminar2
                     static std::mutex iq_table_mutex;
                     static std::unordered_set<int> gemv_init_devices;
                     static std::unordered_set<int> gemv_tuned_init_devices;
+                    static std::unordered_set<int> prefill_init_devices;
 
                     std::lock_guard<std::mutex> lock(iq_table_mutex);
                     if (m == 1)
                     {
-                        const bool use_tuned = g_native_payload_tuned_gemv_enabled;
+                        const bool use_tuned = g_native_vnni_tuned_gemv_enabled;
                         auto &target_set = use_tuned ? gemv_tuned_init_devices : gemv_init_devices;
                         if (!target_set.count(cuda_device_id))
                         {
@@ -575,8 +624,8 @@ namespace llaminar2
                                                                                                  << " before IQ grid table initialization");
                                 return false;
                             }
-                            const bool ok = use_tuned ? cudaNativePayloadInitIQGridTables_tuned()
-                                                      : cudaNativePayloadInitIQGridTables();
+                            const bool ok = use_tuned ? cudaNativeVNNIInitIQGridTables_tuned()
+                                                      : cudaNativeVNNIInitIQGridTables();
                             if (!ok)
                             {
                                 LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to initialize " << (use_tuned ? "tuned" : "original") << " IQ grid tables for CUDA device " << cuda_device_id);
@@ -585,15 +634,35 @@ namespace llaminar2
                             target_set.insert(cuda_device_id);
                         }
                     }
+                    else
+                    {
+                        // Prefill (M>1) also needs IQ grid tables for IQ formats.
+                        // Prefill uses the same device symbols as the original (non-tuned) GEMV.
+                        if (!prefill_init_devices.count(cuda_device_id))
+                        {
+                            if (!cudaQuantGemm_setDevice(cuda_device_id))
+                            {
+                                LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to set CUDA device " << cuda_device_id
+                                                                                                 << " before IQ grid table initialization for prefill");
+                                return false;
+                            }
+                            if (!cudaNativeVNNIInitIQGridTables())
+                            {
+                                LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to initialize IQ grid tables for prefill on CUDA device " << cuda_device_id);
+                                return false;
+                            }
+                            prefill_init_devices.insert(cuda_device_id);
+                        }
+                    }
                 }
 
                 if (m == 1)
                 {
-                    if (!g_native_payload_tuned_gemv_enabled)
+                    if (!g_native_vnni_tuned_gemv_enabled)
                     {
-                        return cudaNativePayloadGemv_fp32(
+                        return cudaNativeVNNIGemv_fp32(
                             d_A_int8,
-                            impl->d_weights_native_payload,
+                            impl->d_weights_native_vnni,
                             impl->d_weights_native_scales,
                             impl->d_weights_native_mins,
                             impl->d_weights_native_emins,
@@ -608,13 +677,13 @@ namespace llaminar2
                             stream);
                     }
 
-                    static std::once_flag native_payload_decode_once;
-                    std::call_once(native_payload_decode_once, [&]()
-                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativePayload tuned GEMV decode enabled for supported CUDA codebooks"); });
+                    static std::once_flag native_vnni_decode_once;
+                    std::call_once(native_vnni_decode_once, [&]()
+                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI tuned GEMV decode enabled for supported CUDA codebooks"); });
 
-                    return cudaNativePayloadGemvTuned_fp32(
+                    return cudaNativeVNNIGemvTuned_fp32(
                         d_A_int8,
-                        impl->d_weights_native_payload,
+                        impl->d_weights_native_vnni,
                         impl->d_weights_native_scales,
                         impl->d_weights_native_mins,
                         impl->d_weights_native_emins,
@@ -631,13 +700,13 @@ namespace llaminar2
 
                 if (impl->native_codebook_id == 0)
                 {
-                    static std::once_flag native_payload_prefill_q40_once;
-                    std::call_once(native_payload_prefill_q40_once, []()
-                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativePayload Q4_0 prefill kernel active"); });
+                    static std::once_flag native_vnni_prefill_q40_once;
+                    std::call_once(native_vnni_prefill_q40_once, []()
+                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI Q4_0 prefill kernel active"); });
 
-                    if (cudaNativePayloadPrefillQ40_fp32(
+                    if (cudaNativeVNNIPrefillQ40_fp32(
                             d_A_int8,
-                            impl->d_weights_native_payload,
+                            impl->d_weights_native_vnni,
                             impl->d_weights_native_scales,
                             d_C_fp32,
                             d_scales_A_blockwise,
@@ -651,7 +720,65 @@ namespace llaminar2
                         return true;
                     }
 
-                    LOG_WARN("[CUDAQuantisedGemmKernel] NativePayload Q4_0 prefill kernel failed, falling back to tensor-core expanded path");
+                    LOG_WARN("[CUDAQuantisedGemmKernel] NativeVNNI Q4_0 prefill kernel failed, falling back to tensor-core expanded path");
+                }
+
+                if (impl->native_codebook_id == 4)
+                {
+                    static std::once_flag native_vnni_prefill_iq4nl_once;
+                    std::call_once(native_vnni_prefill_iq4nl_once, []()
+                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI IQ4_NL prefill kernel active"); });
+
+                    if (cudaNativeVNNIPrefillIQ4NL_fp32(
+                            d_A_int8,
+                            impl->d_weights_native_vnni,
+                            impl->d_weights_native_scales,
+                            d_C_fp32,
+                            d_scales_A_blockwise,
+                            m, n, k,
+                            alpha, beta,
+                            d_C_existing,
+                            d_bias,
+                            cuda_device_id,
+                            stream))
+                    {
+                        return true;
+                    }
+
+                    LOG_WARN("[CUDAQuantisedGemmKernel] NativeVNNI IQ4_NL prefill kernel failed, falling back to tensor-core expanded path");
+                }
+
+                // Generic native VNNI prefill for all other supported codebooks
+                // (Q5_0, Q5_1, Q4_1/Q4_K/Q5_K, IQ3_S, IQ3_XXS, IQ2_XXS, IQ1_S)
+                if (nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id) &&
+                    impl->native_codebook_id != 0 && impl->native_codebook_id != 4)
+                {
+                    static std::once_flag native_vnni_prefill_generic_once;
+                    std::call_once(native_vnni_prefill_generic_once, [&]()
+                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI generic prefill kernel active (codebook " << static_cast<int>(impl->native_codebook_id) << ")"); });
+
+                    if (cudaNativeVNNIPrefill_fp32(
+                            d_A_int8,
+                            impl->d_weights_native_vnni,
+                            impl->d_weights_native_scales,
+                            impl->d_weights_native_mins,
+                            impl->d_weights_native_emins,
+                            d_C_fp32,
+                            d_scales_A_blockwise,
+                            m, n, k,
+                            alpha, beta,
+                            d_C_existing,
+                            d_bias,
+                            impl->native_codebook_id,
+                            cuda_device_id,
+                            stream))
+                    {
+                        return true;
+                    }
+
+                    LOG_WARN("[CUDAQuantisedGemmKernel] NativeVNNI generic prefill kernel failed for codebook "
+                             << static_cast<int>(impl->native_codebook_id)
+                             << ", falling back to tensor-core expanded path");
                 }
 
                 if (impl->d_weights_int8_tc_blocked && impl->d_scales_B)
@@ -740,24 +867,24 @@ namespace llaminar2
             return g_blockwise_backend;
         }
 
-        void CUDAQuantisedGemmKernel::setNativePayloadEnabled(bool enabled)
+        void CUDAQuantisedGemmKernel::setNativeVNNIEnabled(bool enabled)
         {
-            g_native_payload_enabled = enabled;
+            g_native_vnni_enabled = enabled;
         }
 
-        bool CUDAQuantisedGemmKernel::isNativePayloadEnabled()
+        bool CUDAQuantisedGemmKernel::isNativeVNNIEnabled()
         {
-            return g_native_payload_enabled;
+            return g_native_vnni_enabled;
         }
 
-        void CUDAQuantisedGemmKernel::setNativePayloadTunedGemvEnabled(bool enabled)
+        void CUDAQuantisedGemmKernel::setNativeVNNITunedGemvEnabled(bool enabled)
         {
-            g_native_payload_tuned_gemv_enabled = enabled;
+            g_native_vnni_tuned_gemv_enabled = enabled;
         }
 
-        bool CUDAQuantisedGemmKernel::isNativePayloadTunedGemvEnabled()
+        bool CUDAQuantisedGemmKernel::isNativeVNNITunedGemvEnabled()
         {
-            return g_native_payload_tuned_gemv_enabled;
+            return g_native_vnni_tuned_gemv_enabled;
         }
 
         void CUDAQuantisedGemmKernel::setForceCutlassFallback(bool enabled)
@@ -919,22 +1046,51 @@ namespace llaminar2
                 {
                     CUDAPackedWeights::DeviceUpload upload;
 
-                    LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Uploading packed weights to CUDA:"
-                              << cuda_device_id_ << " K=" << packed_->K << " N=" << packed_->N);
-                    if (!cudaQuantGemm_uploadWeights(
-                            packed_->int8_data.data(),
-                            packed_->scales.data(),
-                            &upload.d_int8_data,
-                            &upload.d_scales,
-                            packed_->K,
-                            packed_->N,
-                            cuda_device_id_))
+                    // Check if NativeVNNI alone covers both decode (GEMV) and
+                    // prefill (GEMM) for this codebook on this device.  When it
+                    // does, uploading the INT8 expanded + TC-blocked weights is
+                    // pure VRAM waste (~3× the quantised weight size).  For a 7B
+                    // model this saves ~13 GB of device memory.
+                    const bool vnni_only =
+                        packed_->active_family == CUDAPackedWeightFamily::NativeVNNI &&
+                        !packed_->native_vnni.empty() &&
+                        g_native_vnni_enabled &&
+                        !g_force_cutlass_fallback &&
+                        (packed_->K % 32) == 0 &&
+                        cudaNativeVNNIGemv_supportsCodebook(packed_->native_codebook_id) &&
+                        nativeVNNIPrefillSupportsCodebook(packed_->native_codebook_id) &&
+                        [&]() {
+                            cudaDeviceProp prop;
+                            return cudaGetDeviceProperties(&prop, cuda_device_id_) == cudaSuccess &&
+                                   prop.major >= 8; // Ampere+ required for NativeVNNI prefill
+                        }();
+
+                    if (vnni_only)
                     {
-                        if (upload.d_int8_data)
-                            cudaQuantGemm_freeDevice(upload.d_int8_data);
-                        if (upload.d_scales)
-                            cudaQuantGemm_freeDevice(upload.d_scales);
-                        throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload pre-packed weights");
+                        static std::once_flag vnni_only_once;
+                        std::call_once(vnni_only_once, [&]()
+                                       { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI-only mode: skipping INT8 expanded + TC-blocked upload (codebook "
+                                                  << static_cast<int>(packed_->native_codebook_id) << ")"); });
+                    }
+                    else
+                    {
+                        LOG_DEBUG("[CUDAQuantisedGemmKernel::ensureWeightsConverted] Uploading packed weights to CUDA:"
+                                  << cuda_device_id_ << " K=" << packed_->K << " N=" << packed_->N);
+                        if (!cudaQuantGemm_uploadWeights(
+                                packed_->int8_data.data(),
+                                packed_->scales.data(),
+                                &upload.d_int8_data,
+                                &upload.d_scales,
+                                packed_->K,
+                                packed_->N,
+                                cuda_device_id_))
+                        {
+                            if (upload.d_int8_data)
+                                cudaQuantGemm_freeDevice(upload.d_int8_data);
+                            if (upload.d_scales)
+                                cudaQuantGemm_freeDevice(upload.d_scales);
+                            throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload pre-packed weights");
+                        }
                     }
 
                     if (!uploadNativePackedWeights(*packed_, upload, cuda_device_id_))
@@ -946,14 +1102,17 @@ namespace llaminar2
                         throw std::runtime_error("[CUDAQuantisedGemmKernel] Failed to upload pre-packed native buffers");
                     }
 
-                    if (!cudaQuantGemm_prepareTensorCoreBlockedWeights(
-                            upload.d_int8_data,
-                            &upload.d_int8_data_tc_blocked,
-                            packed_->K,
-                            packed_->N,
-                            cuda_device_id_))
+                    if (!vnni_only && upload.d_int8_data)
                     {
-                        LOG_WARN("[CUDAQuantisedGemmKernel] Failed to prepare tensor-core blocked weights; legacy blockwise path remains available");
+                        if (!cudaQuantGemm_prepareTensorCoreBlockedWeights(
+                                upload.d_int8_data,
+                                &upload.d_int8_data_tc_blocked,
+                                packed_->K,
+                                packed_->N,
+                                cuda_device_id_))
+                        {
+                            LOG_WARN("[CUDAQuantisedGemmKernel] Failed to prepare tensor-core blocked weights; legacy blockwise path remains available");
+                        }
                     }
 
                     auto emplaced = packed_->device_uploads.emplace(cuda_device_id_, upload);
@@ -964,7 +1123,7 @@ namespace llaminar2
                 packed_->d_int8_data = upload.d_int8_data;
                 packed_->d_scales = upload.d_scales;
                 packed_->d_int8_data_tc_blocked = upload.d_int8_data_tc_blocked;
-                packed_->d_native_payload = upload.d_native_payload;
+                packed_->d_native_vnni = upload.d_native_vnni;
                 packed_->d_native_scales = upload.d_native_scales;
                 packed_->d_native_mins = upload.d_native_mins;
                 packed_->d_native_emins = upload.d_native_emins;
@@ -974,7 +1133,7 @@ namespace llaminar2
                 impl_->d_weights_int8 = upload.d_int8_data;
                 impl_->d_scales_B = upload.d_scales;
                 impl_->d_weights_int8_tc_blocked = upload.d_int8_data_tc_blocked;
-                impl_->d_weights_native_payload = upload.d_native_payload;
+                impl_->d_weights_native_vnni = upload.d_native_vnni;
                 impl_->d_weights_native_scales = upload.d_native_scales;
                 impl_->d_weights_native_mins = upload.d_native_mins;
                 impl_->d_weights_native_emins = upload.d_native_emins;
@@ -992,7 +1151,7 @@ namespace llaminar2
                     const size_t freed_bytes =
                         packed_->int8_data.capacity() +
                         packed_->scales.capacity() * sizeof(float) +
-                        packed_->native_payload.capacity() +
+                        packed_->native_vnni.capacity() +
                         packed_->native_scales.capacity() * sizeof(uint16_t) +
                         packed_->native_mins.capacity() * sizeof(uint16_t) +
                         packed_->native_emins.capacity() * sizeof(uint32_t);
@@ -1000,8 +1159,8 @@ namespace llaminar2
                     packed_->int8_data.shrink_to_fit();
                     packed_->scales.clear();
                     packed_->scales.shrink_to_fit();
-                    packed_->native_payload.clear();
-                    packed_->native_payload.shrink_to_fit();
+                    packed_->native_vnni.clear();
+                    packed_->native_vnni.shrink_to_fit();
                     packed_->native_scales.clear();
                     packed_->native_scales.shrink_to_fit();
                     packed_->native_mins.clear();
@@ -1088,7 +1247,7 @@ namespace llaminar2
             }
 
             legacy_packed.device_uploads[cuda_device_id_].d_int8_data_tc_blocked = impl_->d_weights_int8_tc_blocked;
-            impl_->d_weights_native_payload = legacy_packed.device_uploads[cuda_device_id_].d_native_payload;
+            impl_->d_weights_native_vnni = legacy_packed.device_uploads[cuda_device_id_].d_native_vnni;
             impl_->d_weights_native_scales = legacy_packed.device_uploads[cuda_device_id_].d_native_scales;
             impl_->d_weights_native_mins = legacy_packed.device_uploads[cuda_device_id_].d_native_mins;
             impl_->d_weights_native_emins = legacy_packed.device_uploads[cuda_device_id_].d_native_emins;
@@ -1629,7 +1788,7 @@ namespace llaminar2
 
             // Use blockwise quantization for prefill and for decode when a native
             // payload GEMV path is available.
-            const bool use_blockwise = (k % 32 == 0) && (m > 1 || canUseNativePayloadBlockwise(impl_.get(), m, k));
+            const bool use_blockwise = (k % 32 == 0) && (m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));
             float *d_scales_A = nullptr;
             float *d_scales_A_blockwise = nullptr;
 
@@ -1807,7 +1966,7 @@ namespace llaminar2
 
                 if (use_blockwise)
                 {
-                    if (runNativePayloadBlockwiseIfSupported(
+                    if (runNativeVNNIBlockwiseIfSupported(
                             cuda_kernel->impl_.get(),
                             d_A_int8,
                             proj_d_C_int32,
@@ -1942,7 +2101,7 @@ namespace llaminar2
             const bool use_blockwise =
                 !g_force_cutlass_fallback &&
                 (k % 32 == 0) &&
-                (m > 1 || canUseNativePayloadBlockwise(impl_.get(), m, k));
+                (m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));
 
             if (use_blockwise)
             {
@@ -1957,7 +2116,7 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                if (runNativePayloadBlockwiseIfSupported(
+                if (runNativeVNNIBlockwiseIfSupported(
                         impl_.get(),
                         d_A_int8,
                         d_C_int32,
@@ -2126,7 +2285,7 @@ namespace llaminar2
 
             // Use blockwise quantization whenever K is block-aligned so decode can
             // share one quantization pass across projections and choose either the
-            // NativePayload or Int8Expanded GEMV path per projection.
+            // NativeVNNI or Int8Expanded GEMV path per projection.
             const bool use_blockwise =
                 !g_force_cutlass_fallback &&
                 (k % 32 == 0);
@@ -2147,7 +2306,7 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                if (runNativePayloadBlockwiseIfSupported(
+                if (runNativeVNNIBlockwiseIfSupported(
                         impl_.get(),
                         d_A_int8,
                         d_C_int32,

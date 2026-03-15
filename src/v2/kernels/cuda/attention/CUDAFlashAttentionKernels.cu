@@ -607,49 +607,43 @@ namespace
     // Flash Decoding - Split-K Kernel (FP32)
     // =========================================================================
     //
-    // The key insight: we store (m, l, O) partials where:
-    //   m = max score seen in this split
-    //   l = sum of exp(score - m) for all positions in split
-    //   O = sum of exp(score - m) * V for all positions (unnormalized)
+    // Warp-cooperative design: all 32 lanes in a warp cooperate on each KV
+    // position (vs. the old design where each thread owned a full KV position).
     //
-    // These can be combined across splits using stable softmax merge.
+    // Key improvements over the previous per-thread design:
+    //   - O_lane[4] per thread instead of O_local[128] → ~4 regs vs ~128 regs
+    //   - Cooperative dot product: 32 lanes × 4 elements = 128-dim dot in parallel
+    //   - No warp-level O shuffle needed (m/l are warp-uniform after reduce)
+    //   - Vectorized K/V loads (coalesced across lanes)
+    //   - __expf() fast math intrinsic
     // =========================================================================
 
     /**
-     * @brief Warp-level reduction of softmax state (m, l, O)
+     * @brief Warp-level sum reduction (5 shuffle steps for 32 lanes)
      */
-    __device__ void warpReduceSoftmaxState(
-        float &m, float &l, float *O, int head_dim)
+    __device__ __forceinline__ float warpReduceSum(float val)
     {
-        for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
-        {
-            float other_m = __shfl_xor_sync(0xffffffff, m, offset);
-            float other_l = __shfl_xor_sync(0xffffffff, l, offset);
-
-            float m_new = fmaxf(m, other_m);
-            float scale_self = expf(m - m_new);
-            float scale_other = expf(other_m - m_new);
-
-            l = scale_self * l + scale_other * other_l;
-
-            for (int d = 0; d < head_dim; d++)
-            {
-                float other_O = __shfl_xor_sync(0xffffffff, O[d], offset);
-                O[d] = scale_self * O[d] + scale_other * other_O;
-            }
-
-            m = m_new;
-        }
+        val += __shfl_xor_sync(0xffffffff, val, 16);
+        val += __shfl_xor_sync(0xffffffff, val, 8);
+        val += __shfl_xor_sync(0xffffffff, val, 4);
+        val += __shfl_xor_sync(0xffffffff, val, 2);
+        val += __shfl_xor_sync(0xffffffff, val, 1);
+        return val;
     }
 
     /**
-     * @brief Flash Decoding kernel for single-query decode
+     * @brief Flash Decoding kernel for single-query decode (warp-cooperative)
      *
      * Parallelizes over KV cache using split-K pattern.
      * Grid: (n_heads, num_splits, batch_size)
-     * Block: (256,) threads
+     * Block: (256,) threads = 8 warps
+     *
+     * Each warp processes KV positions cooperatively: all 32 lanes share the
+     * dot product and V accumulation for each position. For head_dim=128,
+     * each lane owns 4 output dimensions (128/32 = 4).
      */
-    __global__ void flash_decoding_fp32_kernel(
+    __global__ __launch_bounds__(256, 4)
+    void flash_decoding_fp32_kernel(
         const float *__restrict__ Q,
         const float *__restrict__ K_cache,
         const float *__restrict__ V_cache,
@@ -700,7 +694,11 @@ namespace
 
         const int tid = threadIdx.x;
         const int num_threads = blockDim.x;
+        const int warp_id = tid / WARP_SIZE;
+        const int lane_id = tid % WARP_SIZE;
+        const int num_warps = num_threads / WARP_SIZE;
 
+        // Load Q into shared memory (all threads cooperate)
         extern __shared__ char smem[];
         float *Q_shared = reinterpret_cast<float *>(smem);
 
@@ -711,72 +709,90 @@ namespace
         }
         __syncthreads();
 
-        float O_local[128] = {0};
+        // Per-lane O accumulators — only this lane's output dimensions
+        // For head_dim=128, WARP_SIZE=32: each lane owns 4 dims
+        // Lane i owns dims: i, i+32, i+64, i+96 (strided by WARP_SIZE)
+        constexpr int MAX_DIMS_PER_LANE = 8; // supports head_dim up to 256
+        float O_lane[MAX_DIMS_PER_LANE] = {0};
         float m_local = -FLT_MAX;
         float l_local = 0.0f;
 
         const float *K_batch = K_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
         const float *V_batch = V_cache + batch_idx * kv_stride * n_kv_heads * head_dim;
 
-        for (int kv_pos = kv_start + tid; kv_pos < kv_end; kv_pos += num_threads)
+        // =================================================================
+        // Main loop: warp-cooperative KV processing
+        //
+        // Each warp processes a strided subset of KV positions.
+        // Within each position, all 32 lanes cooperate on the dot product
+        // and V accumulation. K/V loads are coalesced across lanes.
+        // =================================================================
+        for (int kv_pos = kv_start + warp_id; kv_pos < kv_end; kv_pos += num_warps)
         {
             const float *K_ptr = K_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
-            float score = 0.0f;
-            for (int d = 0; d < head_dim; d++)
-            {
-                score += Q_shared[d] * K_ptr[d];
-            }
-            score *= softmax_scale;
 
+            // Cooperative dot product: each lane handles head_dim/32 elements
+            float partial_dot = 0.0f;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE)
+            {
+                partial_dot += Q_shared[d] * K_ptr[d];
+            }
+
+            // Warp reduce → all lanes get full dot product (5 shuffles)
+            float score = warpReduceSum(partial_dot) * softmax_scale;
+
+            // Online softmax — score is uniform across all lanes,
+            // so m_local and l_local stay warp-uniform
             float m_new = fmaxf(m_local, score);
-            float scale_old = expf(m_local - m_new);
-            float p = expf(score - m_new);
+            float scale_old = __expf(m_local - m_new);
+            float p = __expf(score - m_new);
 
             l_local = l_local * scale_old + p;
-            for (int d = 0; d < head_dim; d++)
-            {
-                O_local[d] *= scale_old;
-            }
 
+            // V accumulation: each lane updates only its own output dims
             const float *V_ptr = V_batch + kv_pos * n_kv_heads * head_dim + kv_head_idx * head_dim;
-            for (int d = 0; d < head_dim; d++)
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
             {
-                O_local[d] += p * V_ptr[d];
+                O_lane[o_idx] = O_lane[o_idx] * scale_old + p * V_ptr[d];
             }
 
             m_local = m_new;
         }
 
-        warpReduceSoftmaxState(m_local, l_local, O_local, head_dim);
-
-        const int warp_id = tid / WARP_SIZE;
-        const int lane_id = tid % WARP_SIZE;
-        const int num_warps = num_threads / WARP_SIZE;
-
+        // =================================================================
+        // Inter-warp reduction using shared memory
+        //
+        // Each warp has (m_local, l_local) uniform across its lanes,
+        // and O distributed across lanes (each lane owns head_dim/32 dims).
+        // We merge all warps' results, then write the final partial output.
+        // =================================================================
         __shared__ float block_m[8];
         __shared__ float block_l[8];
-        __shared__ float block_O[8 * 128];
+        __shared__ float block_O[8 * 128]; // 8 warps × max head_dim=128
 
         if (lane_id == 0)
         {
             block_m[warp_id] = m_local;
             block_l[warp_id] = l_local;
-            for (int d = 0; d < head_dim; d++)
+        }
+        // Each lane writes its O values to the correct positions in block_O
+        {
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
             {
-                block_O[warp_id * head_dim + d] = O_local[d];
+                block_O[warp_id * head_dim + d] = O_lane[o_idx];
             }
         }
         __syncthreads();
 
-        if (warp_id == 0 && lane_id == 0)
+        // Thread 0 computes per-warp rescaling factors
+        __shared__ float warp_scales[8];
+        if (tid == 0)
         {
             float final_m = block_m[0];
             float final_l = block_l[0];
-            float final_O[128];
-            for (int d = 0; d < head_dim; d++)
-            {
-                final_O[d] = block_O[d];
-            }
+            warp_scales[0] = 1.0f;
 
             for (int w = 1; w < num_warps; w++)
             {
@@ -784,28 +800,32 @@ namespace
                 float other_l = block_l[w];
 
                 float m_new = fmaxf(final_m, other_m);
-                float scale_self = expf(final_m - m_new);
-                float scale_other = expf(other_m - m_new);
+                float scale_self = __expf(final_m - m_new);
+                float scale_other = __expf(other_m - m_new);
+
+                for (int prev = 0; prev < w; prev++)
+                    warp_scales[prev] *= scale_self;
+                warp_scales[w] = scale_other;
 
                 final_l = scale_self * final_l + scale_other * other_l;
-
-                for (int d = 0; d < head_dim; d++)
-                {
-                    final_O[d] = scale_self * final_O[d] +
-                                 scale_other * block_O[w * head_dim + d];
-                }
-
                 final_m = m_new;
             }
 
             m_partial[partial_idx] = final_m;
             l_partial[partial_idx] = final_l;
+        }
+        __syncthreads();
 
-            float *O_out = O_partial + partial_idx * head_dim;
-            for (int d = 0; d < head_dim; d++)
+        // Parallel output write — all threads cooperate
+        float *O_out = O_partial + partial_idx * head_dim;
+        for (int d = tid; d < head_dim; d += num_threads)
+        {
+            float sum = 0.0f;
+            for (int w = 0; w < num_warps; w++)
             {
-                O_out[d] = final_O[d];
+                sum += warp_scales[w] * block_O[w * head_dim + d];
             }
+            O_out[d] = sum;
         }
     }
 
@@ -845,7 +865,7 @@ namespace
             float l_sum = 0.0f;
             for (int s = 0; s < num_splits; s++)
             {
-                float scale = expf(m_partial[base_idx + s] - m_max);
+                float scale = __expf(m_partial[base_idx + s] - m_max);
                 split_scales[s] = scale;
                 l_sum += scale * l_partial[base_idx + s];
             }

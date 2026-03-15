@@ -775,7 +775,7 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
 /**
  * @brief Helper macro for decode-size (M=1) quantized GEMV parity tests
  *
- * Exercises the NativePayload GEMV path (M=1 decode) for each codebook.
+ * Exercises the NativeVNNI GEMV path (M=1 decode) for each codebook.
  * K-quant formats use 256-element blocks, so K must be multiple of 256.
  */
 #define DEFINE_QUANTIZED_DECODE_PARITY_TEST(TestName, TensorType, CreateMethod, BlockSize, Seed) \
@@ -2076,12 +2076,12 @@ TEST_F(Test__CUDAGemmParity, CachedIQ4_NLKernel_FirstExecutionPopulatesLazyCUDAU
 
     auto *packed = llaminar::v2::kernels::KernelFactory::ensureCUDAPackedWeightsInTensorCache(weights.get());
     ASSERT_NE(packed, nullptr);
-    EXPECT_EQ(packed->preferred_family, llaminar2::cuda::CUDAPackedWeightFamily::NativePayload);
-    EXPECT_EQ(packed->active_family, llaminar2::cuda::CUDAPackedWeightFamily::NativePayload);
+    EXPECT_EQ(packed->preferred_family, llaminar2::cuda::CUDAPackedWeightFamily::NativeVNNI);
+    EXPECT_EQ(packed->active_family, llaminar2::cuda::CUDAPackedWeightFamily::NativeVNNI);
     EXPECT_FALSE(packed->uploaded);
     EXPECT_TRUE(packed->device_uploads.empty());
     EXPECT_FALSE(packed->int8_data.empty());
-    EXPECT_FALSE(packed->native_payload.empty());
+    EXPECT_FALSE(packed->native_vnni.empty());
 
     auto *cached_kernel = getPreparedKernel(weights.get(), gpu_device_);
     ASSERT_NE(cached_kernel, nullptr);
@@ -2108,14 +2108,14 @@ TEST_F(Test__CUDAGemmParity, CachedIQ4_NLKernel_FirstExecutionPopulatesLazyCUDAU
     EXPECT_NE(upload.d_int8_data, nullptr);
     EXPECT_NE(upload.d_scales, nullptr);
     EXPECT_NE(upload.d_int8_data_tc_blocked, nullptr);
-    EXPECT_NE(upload.d_native_payload, nullptr);
+    EXPECT_NE(upload.d_native_vnni, nullptr);
     EXPECT_NE(upload.d_native_scales, nullptr);
     EXPECT_EQ(upload.d_native_mins, nullptr);
     EXPECT_EQ(upload.d_native_emins, nullptr);
 
     EXPECT_TRUE(packed->int8_data.empty()) << "INT8 fallback host buffers should be released after first upload";
     EXPECT_TRUE(packed->scales.empty()) << "INT8 fallback host scales should be released after first upload";
-    EXPECT_TRUE(packed->native_payload.empty()) << "Native payload host buffers should be released after first upload";
+    EXPECT_TRUE(packed->native_vnni.empty()) << "Native payload host buffers should be released after first upload";
     EXPECT_TRUE(packed->native_scales.empty()) << "Native payload host scales should be released after first upload";
 
     cleanupWorkspaceIfNeeded(cached_kernel);

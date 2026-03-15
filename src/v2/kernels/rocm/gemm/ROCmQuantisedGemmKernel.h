@@ -185,7 +185,7 @@ namespace llaminar2
                 void *d_native_vnni_scales = nullptr; // __half* on device; void* for header compatibility
                 void *d_native_vnni_mins = nullptr;   // __half* on device; NULL for symmetric formats
                 void *d_native_vnni_emins = nullptr;  // uint32_t* packed {lo,hi} emins; Q2_K only
-                void *startup_h2d_pinned_native_payload = nullptr;
+                void *startup_h2d_pinned_native_vnni = nullptr;
                 void *startup_h2d_pinned_native_scales = nullptr;
                 void *startup_h2d_pinned_native_mins = nullptr;
                 void *startup_h2d_pinned_native_emins = nullptr;

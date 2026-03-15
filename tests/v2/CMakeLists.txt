@@ -640,9 +640,9 @@ target_link_libraries(v2_unit_device_benchmark
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_DeviceBenchmark 
+add_v2_test(V2_Integration_DeviceBenchmark 
     COMMAND $<TARGET_FILE:v2_unit_device_benchmark>
-    LABELS "V2;Unit;DeviceManagement;Benchmark;Performance"
+    LABELS "V2;Integration;DeviceManagement;Benchmark;Performance"
     MPI_PROCS 1
 )
 
@@ -1046,12 +1046,12 @@ if(HAVE_ROCM)
         GTest::gtest
         GTest::gtest_main
     )
-    add_v2_test(V2_Unit_RCCLBackend 
+    add_v2_test(V2_Integration_RCCLBackend_P2P 
         COMMAND $<TARGET_FILE:v2_unit_rccl_backend>
-        LABELS "V2;Unit;Collective;RCCLBackend;P2P;ROCm;RCCL"
+        LABELS "V2;Integration;Collective;RCCLBackend;P2P;ROCm;RCCL"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added RCCLBackend P2P unit tests")
+    message(STATUS "V2 Tests: Added RCCLBackend P2P integration tests")
 endif()
 
 # Test: HeterogeneousBackend - Heterogeneous multi-GPU collective backend (CUDA + ROCm)
@@ -3977,11 +3977,11 @@ add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemmSweep
     MPI_PROCS 1
 )
 
-add_executable(v2_perf_cuda_native_payload_gemm performance/kernels/cuda/gemm/Perf__CUDANativePayloadGemm.cpp)
-target_link_libraries(v2_perf_cuda_native_payload_gemm llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Perf_CUDANativePayloadGemm
-    COMMAND $<TARGET_FILE:v2_perf_cuda_native_payload_gemm>
-    LABELS "V2;Performance;CUDA;GEMM;NativePayload;Prefill;Qwen;Tuning"
+add_executable(v2_perf_cuda_native_vnni_gemm performance/kernels/cuda/gemm/Perf__CUDANativeVNNIGemm.cpp)
+target_link_libraries(v2_perf_cuda_native_vnni_gemm llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_CUDANativeVNNIGemm
+    COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_gemm>
+    LABELS "V2;Performance;CUDA;GEMM;NativeVNNI;Prefill;Qwen;Tuning"
     MPI_PROCS 1
 )
 
@@ -5539,9 +5539,9 @@ add_v2_test(V2_Unit_TPContextFactory
 # sharding queries, and collective operation interfaces.
 add_executable(v2_test_local_tp_context unit/collective/Test__LocalTPContext.cpp)
 target_link_libraries(v2_test_local_tp_context llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_LocalTPContext
+add_v2_test(V2_Integration_LocalTPContext
     COMMAND $<TARGET_FILE:v2_test_local_tp_context>
-    LABELS "V2;Unit;LocalTP;Context;TensorParallel;Heterogeneous;DeviceManagement"
+    LABELS "V2;Integration;LocalTP;Context;TensorParallel;Heterogeneous;DeviceManagement"
     MPI_PROCS 1
 )
 
@@ -5598,9 +5598,9 @@ add_v2_test(V2_Unit_LocalPPTransferStage
 # Validates that multiple device threads rendezvous before data transfer
 add_executable(v2_test_local_tp_context_barrier unit/collective/Test__LocalTPContextBarrier.cpp)
 target_link_libraries(v2_test_local_tp_context_barrier PRIVATE llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_LocalTPContextBarrier
+add_v2_test(V2_Integration_LocalTPContextBarrier
     COMMAND $<TARGET_FILE:v2_test_local_tp_context_barrier>
-    LABELS "V2;Unit;LocalTP;Barrier;Synchronization;PCIeBAR;Heterogeneous;Collective"
+    LABELS "V2;Integration;LocalTP;Barrier;Synchronization;PCIeBAR;Heterogeneous;Collective"
     MPI_PROCS 1
 )
 
@@ -5609,9 +5609,9 @@ add_v2_test(V2_Unit_LocalTPContextBarrier
 # Phase 2 of PCIeBAR zero-copy allreduce implementation
 add_executable(v2_test_local_tp_context_bar_management unit/collective/Test__LocalTPContext_BARManagement.cpp)
 target_link_libraries(v2_test_local_tp_context_bar_management PRIVATE llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_LocalTPContext_BARManagement
+add_v2_test(V2_Integration_LocalTPContext_BARManagement
     COMMAND $<TARGET_FILE:v2_test_local_tp_context_bar_management>
-    LABELS "V2;Unit;LocalTP;BARManagement;PCIeBAR;ZeroCopy;TensorTracking"
+    LABELS "V2;Integration;LocalTP;BARManagement;PCIeBAR;ZeroCopy;TensorTracking"
     MPI_PROCS 1
 )
 
@@ -5620,9 +5620,9 @@ add_v2_test(V2_Unit_LocalTPContext_BARManagement
 # Validates zero-copy path with BAR-backed tensors and host staging fallback
 add_executable(v2_test_local_tp_context_zero_copy_allreduce unit/collective/Test__LocalTPContext_ZeroCopyAllreduce.cpp)
 target_link_libraries(v2_test_local_tp_context_zero_copy_allreduce PRIVATE llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_LocalTPContext_ZeroCopyAllreduce
+add_v2_test(V2_Integration_LocalTPContext_ZeroCopyAllreduce
     COMMAND $<TARGET_FILE:v2_test_local_tp_context_zero_copy_allreduce>
-    LABELS "V2;Unit;LocalTP;ZeroCopyAllreduce;PCIeBAR;Allreduce;BugFix"
+    LABELS "V2;Integration;LocalTP;ZeroCopyAllreduce;PCIeBAR;Allreduce;BugFix"
     MPI_PROCS 1
 )
 
