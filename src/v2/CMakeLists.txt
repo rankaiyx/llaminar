@@ -230,6 +230,7 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAResidualAddKernels.cu    # Residual Add kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDASwiGLUKernels.cu         # SwiGLU kernels (FP32, BF16, FP16)
+        kernels/cuda/ops/CUDAFusedOpsKernels.cu       # Fused ops: SwiGLU+Quant, ResidualAdd+RMSNorm
         kernels/cuda/ops/CUDARoPEKernels.cu           # RoPE kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAEmbeddingKernels.cu      # Embedding lookup kernel
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
@@ -510,6 +511,7 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmResidualAddKernels.hip          # Residual Add kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmArgmaxKernels.hip               # Argmax kernel for GPU-side greedy sampling
         kernels/rocm/ops/ROCmSamplingKernels.hip              # Top-K kernel for GPU-side top-k/top-p sampling
+        kernels/rocm/ops/ROCmFusedOpsKernels.hip              # Fused Residual+RMSNorm, Fused SwiGLU+Quant kernels
         kernels/rocm/ops/ROCmCastKernels.hip                  # FP32↔FP16 cast kernels for mixed-precision allreduce
         # Profiling utilities
         utils/ROCmKernelProfiler.hip                         # ROCm/HIP event-based kernel profiling
@@ -1155,6 +1157,7 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/RoPEStage.cpp
     execution/compute_stages/stages/SwiGLUStage.cpp
     execution/compute_stages/stages/ResidualAddStage.cpp
+    execution/compute_stages/stages/FusedResidualNormStage.cpp
     execution/compute_stages/stages/AllreduceStage.cpp
     execution/compute_stages/stages/AllGatherStage.cpp
     execution/compute_stages/stages/AllGatherVStage.cpp
@@ -1647,6 +1650,16 @@ endif()
 # Main executable
 add_executable(llaminar2 Main.cpp)
 target_link_libraries(llaminar2 llaminar2_core)
+
+# GEMM tile-config sweep benchmark (CUDA only)
+if(HAVE_CUDA)
+    add_executable(gemm_sweep ../../benchmarks/v2/gemm_sweep_main.cu)
+    target_link_libraries(gemm_sweep PRIVATE llaminar2_core)
+    target_include_directories(gemm_sweep PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(gemm_sweep PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 # Enable testing for V2
 enable_testing()

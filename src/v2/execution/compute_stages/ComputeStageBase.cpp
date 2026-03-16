@@ -102,6 +102,8 @@ namespace llaminar2
             return "FINAL_NORM";
         case ComputeStageType::QK_NORM:
             return "QK_NORM";
+        case ComputeStageType::FUSED_RESIDUAL_NORM:
+            return "FUSED_RESIDUAL_NORM";
         default:
             return "UNKNOWN";
         }

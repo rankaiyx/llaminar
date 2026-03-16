@@ -320,6 +320,9 @@ namespace llaminar2
 
         // Per-head normalization (Qwen3)
         QK_NORM,
+
+        // Fused operations (GPU optimization)
+        FUSED_RESIDUAL_NORM,
     };
 
     /**

@@ -131,6 +131,8 @@ namespace
     static int selectKSplit(int grid_n, int k_groups, int num_sms,
                             int target_waves, int min_kgroups_per_cta)
     {
+        if (min_kgroups_per_cta <= 0)
+            min_kgroups_per_cta = 2;
         int target_blocks = target_waves * num_sms;
         int kb = std::max(2, (target_blocks + grid_n - 1) / grid_n);
         int kb_max = std::max(2, k_groups / min_kgroups_per_cta);

@@ -27,6 +27,7 @@
 #include "../../execution/compute_stages/stages/TPAllreduceStage.h"
 #include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
 #include "../../execution/compute_stages/stages/QKNormStage.h"
+#include "../../execution/compute_stages/stages/FusedResidualNormStage.h"
 #include "../../config/PipelineConfig.h"
 #include "../../memory/BufferId.h" // Phase 2: contract BufferIds
 #include <algorithm>
@@ -1547,21 +1548,45 @@ namespace llaminar2
         {
             InferenceMode inference_mode(config_.activation_precision);
 
-            RMSNormStage::Params attn_norm_params;
-            attn_norm_params.input = (inference_mode.isHybridQ16() && buffers.residual)
-                                         ? buffers.residual
-                                         : buffers.current_hidden;
-            attn_norm_params.output = buffers.normalized;
-            attn_norm_params.gamma = layer.attn_norm;
-            attn_norm_params.eps = config_.rms_norm_eps;
-            attn_norm_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
-            attn_norm_params.device_id = device;     // Use graph's target device for kernel dispatch
-            attn_norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
-            attn_norm_params.output_buffer_id = BufferId::NORMALIZED;
+            if (device.is_gpu() && !inference_mode.isHybridQ16() && layer_idx > 0)
+            {
+                // GPU path for layers 1+: Fused ResidualAdd + RMSNorm
+                // Combines previous layer's ffn_residual with this layer's attn_norm
+                FusedResidualNormStage::Params fused_params;
+                fused_params.device_id = device;
+                fused_params.input = buffers.attn_proj;         // Previous layer's down_proj output
+                fused_params.residual = buffers.current_hidden; // Hidden state (in-place update)
+                fused_params.gamma = layer.attn_norm;
+                fused_params.norm_output = buffers.normalized;
+                fused_params.eps = config_.rms_norm_eps;
+                fused_params.seq_len = total_tokens;
+                fused_params.hidden_dim = config_.d_model;
+                fused_params.input_buffer_id = BufferId::ATTN_PROJ;
+                fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
+                fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
 
-            graph.addNode(prefix + "attn_norm",
-                          ComputeStageFactory::createRMSNorm(attn_norm_params),
-                          device);
+                graph.addNode(prefix + "attn_norm",
+                              ComputeStageFactory::createFusedResidualNorm(fused_params),
+                              device);
+            }
+            else
+            {
+                RMSNormStage::Params attn_norm_params;
+                attn_norm_params.input = (inference_mode.isHybridQ16() && buffers.residual)
+                                             ? buffers.residual
+                                             : buffers.current_hidden;
+                attn_norm_params.output = buffers.normalized;
+                attn_norm_params.gamma = layer.attn_norm;
+                attn_norm_params.eps = config_.rms_norm_eps;
+                attn_norm_params.seq_len = total_tokens;
+                attn_norm_params.device_id = device;
+                attn_norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+                attn_norm_params.output_buffer_id = BufferId::NORMALIZED;
+
+                graph.addNode(prefix + "attn_norm",
+                              ComputeStageFactory::createRMSNorm(attn_norm_params),
+                              device);
+            }
         }
 
         // Stage 2: Q/K/V projections using FusedQKVGEMMStage
@@ -2201,7 +2226,8 @@ namespace llaminar2
 
         // Stage 6: Residual connection
         // Skip when HybridQ16 fusion is enabled - the fused kernel already did residual add
-        if (env.execution.exec_residual && !inference_mode.isHybridQ16())
+        // Skip on GPU - fused into FusedResidualNormStage in buildFFNGraph (saves one memory pass)
+        if (env.execution.exec_residual && !inference_mode.isHybridQ16() && !device.is_gpu())
         {
             ResidualAddStage::Params res_params;
             res_params.device_id = device; // Use graph's target device for kernel dispatch
@@ -2258,21 +2284,45 @@ namespace llaminar2
             // For HybridQ16, read from Q16_1 residual buffer
             InferenceMode inference_mode(config_.activation_precision);
 
-            RMSNormStage::Params ffn_norm_params;
-            ffn_norm_params.input = (inference_mode.isHybridQ16() && buffers.residual)
-                                        ? buffers.residual
-                                        : buffers.current_hidden;
-            ffn_norm_params.output = buffers.normalized;
-            ffn_norm_params.gamma = layer.ffn_norm;
-            ffn_norm_params.eps = config_.rms_norm_eps;
-            ffn_norm_params.seq_len = total_tokens; // Use total_tokens = batch_size * seq_len
-            ffn_norm_params.device_id = device;     // Use graph's target device for kernel dispatch
-            ffn_norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
-            ffn_norm_params.output_buffer_id = BufferId::NORMALIZED;
+            if (device.is_gpu() && !inference_mode.isHybridQ16())
+            {
+                // GPU path: Fused ResidualAdd + RMSNorm in a single kernel
+                // Replaces separate attn_residual + ffn_norm with one kernel pass
+                FusedResidualNormStage::Params fused_params;
+                fused_params.device_id = device;
+                fused_params.input = buffers.attn_proj;       // Wo output (to be added)
+                fused_params.residual = buffers.current_hidden; // Hidden state (in-place update)
+                fused_params.gamma = layer.ffn_norm;            // FFN norm gamma
+                fused_params.norm_output = buffers.normalized;
+                fused_params.eps = config_.rms_norm_eps;
+                fused_params.seq_len = total_tokens;
+                fused_params.hidden_dim = config_.d_model;
+                fused_params.input_buffer_id = BufferId::ATTN_PROJ;
+                fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
+                fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
 
-            graph.addNode(prefix + "ffn_norm",
-                          ComputeStageFactory::createRMSNorm(ffn_norm_params),
-                          device);
+                graph.addNode(prefix + "ffn_norm",
+                              ComputeStageFactory::createFusedResidualNorm(fused_params),
+                              device);
+            }
+            else
+            {
+                RMSNormStage::Params ffn_norm_params;
+                ffn_norm_params.input = (inference_mode.isHybridQ16() && buffers.residual)
+                                            ? buffers.residual
+                                            : buffers.current_hidden;
+                ffn_norm_params.output = buffers.normalized;
+                ffn_norm_params.gamma = layer.ffn_norm;
+                ffn_norm_params.eps = config_.rms_norm_eps;
+                ffn_norm_params.seq_len = total_tokens;
+                ffn_norm_params.device_id = device;
+                ffn_norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+                ffn_norm_params.output_buffer_id = BufferId::NORMALIZED;
+
+                graph.addNode(prefix + "ffn_norm",
+                              ComputeStageFactory::createRMSNorm(ffn_norm_params),
+                              device);
+            }
         }
 
         // Stage 2: Gate and Up projections using FusedGateUpGEMMStage
@@ -2311,7 +2361,10 @@ namespace llaminar2
         }
 
         // Stage 3: SwiGLU activation
-        if (env.execution.exec_swiglu)
+        // On GPU: fused into down_proj GEMM (silu(gate)*up + quantize in single kernel)
+        // On CPU: standalone stage
+        const bool gpu_swiglu_fusion = device.is_gpu();
+        if (env.execution.exec_swiglu && !gpu_swiglu_fusion)
         {
             SwiGLUStage::Params swiglu_params;
             swiglu_params.gate = buffers.gate;
@@ -2341,25 +2394,41 @@ namespace llaminar2
             int down_n = static_cast<int>(layer.down_proj->shape()[0]);
             int down_k = static_cast<int>(layer.down_proj->shape()[1]);
 
+            GEMMStage::Params down_params{
+                .device_id = device,
+                .A = buffers.up,
+                .B = layer.down_proj,
+                .C = buffers.attn_proj,
+                .m = total_tokens,
+                .n = down_n,
+                .k = down_k,
+                .alpha = 1.0f,
+                .beta = 0.0f,
+                .transpose_B = false,
+                .gemm_context = GemmContext::FFN,
+                .a_buffer_id = BufferId::UP_PROJ,
+                .c_buffer_id = BufferId::ATTN_PROJ};
+
+            // GPU SwiGLU fusion: pass gate buffer to GEMM for fused silu(gate)*up + quantize
+            if (gpu_swiglu_fusion && env.execution.exec_swiglu)
+            {
+                down_params.gate_input = buffers.gate;
+                down_params.do_swiglu = true;
+            }
+
             graph.addNode(prefix + "down_proj",
-                          ComputeStageFactory::createGEMM(
-                              GEMMStage::Params{
-                                  .device_id = device,
-                                  .A = buffers.up,
-                                  .B = layer.down_proj,
-                                  .C = buffers.attn_proj,
-                                  .m = total_tokens, // Use total_tokens = batch_size * seq_len
-                                  .n = down_n,
-                                  .k = down_k,
-                                  .alpha = 1.0f,
-                                  .beta = 0.0f,
-                                  .transpose_B = false,
-                                  .gemm_context = GemmContext::FFN,
-                                  .a_buffer_id = BufferId::UP_PROJ,
-                                  .c_buffer_id = BufferId::ATTN_PROJ}),
+                          ComputeStageFactory::createGEMM(down_params),
                           device);
 
-            if (env.execution.exec_swiglu)
+            if (gpu_swiglu_fusion || !env.execution.exec_swiglu)
+            {
+                // GPU fusion or SwiGLU disabled: down_proj depends directly on gate_up_proj
+                if (env.execution.exec_gemm)
+                {
+                    graph.addDependency(prefix + "down_proj", prefix + "gate_up_proj");
+                }
+            }
+            else if (env.execution.exec_swiglu)
             {
                 graph.addDependency(prefix + "down_proj", prefix + "swiglu");
             }
@@ -2388,7 +2457,10 @@ namespace llaminar2
         }
 
         // Stage 5: Residual connection
-        if (env.execution.exec_residual)
+        // On GPU (non-last layers): Skip - fused into next layer's FusedResidualNormStage attn_norm
+        // Last layer must keep ffn_residual since final_norm doesn't include residual add
+        const bool skip_ffn_residual = device.is_gpu() && (layer_idx < config_.n_layers - 1);
+        if (env.execution.exec_residual && !skip_ffn_residual)
         {
             // For HybridQ16, FFN residual uses Q16_1 residual buffer
             InferenceMode inference_mode_ffn_res(config_.activation_precision);

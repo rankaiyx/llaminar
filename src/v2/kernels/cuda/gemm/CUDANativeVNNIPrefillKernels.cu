@@ -43,6 +43,27 @@ namespace
     static thread_local Q40PrefillShape g_last_q40_prefill_shape = Q40PrefillShape::Balanced;
     static std::atomic<uint64_t> g_q40_prefill_shape_counts[3] = {};
 
+    // ─── Sweep-derived tile dispatch ───────────────────────────────────
+    // Tile configurations validated via exhaustive sweep across 336 shapes,
+    // 12 tile/warp configs, and 4 split_k values (15,984 measurements).
+    // Overall penalty vs per-shape oracle: +2.2%.
+
+    enum class TileId : uint8_t
+    {
+        T64x64_w2x2,   // BM=64  BN=64  WM=2 WN=2  (128 threads)
+        T64x128_w2x2,  // BM=64  BN=128 WM=2 WN=2  (128 threads)
+        T64x128_w4x2,  // BM=64  BN=128 WM=4 WN=2  (256 threads)
+        T64x128_w2x4,  // BM=64  BN=128 WM=2 WN=4  (256 threads)
+        T128x128_w4x2, // BM=128 BN=128 WM=4 WN=2  (256 threads)
+        T128x128_w4x4, // BM=128 BN=128 WM=4 WN=4  (512 threads)
+    };
+
+    struct TileChoice
+    {
+        TileId tile;
+        int split_k;
+    };
+
     __device__ __forceinline__ int frag_row(int lane_id, int elem)
     {
         return (elem >> 1) * 8 + (lane_id >> 2);
@@ -559,11 +580,15 @@ namespace
     // =========================================================================
     // Occupancy hint: BM=128 (8 warps) → target 2 blocks/SM (≤128 regs/thread).
     //                 BM=64  (4 warps) → target 3 blocks/SM (≤170 regs/thread).
+    // STAGES_=1: single-buffered (half smem, no load/compute overlap, higher occupancy).
+    // STAGES_=2: double-buffered (overlaps decode(next) with compute(current)).
     template <uint8_t CODEBOOK_ID, int BM, int BN, int WARPS_M, int WARPS_N, int SPLIT_K = 1,
+              int STAGES_ = 2,
               int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32,
-              int MIN_BLOCKS_HINT = (BLOCK_SIZE_ >= 256) ? 2 : 3>
-    __global__ __launch_bounds__(BLOCK_SIZE_, MIN_BLOCKS_HINT)
-    void nativeVnniTC_BK64(
+              int MIN_BLOCKS_HINT = (STAGES_ == 1)
+                                        ? ((BLOCK_SIZE_ >= 256) ? 3 : 4)
+                                        : ((BLOCK_SIZE_ >= 256) ? 2 : 3)>
+    __global__ __launch_bounds__(BLOCK_SIZE_, MIN_BLOCKS_HINT) void nativeVnniTC_BK64(
         const int8_t *__restrict__ A,
         const uint8_t *__restrict__ payload,
         const uint16_t *__restrict__ scales_B,
@@ -623,24 +648,26 @@ namespace
         constexpr bool IS_IQ1_M = Traits::is_iq1_m;
         constexpr bool NEEDS_MINS = IS_ASYMMETRIC || IS_DUAL_SCALE;
 
-        // Shared memory: no smem_B_raw staging buffer needed
-        __shared__ int8_t smem_A[STAGES][BM * SMEM_STRIDE_64];
-        __shared__ int8_t smem_B[STAGES][BN * SMEM_STRIDE_64];
-        __shared__ uint16_t smem_scales_B[STAGES][2 * BN];
+        // Shared memory: no smem_B_raw staging buffer needed.
+        // STAGES_=1 (single-buffered) halves smem → potential 3 blocks/SM.
+        // STAGES_=2 (double-buffered) overlaps load/decode of next tile with compute.
+        __shared__ int8_t smem_A[STAGES_][BM * SMEM_STRIDE_64];
+        __shared__ int8_t smem_B[STAGES_][BN * SMEM_STRIDE_64];
+        __shared__ uint16_t smem_scales_B[STAGES_][2 * BN];
 
         // Activation scales cached in smem to decouple from L1 data cache.
         // Stores 2 FP32 scale values per M-row per K-tile (one per Q4_0 block half).
-        __shared__ float smem_sa[STAGES][BM * 2];
+        __shared__ float smem_sa[STAGES_][BM * 2];
 
         // Asymmetric formats need per-block mins; dual-scale formats need per-block scale_hi.
         // Both use the same smem_mins_B buffer (mins_B pointer carries scale_hi for dual-scale).
-        [[maybe_unused]] __shared__ uint16_t smem_mins_B[STAGES][NEEDS_MINS ? 2 * BN : 1];
+        [[maybe_unused]] __shared__ uint16_t smem_mins_B[STAGES_][NEEDS_MINS ? 2 * BN : 1];
 
         // Q2_K (dual_scale_asym) needs per-block emins: packed {min_lo_fp16, min_hi_fp16} as uint32_t
-        [[maybe_unused]] __shared__ uint32_t smem_emins_B[STAGES][IS_DUAL_SCALE_ASYM ? 2 * BN : 1];
+        [[maybe_unused]] __shared__ uint32_t smem_emins_B[STAGES_][IS_DUAL_SCALE_ASYM ? 2 * BN : 1];
 
         // IQ1_M needs per-block delta sign bytes from payload (qh0, qh1)
-        [[maybe_unused]] __shared__ uint16_t smem_iq1m_qh[STAGES][IS_IQ1_M ? 2 * BN : 1];
+        [[maybe_unused]] __shared__ uint16_t smem_iq1m_qh[STAGES_][IS_IQ1_M ? 2 * BN : 1];
 
         float acc[WM][WN][4];
 #pragma unroll
@@ -670,81 +697,70 @@ namespace
             }
         };
 
-        // Decode B: load 2 payloads directly from global memory,
-        // decode to int8 in registers, write decoded values + scales to smem.
-        // Specialized vectorized path for 16-byte payloads (Q4_0, IQ4_NL, Q4_1);
-        // generic decode_groups<CB>() fallback for all other payload sizes.
+        // Decode B: load payloads from global memory, decode to int8, write to smem.
+        // Split-thread strategy: when BLOCK_SIZE >= 2*BN, first BN threads handle
+        // K-block 0 and next BN threads handle K-block 1 in parallel. This doubles
+        // warp-level parallelism during decode (100% vs 50% thread utilization).
+        // Fallback: original per-column loop for smaller thread counts.
         auto decode_B_direct = [&](int stage, int kt) __attribute__((always_inline))
         {
-            for (int col = threadIdx.x; col < BN; col += BLOCK_SIZE)
+            const int kb0 = kt * 2;
+            const bool has_block1 = (kb0 + 1 < num_q40_blocks);
+
+            if constexpr (BLOCK_SIZE >= 2 * BN)
             {
+                // Split: threads [0, BN) → block 0; threads [BN, 2*BN) → block 1.
+                // All warps participate, halving per-thread work.
+                const int col = threadIdx.x & (BN - 1);  // BN is power of 2
+                const int block_half = threadIdx.x / BN; // 0 or 1
+
+                if (block_half >= 2)
+                    return; // guard for BLOCK_SIZE > 2*BN
+
                 const int gcol = block_n + col;
                 int32_t *dst_words = reinterpret_cast<int32_t *>(&smem_B[stage][col * SMEM_STRIDE_64]);
+                const int word_offset = block_half * 8;
+                const int scale_slot = block_half;
+                const int kb = kb0 + block_half;
+                const bool has_this_block = (block_half == 0) || has_block1;
 
-                if (gcol < N)
+                if (gcol < N && has_this_block)
                 {
-                    const int kb0 = kt * 2;
-                    const bool has_block1 = (kb0 + 1 < num_q40_blocks); // K-tail guard
                     constexpr int PAYLOAD_BYTES = Traits::payload_bytes;
-                    const size_t base0 = (static_cast<size_t>(kb0) * N + gcol) * PAYLOAD_BYTES;
-                    const size_t base1 = has_block1
-                                             ? (static_cast<size_t>(kb0 + 1) * N + gcol) * PAYLOAD_BYTES
-                                             : size_t{0};
+                    const size_t base = (static_cast<size_t>(kb) * N + gcol) * PAYLOAD_BYTES;
+                    const uint16_t s = scales_B[static_cast<size_t>(kb) * N + gcol];
 
-                    // Pre-load both scales while LDGs are in-flight
-                    const uint16_t s0 = scales_B[static_cast<size_t>(kb0) * N + gcol];
-                    const uint16_t s1 = has_block1
-                                            ? scales_B[static_cast<size_t>(kb0 + 1) * N + gcol]
-                                            : uint16_t{0};
-
-                    // load mins for asymmetric formats, scale_hi for dual-scale formats
-                    [[maybe_unused]] uint16_t m0 = 0, m1 = 0;
+                    [[maybe_unused]] uint16_t m = 0;
                     if constexpr (NEEDS_MINS)
-                    {
-                        m0 = mins_B[static_cast<size_t>(kb0) * N + gcol];
-                        if (has_block1)
-                            m1 = mins_B[static_cast<size_t>(kb0 + 1) * N + gcol];
-                    }
+                        m = mins_B[static_cast<size_t>(kb) * N + gcol];
 
-                    // load emins for Q2_K (dual_scale_asym)
-                    [[maybe_unused]] uint32_t em0 = 0, em1 = 0;
+                    [[maybe_unused]] uint32_t em = 0;
                     if constexpr (IS_DUAL_SCALE_ASYM)
-                    {
-                        em0 = emins_B[static_cast<size_t>(kb0) * N + gcol];
-                        if (has_block1)
-                            em1 = emins_B[static_cast<size_t>(kb0 + 1) * N + gcol];
-                    }
+                        em = emins_B[static_cast<size_t>(kb) * N + gcol];
 
-                    // load IQ1_M qh bytes for delta correction
-                    [[maybe_unused]] uint16_t qh_packed0 = 0, qh_packed1 = 0;
+                    [[maybe_unused]] uint16_t qh_packed = 0;
                     if constexpr (IS_IQ1_M)
                     {
-                        qh_packed0 = static_cast<uint16_t>(payload[base0 + 4]) |
-                                     (static_cast<uint16_t>(payload[base0 + 5]) << 8);
-                        if (has_block1)
-                        {
-                            qh_packed1 = static_cast<uint16_t>(payload[base1 + 4]) |
-                                         (static_cast<uint16_t>(payload[base1 + 5]) << 8);
-                        }
+                        qh_packed = static_cast<uint16_t>(payload[base + 4]) |
+                                    (static_cast<uint16_t>(payload[base + 5]) << 8);
                     }
 
-                    // ── Decode block 0 ──────────────────────────────────
+                    // ── Decode one Q-block ──────────────────────────────
                     if constexpr (PAYLOAD_BYTES == 16)
                     {
-                        // Vectorized int4 load for 16-byte payloads
-                        const int4 raw0 = *reinterpret_cast<const int4 *>(payload + base0);
-                        const uint32_t r0 = static_cast<uint32_t>(raw0.x);
-                        const uint32_t r1 = static_cast<uint32_t>(raw0.y);
-                        const uint32_t r2 = static_cast<uint32_t>(raw0.z);
-                        const uint32_t r3 = static_cast<uint32_t>(raw0.w);
+                        const int4 raw = *reinterpret_cast<const int4 *>(payload + base);
+                        const uint32_t r0 = static_cast<uint32_t>(raw.x);
+                        const uint32_t r1 = static_cast<uint32_t>(raw.y);
+                        const uint32_t r2 = static_cast<uint32_t>(raw.z);
+                        const uint32_t r3 = static_cast<uint32_t>(raw.w);
                         if constexpr (CODEBOOK_ID == 0)
                         {
-                            *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
+                            *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
                                 static_cast<int32_t>(__vsub4(r0 & 0x0F0F0F0Fu, 0x08080808u)),
                                 static_cast<int32_t>(__vsub4(r1 & 0x0F0F0F0Fu, 0x08080808u)),
                                 static_cast<int32_t>(__vsub4(r2 & 0x0F0F0F0Fu, 0x08080808u)),
                                 static_cast<int32_t>(__vsub4(r3 & 0x0F0F0F0Fu, 0x08080808u)));
-                            *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
+                            *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
                                 static_cast<int32_t>(__vsub4((r0 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                 static_cast<int32_t>(__vsub4((r1 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                 static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
@@ -758,55 +774,123 @@ namespace
                             iq4nl_decode_word(r1, lo1, hi1);
                             iq4nl_decode_word(r2, lo2, hi2);
                             iq4nl_decode_word(r3, lo3, hi3);
-                            *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
+                            *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
                                 static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
                                 static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
-                            *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
+                            *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
                                 static_cast<int32_t>(hi0), static_cast<int32_t>(hi1),
                                 static_cast<int32_t>(hi2), static_cast<int32_t>(hi3));
                         }
                         else
                         {
-                            // Q4_1 (CB=5): 16-byte payload, generic decode
-                            int32_t groups0[8];
+                            int32_t groups[8];
                             llaminar2::cuda_native_vnni::decode_groups_vec<CODEBOOK_ID>(
-                                payload + base0, groups0);
-                            *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
-                                groups0[0], groups0[1], groups0[2], groups0[3]);
-                            *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
-                                groups0[4], groups0[5], groups0[6], groups0[7]);
+                                payload + base, groups);
+                            *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
+                                groups[0], groups[1], groups[2], groups[3]);
+                            *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
+                                groups[4], groups[5], groups[6], groups[7]);
                         }
                     }
                     else
                     {
-                        // Generic path for non-16-byte payloads (Q5_0, Q5_1, IQ3_S, etc.)
-                        int32_t groups0[8];
+                        int32_t groups[8];
                         llaminar2::cuda_native_vnni::decode_groups<CODEBOOK_ID>(
-                            payload + base0, groups0);
-                        *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
-                            groups0[0], groups0[1], groups0[2], groups0[3]);
-                        *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
-                            groups0[4], groups0[5], groups0[6], groups0[7]);
+                            payload + base, groups);
+                        *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(
+                            groups[0], groups[1], groups[2], groups[3]);
+                        *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(
+                            groups[4], groups[5], groups[6], groups[7]);
                     }
 
-                    // ── Decode block 1 (K-tail: zero-fill if no second block) ──
-                    if (has_block1)
+                    smem_scales_B[stage][2 * col + scale_slot] = s;
+                    if constexpr (NEEDS_MINS)
+                        smem_mins_B[stage][2 * col + scale_slot] = m;
+                    if constexpr (IS_DUAL_SCALE_ASYM)
+                        smem_emins_B[stage][2 * col + scale_slot] = em;
+                    if constexpr (IS_IQ1_M)
+                        smem_iq1m_qh[stage][2 * col + scale_slot] = qh_packed;
+                }
+                else if (gcol < N)
+                {
+                    // K-tail or out-of-bounds block: zero-fill this half
+                    *reinterpret_cast<int4 *>(&dst_words[word_offset]) = make_int4(0, 0, 0, 0);
+                    *reinterpret_cast<int4 *>(&dst_words[word_offset + 4]) = make_int4(0, 0, 0, 0);
+                    smem_scales_B[stage][2 * col + scale_slot] = uint16_t{0};
+                    if constexpr (NEEDS_MINS)
+                        smem_mins_B[stage][2 * col + scale_slot] = uint16_t{0};
+                    if constexpr (IS_DUAL_SCALE_ASYM)
+                        smem_emins_B[stage][2 * col + scale_slot] = 0u;
+                    if constexpr (IS_IQ1_M)
+                        smem_iq1m_qh[stage][2 * col + scale_slot] = 0;
+                }
+                // gcol >= N: no smem write needed (border tiles use compute_k_tile_border)
+            }
+            else
+            {
+                // Fallback: original per-column loop (BLOCK_SIZE < 2*BN)
+                for (int col = threadIdx.x; col < BN; col += BLOCK_SIZE)
+                {
+                    const int gcol = block_n + col;
+                    int32_t *dst_words = reinterpret_cast<int32_t *>(&smem_B[stage][col * SMEM_STRIDE_64]);
+
+                    if (gcol < N)
                     {
+                        constexpr int PAYLOAD_BYTES = Traits::payload_bytes;
+                        const size_t base0 = (static_cast<size_t>(kb0) * N + gcol) * PAYLOAD_BYTES;
+                        const size_t base1 = has_block1
+                                                 ? (static_cast<size_t>(kb0 + 1) * N + gcol) * PAYLOAD_BYTES
+                                                 : size_t{0};
+
+                        const uint16_t s0 = scales_B[static_cast<size_t>(kb0) * N + gcol];
+                        const uint16_t s1 = has_block1
+                                                ? scales_B[static_cast<size_t>(kb0 + 1) * N + gcol]
+                                                : uint16_t{0};
+
+                        [[maybe_unused]] uint16_t m0 = 0, m1 = 0;
+                        if constexpr (NEEDS_MINS)
+                        {
+                            m0 = mins_B[static_cast<size_t>(kb0) * N + gcol];
+                            if (has_block1)
+                                m1 = mins_B[static_cast<size_t>(kb0 + 1) * N + gcol];
+                        }
+
+                        [[maybe_unused]] uint32_t em0 = 0, em1 = 0;
+                        if constexpr (IS_DUAL_SCALE_ASYM)
+                        {
+                            em0 = emins_B[static_cast<size_t>(kb0) * N + gcol];
+                            if (has_block1)
+                                em1 = emins_B[static_cast<size_t>(kb0 + 1) * N + gcol];
+                        }
+
+                        [[maybe_unused]] uint16_t qh_packed0 = 0, qh_packed1 = 0;
+                        if constexpr (IS_IQ1_M)
+                        {
+                            qh_packed0 = static_cast<uint16_t>(payload[base0 + 4]) |
+                                         (static_cast<uint16_t>(payload[base0 + 5]) << 8);
+                            if (has_block1)
+                            {
+                                qh_packed1 = static_cast<uint16_t>(payload[base1 + 4]) |
+                                             (static_cast<uint16_t>(payload[base1 + 5]) << 8);
+                            }
+                        }
+
+                        // ── Decode block 0 ──────────────────────────────────
                         if constexpr (PAYLOAD_BYTES == 16)
                         {
-                            const int4 raw1 = *reinterpret_cast<const int4 *>(payload + base1);
-                            const uint32_t r0 = static_cast<uint32_t>(raw1.x);
-                            const uint32_t r1 = static_cast<uint32_t>(raw1.y);
-                            const uint32_t r2 = static_cast<uint32_t>(raw1.z);
-                            const uint32_t r3 = static_cast<uint32_t>(raw1.w);
+                            const int4 raw0 = *reinterpret_cast<const int4 *>(payload + base0);
+                            const uint32_t r0 = static_cast<uint32_t>(raw0.x);
+                            const uint32_t r1 = static_cast<uint32_t>(raw0.y);
+                            const uint32_t r2 = static_cast<uint32_t>(raw0.z);
+                            const uint32_t r3 = static_cast<uint32_t>(raw0.w);
                             if constexpr (CODEBOOK_ID == 0)
                             {
-                                *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
                                     static_cast<int32_t>(__vsub4(r0 & 0x0F0F0F0Fu, 0x08080808u)),
                                     static_cast<int32_t>(__vsub4(r1 & 0x0F0F0F0Fu, 0x08080808u)),
                                     static_cast<int32_t>(__vsub4(r2 & 0x0F0F0F0Fu, 0x08080808u)),
                                     static_cast<int32_t>(__vsub4(r3 & 0x0F0F0F0Fu, 0x08080808u)));
-                                *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
                                     static_cast<int32_t>(__vsub4((r0 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                     static_cast<int32_t>(__vsub4((r1 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
                                     static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
@@ -820,84 +904,144 @@ namespace
                                 iq4nl_decode_word(r1, lo1, hi1);
                                 iq4nl_decode_word(r2, lo2, hi2);
                                 iq4nl_decode_word(r3, lo3, hi3);
-                                *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
                                     static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
                                     static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
-                                *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
                                     static_cast<int32_t>(hi0), static_cast<int32_t>(hi1),
                                     static_cast<int32_t>(hi2), static_cast<int32_t>(hi3));
                             }
                             else
                             {
-                                int32_t groups1[8];
+                                int32_t groups0[8];
                                 llaminar2::cuda_native_vnni::decode_groups_vec<CODEBOOK_ID>(
+                                    payload + base0, groups0);
+                                *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
+                                    groups0[0], groups0[1], groups0[2], groups0[3]);
+                                *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
+                                    groups0[4], groups0[5], groups0[6], groups0[7]);
+                            }
+                        }
+                        else
+                        {
+                            int32_t groups0[8];
+                            llaminar2::cuda_native_vnni::decode_groups<CODEBOOK_ID>(
+                                payload + base0, groups0);
+                            *reinterpret_cast<int4 *>(&dst_words[0]) = make_int4(
+                                groups0[0], groups0[1], groups0[2], groups0[3]);
+                            *reinterpret_cast<int4 *>(&dst_words[4]) = make_int4(
+                                groups0[4], groups0[5], groups0[6], groups0[7]);
+                        }
+
+                        // ── Decode block 1 (K-tail: zero-fill if no second block) ──
+                        if (has_block1)
+                        {
+                            if constexpr (PAYLOAD_BYTES == 16)
+                            {
+                                const int4 raw1 = *reinterpret_cast<const int4 *>(payload + base1);
+                                const uint32_t r0 = static_cast<uint32_t>(raw1.x);
+                                const uint32_t r1 = static_cast<uint32_t>(raw1.y);
+                                const uint32_t r2 = static_cast<uint32_t>(raw1.z);
+                                const uint32_t r3 = static_cast<uint32_t>(raw1.w);
+                                if constexpr (CODEBOOK_ID == 0)
+                                {
+                                    *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                        static_cast<int32_t>(__vsub4(r0 & 0x0F0F0F0Fu, 0x08080808u)),
+                                        static_cast<int32_t>(__vsub4(r1 & 0x0F0F0F0Fu, 0x08080808u)),
+                                        static_cast<int32_t>(__vsub4(r2 & 0x0F0F0F0Fu, 0x08080808u)),
+                                        static_cast<int32_t>(__vsub4(r3 & 0x0F0F0F0Fu, 0x08080808u)));
+                                    *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                        static_cast<int32_t>(__vsub4((r0 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                                        static_cast<int32_t>(__vsub4((r1 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                                        static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                                        static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
+                                }
+                                else if constexpr (CODEBOOK_ID == 4)
+                                {
+                                    using llaminar2::cuda_native_vnni::iq4nl_decode_word;
+                                    uint32_t lo0, hi0, lo1, hi1, lo2, hi2, lo3, hi3;
+                                    iq4nl_decode_word(r0, lo0, hi0);
+                                    iq4nl_decode_word(r1, lo1, hi1);
+                                    iq4nl_decode_word(r2, lo2, hi2);
+                                    iq4nl_decode_word(r3, lo3, hi3);
+                                    *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                        static_cast<int32_t>(lo0), static_cast<int32_t>(lo1),
+                                        static_cast<int32_t>(lo2), static_cast<int32_t>(lo3));
+                                    *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                        static_cast<int32_t>(hi0), static_cast<int32_t>(hi1),
+                                        static_cast<int32_t>(hi2), static_cast<int32_t>(hi3));
+                                }
+                                else
+                                {
+                                    int32_t groups1[8];
+                                    llaminar2::cuda_native_vnni::decode_groups_vec<CODEBOOK_ID>(
+                                        payload + base1, groups1);
+                                    *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
+                                        groups1[0], groups1[1], groups1[2], groups1[3]);
+                                    *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
+                                        groups1[4], groups1[5], groups1[6], groups1[7]);
+                                }
+                            }
+                            else
+                            {
+                                int32_t groups1[8];
+                                llaminar2::cuda_native_vnni::decode_groups<CODEBOOK_ID>(
                                     payload + base1, groups1);
                                 *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
                                     groups1[0], groups1[1], groups1[2], groups1[3]);
                                 *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
                                     groups1[4], groups1[5], groups1[6], groups1[7]);
                             }
-                        }
+                        } // has_block1
                         else
                         {
-                            int32_t groups1[8];
-                            llaminar2::cuda_native_vnni::decode_groups<CODEBOOK_ID>(
-                                payload + base1, groups1);
-                            *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(
-                                groups1[0], groups1[1], groups1[2], groups1[3]);
-                            *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(
-                                groups1[4], groups1[5], groups1[6], groups1[7]);
+                            *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(0, 0, 0, 0);
+                            *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(0, 0, 0, 0);
                         }
-                    } // has_block1
+
+                        smem_scales_B[stage][2 * col] = s0;
+                        smem_scales_B[stage][2 * col + 1] = s1;
+
+                        if constexpr (NEEDS_MINS)
+                        {
+                            smem_mins_B[stage][2 * col] = m0;
+                            smem_mins_B[stage][2 * col + 1] = m1;
+                        }
+
+                        if constexpr (IS_DUAL_SCALE_ASYM)
+                        {
+                            smem_emins_B[stage][2 * col] = em0;
+                            smem_emins_B[stage][2 * col + 1] = em1;
+                        }
+
+                        if constexpr (IS_IQ1_M)
+                        {
+                            smem_iq1m_qh[stage][2 * col] = qh_packed0;
+                            smem_iq1m_qh[stage][2 * col + 1] = qh_packed1;
+                        }
+                    }
                     else
                     {
-                        // K-tail: zero-fill second half of B tile
-                        *reinterpret_cast<int4 *>(&dst_words[8]) = make_int4(0, 0, 0, 0);
-                        *reinterpret_cast<int4 *>(&dst_words[12]) = make_int4(0, 0, 0, 0);
-                    }
-
-                    smem_scales_B[stage][2 * col] = s0;
-                    smem_scales_B[stage][2 * col + 1] = s1;
-
-                    if constexpr (NEEDS_MINS)
-                    {
-                        smem_mins_B[stage][2 * col] = m0;
-                        smem_mins_B[stage][2 * col + 1] = m1;
-                    }
-
-                    if constexpr (IS_DUAL_SCALE_ASYM)
-                    {
-                        smem_emins_B[stage][2 * col] = em0;
-                        smem_emins_B[stage][2 * col + 1] = em1;
-                    }
-
-                    if constexpr (IS_IQ1_M)
-                    {
-                        smem_iq1m_qh[stage][2 * col] = qh_packed0;
-                        smem_iq1m_qh[stage][2 * col + 1] = qh_packed1;
-                    }
-                }
-                else
-                {
 #pragma unroll
-                    for (int g = 0; g < 16; ++g)
-                        dst_words[g] = 0;
-                    smem_scales_B[stage][2 * col] = uint16_t{0};
-                    smem_scales_B[stage][2 * col + 1] = uint16_t{0};
-                    if constexpr (NEEDS_MINS)
-                    {
-                        smem_mins_B[stage][2 * col] = uint16_t{0};
-                        smem_mins_B[stage][2 * col + 1] = uint16_t{0};
-                    }
-                    if constexpr (IS_DUAL_SCALE_ASYM)
-                    {
-                        smem_emins_B[stage][2 * col] = 0u;
-                        smem_emins_B[stage][2 * col + 1] = 0u;
-                    }
-                    if constexpr (IS_IQ1_M)
-                    {
-                        smem_iq1m_qh[stage][2 * col] = 0;
-                        smem_iq1m_qh[stage][2 * col + 1] = 0;
+                        for (int g = 0; g < 16; ++g)
+                            dst_words[g] = 0;
+                        smem_scales_B[stage][2 * col] = uint16_t{0};
+                        smem_scales_B[stage][2 * col + 1] = uint16_t{0};
+                        if constexpr (NEEDS_MINS)
+                        {
+                            smem_mins_B[stage][2 * col] = uint16_t{0};
+                            smem_mins_B[stage][2 * col + 1] = uint16_t{0};
+                        }
+                        if constexpr (IS_DUAL_SCALE_ASYM)
+                        {
+                            smem_emins_B[stage][2 * col] = 0u;
+                            smem_emins_B[stage][2 * col + 1] = 0u;
+                        }
+                        if constexpr (IS_IQ1_M)
+                        {
+                            smem_iq1m_qh[stage][2 * col] = 0;
+                            smem_iq1m_qh[stage][2 * col + 1] = 0;
+                        }
                     }
                 }
             }
@@ -972,23 +1116,25 @@ namespace
                     }
                 }
 
+                // ── Pre-load ALL A fragments for this half ────────────
+                // Decouples A ldmatrix from MMA, enabling the restructured
+                // wj→wi loop that loads each B fragment ONCE instead of WM times.
+                uint32_t A_frag_all[WM][4];
+                [[maybe_unused]] float sum_A_row0_all[WM], sum_A_row1_all[WM];
+                [[maybe_unused]] float sum_A_lo_row0_all[WM], sum_A_lo_row1_all[WM];
+                [[maybe_unused]] float sum_A_hi_row0_all[WM], sum_A_hi_row1_all[WM];
+                [[maybe_unused]] int sg0_r0_all[WM], sg1_r0_all[WM], sg2_r0_all[WM], sg3_r0_all[WM];
+                [[maybe_unused]] int sg0_r1_all[WM], sg1_r1_all[WM], sg2_r1_all[WM], sg3_r1_all[WM];
+
 #pragma unroll
                 for (int wi = 0; wi < WM; ++wi)
                 {
                     const int a_row_base = wr * WARP_M + wi * 16;
-                    uint32_t A_frag[4];
                     load_ldmatrix_a_m16n8k32(
-                        A_frag,
+                        A_frag_all[wi],
                         reinterpret_cast<const int *>(&smem_A[stage][a_row_base * SMEM_STRIDE_64 + k_offset]),
                         SMEM_STRIDE_64 / 4, lane_id);
 
-                    const float sa0 = sa_pre[wi][0];
-                    const float sa1 = sa_pre[wi][1];
-
-                    // For asymmetric formats: compute sum of A int8 values in this
-                    // row-segment (32 elements). sum_A[row] = sum_k(A_int8[row][k]).
-                    // Used for the min correction: += scale_A * min_B * sum_A.
-                    [[maybe_unused]] float sum_A_row0 = 0.0f, sum_A_row1 = 0.0f;
                     if constexpr (IS_ASYMMETRIC)
                     {
                         const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
@@ -1000,14 +1146,10 @@ namespace
                             s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
                             s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
                         }
-                        sum_A_row0 = static_cast<float>(s0);
-                        sum_A_row1 = static_cast<float>(s1);
+                        sum_A_row0_all[wi] = static_cast<float>(s0);
+                        sum_A_row1_all[wi] = static_cast<float>(s1);
                     }
 
-                    // For dual-scale-asym (Q2_K) and IQ1_M: compute split sums of A
-                    // sum_A_lo = sum(A[0..15]), sum_A_hi = sum(A[16..31])
-                    [[maybe_unused]] float sum_A_lo_row0 = 0.0f, sum_A_lo_row1 = 0.0f;
-                    [[maybe_unused]] float sum_A_hi_row0 = 0.0f, sum_A_hi_row1 = 0.0f;
                     if constexpr (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
                     {
                         const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
@@ -1025,79 +1167,81 @@ namespace
                             shi0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], shi0);
                             shi1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], shi1);
                         }
-                        sum_A_lo_row0 = static_cast<float>(slo0);
-                        sum_A_lo_row1 = static_cast<float>(slo1);
-                        sum_A_hi_row0 = static_cast<float>(shi0);
-                        sum_A_hi_row1 = static_cast<float>(shi1);
+                        sum_A_lo_row0_all[wi] = static_cast<float>(slo0);
+                        sum_A_lo_row1_all[wi] = static_cast<float>(slo1);
+                        sum_A_hi_row0_all[wi] = static_cast<float>(shi0);
+                        sum_A_hi_row1_all[wi] = static_cast<float>(shi1);
                     }
 
-                    // IQ1_M: load per-block delta signs from smem and compute sub-group sums
-                    // IQ1_M: sub-group sums of A (4 groups of 8 elements) for delta correction
-                    [[maybe_unused]] int sg0_r0 = 0, sg1_r0 = 0, sg2_r0 = 0, sg3_r0 = 0;
-                    [[maybe_unused]] int sg0_r1 = 0, sg1_r1 = 0, sg2_r1 = 0, sg3_r1 = 0;
                     if constexpr (IS_IQ1_M)
                     {
                         const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
                         const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
+                        sg0_r0_all[wi] = sg1_r0_all[wi] = sg2_r0_all[wi] = sg3_r0_all[wi] = 0;
+                        sg0_r1_all[wi] = sg1_r1_all[wi] = sg2_r1_all[wi] = sg3_r1_all[wi] = 0;
                         for (int w = 0; w < 2; ++w)
                         {
-                            sg0_r0 += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                            sg0_r1 += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
+                            sg0_r0_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
+                            sg0_r1_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
                         }
                         for (int w = 2; w < 4; ++w)
                         {
-                            sg1_r0 += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                            sg1_r1 += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
+                            sg1_r0_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
+                            sg1_r1_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
                         }
                         for (int w = 4; w < 6; ++w)
                         {
-                            sg2_r0 += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                            sg2_r1 += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
+                            sg2_r0_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
+                            sg2_r1_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
                         }
                         for (int w = 6; w < 8; ++w)
                         {
-                            sg3_r0 += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
-                            sg3_r1 += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
+                            sg3_r0_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row0_ptr)[w]);
+                            sg3_r1_all[wi] += llaminar2::cuda_native_vnni::sum_packed_i8(reinterpret_cast<const int32_t *>(row1_ptr)[w]);
                         }
                     }
+                }
+
+                // ── Compute: wj (outer) → wi (inner) ─────────────────
+                // B fragment loaded ONCE per wj, reused across all WM rows.
+                // Halves B ldmatrix loads vs the original wi→wj order.
+#pragma unroll
+                for (int wj = 0; wj < WN; ++wj)
+                {
+                    uint32_t B_frag[2];
+                    load_ldmatrix_b_m16n8k32(
+                        B_frag,
+                        reinterpret_cast<const int *>(&smem_B[stage][(wc * WARP_N + wj * 8) * SMEM_STRIDE_64 + k_offset]),
+                        SMEM_STRIDE_64 / 4, lane_id);
 
 #pragma unroll
-                    for (int wj = 0; wj < WN; ++wj)
+                    for (int wi = 0; wi < WM; ++wi)
                     {
-                        uint32_t B_frag[2];
-                        load_ldmatrix_b_m16n8k32(
-                            B_frag,
-                            reinterpret_cast<const int *>(&smem_B[stage][(wc * WARP_N + wj * 8) * SMEM_STRIDE_64 + k_offset]),
-                            SMEM_STRIDE_64 / 4, lane_id);
+                        const float sa0 = sa_pre[wi][0];
+                        const float sa1 = sa_pre[wi][1];
 
                         if constexpr (IS_DUAL_SCALE)
                         {
-                            // Dual-scale: split MMA into lo (K=0..15) and hi (K=16..31)
-                            // B_frag[0] = K=0..15, B_frag[1] = K=16..31
-                            // Zero one half to isolate each dot product half
                             const uint32_t B_lo[2] = {B_frag[0], 0u};
                             const uint32_t B_hi[2] = {0u, B_frag[1]};
                             int32_t D_lo[4] = {0, 0, 0, 0};
                             int32_t D_hi[4] = {0, 0, 0, 0};
-                            mma_m16n8k32_s8(D_lo, A_frag, B_lo);
-                            mma_m16n8k32_s8(D_hi, A_frag, B_hi);
+                            mma_m16n8k32_s8(D_lo, A_frag_all[wi], B_lo);
+                            mma_m16n8k32_s8(D_hi, A_frag_all[wi], B_hi);
 
-                            // sb_pre = scale_lo, mb_pre = scale_hi (dual-scale naming)
                             acc[wi][wj][0] += sa0 * (sb_pre[wj][0] * static_cast<float>(D_lo[0]) + mb_pre[wj][0] * static_cast<float>(D_hi[0]));
                             acc[wi][wj][1] += sa0 * (sb_pre[wj][1] * static_cast<float>(D_lo[1]) + mb_pre[wj][1] * static_cast<float>(D_hi[1]));
                             acc[wi][wj][2] += sa1 * (sb_pre[wj][0] * static_cast<float>(D_lo[2]) + mb_pre[wj][0] * static_cast<float>(D_hi[2]));
                             acc[wi][wj][3] += sa1 * (sb_pre[wj][1] * static_cast<float>(D_lo[3]) + mb_pre[wj][1] * static_cast<float>(D_hi[3]));
 
-                            // Q2_K additional emins correction: += sa * (min_lo * sum_A_lo + min_hi * sum_A_hi)
                             if constexpr (IS_DUAL_SCALE_ASYM)
                             {
-                                acc[wi][wj][0] += sa0 * (emin_lo_pre[wj][0] * sum_A_lo_row0 + emin_hi_pre[wj][0] * sum_A_hi_row0);
-                                acc[wi][wj][1] += sa0 * (emin_lo_pre[wj][1] * sum_A_lo_row0 + emin_hi_pre[wj][1] * sum_A_hi_row0);
-                                acc[wi][wj][2] += sa1 * (emin_lo_pre[wj][0] * sum_A_lo_row1 + emin_hi_pre[wj][0] * sum_A_hi_row1);
-                                acc[wi][wj][3] += sa1 * (emin_lo_pre[wj][1] * sum_A_lo_row1 + emin_hi_pre[wj][1] * sum_A_hi_row1);
+                                acc[wi][wj][0] += sa0 * (emin_lo_pre[wj][0] * sum_A_lo_row0_all[wi] + emin_hi_pre[wj][0] * sum_A_hi_row0_all[wi]);
+                                acc[wi][wj][1] += sa0 * (emin_lo_pre[wj][1] * sum_A_lo_row0_all[wi] + emin_hi_pre[wj][1] * sum_A_hi_row0_all[wi]);
+                                acc[wi][wj][2] += sa1 * (emin_lo_pre[wj][0] * sum_A_lo_row1_all[wi] + emin_hi_pre[wj][0] * sum_A_hi_row1_all[wi]);
+                                acc[wi][wj][3] += sa1 * (emin_lo_pre[wj][1] * sum_A_lo_row1_all[wi] + emin_hi_pre[wj][1] * sum_A_hi_row1_all[wi]);
                             }
 
-                            // IQ1_M delta correction: per-column delta signs × per-row sub-group sums
                             if constexpr (IS_IQ1_M)
                             {
                                 constexpr float IQ1S_DELTA_VAL = 0.125f;
@@ -1118,32 +1262,32 @@ namespace
                                 };
 
                                 acc[wi][wj][0] += sa0 * iq1m_corr(qh_c0,
-                                                                  static_cast<float>(sg0_r0), static_cast<float>(sg1_r0),
-                                                                  static_cast<float>(sg2_r0), static_cast<float>(sg3_r0),
+                                                                  static_cast<float>(sg0_r0_all[wi]), static_cast<float>(sg1_r0_all[wi]),
+                                                                  static_cast<float>(sg2_r0_all[wi]), static_cast<float>(sg3_r0_all[wi]),
                                                                   sb_pre[wj][0], mb_pre[wj][0]);
                                 acc[wi][wj][1] += sa0 * iq1m_corr(qh_c1,
-                                                                  static_cast<float>(sg0_r0), static_cast<float>(sg1_r0),
-                                                                  static_cast<float>(sg2_r0), static_cast<float>(sg3_r0),
+                                                                  static_cast<float>(sg0_r0_all[wi]), static_cast<float>(sg1_r0_all[wi]),
+                                                                  static_cast<float>(sg2_r0_all[wi]), static_cast<float>(sg3_r0_all[wi]),
                                                                   sb_pre[wj][1], mb_pre[wj][1]);
                                 acc[wi][wj][2] += sa1 * iq1m_corr(qh_c0,
-                                                                  static_cast<float>(sg0_r1), static_cast<float>(sg1_r1),
-                                                                  static_cast<float>(sg2_r1), static_cast<float>(sg3_r1),
+                                                                  static_cast<float>(sg0_r1_all[wi]), static_cast<float>(sg1_r1_all[wi]),
+                                                                  static_cast<float>(sg2_r1_all[wi]), static_cast<float>(sg3_r1_all[wi]),
                                                                   sb_pre[wj][0], mb_pre[wj][0]);
                                 acc[wi][wj][3] += sa1 * iq1m_corr(qh_c1,
-                                                                  static_cast<float>(sg0_r1), static_cast<float>(sg1_r1),
-                                                                  static_cast<float>(sg2_r1), static_cast<float>(sg3_r1),
+                                                                  static_cast<float>(sg0_r1_all[wi]), static_cast<float>(sg1_r1_all[wi]),
+                                                                  static_cast<float>(sg2_r1_all[wi]), static_cast<float>(sg3_r1_all[wi]),
                                                                   sb_pre[wj][1], mb_pre[wj][1]);
                             }
                         }
                         else
                         {
                             int32_t D[4] = {0, 0, 0, 0};
-                            mma_m16n8k32_s8(D, A_frag, B_frag);
+                            mma_m16n8k32_s8(D, A_frag_all[wi], B_frag);
 
                             if constexpr (IS_ASYMMETRIC)
                             {
-                                const float sa0_sum0 = sa0 * sum_A_row0;
-                                const float sa1_sum1 = sa1 * sum_A_row1;
+                                const float sa0_sum0 = sa0 * sum_A_row0_all[wi];
+                                const float sa1_sum1 = sa1 * sum_A_row1_all[wi];
                                 acc[wi][wj][0] += static_cast<float>(D[0]) * sa0 * sb_pre[wj][0] + sa0_sum0 * mb_pre[wj][0];
                                 acc[wi][wj][1] += static_cast<float>(D[1]) * sa0 * sb_pre[wj][1] + sa0_sum0 * mb_pre[wj][1];
                                 acc[wi][wj][2] += static_cast<float>(D[2]) * sa1 * sb_pre[wj][0] + sa1_sum1 * mb_pre[wj][0];
@@ -1416,48 +1560,451 @@ namespace
             }
         };
 
-        // Pipeline prolog: overlap A cp.async with B decode (independent)
-        load_A_tile(0, kt_begin);
-        cp_async_commit();
-        decode_B_direct(0, kt_begin); // runs while cp.async for A is in-flight
-        load_scales_A(0, kt_begin);   // cooperative scale load (< 1 KB)
-        cp_async_wait<0>();
-        __syncthreads(); // single barrier: both A load and B decode complete
-
-        // Main loop — decode(next) overlaps with compute(current).
-        // decode_B writes to smem_B[next_stage], compute reads smem_B[current_stage]:
-        // different buffers → no conflict.  Single sync ensures both finish
-        // before the stages flip.
-        for (int ki = 0; ki < num_k_iters; ++ki)
+        if constexpr (STAGES_ == 1)
         {
-            const int stage = ki & 1;
-            const int kt = kt_begin + ki;
-
-            if (ki + 1 < num_k_iters)
+            // ── Single-buffered main loop ────────────────────────────────
+            // Half the smem → higher occupancy (3+ blocks/SM).
+            // Trade-off: no load/compute overlap, 2 syncs per K-tile.
+            // cp.async for A still overlaps with sync B decode.
+            for (int ki = 0; ki < num_k_iters; ++ki)
             {
-                // Start async A load for next iteration
-                load_A_tile(stage ^ 1, kt + 1);
+                const int kt = kt_begin + ki;
+
+                load_A_tile(0, kt);
                 cp_async_commit();
-
-                // Decode B for next iteration into next stage's smem buffers.
-                // This runs concurrently with compute below: decode writes
-                // smem_B[stage^1] while compute reads smem_B[stage].
-                decode_B_direct(stage ^ 1, kt + 1);
-
-                // Load activation scales for next K-tile into smem (< 1 KB per stage)
-                load_scales_A(stage ^ 1, kt + 1);
-            }
-
-            if (is_interior_tile)
-                compute_k_tile_interior(stage, kt);
-            else
-                compute_k_tile_border(stage, kt);
-
-            if (ki + 1 < num_k_iters)
-            {
+                decode_B_direct(0, kt); // runs while cp.async for A is in-flight
+                load_scales_A(0, kt);
                 cp_async_wait<0>();
-                __syncthreads(); // single barrier: decode writes + A load + compute reads all done
+                __syncthreads(); // A load + B decode both complete
+
+                if (is_interior_tile)
+                    compute_k_tile_interior(0, kt);
+                else
+                    compute_k_tile_border(0, kt);
+
+                if (ki + 1 < num_k_iters)
+                    __syncthreads(); // ensure all warps done before overwriting smem
             }
+        }
+        else
+        {
+            // ── Double-buffered pipeline (STAGES_=2) ─────────────────────
+            // Pipeline prolog: overlap A cp.async with B decode (independent)
+            load_A_tile(0, kt_begin);
+            cp_async_commit();
+            decode_B_direct(0, kt_begin); // runs while cp.async for A is in-flight
+            load_scales_A(0, kt_begin);   // cooperative scale load (< 1 KB)
+            cp_async_wait<0>();
+            __syncthreads(); // single barrier: both A load and B decode complete
+
+            // Main loop — decode(next) overlaps with compute(current).
+            // decode_B writes to smem_B[next_stage], compute reads smem_B[current_stage]:
+            // different buffers → no conflict.  Single sync ensures both finish
+            // before the stages flip.
+            for (int ki = 0; ki < num_k_iters; ++ki)
+            {
+                const int stage = ki & 1;
+                const int kt = kt_begin + ki;
+
+                if (ki + 1 < num_k_iters)
+                {
+                    // Start async A load for next iteration
+                    load_A_tile(stage ^ 1, kt + 1);
+                    cp_async_commit();
+
+                    // Decode B for next iteration into next stage's smem buffers.
+                    // This runs concurrently with compute below: decode writes
+                    // smem_B[stage^1] while compute reads smem_B[stage].
+                    decode_B_direct(stage ^ 1, kt + 1);
+
+                    // Load activation scales for next K-tile into smem (< 1 KB per stage)
+                    load_scales_A(stage ^ 1, kt + 1);
+                }
+
+                if (is_interior_tile)
+                    compute_k_tile_interior(stage, kt);
+                else
+                    compute_k_tile_border(stage, kt);
+
+                if (ki + 1 < num_k_iters)
+                {
+                    cp_async_wait<0>();
+                    __syncthreads(); // single barrier: decode writes + A load + compute reads all done
+                }
+            }
+        }
+
+        // Epilogue: write accumulators to global memory
+        const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
+
+#pragma unroll
+        for (int wj = 0; wj < WN; ++wj)
+        {
+            const int tile_n = block_n + wc * WARP_N + wj * 8;
+            const int gc0 = tile_n + frag_col(lane_id, 0);
+            const int gc1 = tile_n + frag_col(lane_id, 1);
+            const bool gc0_valid = gc0 < N;
+            const bool gc1_valid = gc1 < N;
+            const float bias0 = (bias && gc0_valid) ? bias[gc0] : 0.0f;
+            const float bias1 = (bias && gc1_valid) ? bias[gc1] : 0.0f;
+
+#pragma unroll
+            for (int wi = 0; wi < WM; ++wi)
+            {
+                const int tile_m = block_m + wr * WARP_M + wi * 16;
+                const bool interior = (tile_m + 15 < M) && (tile_n + 7 < N);
+
+                if (interior && simple_epilogue)
+                {
+                    const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
+                    const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
+                    const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
+                    const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
+
+                    if constexpr (SPLIT_K > 1)
+                    {
+                        atomicAdd(&C[out_idx0], acc[wi][wj][0] * alpha);
+                        atomicAdd(&C[out_idx1], acc[wi][wj][1] * alpha);
+                        atomicAdd(&C[out_idx2], acc[wi][wj][2] * alpha);
+                        atomicAdd(&C[out_idx3], acc[wi][wj][3] * alpha);
+                    }
+                    else
+                    {
+                        C[out_idx0] = acc[wi][wj][0] * alpha;
+                        C[out_idx1] = acc[wi][wj][1] * alpha;
+                        C[out_idx2] = acc[wi][wj][2] * alpha;
+                        C[out_idx3] = acc[wi][wj][3] * alpha;
+                    }
+                    continue;
+                }
+
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                {
+                    const int gr = tile_m + frag_row(lane_id, e);
+                    const int gc = (e & 1) ? gc1 : gc0;
+
+                    if (gr < M && gc < N)
+                    {
+                        const int out_idx = gr * N + gc;
+                        float val = acc[wi][wj][e] * alpha;
+
+                        if constexpr (SPLIT_K > 1)
+                        {
+                            if (blockIdx.z == 0)
+                            {
+                                if (beta != 0.0f && C_existing)
+                                    val += beta * C_existing[out_idx];
+                                if (bias)
+                                    val += (e & 1) ? bias1 : bias0;
+                            }
+                            atomicAdd(&C[out_idx], val);
+                        }
+                        else
+                        {
+                            if (beta != 0.0f && C_existing)
+                                val += beta * C_existing[out_idx];
+                            if (bias)
+                                val += (e & 1) ? bias1 : bias0;
+                            C[out_idx] = val;
+                        }
+                    }
+                }
+            }
+        }
+#else
+        (void)A;
+        (void)payload;
+        (void)scales_B;
+        (void)C;
+        (void)scales_A;
+        (void)C_existing;
+        (void)bias;
+        (void)M;
+        (void)N;
+        (void)K;
+        (void)alpha;
+        (void)beta;
+#endif
+    }
+
+    // =========================================================================
+    // BK=256 kernel: processes 8 quantized blocks per outer K-tile iteration.
+    // Weights (B) loaded once for full K=256; activations (A) loaded in two
+    // K=128 halves (llama.cpp-style). Per half, all A MMA fragments are
+    // pre-loaded into registers, then the compute loop iterates
+    // k→wj(loads B once)→wi(reuses pre-loaded A), halving B ldmatrix loads.
+    //
+    // smem layout (BM=128, BN=128):
+    //   smem_A:        128 × 144 = 18,432 bytes  (activations K=128 half, INT8)
+    //   smem_B:        128 × 272 = 34,816 bytes  (decoded Q4_0 weights, INT8)
+    //   smem_scales_B: 8 × 128 × 2 = 2,048 bytes (FP16 weight scales)
+    //   smem_sa:       128 × 8 × 4 = 4,096 bytes (FP32 activation scales)
+    //   Total: ~59,392 bytes → 1 block/SM (requires >48KB smem opt-in)
+    //
+    // Q4_0 only (CODEBOOK_ID=0). For other codebook types, use BK=64.
+    // =========================================================================
+    // BK=256 / BK=128 constants
+    constexpr int BK256 = 256;
+    constexpr int BK256_PAD = 16;
+    constexpr int BK256_STRIDE = BK256 + BK256_PAD; // 272, 16-byte aligned
+    constexpr int BK128 = 128;
+    constexpr int BK128_PAD = 16;
+    constexpr int BK128_STRIDE = BK128 + BK128_PAD; // 144, 16-byte aligned
+
+    template <int BM, int BN, int WARPS_M, int WARPS_N, int SPLIT_K = 1,
+              int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32>
+    __global__ __launch_bounds__(BLOCK_SIZE_, 1) // 1 block/SM: max register budget
+        void nativeVnniTC_BK256(
+            const int8_t *__restrict__ A,
+            const uint8_t *__restrict__ payload,
+            const uint16_t *__restrict__ scales_B,
+            float *__restrict__ C,
+            const float *__restrict__ scales_A,
+            const float *__restrict__ C_existing,
+            const float *__restrict__ bias,
+            int M,
+            int N,
+            int K,
+            float alpha,
+            float beta)
+    {
+#if __CUDA_ARCH__ >= 800
+        constexpr int NUM_WARPS = WARPS_M * WARPS_N;
+        constexpr int BLOCK_SIZE = NUM_WARPS * 32;
+        constexpr int WARP_M = BM / WARPS_M;
+        constexpr int WARP_N = BN / WARPS_N;
+        constexpr int WM = WARP_M / 16;
+        constexpr int WN = WARP_N / 8;
+        constexpr int A_HALF_VEC_LOADS = BM * BK128 / 16;
+        constexpr int Q40_PL = 16; // Q4_0 payload bytes per 32-element block
+
+        static_assert(BM % WARPS_M == 0 && BN % WARPS_N == 0);
+        static_assert(WARP_M % 16 == 0 && WARP_N % 8 == 0);
+
+        const int warp_id = threadIdx.x >> 5;
+        const int lane_id = threadIdx.x & 31;
+        const int wr = warp_id / WARPS_N;
+        const int wc = warp_id % WARPS_N;
+        const int gid = lane_id >> 2;
+
+        const int block_m = blockIdx.x * BM;
+        const int block_n = blockIdx.y * BN;
+
+        const int num_q40_blocks = K / 32;
+        const int num_outer_tiles = (num_q40_blocks + 7) / 8;
+        int ot_begin = 0;
+        int ot_end = num_outer_tiles;
+        if constexpr (SPLIT_K > 1)
+        {
+            const int tiles_per_part = (num_outer_tiles + SPLIT_K - 1) / SPLIT_K;
+            ot_begin = static_cast<int>(blockIdx.z) * tiles_per_part;
+            ot_end = min(ot_begin + tiles_per_part, num_outer_tiles);
+        }
+        if (ot_end <= ot_begin)
+            return;
+
+        // Dynamic shared memory: exceeds 48KB static limit for BM=128
+        // Layout: smem_A (K=128 half) | smem_B (K=256 full) | smem_scales_B | smem_sa
+        extern __shared__ char smem_raw[];
+        int8_t *smem_A = reinterpret_cast<int8_t *>(smem_raw);
+        int8_t *smem_B = reinterpret_cast<int8_t *>(smem_raw + BM * BK128_STRIDE);
+        constexpr int SCALES_B_OFFSET = BM * BK128_STRIDE + BN * BK256_STRIDE;
+        uint16_t *smem_scales_B = reinterpret_cast<uint16_t *>(smem_raw + SCALES_B_OFFSET);
+        constexpr int SA_OFFSET = SCALES_B_OFFSET + 8 * BN * sizeof(uint16_t);
+        // Align smem_sa to 4-byte boundary (float alignment)
+        constexpr int SA_ALIGNED = (SA_OFFSET + 3) & ~3;
+        float *smem_sa = reinterpret_cast<float *>(smem_raw + SA_ALIGNED);
+
+        float acc[WM][WN][4];
+#pragma unroll
+        for (int i = 0; i < WM; ++i)
+#pragma unroll
+            for (int j = 0; j < WN; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e)
+                    acc[i][j][e] = 0.0f;
+
+        // Load A: BM × 128 bytes (one K-half) via 16-byte async copies
+        auto load_A_half = [&](int outer_kt, int half_idx) __attribute__((always_inline))
+        {
+            const int k_start = outer_kt * BK256 + half_idx * BK128;
+#pragma unroll 4
+            for (int idx = threadIdx.x; idx < A_HALF_VEC_LOADS; idx += BLOCK_SIZE)
+            {
+                const int row = idx >> 3;       // / 8 (128 bytes per row / 16 bytes per load)
+                const int col = (idx & 7) << 4; // (% 8) * 16
+                const int grow = block_m + row;
+                void *dst = &smem_A[row * BK128_STRIDE + col];
+                const bool valid = grow < M && (k_start + col + 16 <= K);
+                const void *src = valid
+                                      ? static_cast<const void *>(&A[static_cast<size_t>(grow) * K + k_start + col])
+                                      : static_cast<const void *>(A);
+                cp_async_cg_16_zfill_128(dst, src, valid ? 16 : 0);
+            }
+        };
+
+        // Decode B: 8 Q4_0 blocks per column, linearized across all threads
+        auto decode_B_big = [&](int outer_kt) __attribute__((always_inline))
+        {
+            const int kb_start = outer_kt * 8;
+            // BN * 8 items: each item = decode 1 Q4_0 block for 1 column.
+            // Column-major mapping: adjacent threads → adjacent columns → coalesced global loads.
+            for (int idx = threadIdx.x; idx < BN * 8; idx += BLOCK_SIZE)
+            {
+                const int bi = idx / BN;        // K-block index 0..7 (outer, varies slowly)
+                const int col = idx & (BN - 1); // column 0..BN-1 (inner, varies quickly)
+                const int gcol = block_n + col;
+                const int kb = kb_start + bi;
+
+                int32_t *dst = reinterpret_cast<int32_t *>(&smem_B[col * BK256_STRIDE + bi * 32]);
+
+                if (gcol < N && kb < num_q40_blocks)
+                {
+                    const size_t base = (static_cast<size_t>(kb) * N + gcol) * Q40_PL;
+                    const int4 raw = *reinterpret_cast<const int4 *>(payload + base);
+                    const uint32_t r0 = static_cast<uint32_t>(raw.x);
+                    const uint32_t r1 = static_cast<uint32_t>(raw.y);
+                    const uint32_t r2 = static_cast<uint32_t>(raw.z);
+                    const uint32_t r3 = static_cast<uint32_t>(raw.w);
+                    *reinterpret_cast<int4 *>(&dst[0]) = make_int4(
+                        static_cast<int32_t>(__vsub4(r0 & 0x0F0F0F0Fu, 0x08080808u)),
+                        static_cast<int32_t>(__vsub4(r1 & 0x0F0F0F0Fu, 0x08080808u)),
+                        static_cast<int32_t>(__vsub4(r2 & 0x0F0F0F0Fu, 0x08080808u)),
+                        static_cast<int32_t>(__vsub4(r3 & 0x0F0F0F0Fu, 0x08080808u)));
+                    *reinterpret_cast<int4 *>(&dst[4]) = make_int4(
+                        static_cast<int32_t>(__vsub4((r0 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                        static_cast<int32_t>(__vsub4((r1 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                        static_cast<int32_t>(__vsub4((r2 >> 4) & 0x0F0F0F0Fu, 0x08080808u)),
+                        static_cast<int32_t>(__vsub4((r3 >> 4) & 0x0F0F0F0Fu, 0x08080808u)));
+
+                    smem_scales_B[bi * BN + col] = scales_B[static_cast<size_t>(kb) * N + gcol];
+                }
+                else
+                {
+                    *reinterpret_cast<int4 *>(&dst[0]) = make_int4(0, 0, 0, 0);
+                    *reinterpret_cast<int4 *>(&dst[4]) = make_int4(0, 0, 0, 0);
+                    smem_scales_B[bi * BN + col] = 0;
+                }
+            }
+        };
+
+        // Load all 8 activation scales per row for the K=256 chunk
+        auto load_scales_A_big = [&](int outer_kt) __attribute__((always_inline))
+        {
+            const int kb_start = outer_kt * 8;
+            for (int idx = threadIdx.x; idx < BM * 8; idx += BLOCK_SIZE)
+            {
+                const int row = idx >> 3;
+                const int si = idx & 7;
+                const int kb = kb_start + si;
+                const int grow = block_m + row;
+                smem_sa[idx] = (grow < M && kb < num_q40_blocks)
+                                   ? scales_A[grow * num_q40_blocks + kb]
+                                   : 0.0f;
+            }
+        };
+
+        // Main loop: outer K=256 tiles
+        for (int ot = ot_begin; ot < ot_end; ++ot)
+        {
+            // Phase 1: Issue A half-0 cp.async, overlapped with B decode
+            load_A_half(ot, 0);
+            cp_async_commit();
+            decode_B_big(ot);
+            load_scales_A_big(ot);
+            cp_async_wait<0>();
+            __syncthreads(); // sync 1: B decoded + A half 0 ready
+
+            // Phase 2: two K=128 halves, each with pre-loaded A fragments
+#pragma unroll
+            for (int hi = 0; hi < 2; ++hi)
+            {
+                // Pre-load ALL A MMA fragments for this half (4 k-subtiles × WM rows).
+                // This decouples A ldmatrix loads from MMA, enabling the compiler
+                // to pipeline them. The restructured loop iterates wj in the middle,
+                // loading each B fragment once per (k, wj) instead of WM times.
+                uint32_t A_frag_all[WM][4][4];
+                float sa_all[WM][2][4];
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                {
+                    const int k_offset = k * 32;
+                    const int scale_idx = hi * 4 + k;
+#pragma unroll
+                    for (int wi = 0; wi < WM; ++wi)
+                    {
+                        const int a_row_base = wr * WARP_M + wi * 16;
+                        load_ldmatrix_a_m16n8k32(
+                            A_frag_all[wi][k],
+                            reinterpret_cast<const int *>(&smem_A[a_row_base * BK128_STRIDE + k_offset]),
+                            BK128_STRIDE / 4, lane_id);
+
+                        const int local_row0 = a_row_base + gid;
+                        sa_all[wi][0][k] = smem_sa[local_row0 * 8 + scale_idx];
+                        sa_all[wi][1][k] = smem_sa[(local_row0 + 8) * 8 + scale_idx];
+                    }
+                }
+
+                // Compute: k (outer) → wj (middle, loads B) → wi (inner, reuses pre-loaded A)
+#pragma unroll
+                for (int k = 0; k < 4; ++k)
+                {
+                    const int b_k_offset = hi * 128 + k * 32;
+                    const int scale_idx_b = hi * 4 + k;
+
+                    float sb_pre[WN][2];
+#pragma unroll
+                    for (int wj = 0; wj < WN; ++wj)
+                    {
+                        const int b_col_base = wc * WARP_N + wj * 8;
+                        sb_pre[wj][0] = fp16_bits_to_float(
+                            smem_scales_B[scale_idx_b * BN + b_col_base + frag_col(lane_id, 0)]);
+                        sb_pre[wj][1] = fp16_bits_to_float(
+                            smem_scales_B[scale_idx_b * BN + b_col_base + frag_col(lane_id, 1)]);
+                    }
+
+#pragma unroll
+                    for (int wj = 0; wj < WN; ++wj)
+                    {
+                        uint32_t B_frag[2];
+                        load_ldmatrix_b_m16n8k32(
+                            B_frag,
+                            reinterpret_cast<const int *>(&smem_B[(wc * WARP_N + wj * 8) * BK256_STRIDE + b_k_offset]),
+                            BK256_STRIDE / 4, lane_id);
+
+#pragma unroll
+                        for (int wi = 0; wi < WM; ++wi)
+                        {
+                            int32_t D[4] = {0, 0, 0, 0};
+                            mma_m16n8k32_s8(D, A_frag_all[wi][k], B_frag);
+
+                            const float cs00 = sa_all[wi][0][k] * sb_pre[wj][0];
+                            const float cs01 = sa_all[wi][0][k] * sb_pre[wj][1];
+                            const float cs10 = sa_all[wi][1][k] * sb_pre[wj][0];
+                            const float cs11 = sa_all[wi][1][k] * sb_pre[wj][1];
+                            acc[wi][wj][0] += static_cast<float>(D[0]) * cs00;
+                            acc[wi][wj][1] += static_cast<float>(D[1]) * cs01;
+                            acc[wi][wj][2] += static_cast<float>(D[2]) * cs10;
+                            acc[wi][wj][3] += static_cast<float>(D[3]) * cs11;
+                        }
+                    }
+                }
+
+                // Transition: reload smem_A with next half
+                if (hi == 0)
+                {
+                    __syncthreads(); // sync 2: protect smem_A reads before reload
+                    load_A_half(ot, 1);
+                    cp_async_commit();
+                    cp_async_wait<0>();
+                    __syncthreads(); // sync 3: A half 1 ready
+                }
+            }
+
+            // Barrier before next outer iteration (smem_B will be overwritten)
+            if (ot + 1 < ot_end)
+                __syncthreads(); // sync 4
         }
 
         // Epilogue: write accumulators to global memory
@@ -1634,6 +2181,178 @@ namespace
         return Q40PrefillShape::Balanced;
     }
 
+    // SM count query (cached)
+    int getSmCount()
+    {
+        static int count = 0;
+        if (count == 0)
+        {
+            int dev = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, dev);
+            if (count <= 0)
+                count = 82;
+        }
+        return count;
+    }
+
+    // ─── Sweep-derived tile + split_k heuristic ───────────────────────
+    // Fills-first strategy: prefer the largest tile family that fills the
+    // GPU without split_k, only adding split_k when no family fills.
+    // Within 64×128, warp config depends on real tile count:
+    //   tiles ≥ 112 → w2x2 (more blocks/SM at high tile count)
+    //   ki ≤ 7      → w4x2 (small K, 4 warps in M-dim)
+    //   otherwise   → w2x4 (default, 8 warps for ILP)
+    TileChoice chooseQ40PrefillTile(int M, int N, int K)
+    {
+        const int SM = getSmCount();
+        constexpr int HBK = 128; // heuristic block-K unit (analysis granularity)
+        const int ki = K / HBK;
+        const int t64 = ((M + 63) / 64) * ((N + 63) / 64);
+        const int t64x128 = ((M + 63) / 64) * ((N + 127) / 128);
+        const int t128 = ((M + 127) / 128) * ((N + 127) / 128);
+
+        const bool fills_128 = (t128 >= SM) && (M >= 128);
+        const bool fills_64x128 = (t64x128 >= SM);
+        const bool fills_64 = (t64 >= SM);
+
+        // Helper: pick 64×128 warp config from real tile count
+        auto pick_warp = [&](int real_tiles, int k_iters) -> TileId
+        {
+            if (real_tiles >= 112)
+                return TileId::T64x128_w2x2;
+            if (k_iters <= 7)
+                return TileId::T64x128_w4x2;
+            return TileId::T64x128_w2x4;
+        };
+
+        // ═══ TIER 1: 128×128 fills ═══
+        if (fills_128)
+        {
+            bool use_128 = true;
+            // Small K + many tiles → occupancy limited, smaller tile better
+            if (ki <= 7 && t128 > 2 * SM)
+                use_128 = false;
+            else if (ki <= 16 && t128 > 3 * SM)
+                use_128 = false;
+
+            if (use_128)
+            {
+                // w4x4 for adequate tiles + K + M
+                if ((t128 >= 56 && ki >= 7 && M >= 512) ||
+                    (t128 >= 128 && ki >= 16))
+                    return {TileId::T128x128_w4x4, 1};
+                return {TileId::T128x128_w4x2, 1};
+            }
+            // Demote to 64×128
+            return {pick_warp(t64x128, ki), 1};
+        }
+
+        // ═══ TIER 2: 64×128 fills ═══
+        if (fills_64x128)
+        {
+            // Prefer 64×64 for small K + high tile parallelism
+            if (ki <= 7 && t64 >= (5 * SM / 2))
+                return {TileId::T64x64_w2x2, 1};
+            if (ki <= 14 && t64x128 < (13 * SM / 10) && t64 >= 2 * SM)
+                return {TileId::T64x64_w2x2, 1};
+
+            int sk = 1;
+            // Marginal wave fill (< 1.5 waves) + sufficient K → sk=2
+            if (t64x128 < (3 * SM / 2) && ki >= 28)
+                sk = 2;
+
+            TileId warp = pick_warp(t64x128 * sk, ki);
+
+            // 128×128+sk override for very large K at moderate M
+            if (M >= 256 && ki >= 40 && t128 >= 32 && t64x128 <= (3 * SM / 2))
+                return {TileId::T128x128_w4x2, 2};
+
+            // 128×128_sk2 when tiles fill and K is very large
+            if (M >= 128 && ki >= 40 && t128 >= 32 && t64x128 >= (3 * SM / 2))
+            {
+                if (t128 * 2 >= SM)
+                    return {TileId::T128x128_w4x2, 2};
+            }
+
+            return {warp, sk};
+        }
+
+        // ═══ TIER 3: 64×64 fills ═══
+        if (fills_64)
+        {
+            // Try upgrading to 64×128 with split_k for large K
+            if (ki >= 14 && t64x128 >= 28)
+            {
+                const int target = 3 * SM / 2; // ~1.5 waves
+                int sk = 1;
+                for (int s = 1; s <= 4; s *= 2)
+                {
+                    if (ki < s * 7) // min 7 K-iters per partition
+                        break;
+                    sk = s;
+                    if (t64x128 * s >= target)
+                        break;
+                }
+                TileId warp = pick_warp(t64x128 * sk, ki);
+
+                // Further upgrade: 128×128+sk for very large K
+                if (t128 >= 16 && ki >= 40 && M >= 128)
+                {
+                    int sk128 = 1;
+                    for (int s = 1; s <= 8; s *= 2)
+                    {
+                        if (ki < s * 7)
+                            break;
+                        sk128 = s;
+                        if (t128 * s >= SM)
+                            break;
+                    }
+                    if (t128 * sk128 >= (7 * SM / 10))
+                        return {TileId::T128x128_w4x2, sk128};
+                }
+
+                return {warp, sk};
+            }
+            return {TileId::T64x64_w2x2, 1};
+        }
+
+        // ═══ TIER 4: Nothing fills → split_k required ═══
+        TileId tile;
+        int bm, bn;
+        if (t128 >= 16 && ki >= 40 && M >= 128)
+        {
+            tile = TileId::T128x128_w4x2;
+            bm = 128;
+            bn = 128;
+        }
+        else if (t64x128 >= 8 && ki >= 8)
+        {
+            tile = pick_warp(0, ki); // will yield w2x4 or w4x2
+            bm = 64;
+            bn = 128;
+        }
+        else
+        {
+            tile = TileId::T64x64_w2x2;
+            bm = 64;
+            bn = 64;
+        }
+
+        const int base = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
+        const int target = 3 * SM / 2; // ~1.5 waves
+        int sk = 1;
+        for (int s = 1; s <= 8; s *= 2)
+        {
+            if (base >= 8 && ki < s)
+                break;
+            sk = s;
+            if (base * s >= target)
+                break;
+        }
+        return {tile, sk};
+    }
+
     bool isAmperePlus(int device_id)
     {
         static int cached_device = -1;
@@ -1740,26 +2459,191 @@ namespace
         return cudaGetLastError() == cudaSuccess;
     }
 
+    // Single-buffered BK=64 launch helper (STAGES_=1, higher occupancy target)
+    template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN, int SPLIT_K = 1>
+    bool launchNativeVNNITC_BK64_SB(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        const uint16_t *d_mins,
+        const uint32_t *d_emins,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        int M,
+        int N,
+        int K,
+        float alpha,
+        float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        cudaStream_t cuda_stream)
+    {
+        const int num_k_tiles = (K / 32 + 1) / 2;
+        int kt_per_part = num_k_tiles;
+        if constexpr (SPLIT_K > 1)
+            kt_per_part = (num_k_tiles + SPLIT_K - 1) / SPLIT_K;
+        if (kt_per_part <= 0)
+            return false;
+
+        const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
+        const dim3 block(WM * WN * 32);
+
+        if constexpr (SPLIT_K > 1)
+            cudaMemsetAsync(d_C_fp32, 0, static_cast<size_t>(M) * N * sizeof(float), cuda_stream);
+
+        (void)cudaGetLastError();
+
+        // STAGES_=1: single-buffered, half smem, higher occupancy
+        nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, SPLIT_K, /*STAGES_=*/1><<<grid, block, 0, cuda_stream>>>(
+            d_A_int8,
+            d_payload,
+            d_scales,
+            d_mins,
+            d_emins,
+            d_C_fp32,
+            d_scales_A_block,
+            d_C_existing,
+            d_bias,
+            M,
+            N,
+            K,
+            alpha,
+            beta);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
     int chooseSplitK_BK64(Q40PrefillShape shape, int M, int N, int K, int bm, int bn)
     {
         const int grid_blocks = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
         const int num_k_tiles = (K / 32 + 1) / 2; // ceil: handles K%64!=0
         const bool k_rich = (K >= 2 * N);
+
+        // Estimate max concurrent blocks per SM from block size.
+        // BM=128 → 256 threads, 128 regs, ~44KB smem → 2 blocks/SM.
+        // BM=64  → 128 threads, 168 regs, ~32KB smem → 3 blocks/SM.
+        const int num_warps = (bm >= 128) ? 8 : 4;
+        const int max_blocks_per_sm = (num_warps >= 8) ? 2 : 3;
+        const int num_sms = getSmCount();
+        const int total_slots = num_sms * max_blocks_per_sm;
+        const float waves = static_cast<float>(grid_blocks) / static_cast<float>(total_slots);
+
+        // Wave-efficiency split_k: when grid doesn't fill 2 full waves,
+        // use split_k to improve SM utilization even if grid_blocks >= MIN_GRID_BLOCKS.
+        // Only for k_rich shapes (large K) where atomicAdd overhead is amortized.
+        const bool low_wave_fill = k_rich && waves < 2.0f && num_k_tiles >= 16;
+
         const bool recover_underfill =
             grid_blocks < MIN_GRID_BLOCKS &&
             num_k_tiles >= 16;
+
+        if (!k_rich && !recover_underfill && !low_wave_fill)
+            return 1;
+        if (!recover_underfill && !low_wave_fill && grid_blocks >= MIN_GRID_BLOCKS)
+            return 1;
+        if (num_k_tiles < 2)
+            return 1;
+
+        int needed;
+        if (low_wave_fill && !recover_underfill)
+        {
+            // Target ~4 waves for better amortization of wave tails
+            // and higher sustained SM utilization.
+            const int target_blocks = total_slots * 4;
+            needed = (target_blocks + grid_blocks - 1) / grid_blocks;
+        }
+        else
+        {
+            needed = (MIN_GRID_BLOCKS + grid_blocks - 1) / grid_blocks;
+        }
+        int split_k = roundUpPow2Clamped(needed, 8);
+        const int min_tiles_per_part = k_rich ? 1 : 4;
+        while (split_k > 1 && (num_k_tiles / split_k) < min_tiles_per_part)
+            split_k >>= 1;
+        return std::max(1, split_k);
+    }
+
+    // BK=256 launch helper: sets >48KB dynamic smem opt-in before first launch
+    template <int BM, int BN, int WM, int WN, int SPLIT_K = 1>
+    bool launchNativeVNNITC_BK256(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        int M,
+        int N,
+        int K,
+        float alpha,
+        float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        cudaStream_t cuda_stream)
+    {
+        // Compute dynamic smem size (must match kernel layout: A uses K=128 half)
+        constexpr int SCALES_B_OFF = BM * BK128_STRIDE + BN * BK256_STRIDE;
+        constexpr int SA_OFF = SCALES_B_OFF + 8 * BN * static_cast<int>(sizeof(uint16_t));
+        constexpr int SA_ALIGNED = (SA_OFF + 3) & ~3;
+        constexpr int smem_bytes = SA_ALIGNED + BM * 8 * static_cast<int>(sizeof(float));
+
+        // Opt-in for >48KB dynamic shared memory (once per kernel template)
+        static bool smem_configured = false;
+        if (!smem_configured)
+        {
+            auto fn_ptr = nativeVnniTC_BK256<BM, BN, WM, WN, SPLIT_K>;
+            cudaFuncSetAttribute(fn_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+            smem_configured = true;
+        }
+
+        const int num_outer_tiles = (K / 32 + 7) / 8;
+        int ot_per_part = num_outer_tiles;
+        if constexpr (SPLIT_K > 1)
+            ot_per_part = (num_outer_tiles + SPLIT_K - 1) / SPLIT_K;
+        if (ot_per_part <= 0)
+            return false;
+
+        const dim3 grid((M + BM - 1) / BM, (N + BN - 1) / BN, SPLIT_K);
+        const dim3 block(WM * WN * 32);
+
+        if constexpr (SPLIT_K > 1)
+            cudaMemsetAsync(d_C_fp32, 0, static_cast<size_t>(M) * N * sizeof(float), cuda_stream);
+
+        (void)cudaGetLastError(); // clear stale errors
+
+        nativeVnniTC_BK256<BM, BN, WM, WN, SPLIT_K><<<grid, block, smem_bytes, cuda_stream>>>(
+            d_A_int8,
+            d_payload,
+            d_scales,
+            d_C_fp32,
+            d_scales_A_block,
+            d_C_existing,
+            d_bias,
+            M,
+            N,
+            K,
+            alpha,
+            beta);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
+    int chooseSplitK_BK256(Q40PrefillShape shape, int M, int N, int K, int bm, int bn)
+    {
+        const int grid_blocks = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
+        const int num_outer_tiles = (K / 32 + 7) / 8;
+        const bool k_rich = (K >= 2 * N);
+        const bool recover_underfill =
+            grid_blocks < MIN_GRID_BLOCKS &&
+            num_outer_tiles >= 4;
 
         if (!k_rich && !recover_underfill)
             return 1;
         if (!recover_underfill && grid_blocks >= MIN_GRID_BLOCKS)
             return 1;
-        if (num_k_tiles < 2)
+        if (num_outer_tiles < 2)
             return 1;
 
         const int needed = (MIN_GRID_BLOCKS + grid_blocks - 1) / grid_blocks;
         int split_k = roundUpPow2Clamped(needed, 8);
-        const int min_tiles_per_part = k_rich ? 1 : 4;
-        while (split_k > 1 && (num_k_tiles / split_k) < min_tiles_per_part)
+        while (split_k > 1 && (num_outer_tiles / split_k) < 2)
             split_k >>= 1;
         return std::max(1, split_k);
     }
@@ -1793,186 +2677,61 @@ extern "C"
             return false;
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        // Legacy shape tracking (kept for diagnostics / family counters)
         const Q40PrefillShape shape = classifyQ40PrefillShape(M, N, K);
         recordQ40PrefillShape(shape);
 
-        // BK=64 uses BM=64 (64 acc regs) which gives better register
-        // budget for ILP.  Always use BK=64 now that K-tail handling
-        // supports K%64!=0 (K%32==0 is sufficient).
-        const bool use_bk64 = true;
+        // ─── Sweep-derived dispatch ───────────────────────────────────
+        const TileChoice tc = chooseQ40PrefillTile(M, N, K);
 
-        switch (shape)
+// Macro to fan out split_k for a given tile config (avoids 24-way copy-paste)
+#define Q40_DISPATCH_SK(CB, BM_, BN_, WM_, WN_)                           \
+    do                                                                    \
+    {                                                                     \
+        switch (tc.split_k)                                               \
+        {                                                                 \
+        case 8:                                                           \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(    \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,          \
+                d_C_fp32, d_scales_A_block,                               \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream); \
+        case 4:                                                           \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(    \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,          \
+                d_C_fp32, d_scales_A_block,                               \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream); \
+        case 2:                                                           \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(    \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,          \
+                d_C_fp32, d_scales_A_block,                               \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream); \
+        default:                                                          \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(    \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,          \
+                d_C_fp32, d_scales_A_block,                               \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream); \
+        }                                                                 \
+    } while (0)
+
+        switch (tc.tile)
         {
-        case Q40PrefillShape::TpNarrow:
-        {
-            if (use_bk64)
-            {
-                const int split_k = chooseSplitK_BK64(shape, M, N, K, 64, 128);
-                switch (split_k)
-                {
-                case 8:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 8>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 4:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 4>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 2:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 2>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                default:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 1>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                }
-            }
-            const int split_k = chooseSplitK(shape, M, N, K, 128, 64);
-            switch (split_k)
-            {
-            case 8:
-                return launchQ40TensorCoreVariant<128, 64, 2, 1, 8, true>(
-                    d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-            case 4:
-                return launchQ40TensorCoreVariant<128, 64, 2, 1, 4, true>(
-                    d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-            case 2:
-                return launchQ40TensorCoreVariant<128, 64, 2, 1, 2, true>(
-                    d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-            default:
-                return launchQ40TensorCoreVariant<128, 64, 2, 1, 1, true>(
-                    d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-            }
+        case TileId::T64x64_w2x2:
+            Q40_DISPATCH_SK(0, 64, 64, 2, 2);
+        case TileId::T64x128_w2x2:
+            Q40_DISPATCH_SK(0, 64, 128, 2, 2);
+        case TileId::T64x128_w4x2:
+            Q40_DISPATCH_SK(0, 64, 128, 4, 2);
+        case TileId::T64x128_w2x4:
+            Q40_DISPATCH_SK(0, 64, 128, 2, 4);
+        case TileId::T128x128_w4x2:
+            Q40_DISPATCH_SK(0, 128, 128, 4, 2);
+        case TileId::T128x128_w4x4:
+            Q40_DISPATCH_SK(0, 128, 128, 4, 4);
         }
 
-        case Q40PrefillShape::Wide:
-        {
-            if (use_bk64 && M >= 128)
-            {
-                // BM=128 halves weight re-reads for large M; scales_A
-                // cached in smem so we don't depend on L1 for it.
-                const int split_k = chooseSplitK_BK64(shape, M, N, K, 128, 128);
-                switch (split_k)
-                {
-                case 8:
-                    return launchNativeVNNITC_BK64<0, 128, 128, 4, 2, 8>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 4:
-                    return launchNativeVNNITC_BK64<0, 128, 128, 4, 2, 4>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 2:
-                    return launchNativeVNNITC_BK64<0, 128, 128, 4, 2, 2>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                default:
-                    return launchNativeVNNITC_BK64<0, 128, 128, 4, 2, 1>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                }
-            }
-            if (use_bk64)
-            {
-                const int split_k = chooseSplitK_BK64(shape, M, N, K, 64, 128);
-                switch (split_k)
-                {
-                case 8:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 8>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 4:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 4>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 2:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 2>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                default:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 1>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                }
-            }
-            else
-            {
-                const int split_k = chooseSplitK(shape, M, N, K, 64, 128);
-                switch (split_k)
-                {
-                case 8:
-                    return launchQ40TensorCoreVariant<64, 128, 2, 2, 8, true>(
-                        d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 4:
-                    return launchQ40TensorCoreVariant<64, 128, 2, 2, 4, true>(
-                        d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 2:
-                    return launchQ40TensorCoreVariant<64, 128, 2, 2, 2, true>(
-                        d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                default:
-                    return launchQ40TensorCoreVariant<64, 128, 2, 2, 1, true>(
-                        d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                }
-            }
-        }
-
-        case Q40PrefillShape::Balanced:
-        default:
-        {
-            if (use_bk64)
-            {
-                const int split_k = chooseSplitK_BK64(shape, M, N, K, 64, 128);
-                switch (split_k)
-                {
-                case 8:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 8>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 4:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 4>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                case 2:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 2>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                default:
-                    return launchNativeVNNITC_BK64<0, 64, 128, 2, 2, 1>(
-                        d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-                }
-            }
-            const int split_k = chooseSplitK(shape, M, N, K, 128, 128);
-            switch (split_k)
-            {
-            case 8:
-                return launchQ40TensorCoreVariant<128, 128, 2, 2, 8, true>(
-                    d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-            case 4:
-                return launchQ40TensorCoreVariant<128, 128, 2, 2, 4, true>(
-                    d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-            case 2:
-                return launchQ40TensorCoreVariant<128, 128, 2, 2, 2, true>(
-                    d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-            default:
-                return launchQ40TensorCoreVariant<128, 128, 2, 2, 1, true>(
-                    d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                    M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
-            }
-        }
-        }
+#undef Q40_DISPATCH_SK
+        return false; // unreachable
     }
 
     const char *cudaNativeVNNIPrefillQ40_lastSelectedFamily()
@@ -2296,5 +3055,144 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
 
     default:
         return false;
+    }
+}
+
+// =========================================================================
+// GEMM Sweep Benchmark API
+// =========================================================================
+// Exposes all tile-config variants via numbered config IDs so an external
+// benchmark driver can systematically sweep (BM, BN, WARPS_M, WARPS_N,
+// SPLIT_K) for any (M, N, K) shape.
+// =========================================================================
+
+namespace
+{
+    struct SweepConfig
+    {
+        int bm, bn, warps_m, warps_n;
+        const char *name;
+    };
+
+    // 17 tile configs covering the practical design space.
+    // Constraint: WARP_M = BM/WARPS_M >= 16, WARP_N = BN/WARPS_N >= 8.
+    static constexpr SweepConfig kSweepConfigs[] = {
+        {32, 128, 1, 2, "32x128_w1x2"},   //  0:  64 thr, ~27KB smem
+        {32, 128, 1, 4, "32x128_w1x4"},   //  1: 128 thr, ~27KB smem
+        {64, 64, 2, 1, "64x64_w2x1"},     //  2:  64 thr, ~22KB smem
+        {64, 64, 2, 2, "64x64_w2x2"},     //  3: 128 thr, ~22KB smem
+        {64, 128, 2, 2, "64x128_w2x2"},   //  4: 128 thr, ~33KB smem (DEFAULT small-M)
+        {64, 128, 4, 2, "64x128_w4x2"},   //  5: 256 thr, ~33KB smem
+        {64, 128, 2, 4, "64x128_w2x4"},   //  6: 256 thr, ~33KB smem
+        {128, 64, 4, 1, "128x64_w4x1"},   //  7: 128 thr, ~33KB smem
+        {128, 64, 2, 1, "128x64_w2x1"},   //  8:  64 thr, ~33KB smem (high ILP)
+        {128, 128, 4, 2, "128x128_w4x2"}, //  9: 256 thr, ~44KB smem (DEFAULT large-M)
+        {128, 128, 2, 2, "128x128_w2x2"}, // 10: 128 thr, ~44KB smem (high ILP)
+        {128, 128, 4, 4, "128x128_w4x4"}, // 11: 512 thr, ~44KB smem
+    };
+    static constexpr int kNumSweepConfigs = sizeof(kSweepConfigs) / sizeof(kSweepConfigs[0]);
+
+    template <int BM, int BN, int WM, int WN>
+    bool sweepLaunchQ40(int split_k,
+                        const int8_t *A, const uint8_t *payload, const uint16_t *scales,
+                        float *C, const float *scales_A,
+                        int M, int N, int K, float alpha, float beta,
+                        const float *C_existing, const float *bias,
+                        cudaStream_t stream)
+    {
+        switch (split_k)
+        {
+        case 8:
+            return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 8>(
+                A, payload, scales, nullptr, nullptr, C, scales_A,
+                M, N, K, alpha, beta, C_existing, bias, stream);
+        case 4:
+            return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 4>(
+                A, payload, scales, nullptr, nullptr, C, scales_A,
+                M, N, K, alpha, beta, C_existing, bias, stream);
+        case 2:
+            return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 2>(
+                A, payload, scales, nullptr, nullptr, C, scales_A,
+                M, N, K, alpha, beta, C_existing, bias, stream);
+        default:
+            return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 1>(
+                A, payload, scales, nullptr, nullptr, C, scales_A,
+                M, N, K, alpha, beta, C_existing, bias, stream);
+        }
+    }
+
+} // namespace
+
+extern "C"
+{
+    int cudaGemmSweepNumConfigs() { return kNumSweepConfigs; }
+
+    void cudaGemmSweepGetConfig(int idx, int *bm, int *bn, int *warps_m, int *warps_n, const char **name)
+    {
+        if (idx < 0 || idx >= kNumSweepConfigs)
+            return;
+        if (bm)
+            *bm = kSweepConfigs[idx].bm;
+        if (bn)
+            *bn = kSweepConfigs[idx].bn;
+        if (warps_m)
+            *warps_m = kSweepConfigs[idx].warps_m;
+        if (warps_n)
+            *warps_n = kSweepConfigs[idx].warps_n;
+        if (name)
+            *name = kSweepConfigs[idx].name;
+    }
+
+    bool cudaGemmSweepLaunch(
+        int config_idx, int split_k,
+        const int8_t *A, const uint8_t *payload, const uint16_t *scales,
+        float *C, const float *scales_A,
+        int M, int N, int K,
+        float alpha, float beta,
+        const float *C_existing, const float *bias,
+        int device_id, void *stream)
+    {
+        if (config_idx < 0 || config_idx >= kNumSweepConfigs)
+            return false;
+        if (!A || !payload || !scales || !C || !scales_A)
+            return false;
+        if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+            return false;
+        if (!isAmperePlus(device_id))
+            return false;
+        if (cudaSetDevice(device_id) != cudaSuccess)
+            return false;
+
+        cudaStream_t cs = static_cast<cudaStream_t>(stream);
+
+        switch (config_idx)
+        {
+        case 0:
+            return sweepLaunchQ40<32, 128, 1, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 1:
+            return sweepLaunchQ40<32, 128, 1, 4>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 2:
+            return sweepLaunchQ40<64, 64, 2, 1>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 3:
+            return sweepLaunchQ40<64, 64, 2, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 4:
+            return sweepLaunchQ40<64, 128, 2, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 5:
+            return sweepLaunchQ40<64, 128, 4, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 6:
+            return sweepLaunchQ40<64, 128, 2, 4>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 7:
+            return sweepLaunchQ40<128, 64, 4, 1>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 8:
+            return sweepLaunchQ40<128, 64, 2, 1>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 9:
+            return sweepLaunchQ40<128, 128, 4, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 10:
+            return sweepLaunchQ40<128, 128, 2, 2>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        case 11:
+            return sweepLaunchQ40<128, 128, 4, 4>(split_k, A, payload, scales, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs);
+        default:
+            return false;
+        }
     }
 }

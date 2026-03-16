@@ -55,8 +55,6 @@ namespace llaminar2
     namespace cuda
     {
 
-
-
         /**
          * @brief CUDA GEMM kernel for quantized weight tensors using CUDA packed weights
          *
@@ -90,6 +88,8 @@ namespace llaminar2
         class CUDAQuantisedGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
+            struct Impl; // Forward declaration for PIMPL (definition in .cpp)
+
             static void setNativeVNNIEnabled(bool enabled);
             static bool isNativeVNNIEnabled();
             static void setForceCutlassFallback(bool enabled);
@@ -333,6 +333,9 @@ namespace llaminar2
             // =========================================================================
 
             int cuda_device_id() const { return cuda_device_id_; }
+            int getCudaDeviceId() const { return cuda_device_id_; }
+            void *getGPUStream() const { return gpu_stream_; }
+
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
             bool weights_converted() const { return weights_converted_; }
@@ -344,6 +347,56 @@ namespace llaminar2
              * Call this during weight preloading to avoid first-use overhead.
              */
             void prepareWeights() override { ensureWeightsConverted(); }
+
+            // =========================================================================
+            // Fused Activation+GEMM entry points
+            // =========================================================================
+
+            /**
+             * @brief GEMM with fused SwiGLU activation preprocessing
+             *
+             * Replaces the standalone SwiGLU kernel + activation quantization with
+             * a single fused kernel: silu(gate) * up → INT8, then runs GEMM.
+             * Eliminates one FP32 write + read of the intermediate SwiGLU output.
+             *
+             * @param d_gate  Gate activations [m, k] FP32 on device
+             * @param d_up    Up activations [m, k] FP32 on device
+             * @param d_C     Output [m, n] FP32 on device
+             * @param m       Rows (sequence length)
+             * @param n       Output columns
+             * @param k       Input columns (intermediate_size)
+             * @param alpha   Output scale
+             * @param beta    Accumulation scale (0 = overwrite)
+             * @return true on success
+             */
+            bool multiply_with_fused_swiglu(
+                const float *d_gate, const float *d_up,
+                float *d_C,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /**
+             * @brief Tensor-based GEMM with fused SwiGLU activation
+             *
+             * High-level entry point for GEMMStage. Handles GPU coherence:
+             * extracts device pointers from gate/up tensors, runs fused
+             * SwiGLU+quantize+GEMM, marks output as device-dirty.
+             *
+             * @param gate   Gate tensor [m, k] (must be on GPU)
+             * @param up     Up tensor [m, k] (must be on GPU)
+             * @param output Output tensor [m, n]
+             * @param m      Rows
+             * @param n      Output columns
+             * @param k      Input columns
+             * @param alpha  Output scale
+             * @param beta   Accumulation scale
+             * @return true on success
+             */
+            bool multiply_tensor_with_fused_swiglu(
+                const TensorBase *gate, const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f);
 
         private:
             // =========================================================================
@@ -465,8 +518,7 @@ namespace llaminar2
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;
 
-            // PIMPL for CUTLASS implementation (avoids CUTLASS in header)
-            struct Impl;
+            // PIMPL for CUTLASS implementation (definition in .cpp)
             std::unique_ptr<Impl> impl_;
 
             // Friend class for WeightPreloader (deprecated, will be removed)

@@ -478,6 +478,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Fused SwiGLU activation + GEMM: output = (silu(gate) * up) @ B
+         *
+         * Eliminates the separate SwiGLU kernel and intermediate FP32 write/read by
+         * fusing the activation function with the subsequent quantization and GEMM.
+         * On GPU: silu(gate)*up is computed and quantized in a single kernel launch.
+         *
+         * @return true if fused path executed, false to fall back to separate SwiGLU + GEMM
+         */
+        virtual bool multiply_tensor_with_fused_swiglu(
+            const TensorBase *gate,
+            const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha = 1.0f, float beta = 0.0f)
+        {
+            (void)gate; (void)up; (void)output;
+            (void)m; (void)n; (void)k;
+            (void)alpha; (void)beta;
+            return false; // Default: not supported, fall back to separate path
+        }
+
+        /**
          * @brief Descriptor for fused multi-projection GEMM
          *
          * Used by multiply_fused() to specify multiple output projections

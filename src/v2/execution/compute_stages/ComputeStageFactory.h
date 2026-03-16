@@ -30,6 +30,7 @@
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/MoEStages.h"
 #include "stages/QKNormStage.h"
+#include "stages/FusedResidualNormStage.h"
 
 namespace llaminar2
 {
@@ -112,6 +113,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createResidualAdd(
             const ResidualAddStage::Params &params);
+
+        /**
+         * @brief Create a fused residual add + RMSNorm stage (GPU optimization)
+         */
+        static std::unique_ptr<IComputeStage> createFusedResidualNorm(
+            const FusedResidualNormStage::Params &params);
 
         // =====================================================================
         // Attention Stages

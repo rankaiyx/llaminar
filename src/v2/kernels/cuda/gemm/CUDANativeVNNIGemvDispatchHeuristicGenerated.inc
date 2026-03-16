@@ -972,6 +972,67 @@ inline bool selectKnownShapeGenerated(int N, int K, NativeGemvShape &out_shape, 
         };
         return findGeneratedKnownShape(kTable, packed_key, out_shape, out_tuning);
     }
+        else if constexpr (CB == 18) { // Q8_0
+        static constexpr GeneratedKnownShapeEntry kTable[] = {
+            { 0x000000e000000380ULL, NativeGemvShape::KPAR, { 64, 1, 8, 4, 2, 1 } }, // 896x224
+            { 0x000001c000000380ULL, NativeGemvShape::KPAR, { 128, 2, 4, 2, 8, 2 } }, // 896x448
+            { 0x0000020000000800ULL, NativeGemvShape::KPAR, { 32, 1, 4, 2, 0, 1 } }, // 2048x512
+            { 0x00000380000000e0ULL, NativeGemvShape::KPAR, { 128, 2, 4, 2, 0, 2 } }, // 224x896
+            { 0x00000380000001c0ULL, NativeGemvShape::KPAR, { 64, 1, 8, 2, 0, 2 } }, // 448x896
+            { 0x0000038000000380ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 1 } }, // 896x896
+            { 0x00000380000004c0ULL, NativeGemvShape::KPAR, { 128, 1, 16, 2, 8, 0 } }, // 1216x896
+            { 0x0000038000000980ULL, NativeGemvShape::KPAR, { 128, 2, 4, 2, 0, 1 } }, // 2432x896
+            { 0x0000038000000e00ULL, NativeGemvShape::KPAR, { 128, 1, 16, 4, 4, 1 } }, // 3584x896
+            { 0x0000038000001300ULL, NativeGemvShape::KPAR, { 128, 1, 16, 4, 4, 0 } }, // 4864x896
+            { 0x0000038000009460ULL, NativeGemvShape::DIRECT, { 64, 1, 0, 0, 0, 0 } }, // 37984x896
+            { 0x00000380000128c0ULL, NativeGemvShape::WIDE, { 128, 1, 0, 0, 0, 0 } }, // 75968x896
+            { 0x0000038000025180ULL, NativeGemvShape::DIRECT, { 64, 1, 0, 0, 0, 0 } }, // 151936x896
+            { 0x0000040000000800ULL, NativeGemvShape::KPAR, { 256, 2, 4, 2, 0, 2 } }, // 2048x1024
+            { 0x000004c000000380ULL, NativeGemvShape::KPAR, { 128, 2, 8, 2, 0, 2 } }, // 896x1216
+            { 0x0000050000001400ULL, NativeGemvShape::KPAR, { 128, 1, 8, 4, 4, 0 } }, // 5120x1280
+            { 0x0000070000000e00ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 0 } }, // 3584x1792
+            { 0x0000080000000200ULL, NativeGemvShape::KPAR, { 128, 2, 4, 2, 0, 2 } }, // 512x2048
+            { 0x0000080000000400ULL, NativeGemvShape::KPAR, { 128, 1, 16, 2, 0, 2 } }, // 1024x2048
+            { 0x0000080000000800ULL, NativeGemvShape::KPAR, { 128, 1, 16, 2, 0, 2 } }, // 2048x2048
+            { 0x0000080000000ac0ULL, NativeGemvShape::KPAR, { 64, 1, 16, 2, 0, 2 } }, // 2752x2048
+            { 0x0000080000001580ULL, NativeGemvShape::KPAR, { 128, 1, 16, 2, 0, 0 } }, // 5504x2048
+            { 0x0000080000002b00ULL, NativeGemvShape::KPAR, { 128, 1, 8, 4, 0, 0 } }, // 11008x2048
+            { 0x0000080000009460ULL, NativeGemvShape::KPAR, { 64, 1, 16, 2, 0, 0 } }, // 37984x2048
+            { 0x00000800000128c0ULL, NativeGemvShape::DIRECT, { 128, 1, 0, 0, 0, 0 } }, // 75968x2048
+            { 0x0000080000025180ULL, NativeGemvShape::WIDE, { 256, 2, 0, 0, 0, 0 } }, // 151936x2048
+            { 0x0000098000000380ULL, NativeGemvShape::KPAR, { 128, 1, 16, 2, 0, 2 } }, // 896x2432
+            { 0x00000a0000001400ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 0 } }, // 5120x2560
+            { 0x00000ac000000800ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 2 } }, // 2048x2752
+            { 0x00000d8000001400ULL, NativeGemvShape::KPAR, { 128, 1, 16, 2, 0, 2 } }, // 5120x3456
+            { 0x00000e0000000380ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 2 } }, // 896x3584
+            { 0x00000e0000000700ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 0 } }, // 1792x3584
+            { 0x00000e0000000e00ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 0 } }, // 3584x3584
+            { 0x00000e0000001280ULL, NativeGemvShape::KPAR, { 128, 1, 8, 4, 0, 0 } }, // 4736x3584
+            { 0x00000e0000002500ULL, NativeGemvShape::KPAR, { 128, 1, 8, 4, 0, 0 } }, // 9472x3584
+            { 0x00000e0000004a00ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 0 } }, // 18944x3584
+            { 0x00000e0000009480ULL, NativeGemvShape::KPAR, { 64, 1, 4, 2, 0, 0 } }, // 38016x3584
+            { 0x00000e0000012900ULL, NativeGemvShape::DIRECT, { 64, 1, 0, 0, 0, 0 } }, // 76032x3584
+            { 0x00000e0000025200ULL, NativeGemvShape::WIDE, { 128, 2, 0, 0, 0, 0 } }, // 152064x3584
+            { 0x0000128000000e00ULL, NativeGemvShape::KPAR, { 128, 2, 8, 2, 0, 0 } }, // 3584x4736
+            { 0x0000130000000380ULL, NativeGemvShape::KPAR, { 32, 1, 16, 2, 0, 2 } }, // 896x4864
+            { 0x0000140000000500ULL, NativeGemvShape::KPAR, { 128, 1, 4, 2, 0, 2 } }, // 1280x5120
+            { 0x0000140000000a00ULL, NativeGemvShape::KPAR, { 128, 1, 8, 4, 0, 0 } }, // 2560x5120
+            { 0x0000140000000d80ULL, NativeGemvShape::KPAR, { 128, 1, 8, 4, 0, 0 } }, // 3456x5120
+            { 0x0000140000001400ULL, NativeGemvShape::KPAR, { 64, 1, 16, 8, 0, 2 } }, // 5120x5120
+            { 0x0000140000001b00ULL, NativeGemvShape::KPAR, { 128, 1, 4, 4, 0, 2 } }, // 6912x5120
+            { 0x0000140000003600ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 0 } }, // 13824x5120
+            { 0x0000140000009480ULL, NativeGemvShape::KPAR, { 64, 1, 4, 8, 2, 0 } }, // 38016x5120
+            { 0x0000140000012900ULL, NativeGemvShape::WIDE, { 128, 1, 0, 0, 0, 0 } }, // 76032x5120
+            { 0x0000140000025200ULL, NativeGemvShape::WIDE, { 128, 2, 0, 0, 0, 0 } }, // 152064x5120
+            { 0x0000158000000800ULL, NativeGemvShape::KPAR, { 128, 1, 8, 4, 0, 0 } }, // 2048x5504
+            { 0x00001b0000001400ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 2 } }, // 5120x6912
+            { 0x0000250000000e00ULL, NativeGemvShape::KPAR, { 128, 2, 16, 8, 0, 0 } }, // 3584x9472
+            { 0x00002b0000000800ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 2 } }, // 2048x11008
+            { 0x0000360000001400ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 2 } }, // 5120x13824
+            { 0x00004a0000000e00ULL, NativeGemvShape::KPAR, { 128, 2, 16, 2, 0, 2 } }, // 3584x18944
+        };
+        return findGeneratedKnownShape(kTable, packed_key, out_shape, out_tuning);
+    }
     return false;
 }
 
@@ -1233,6 +1294,23 @@ inline NativeGemvShape classifyShapeGeneratedFallback(int N, int K)
         }
                 else if (true) {
             return NativeGemvShape::KPAR; // 19/19
+        }
+        return NativeGemvShape::KPAR;
+    }
+        else if constexpr (CB == 18) { // Q8_0
+                if (aspect_ratio >= 16.0f) {
+            if (work_items <= 34033664LL) return NativeGemvShape::DIRECT;
+            else if (work_items <= 272498688LL) return NativeGemvShape::DIRECT;
+            return NativeGemvShape::WIDE;
+        }
+                else if (aspect_ratio >= 2.0f) {
+            return NativeGemvShape::KPAR;
+        }
+                else if (aspect_ratio >= 0.75f) {
+            return NativeGemvShape::KPAR;
+        }
+                else if (true) {
+            return NativeGemvShape::KPAR;
         }
         return NativeGemvShape::KPAR;
     }
@@ -1770,6 +1848,47 @@ inline GeneratedDispatchTuning selectGeneratedTuningFallback(NativeGemvShape sha
             }
             break;
         case NativeGemvShape::DIRECT:
+            break;
+        }
+    }
+        else if constexpr (CB == 18) { // Q8_0
+        switch (shape)
+        {
+        case NativeGemvShape::WIDE:
+                        if (aspect_ratio >= 16.0f) {
+                if (work_items <= 68067328LL) return { 128, 1, 0, 0, 0, 0 };
+                else if (work_items <= 311164928LL) return { 256, 2, 0, 0, 0, 0 };
+                return { 128, 2, 0, 0, 0, 0 };
+            }
+                        else if (aspect_ratio >= 2.0f) {
+                return { 128, 1, 0, 0, 0, 0 };
+            }
+            break;
+        case NativeGemvShape::KPAR:
+                        if (aspect_ratio >= 16.0f) {
+                return { 64, 1, 16, 2, 0, 0 };
+            }
+                        else if (aspect_ratio >= 2.0f) {
+                if (work_items <= 2097152LL) return { 256, 2, 4, 2, 0, 2 };
+                return { 128, 1, 8, 2, 0, 0 };
+            }
+                        else if (aspect_ratio >= 0.75f) {
+                if (work_items <= 802816LL) return { 128, 1, 8, 2, 0, 1 };
+                else if (work_items <= 1089536LL) return { 128, 1, 16, 2, 8, 0 };
+                return { 128, 1, 16, 2, 0, 2 };
+            }
+                        else if (true) {
+                if (work_items <= 1089536LL) return { 128, 2, 4, 2, 0, 2 };
+                else if (work_items <= 4358144LL) return { 128, 1, 16, 2, 0, 2 };
+                return { 128, 1, 8, 2, 0, 2 };
+            }
+            break;
+        case NativeGemvShape::DIRECT:
+                        if (aspect_ratio >= 16.0f) {
+                if (work_items <= 136134656LL) return { 64, 1, 0, 0, 0, 0 };
+                else if (work_items <= 155582464LL) return { 128, 1, 0, 0, 0, 0 };
+                return { 64, 1, 0, 0, 0, 0 };
+            }
             break;
         }
     }

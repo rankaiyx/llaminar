@@ -214,6 +214,27 @@ namespace llaminar2
                                                 << " for weight ITensor*=" << static_cast<const void *>(params_.B)
                                                 << " TensorBase*=" << static_cast<const void *>(B_base));
 
+        // GPU fused SwiGLU path: silu(gate)*up quantized in one kernel, then GEMM.
+        // This avoids the separate SwiGLU write + quant read (saves ~4.6ms/iter).
+        // Try BEFORE qgemm cast since CUDA kernels don't inherit from QuantisedGemmKernel.
+        if (params_.gate_input)
+        {
+            auto *gate_base = requireTensorBase(params_.gate_input, "gate input");
+            auto *A_base_up = requireTensorBase(params_.A, "input A (up)");
+            auto *C_base = asTensorBase(params_.C, "output C");
+
+            if (gemm->multiply_tensor_with_fused_swiglu(
+                    gate_base, A_base_up, C_base,
+                    params_.m, effective_n, params_.k,
+                    params_.alpha, params_.beta))
+            {
+                LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
+                traceOutput("C", params_.C);
+                return true;
+            }
+            // Fall through to CPU path below
+        }
+
         // Cast to QuantisedGemmKernel for full API access
         auto *qgemm = dynamic_cast<gemm_v4::QuantisedGemmKernel *>(gemm);
 
@@ -232,6 +253,7 @@ namespace llaminar2
             }
 
             // Check if we have a gate input for SwiGLU fusion
+            // (GPU fused path already tried above - this is the CPU fallback)
             const float *gate_fp32 = params_.gate_input ? params_.gate_input->fp32_data() : nullptr;
 
             // If no SwiGLU fusion, use multiply_tensor for type-aware dispatch.

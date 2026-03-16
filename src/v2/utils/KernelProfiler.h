@@ -391,6 +391,12 @@ namespace llaminar2
                                   return a_total > b_total;
                               });
 
+                    constexpr size_t MAX_DISPLAY_STAGES = 15;
+                    size_t displayed = 0;
+                    size_t skipped = 0;
+                    uint64_t skipped_h2d_count = 0, skipped_h2d_bytes = 0;
+                    uint64_t skipped_d2h_count = 0, skipped_d2h_bytes = 0;
+
                     for (const auto &[name, stats] : sorted_stages)
                     {
                         uint64_t sh2d_count = stats->h2d.transfer_count.load();
@@ -401,6 +407,16 @@ namespace llaminar2
                         // Skip stages with no transfers
                         if (sh2d_count == 0 && sd2h_count == 0)
                             continue;
+
+                        if (displayed >= MAX_DISPLAY_STAGES)
+                        {
+                            skipped++;
+                            skipped_h2d_count += sh2d_count;
+                            skipped_h2d_bytes += sh2d_bytes;
+                            skipped_d2h_count += sd2h_count;
+                            skipped_d2h_bytes += sd2h_bytes;
+                            continue;
+                        }
 
                         // Truncate stage name if too long
                         std::string display_name = name;
@@ -414,6 +430,18 @@ namespace llaminar2
                                     << formatBytes(sh2d_bytes)
                                     << sd2h_count
                                     << formatBytes(sd2h_bytes)
+                                    << fort::endr;
+                        displayed++;
+                    }
+
+                    if (skipped > 0)
+                    {
+                        std::string label = "... and " + std::to_string(skipped) + " more stages";
+                        stage_table << label
+                                    << skipped_h2d_count
+                                    << formatBytes(skipped_h2d_bytes)
+                                    << skipped_d2h_count
+                                    << formatBytes(skipped_d2h_bytes)
                                     << fort::endr;
                     }
 
@@ -794,6 +822,13 @@ namespace llaminar2
                     has_prefill = true;
                 if (inst.decode_stats_[i].call_count.load(std::memory_order_relaxed) > 0)
                     has_decode = true;
+            }
+
+            // Skip entirely when no CPU kernels were recorded (all work on GPU)
+            if (!has_prefill && !has_decode)
+            {
+                // Still append transfer summary (transfers happen regardless of CPU kernels)
+                return TransferProfiler::getSummary();
             }
 
             std::ostringstream oss;

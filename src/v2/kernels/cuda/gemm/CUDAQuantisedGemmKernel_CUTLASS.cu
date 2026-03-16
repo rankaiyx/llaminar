@@ -187,7 +187,7 @@ namespace
 
             // Warp-level max_abs reduction via shuffle
             float abs_val = fabsf(val);
-            #pragma unroll
+#pragma unroll
             for (int mask = 16; mask > 0; mask >>= 1)
             {
                 abs_val = fmaxf(abs_val, __shfl_xor_sync(0xFFFFFFFF, abs_val, mask));
@@ -916,6 +916,54 @@ extern "C"
         {
             CUDA_CHECK(cudaDeviceSynchronize());
         }
+        return true;
+    }
+
+    // ── Concurrent prefill stream/event helpers ─────────────────────────────
+
+    bool cudaQuantGemm_createStream(void **out_stream, int cuda_device_id)
+    {
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        cudaStream_t s;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+        *out_stream = static_cast<void *>(s);
+        return true;
+    }
+
+    void cudaQuantGemm_destroyStream(void *stream)
+    {
+        if (stream)
+            cudaStreamDestroy(static_cast<cudaStream_t>(stream));
+    }
+
+    bool cudaQuantGemm_createEvent(void **out_event, int cuda_device_id)
+    {
+        CUDA_CHECK(cudaSetDevice(cuda_device_id));
+        cudaEvent_t e;
+        CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        *out_event = static_cast<void *>(e);
+        return true;
+    }
+
+    void cudaQuantGemm_destroyEvent(void *event)
+    {
+        if (event)
+            cudaEventDestroy(static_cast<cudaEvent_t>(event));
+    }
+
+    bool cudaQuantGemm_recordEvent(void *event, void *stream)
+    {
+        CUDA_CHECK(cudaEventRecord(
+            static_cast<cudaEvent_t>(event),
+            static_cast<cudaStream_t>(stream)));
+        return true;
+    }
+
+    bool cudaQuantGemm_streamWaitEvent(void *stream, void *event)
+    {
+        CUDA_CHECK(cudaStreamWaitEvent(
+            static_cast<cudaStream_t>(stream),
+            static_cast<cudaEvent_t>(event), 0));
         return true;
     }
 

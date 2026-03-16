@@ -90,6 +90,12 @@ namespace llaminar2
         return std::make_unique<ResidualAddStage>(params);
     }
 
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createFusedResidualNorm(
+        const FusedResidualNormStage::Params &params)
+    {
+        return std::make_unique<FusedResidualNormStage>(params);
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoERouter(
         const MoERouterStage::Params &params)
     {

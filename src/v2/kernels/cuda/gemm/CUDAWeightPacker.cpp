@@ -120,7 +120,7 @@ namespace llaminar2::cuda
             if ((K % 32) != 0)
             {
                 LOG_ERROR("[packNativeVNNICUDA] K=" << K << " not divisible by 32 for "
-                                                       << tensorTypeName(tensor->native_type()));
+                                                    << tensorTypeName(tensor->native_type()));
                 return false;
             }
 
@@ -211,6 +211,15 @@ namespace llaminar2::cuda
             return CUDAPackedWeightFamily::NativeVNNI;
         }
 
+        // Q8_0 has per-block-of-32 FP16 scales (codebook 18) that the CUDA
+        // native-VNNI GEMV and prefill kernels already support.  Routing Q8_0
+        // through NativeVNNI preserves these per-block scales, avoiding the
+        // precision loss of Int8Expanded's single per-row scale.
+        if (type == TensorType::Q8_0)
+        {
+            return CUDAPackedWeightFamily::NativeVNNI;
+        }
+
         return CUDAPackedWeightFamily::Int8Expanded;
     }
 
@@ -277,12 +286,12 @@ namespace llaminar2::cuda
         }
 
         LOG_DEBUG("[packWeightsToCUDA] Packed " << N << "x" << K
-                             << " weights with active_family=" << cudaPackedWeightFamilyName(out.active_family)
-                             << " preferred_family=" << cudaPackedWeightFamilyName(out.preferred_family)
-                             << " source_type=" << tensorTypeName(tensor->native_type())
-                             << " native_vnni_bytes=" << out.native_vnni.size()
-                             << " int8_fallback_bytes=" << out.int8_data.size()
-                             << ")");
+                                                << " weights with active_family=" << cudaPackedWeightFamilyName(out.active_family)
+                                                << " preferred_family=" << cudaPackedWeightFamilyName(out.preferred_family)
+                                                << " source_type=" << tensorTypeName(tensor->native_type())
+                                                << " native_vnni_bytes=" << out.native_vnni.size()
+                                                << " int8_fallback_bytes=" << out.int8_data.size()
+                                                << ")");
         LOG_DEBUG("[packWeightsToCUDA] First 4 host scales: "
                   << out.scales[0] << "," << (N > 1 ? out.scales[1] : 0.f) << ","
                   << (N > 2 ? out.scales[2] : 0.f) << "," << (N > 3 ? out.scales[3] : 0.f));

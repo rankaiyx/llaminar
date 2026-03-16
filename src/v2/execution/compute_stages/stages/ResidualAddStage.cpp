@@ -595,6 +595,10 @@ namespace llaminar2
         case ComputeBackendType::GPU_CUDA:
             return true;
 #endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
         default:
             return false;
         }

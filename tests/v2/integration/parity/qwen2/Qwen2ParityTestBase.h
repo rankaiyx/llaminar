@@ -811,6 +811,7 @@ namespace llaminar2::test::parity::qwen2
             config_.min_top1_accuracy = thresholds.min_top1_accuracy;
             config_.min_top5_accuracy = thresholds.min_top5_accuracy;
             config_.min_decode_pass_rate = thresholds.min_decode_pass_rate;
+            config_.pytorch_top1_in_topk = thresholds.pytorch_top1_in_topk;
 
             // Apply model path/snapshot dir overrides from TestConfig if available
             applyModelOverrides();

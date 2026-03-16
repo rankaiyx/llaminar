@@ -348,8 +348,12 @@ namespace llaminar2
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 
-        // Re-enable GPU stage timeline for benchmark iterations
-        runner_->setSuppressTimeline(false);
+        // Keep GPU stage timeline suppressed during benchmark — per-iteration
+        // tables are too verbose (one 30-line table per decode token).  The
+        // CUDA / ROCm kernel profiling summaries already aggregate the same
+        // information and are printed once at the end.  Users who need
+        // per-step detail can use LLAMINAR_GPU_STAGE_TIMING_DETAIL=1 outside
+        // of benchmark mode.
 
         // ========================================================================
         // Benchmark Iterations - Run multiple times and average

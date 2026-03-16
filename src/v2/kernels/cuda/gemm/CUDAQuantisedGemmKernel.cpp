@@ -33,6 +33,7 @@
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "utils/Logger.h"
 #include "utils/CUDAKernelProfiler.h"
+#include "utils/DebugEnv.h"
 
 #include <cuda_runtime.h>
 
@@ -138,6 +139,24 @@ namespace llaminar2
 
             // Free device memory
             void cudaQuantGemm_freeDevice(void *d_ptr);
+
+            // Fused SwiGLU + blockwise quantization (from CUDAFusedOpsKernels.cu)
+            bool cudaOps_fused_swiglu_quantize_blockwise(
+                const float *gate,
+                const float *up,
+                int8_t *A_int8,
+                float *scales_A_blockwise,
+                int M, int K,
+                int device_idx,
+                void *stream);
+
+            // Concurrent prefill stream/event helpers (from CUDAQuantisedGemmKernel_CUTLASS.cu)
+            bool cudaQuantGemm_createStream(void **out_stream, int cuda_device_id);
+            void cudaQuantGemm_destroyStream(void *stream);
+            bool cudaQuantGemm_createEvent(void **out_event, int cuda_device_id);
+            void cudaQuantGemm_destroyEvent(void *event);
+            bool cudaQuantGemm_recordEvent(void *event, void *stream);
+            bool cudaQuantGemm_streamWaitEvent(void *stream, void *event);
 
             // Upload raw bytes from host to device (nvcc-compiled for CUDA runtime consistency)
             bool cudaQuantGemm_uploadRawBytes(const void *h_src, void **d_dst, size_t bytes, int cuda_device_id);
@@ -455,9 +474,21 @@ namespace llaminar2
             {
                 switch (cb)
                 {
-                case 0: case 4: case 5: case 6: case 7:
-                case 8: case 9: case 10: case 11: case 12:
-                case 13: case 14: case 15: case 16: case 17:
+                case 0:
+                case 4:
+                case 5:
+                case 6:
+                case 7:
+                case 8:
+                case 9:
+                case 10:
+                case 11:
+                case 12:
+                case 13:
+                case 14:
+                case 15:
+                case 16:
+                case 17:
                 case 18:
                     return true;
                 default:
@@ -889,11 +920,12 @@ namespace llaminar2
                         (packed_->K % 32) == 0 &&
                         cudaNativeVNNIGemvTuned_supportsCodebook(packed_->native_codebook_id) &&
                         nativeVNNIPrefillSupportsCodebook(packed_->native_codebook_id) &&
-                        [&]() {
-                            cudaDeviceProp prop;
-                            return cudaGetDeviceProperties(&prop, cuda_device_id_) == cudaSuccess &&
-                                   prop.major >= 8; // Ampere+ required for NativeVNNI prefill
-                        }();
+                        [&]()
+                    {
+                        cudaDeviceProp prop;
+                        return cudaGetDeviceProperties(&prop, cuda_device_id_) == cudaSuccess &&
+                               prop.major >= 8; // Ampere+ required for NativeVNNI prefill
+                    }();
 
                     if (vnni_only)
                     {
@@ -1538,6 +1570,65 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // Concurrent prefill stream pool (ROCm-style multi-stream dispatch)
+        // =====================================================================
+
+        struct CUDAConcurrentPrefillPool
+        {
+            static constexpr int MAX_STREAMS = 8;
+
+            void *streams[MAX_STREAMS] = {};
+            void *completion[MAX_STREAMS] = {};
+            void *quant_ready = nullptr;
+            int count = 0;
+            int device_id = -1;
+            bool initialized = false;
+
+            void init(int dev_id, int num_streams)
+            {
+                if (initialized)
+                    return;
+                device_id = dev_id;
+                count = std::min(num_streams, MAX_STREAMS);
+                for (int i = 0; i < count; ++i)
+                {
+                    cudaQuantGemm_createStream(&streams[i], dev_id);
+                    cudaQuantGemm_createEvent(&completion[i], dev_id);
+                }
+                cudaQuantGemm_createEvent(&quant_ready, dev_id);
+                initialized = true;
+                LOG_INFO("[CUDAConcurrentPrefillPool] Initialized " << count
+                                                                    << " streams on device " << dev_id);
+            }
+
+            void destroy()
+            {
+                if (!initialized)
+                    return;
+                for (int i = 0; i < count; ++i)
+                {
+                    cudaQuantGemm_destroyStream(streams[i]);
+                    streams[i] = nullptr;
+                    cudaQuantGemm_destroyEvent(completion[i]);
+                    completion[i] = nullptr;
+                }
+                cudaQuantGemm_destroyEvent(quant_ready);
+                quant_ready = nullptr;
+                initialized = false;
+                count = 0;
+            }
+
+            ~CUDAConcurrentPrefillPool() { destroy(); }
+        };
+
+        static CUDAConcurrentPrefillPool &getConcurrentPrefillPool(int device_id)
+        {
+            static CUDAConcurrentPrefillPool pools[8];
+            int idx = std::clamp(device_id, 0, 7);
+            return pools[idx];
+        }
+
+        // =====================================================================
         // ITensorGemm interface - multiply_fused_tensor() for TensorBase API
         // =====================================================================
 
@@ -1649,7 +1740,133 @@ namespace llaminar2
                 }
             }
 
-            // Step 4: Execute each projection using the SHARED quantized activations
+            // Step 4: Try concurrent multi-stream dispatch for prefill
+            const bool concurrent_eligible = use_blockwise && m > 1 &&
+                                             projections.size() >= 2 &&
+                                             debugEnv().gemm.cuda_concurrent_prefill;
+
+            if (concurrent_eligible)
+            {
+                const int num_proj = static_cast<int>(projections.size());
+                auto &pool = getConcurrentPrefillPool(cuda_device_id_);
+                pool.init(cuda_device_id_, num_proj);
+
+                // Record event after quantization completes on main stream
+                cudaQuantGemm_recordEvent(pool.quant_ready, gpu_stream_);
+
+                bool concurrent_ok = true;
+                for (int pi = 0; pi < num_proj && concurrent_ok; ++pi)
+                {
+                    const auto &proj = projections[pi];
+                    auto *cuda_kernel = dynamic_cast<CUDAQuantisedGemmKernel *>(proj.kernel);
+                    if (!cuda_kernel || !proj.output)
+                    {
+                        concurrent_ok = false;
+                        break;
+                    }
+
+                    const int n = proj.n;
+                    cuda_kernel->ensureWeightsConverted();
+                    cuda_kernel->validateWorkspace();
+                    int32_t *proj_d_C_int32 = static_cast<int32_t *>(
+                        cuda_kernel->workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
+
+                    auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
+                    if (!fp32_output)
+                    {
+                        concurrent_ok = false;
+                        break;
+                    }
+                    float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                    if (!d_output)
+                    {
+                        concurrent_ok = false;
+                        break;
+                    }
+
+                    const float *d_bias = nullptr;
+                    if (proj.bias)
+                    {
+                        const TensorBase *bias_tensor = proj.bias;
+                        if (auto *slice = dynamic_cast<const TensorSlice *>(proj.bias))
+                            bias_tensor = slice->inner();
+
+                        auto *fp32_bias = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(bias_tensor));
+                        if (fp32_bias)
+                        {
+                            auto current_dev = fp32_bias->current_device();
+                            if (current_dev.has_value() && current_dev.value() == target_device)
+                                d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                            else if (!current_dev.has_value() || !current_dev->is_gpu())
+                            {
+                                fp32_bias->ensureOnDevice(target_device);
+                                d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                            }
+                        }
+                    }
+
+                    int stream_idx = pi % pool.count;
+
+                    // This stream waits for quantization to complete
+                    cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.quant_ready);
+
+                    // If reusing a stream, wait for its previous work
+                    if (pi >= pool.count)
+                        cudaQuantGemm_streamWaitEvent(pool.streams[stream_idx], pool.completion[stream_idx]);
+
+                    LOG_DEBUG("[ConcurrentPrefill] Projection " << pi
+                                                                << " (" << (proj.name ? proj.name : "?")
+                                                                << ") M=" << m << " N=" << n << " K=" << k
+                                                                << " on stream " << stream_idx);
+
+                    bool proj_ok = runNativeVNNIBlockwiseIfSupported(
+                        cuda_kernel->impl_.get(),
+                        d_A_int8, proj_d_C_int32, d_output, d_scales_A_blockwise,
+                        m, n, k, 1.0f, 0.0f, nullptr, d_bias,
+                        cuda_device_id_, pool.streams[stream_idx]);
+
+                    if (!proj_ok)
+                    {
+                        proj_ok = runSelectedBlockwiseBackend(
+                            d_A_int8,
+                            cuda_kernel->impl_->d_weights_int8,
+                            cuda_kernel->impl_->d_weights_int8_tc_blocked,
+                            proj_d_C_int32, d_output,
+                            d_scales_A_blockwise,
+                            cuda_kernel->impl_->d_scales_B,
+                            m, n, k, 1.0f, 0.0f, nullptr, d_bias,
+                            cuda_device_id_, pool.streams[stream_idx]);
+                    }
+
+                    if (!proj_ok)
+                    {
+                        LOG_WARN("[ConcurrentPrefill] Projection " << pi << " failed; falling back to sequential");
+                        concurrent_ok = false;
+                        break;
+                    }
+
+                    cudaQuantGemm_recordEvent(pool.completion[stream_idx], pool.streams[stream_idx]);
+                }
+
+                if (concurrent_ok)
+                {
+                    for (int si = 0; si < std::min(num_proj, pool.count); ++si)
+                    {
+                        cudaQuantGemm_streamWaitEvent(gpu_stream_, pool.completion[si]);
+                    }
+                    LOG_DEBUG("[ConcurrentPrefill] All " << num_proj << " projections dispatched concurrently");
+                    return true;
+                }
+
+                // Concurrent path failed — sync all streams and fall through to sequential
+                for (int si = 0; si < pool.count; ++si)
+                {
+                    cudaQuantGemm_streamSync(cuda_device_id_, pool.streams[si]);
+                }
+                LOG_WARN("[ConcurrentPrefill] Falling back to sequential dispatch");
+            }
+
+            // Step 5: Execute each projection using the SHARED quantized activations (sequential fallback)
             bool all_success = true;
             for (size_t i = 0; i < projections.size() && all_success; ++i)
             {
@@ -1904,6 +2121,108 @@ namespace llaminar2
             // TODO: Implement Q8_1→Q8_1 fused requant path
             LOG_ERROR("[CUDAQuantisedGemmKernel] Q8_1→Q8_1 path not yet implemented");
             return false;
+        }
+
+        bool CUDAQuantisedGemmKernel::multiply_with_fused_swiglu(
+            const float *d_gate, const float *d_up,
+            float *d_C,
+            int m, int n, int k,
+            float alpha, float beta)
+        {
+            LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] m=" << m << " n=" << n << " k=" << k);
+
+            validateWorkspace();
+
+            int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+
+            ensureWeightsConverted();
+
+            const bool use_blockwise =
+                !g_force_cutlass_fallback &&
+                (k % 32 == 0) &&
+                (m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));
+
+            if (use_blockwise)
+            {
+                float *d_scales_A_blockwise = static_cast<float *>(
+                    workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+
+                // Fused SwiGLU + blockwise quantization: replaces separate SwiGLU + quant kernels
+                if (!cudaOps_fused_swiglu_quantize_blockwise(
+                        d_gate, d_up, d_A_int8, d_scales_A_blockwise,
+                        m, k, cuda_device_id_, gpu_stream_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU+quantize failed");
+                    return false;
+                }
+
+                const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+
+                // Try native VNNI blockwise path (GEMV for decode)
+                if (runNativeVNNIBlockwiseIfSupported(
+                        impl_.get(),
+                        d_A_int8, nullptr, d_C, d_scales_A_blockwise,
+                        m, n, k, alpha, beta, d_C_existing, nullptr,
+                        cuda_device_id_, gpu_stream_))
+                {
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (native GEMV)");
+                    return true;
+                }
+
+                // Blockwise GEMM
+                int32_t *d_C_int32 = static_cast<int32_t *>(
+                    workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
+                {
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
+                    if (!runSelectedBlockwiseBackend(
+                            d_A_int8,
+                            impl_->d_weights_int8,
+                            impl_->d_weights_int8_tc_blocked,
+                            d_C_int32, d_C,
+                            d_scales_A_blockwise,
+                            impl_->d_scales_B,
+                            m, n, k, alpha, beta, d_C_existing, nullptr,
+                            cuda_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU GEMM failed");
+                        return false;
+                    }
+                }
+
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (blockwise)");
+                return true;
+            }
+
+            // Fallback: row-wise path (K not divisible by 32).
+            // Compute SwiGLU into a temp buffer, then use standard quantize + GEMM.
+            // This is rare (Qwen K=18944 is divisible by 32).
+            LOG_WARN("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] "
+                     "Falling back to non-fused path (K="
+                     << k << " not divisible by 32)");
+            return false;
+        }
+
+        bool CUDAQuantisedGemmKernel::multiply_tensor_with_fused_swiglu(
+            const TensorBase *gate, const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha, float beta)
+        {
+            // Get device pointers (tensors must already be on GPU via DeviceGraphExecutor coherence)
+            const float *d_gate = static_cast<const float *>(gate->gpu_data_ptr());
+            const float *d_up = static_cast<const float *>(up->gpu_data_ptr());
+            float *d_C = static_cast<float *>(output->gpu_data_ptr());
+
+            if (!d_gate || !d_up || !d_C)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                          "Null GPU pointer: gate="
+                          << (void *)d_gate
+                          << " up=" << (void *)d_up << " C=" << (void *)d_C);
+                return false;
+            }
+
+            return multiply_with_fused_swiglu(d_gate, d_up, d_C, m, n, k, alpha, beta);
         }
 
         bool CUDAQuantisedGemmKernel::multiply_fp32_to_fp32(

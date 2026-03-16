@@ -615,13 +615,13 @@ namespace llaminar2
             // Device memory for converted weights (only used when owns_weight_memory_ = true)
             // Option B: Only VNNI layout is persistent on device. Row-major is repacked
             // on-demand from VNNI into d_B_rowmajor_scratch (workspace buffer).
-            int8_t *d_weights_int8_vnni = nullptr;       // [K/4 x N x 4] VNNI layout (sole device copy)
-            int8_t *d_weights_int8_rowmajor = nullptr;   // [N x K] optional persistent CK row-major buffer (startup repack)
-            float *d_scales_B = nullptr;                 // [N] per-column scales
-            uint8_t *d_weights_native_vnni = nullptr; // [blocks_per_row × N × payload_bytes]
-            void *d_weights_native_scales = nullptr;     // [blocks_per_row × N] __half*
-            void *d_weights_native_mins = nullptr;       // [blocks_per_row × N] __half* (asymmetric only, else NULL)
-            void *d_weights_native_emins = nullptr;      // [blocks_per_row × N] uint32_t* (Q2_K only, packed {lo,hi} FP16 emins)
+            int8_t *d_weights_int8_vnni = nullptr;     // [K/4 x N x 4] VNNI layout (sole device copy)
+            int8_t *d_weights_int8_rowmajor = nullptr; // [N x K] optional persistent CK row-major buffer (startup repack)
+            float *d_scales_B = nullptr;               // [N] per-column scales
+            uint8_t *d_weights_native_vnni = nullptr;  // [blocks_per_row × N × payload_bytes]
+            void *d_weights_native_scales = nullptr;   // [blocks_per_row × N] __half*
+            void *d_weights_native_mins = nullptr;     // [blocks_per_row × N] __half* (asymmetric only, else NULL)
+            void *d_weights_native_emins = nullptr;    // [blocks_per_row × N] uint32_t* (Q2_K only, packed {lo,hi} FP16 emins)
             uint8_t native_vnni_codebook_id = 0;
             uint32_t native_vnni_blocks_per_row = 0;
             bool has_native_vnni = false;
@@ -881,7 +881,7 @@ namespace llaminar2
                     hipEventCreateWithFlags(&quant_ready, hipEventDisableTiming);
                     initialized = true;
                     LOG_INFO("[ConcurrentPrefillPool] Initialized " << count
-                                                                     << " streams on device " << dev_id);
+                                                                    << " streams on device " << dev_id);
                 }
 
                 // Ensure scratch buffer i has at least `elements` int32s
@@ -943,7 +943,7 @@ namespace llaminar2
                     }
                     scatter_partial_capacity[idx] = elements;
                     LOG_DEBUG("[ConcurrentPool] Allocated scatter_partial[" << idx
-                                                                           << "] = " << (elements * 4 / 1024) << " KB");
+                                                                            << "] = " << (elements * 4 / 1024) << " KB");
                     return true;
                 }
 
@@ -4044,9 +4044,9 @@ namespace llaminar2
 
                         // Dispatch with stream + scratch overrides
                         LOG_DEBUG("[ConcurrentPrefill] Projection " << pi
-                                                                     << " (" << (proj.name ? proj.name : "?")
-                                                                     << ") M=" << m << " N=" << n << " K=" << k
-                                                                     << " on stream " << stream_idx);
+                                                                    << " (" << (proj.name ? proj.name : "?")
+                                                                    << ") M=" << m << " N=" << n << " K=" << k
+                                                                    << " on stream " << stream_idx);
 
                         bool proj_ok = rocm_kernel->tryPrefillNativeGemm(
                             impl_->d_A_int8,
@@ -4064,7 +4064,7 @@ namespace llaminar2
                         if (!proj_ok)
                         {
                             LOG_WARN("[ConcurrentPrefill] Projection " << pi
-                                                                        << " failed on concurrent path; falling back to sequential");
+                                                                       << " failed on concurrent path; falling back to sequential");
                             concurrent_ok = false;
                             break;
                         }
@@ -4085,7 +4085,7 @@ namespace llaminar2
                         }
 
                         LOG_DEBUG("[ConcurrentPrefill] All " << num_proj
-                                                              << " projections dispatched concurrently");
+                                                             << " projections dispatched concurrently");
 
                         // Restore workspace and return success
                         if (ws && ws != saved_workspace)
@@ -4263,7 +4263,7 @@ namespace llaminar2
                         if (!proj_ok)
                         {
                             LOG_WARN("[ConcurrentDecode] Projection " << pi
-                                                                       << " failed; falling back to sequential");
+                                                                      << " failed; falling back to sequential");
                             concurrent_ok = false;
                             break;
                         }
@@ -4293,7 +4293,7 @@ namespace llaminar2
                         }
 
                         LOG_DEBUG("[ConcurrentDecode] All " << num_proj
-                                                             << " projections dispatched concurrently");
+                                                            << " projections dispatched concurrently");
 
                         if (ws && ws != saved_workspace)
                             workspace_ = saved_workspace;
@@ -5842,6 +5842,141 @@ namespace llaminar2
         {
             // TODO: Implement in Phase 5
             return false;
+        }
+
+        // =====================================================================
+        // Fused SwiGLU + GEMM
+        // =====================================================================
+
+        extern "C"
+        {
+            bool hipOps_swiglu_fp32(
+                const float *gate, const float *up, float *output,
+                int size, int device_idx, void *stream);
+            bool hipOps_fused_swiglu_quantize_blockwise(
+                const float *gate, const float *up,
+                int8_t *A_int8, float *scales_A_blockwise,
+                int M, int K, int device_idx, void *stream);
+        }
+
+        bool ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu(
+            const TensorBase *gate,
+            const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha, float beta)
+        {
+            // Get GPU data pointers (tensors must already be on device via coherence)
+            const float *d_gate = static_cast<const float *>(gate->gpu_data_ptr());
+            const float *d_up = static_cast<const float *>(up->gpu_data_ptr());
+            float *d_C = static_cast<float *>(output->gpu_data_ptr());
+
+            if (!d_gate || !d_up || !d_C)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                          "Null GPU pointer: gate="
+                          << (void *)d_gate
+                          << " up=" << (void *)d_up << " C=" << (void *)d_C);
+                return false;
+            }
+
+            ensureWeightsConverted();
+            validateWorkspace();
+
+            if (!impl_)
+            {
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                          "No impl_ (workspace buffers not initialized)");
+                return false;
+            }
+
+            if (m > 1)
+            {
+                // M>1 PREFILL: Fused SwiGLU + blockwise quantize → INT8 GEMM
+                if (!impl_->d_A_int8 || !impl_->d_scales_A_blockwise)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                              "Missing workspace buffers for fused SwiGLU+quant (d_A_int8 or d_scales_A_blockwise)");
+                    return false;
+                }
+
+                // Step 1: Fused SwiGLU + blockwise quantize → d_A_int8 + d_scales_A_blockwise
+                if (!hipOps_fused_swiglu_quantize_blockwise(
+                        d_gate, d_up,
+                        impl_->d_A_int8, impl_->d_scales_A_blockwise,
+                        m, k, rocm_device_id_, gpu_stream_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                              "Fused SwiGLU+quantize kernel failed");
+                    return false;
+                }
+
+                // Step 2: Native-VNNI GEMM (same dispatch as multiply_tensor M>1)
+                if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
+                {
+                    const uint8_t cb_id = impl_->native_vnni_codebook_id;
+                    if (rocmGemm_native_vnni_fp32(
+                            impl_->d_A_int8,
+                            impl_->d_weights_native_vnni,
+                            impl_->d_weights_native_scales,
+                            impl_->d_weights_native_mins,
+                            impl_->d_weights_native_emins,
+                            d_C,
+                            impl_->d_scales_A,
+                            impl_->d_scales_A_blockwise,
+                            m, n, k,
+                            cb_id,
+                            rocm_device_id_, gpu_stream_))
+                    {
+                        return true;
+                    }
+                }
+
+                // Resolve d_scales_B (same logic as multiply_tensor)
+                float *d_scales_B = nullptr;
+                if (packed_)
+                    d_scales_B = packed_->d_scales;
+                else if (impl_)
+                    d_scales_B = impl_->d_scales_B;
+
+                // Fallback: tryPrefillNativeGemm (INT8 VNNI path)
+                if (tryPrefillNativeGemm(
+                        impl_->d_A_int8, d_C,
+                        impl_->d_scales_A, impl_->d_scales_A_blockwise,
+                        d_scales_B, nullptr,
+                        m, n, k, alpha, beta,
+                        "ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu"))
+                {
+                    return true;
+                }
+
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                          "No GEMM path available for M>1 (m="
+                          << m << " n=" << n << " k=" << k << ")");
+                return false;
+            }
+            else
+            {
+                // M=1 DECODE: SwiGLU → FP32 temp → standard FP32→FP32 GEMV path
+                if (!impl_->d_A_fp32)
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                              "No temp FP32 workspace buffer for M=1 decode path");
+                    return false;
+                }
+
+                // Step 1: Compute SwiGLU on GPU: temp = silu(gate) * up
+                if (!hipOps_swiglu_fp32(d_gate, d_up, impl_->d_A_fp32, m * k,
+                                        rocm_device_id_, gpu_stream_))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                              "SwiGLU kernel failed for decode");
+                    return false;
+                }
+
+                // Step 2: Quantize + GEMV via existing FP32→FP32 path
+                return multiply_fp32_to_fp32(impl_->d_A_fp32, d_C, m, n, k, alpha, beta);
+            }
         }
 
         bool ROCmQuantisedGemmKernel::multiply_fp32_to_fp32(

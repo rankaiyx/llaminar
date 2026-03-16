@@ -35,14 +35,15 @@
 
 // CUDA kernel classes
 #ifdef HAVE_CUDA
-#include "cuda/gemm/CUDAQuantisedGemmKernel.h"             // Quantized tensors via CUTLASS INT8
-#include "cuda/gemm/CUDAFloatingPointGemmKernel.h"         // FP32/FP16/BF16 via cuBLAS
+#include "cuda/gemm/CUDAQuantisedGemmKernel.h"        // Quantized tensors via CUTLASS INT8
+#include "cuda/gemm/CUDAFloatingPointGemmKernel.h"    // FP32/FP16/BF16 via cuBLAS
 #include "cuda/ops/CUDARMSNormKernelT.h"              // RMSNorm FP32/FP16/BF16
 #include "cuda/ops/CUDARoPEKernelT.h"                 // RoPE FP32/FP16/BF16
 #include "cuda/ops/CUDASwiGLUKernelT.h"               // SwiGLU FP32/FP16/BF16
 #include "cuda/ops/CUDAResidualAddKernelT.h"          // ResidualAdd FP32/FP16/BF16
 #include "cuda/ops/CUDAEmbeddingKernelT.h"            // Embedding FP32
 #include "cuda/attention/CUDAFlashAttentionKernelT.h" // Flash Attention
+
 #endif
 
 // ROCm kernel classes
@@ -4005,11 +4006,7 @@ namespace llaminar
                         return false;
                     }
 
-                    // Use fused multi-projection GEMM: quantize activations ONCE,
-                    // batch scatter+reduce kernels → eliminates redundant quantization
-                    // and reduces kernel launches from 6 to 3 per layer.
-                    // On CPU: default fallback calls individual multiply_tensor() per projection.
-                    // On ROCm: batched dispatch with shared activation quantization.
+                    // Standard per-projection path (shares activation quantization)
                     std::vector<llaminar2::ITensorGemm::TensorProjectionDesc> projections = {
                         {gemm_gate_, output_gate, n_gate, nullptr, nullptr, false, "gate"},
                         {gemm_up_, output_up, n_up, nullptr, nullptr, false, "up"}};

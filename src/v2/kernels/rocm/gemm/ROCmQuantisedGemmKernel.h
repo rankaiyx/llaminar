@@ -555,6 +555,18 @@ namespace llaminar2
                 const MPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
+            /**
+             * @brief Fused SwiGLU + GEMM: output = (silu(gate) * up) @ B
+             *
+             * Computes SwiGLU activation on GPU, then runs quantized GEMM.
+             */
+            bool multiply_tensor_with_fused_swiglu(
+                const TensorBase *gate,
+                const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f) override;
+
             // =========================================================================
             // ITensorKernel interface
             // =========================================================================

@@ -138,6 +138,7 @@ namespace llaminar2::test::parity
         float kl_threshold = 0.15f;      ///< Maximum KL divergence for logits
         float min_top1_accuracy = 60.0f; ///< Minimum Top-1 accuracy percentage
         float min_top5_accuracy = 80.0f; ///< Minimum Top-5 accuracy percentage
+        int pytorch_top1_in_topk = 3;    ///< PyTorch's top-1 must be in llaminar's top-K (0=disabled)
 
         // Decode thresholds (for incremental decode tests)
         float decode_cosine_threshold = 0.99f;
@@ -197,6 +198,7 @@ namespace llaminar2::test::parity
         float lm_head_kl = 0.0f;
         float lm_head_top1 = 0.0f;
         float lm_head_top5 = 0.0f;
+        bool lm_head_pytorch_top1_in_top3 = false; ///< PyTorch's top-1 is in llaminar's top-3
         bool lm_head_passed = false;
 
         // Overall
@@ -219,6 +221,7 @@ namespace llaminar2::test::parity
         int pytorch_token = -1;
         bool token_match = false;
         bool top5_match = false; ///< True if PyTorch top-1 appears in Llaminar top-5
+        bool top3_match = false; ///< True if PyTorch top-1 appears in Llaminar top-3
         bool passed = false;
     };
 
@@ -231,10 +234,12 @@ namespace llaminar2::test::parity
         int steps_passed = 0;
         int steps_total = 0;
         int top1_matches = 0;
+        int top3_matches = 0;
         int top5_matches = 0;
         float avg_cosine = 0.0f;
         float avg_kl = 0.0f;
         float top1_accuracy = 0.0f;
+        float top3_accuracy = 0.0f;
         float top5_accuracy = 0.0f;
         bool overall_passed = false;
     };
@@ -314,6 +319,7 @@ namespace llaminar2::test::parity
         float lm_head_kl = 0.0f;
         float lm_head_top1 = 0.0f;
         float lm_head_top5 = 0.0f;
+        bool lm_head_pytorch_top1_in_top3 = false;
         bool lm_head_passed = false;
 
         // Overall
@@ -513,6 +519,7 @@ namespace llaminar2::test::parity
         float min_top1_accuracy = 80.0f;               ///< Min Top-1 accuracy %
         float min_top5_accuracy = 80.0f;               ///< Min Top-5 accuracy %
         float min_decode_pass_rate = 0.8f;             ///< Min fraction of decode steps passing
+        int pytorch_top1_in_topk = 3;                  ///< PyTorch's top-1 must be in llaminar's top-K (0=disabled)
     };
 
     // =============================================================================
@@ -791,6 +798,76 @@ namespace llaminar2::test::parity
         }
 
         return static_cast<float>(total_overlap / seq_len);
+    }
+
+    /**
+     * @brief Check if PyTorch's top-1 token appears in llaminar's top-K
+     *
+     * For a single logit row: finds the argmax token in expected_logits (PyTorch)
+     * and checks if that token is among the top-K tokens in actual_logits (llaminar).
+     *
+     * For multiple rows (seq_len > 1): returns the fraction of positions where
+     * the check passes.
+     *
+     * This is a clearer gate than Top-K overlap: it answers "does llaminar consider
+     * the correct answer to be a plausible choice?"
+     *
+     * @param actual_logits Llaminar logits
+     * @param expected_logits PyTorch reference logits
+     * @param size Total float count (seq_len * vocab_size)
+     * @param vocab_size Vocabulary size
+     * @param k Top-K to search in llaminar (e.g., 3)
+     * @return Fraction of positions where PyTorch's top-1 is in llaminar's top-K [0, 1]
+     */
+    inline float pytorchTop1InLlaminarTopK(
+        const float *actual_logits,
+        const float *expected_logits,
+        size_t size,
+        size_t vocab_size,
+        int k)
+    {
+        size_t seq_len = size / vocab_size;
+        if (seq_len == 0 || vocab_size == 0)
+            return 0.0f;
+
+        int hits = 0;
+        for (size_t pos = 0; pos < seq_len; ++pos)
+        {
+            const float *actual_row = actual_logits + pos * vocab_size;
+            const float *expected_row = expected_logits + pos * vocab_size;
+
+            // Find PyTorch's argmax
+            int pytorch_argmax = 0;
+            float pytorch_max = expected_row[0];
+            for (size_t i = 1; i < vocab_size; ++i)
+            {
+                if (expected_row[i] > pytorch_max)
+                {
+                    pytorch_max = expected_row[i];
+                    pytorch_argmax = static_cast<int>(i);
+                }
+            }
+
+            // Find llaminar's top-K tokens
+            std::vector<std::pair<float, int>> scores(vocab_size);
+            for (size_t i = 0; i < vocab_size; ++i)
+                scores[i] = {actual_row[i], static_cast<int>(i)};
+            std::partial_sort(scores.begin(), scores.begin() + k, scores.end(),
+                              [](const auto &a, const auto &b)
+                              { return a.first > b.first; });
+
+            // Check if PyTorch's argmax is in llaminar's top-K
+            for (int i = 0; i < k; ++i)
+            {
+                if (scores[i].second == pytorch_argmax)
+                {
+                    hits++;
+                    break;
+                }
+            }
+        }
+
+        return static_cast<float>(hits) / seq_len;
     }
 
     // =============================================================================
@@ -2576,12 +2653,27 @@ namespace llaminar2::test::parity
                             llaminar_data + llaminar_last_offset,
                             pytorch_lm_head.data() + pytorch_last_offset,
                             vocab_size, vocab_size, 5);
+
+                        // Check if PyTorch's top-1 token is in llaminar's top-K
+                        if (config_.pytorch_top1_in_topk > 0)
+                        {
+                            float topk_recall = pytorchTop1InLlaminarTopK(
+                                llaminar_data + llaminar_last_offset,
+                                pytorch_lm_head.data() + pytorch_last_offset,
+                                vocab_size, vocab_size, config_.pytorch_top1_in_topk);
+                            summary.lm_head_pytorch_top1_in_top3 = (topk_recall >= 1.0f - 1e-6f);
+                        }
+                        else
+                        {
+                            summary.lm_head_pytorch_top1_in_top3 = true; // gate disabled
+                        }
                     }
                 }
             }
             summary.lm_head_passed = (summary.lm_head_kl < config_.kl_threshold) &&
                                      ((summary.lm_head_top1 * 100.0f) >= config_.min_top1_accuracy) &&
-                                     ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy);
+                                     ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy) &&
+                                     (config_.pytorch_top1_in_topk <= 0 || summary.lm_head_pytorch_top1_in_top3);
 
             // Count early layers passed
             summary.early_layers_passed = summary.embedding_passed ? 1 : 0;
@@ -2679,11 +2771,11 @@ namespace llaminar2::test::parity
             size_t kv_dim = n_kv_heads * head_dim;
             std::vector<StageInfo> per_layer_stages = {
                 {"ATTENTION_NORM", d_model},
-                {"Q_PROJECTION", d_model},     // DIAGNOSTIC: check QKV GEMM output
-                {"K_PROJECTION", kv_dim},      // DIAGNOSTIC: check K projection
-                {"V_PROJECTION", kv_dim},      // DIAGNOSTIC: check V projection
-                {"Q_ROPE", d_model},           // DIAGNOSTIC: check RoPE output
-                {"K_ROPE", kv_dim},            // DIAGNOSTIC: check K RoPE output
+                {"Q_PROJECTION", d_model},      // DIAGNOSTIC: check QKV GEMM output
+                {"K_PROJECTION", kv_dim},       // DIAGNOSTIC: check K projection
+                {"V_PROJECTION", kv_dim},       // DIAGNOSTIC: check V projection
+                {"Q_ROPE", d_model},            // DIAGNOSTIC: check RoPE output
+                {"K_ROPE", kv_dim},             // DIAGNOSTIC: check K RoPE output
                 {"ATTENTION_CONTEXT", d_model}, // num_heads * head_dim = d_model
                 {"ATTENTION_OUTPUT", d_model},
                 {"FFN_NORM", d_model},
@@ -2779,22 +2871,25 @@ namespace llaminar2::test::parity
                             size_t half_hd = hd / 2;
 
                             LOG_INFO("[RoPE CrossCheck] theta_base=" << theta_base
-                                     << " head_dim=" << hd << " local_cols=" << local_cols
-                                     << " pytorch_qp_cols=" << d_model);
+                                                                     << " head_dim=" << hd << " local_cols=" << local_cols
+                                                                     << " pytorch_qp_cols=" << d_model);
 
                             // Check multiple RoPE pairs across different rows and heads
                             for (size_t row : {0ul, 4ul, 8ul})
                             {
-                                if (row >= seq_len) break;
+                                if (row >= seq_len)
+                                    break;
                                 for (size_t pair_i : {0ul, 4ul, 15ul, 31ul})
                                 {
-                                    if (pair_i >= half_hd) continue;
+                                    if (pair_i >= half_hd)
+                                        continue;
                                     // Check head 0 and head 1
                                     for (size_t h : {0ul, 1ul})
                                     {
                                         size_t col_i0 = h * hd + pair_i;           // first half
                                         size_t col_i1 = h * hd + pair_i + half_hd; // second half
-                                        if (col_i1 >= local_cols) continue;
+                                        if (col_i1 >= local_cols)
+                                            continue;
 
                                         size_t idx_i0 = row * local_cols + col_i0;
                                         size_t idx_i1 = row * local_cols + col_i1;
@@ -2828,15 +2923,15 @@ namespace llaminar2::test::parity
                                         if (diff_i0 > 0.01f || diff_i1 > 0.01f)
                                         {
                                             LOG_INFO("[RoPE CrossCheck] MISMATCH row=" << row
-                                                     << " head=" << h << " pair=" << pair_i
-                                                     << " | Q_PROJ: ll_x0=" << x0_ll << " pt_x0=" << x0_pt
-                                                     << " ll_x1=" << x1_ll << " pt_x1=" << x1_pt
-                                                     << " | inv_freq=" << inv_freq_i << " angle=" << angle
-                                                     << " cos=" << cos_a << " sin=" << sin_a
-                                                     << " | CPU_expected: i0=" << cpu_i0 << " i1=" << cpu_i1
-                                                     << " | GPU_actual: i0=" << ll_i0 << " i1=" << ll_i1
-                                                     << " | PyTorch: i0=" << pt_i0 << " i1=" << pt_i1
-                                                     << " | diff_i0=" << diff_i0 << " diff_i1=" << diff_i1);
+                                                                                       << " head=" << h << " pair=" << pair_i
+                                                                                       << " | Q_PROJ: ll_x0=" << x0_ll << " pt_x0=" << x0_pt
+                                                                                       << " ll_x1=" << x1_ll << " pt_x1=" << x1_pt
+                                                                                       << " | inv_freq=" << inv_freq_i << " angle=" << angle
+                                                                                       << " cos=" << cos_a << " sin=" << sin_a
+                                                                                       << " | CPU_expected: i0=" << cpu_i0 << " i1=" << cpu_i1
+                                                                                       << " | GPU_actual: i0=" << ll_i0 << " i1=" << ll_i1
+                                                                                       << " | PyTorch: i0=" << pt_i0 << " i1=" << pt_i1
+                                                                                       << " | diff_i0=" << diff_i0 << " diff_i1=" << diff_i1);
                                         }
                                     }
                                 }
@@ -2868,7 +2963,7 @@ namespace llaminar2::test::parity
                                     extractColumnSlice(pytorch_qr.data(), seq_len, d_model, 0, local_cols).data() + 8 * local_cols,
                                     local_cols);
                                 LOG_INFO("[RoPE CrossCheck] Row8 cosine: CPU_vs_llaminar=" << std::fixed << std::setprecision(6) << cos_cpu_vs_ll
-                                         << " CPU_vs_pytorch=" << cos_cpu_vs_pt);
+                                                                                           << " CPU_vs_pytorch=" << cos_cpu_vs_pt);
                             }
                         }
                     }
@@ -2919,12 +3014,27 @@ namespace llaminar2::test::parity
                             combined_ptr + llaminar_last_offset,
                             pytorch_lm_head.data() + pytorch_last_offset,
                             vocab_size, vocab_size, 5);
+
+                        // Check if PyTorch's top-1 token is in llaminar's top-K
+                        if (config_.pytorch_top1_in_topk > 0)
+                        {
+                            float topk_recall = pytorchTop1InLlaminarTopK(
+                                combined_ptr + llaminar_last_offset,
+                                pytorch_lm_head.data() + pytorch_last_offset,
+                                vocab_size, vocab_size, config_.pytorch_top1_in_topk);
+                            summary.lm_head_pytorch_top1_in_top3 = (topk_recall >= 1.0f - 1e-6f);
+                        }
+                        else
+                        {
+                            summary.lm_head_pytorch_top1_in_top3 = true; // gate disabled
+                        }
                     }
                 }
             }
             summary.lm_head_passed = (summary.lm_head_kl < config_.kl_threshold) &&
                                      ((summary.lm_head_top1 * 100.0f) >= config_.min_top1_accuracy) &&
-                                     ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy);
+                                     ((summary.lm_head_top5 * 100.0f) >= config_.min_top5_accuracy) &&
+                                     (config_.pytorch_top1_in_topk <= 0 || summary.lm_head_pytorch_top1_in_top3);
 
             // Count early layers passed
             summary.early_layers_passed = summary.embedding_result.passed ? 1 : 0;
@@ -3101,6 +3211,21 @@ namespace llaminar2::test::parity
                 if (step_stats.top5_match)
                     summary.top5_matches++;
 
+                // Check if PyTorch's top-1 token appears in Llaminar's top-K
+                if (config_.pytorch_top1_in_topk > 0)
+                {
+                    float topk_recall = pytorchTop1InLlaminarTopK(
+                        llaminar_logits, pytorch_lm_head.data(),
+                        vocab_size, vocab_size, config_.pytorch_top1_in_topk);
+                    step_stats.top3_match = (topk_recall >= 1.0f - 1e-6f);
+                }
+                else
+                {
+                    step_stats.top3_match = true; // gate disabled
+                }
+                if (step_stats.top3_match)
+                    summary.top3_matches++;
+
                 // Pass criteria: either cosine >= threshold OR KL < threshold
                 step_stats.passed = (step_stats.cosine_similarity >= config_.decode_cosine_threshold) ||
                                     (step_stats.kl_divergence < config_.kl_threshold);
@@ -3122,14 +3247,18 @@ namespace llaminar2::test::parity
                 summary.avg_cosine = sum_cosine / summary.steps_total;
                 summary.avg_kl = sum_kl / summary.steps_total;
                 summary.top1_accuracy = 100.0f * summary.top1_matches / summary.steps_total;
+                summary.top3_accuracy = 100.0f * summary.top3_matches / summary.steps_total;
                 summary.top5_accuracy = 100.0f * summary.top5_matches / summary.steps_total;
             }
 
             // Overall pass criteria
             int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
+            bool topk_gate = (config_.pytorch_top1_in_topk <= 0) ||
+                             (summary.top3_matches == summary.steps_total);
             summary.overall_passed = (summary.steps_passed >= min_steps_required) &&
                                      (summary.top5_accuracy >= config_.min_top5_accuracy) &&
-                                     (summary.avg_cosine >= config_.decode_cosine_threshold);
+                                     (summary.avg_cosine >= config_.decode_cosine_threshold) &&
+                                     topk_gate;
 
             return summary;
         }
@@ -3162,6 +3291,12 @@ namespace llaminar2::test::parity
             EXPECT_GE(summary.lm_head_top5 * 100.0f, config_.min_top5_accuracy)
                 << "LM_HEAD Top-5 accuracy too low: " << (summary.lm_head_top5 * 100.0f)
                 << "% (required: " << config_.min_top5_accuracy << "%)";
+
+            if (config_.pytorch_top1_in_topk > 0)
+            {
+                EXPECT_TRUE(summary.lm_head_pytorch_top1_in_top3)
+                    << "PyTorch's top-1 token must appear in llaminar's top-" << config_.pytorch_top1_in_topk << " for LM_HEAD";
+            }
         }
 
         /**
@@ -3195,6 +3330,12 @@ namespace llaminar2::test::parity
             EXPECT_GE(summary.lm_head_top5 * 100.0f, config_.min_top5_accuracy)
                 << "LM_HEAD Top-5 accuracy too low: " << (summary.lm_head_top5 * 100.0f)
                 << "% (required: " << config_.min_top5_accuracy << "%)";
+
+            if (config_.pytorch_top1_in_topk > 0)
+            {
+                EXPECT_TRUE(summary.lm_head_pytorch_top1_in_top3)
+                    << "PyTorch's top-1 token must appear in llaminar's top-" << config_.pytorch_top1_in_topk << " for LM_HEAD";
+            }
         }
 
         // =========================================================================
@@ -3366,6 +3507,23 @@ namespace llaminar2::test::parity
                     summary.top5_matches++;
                 }
 
+                // Check if PyTorch's top-1 token appears in Llaminar's top-K
+                if (config_.pytorch_top1_in_topk > 0)
+                {
+                    float topk_recall = pytorchTop1InLlaminarTopK(
+                        llaminar_logits, pytorch_lm_head.data(),
+                        vocab_size, vocab_size, config_.pytorch_top1_in_topk);
+                    step_stats.top3_match = (topk_recall >= 1.0f - 1e-6f);
+                }
+                else
+                {
+                    step_stats.top3_match = true; // gate disabled
+                }
+                if (step_stats.top3_match)
+                {
+                    summary.top3_matches++;
+                }
+
                 // Pass criteria: either cosine >= threshold OR KL < threshold
                 step_stats.passed = (step_stats.cosine_similarity >= config_.decode_cosine_threshold) ||
                                     (step_stats.kl_divergence < config_.kl_threshold);
@@ -3387,14 +3545,18 @@ namespace llaminar2::test::parity
                 summary.avg_cosine = sum_cosine / summary.steps_total;
                 summary.avg_kl = sum_kl / summary.steps_total;
                 summary.top1_accuracy = 100.0f * summary.top1_matches / summary.steps_total;
+                summary.top3_accuracy = 100.0f * summary.top3_matches / summary.steps_total;
                 summary.top5_accuracy = 100.0f * summary.top5_matches / summary.steps_total;
             }
 
             // Overall pass criteria
             int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
+            bool topk_gate = (config_.pytorch_top1_in_topk <= 0) ||
+                             (summary.top3_matches == summary.steps_total);
             summary.overall_passed = (summary.steps_passed >= min_steps_required) &&
                                      (summary.top5_accuracy >= config_.min_top5_accuracy) &&
-                                     (summary.avg_cosine >= config_.decode_cosine_threshold);
+                                     (summary.avg_cosine >= config_.decode_cosine_threshold) &&
+                                     topk_gate;
 
             return summary;
         }
@@ -3473,7 +3635,7 @@ namespace llaminar2::test::parity
 
             // Header row
             table << fort::header
-                  << "Step" << "Cosine" << "KL" << "Llaminar" << "PyTorch" << "OK"
+                  << "Step" << "Cosine" << "KL" << "Llaminar" << "PyTorch" << ("InTop" + std::to_string(config_.pytorch_top1_in_topk > 0 ? config_.pytorch_top1_in_topk : 3)) << "OK"
                   << fort::endr;
 
             // Set column alignments
@@ -3483,6 +3645,7 @@ namespace llaminar2::test::parity
             table.column(3).set_cell_text_align(fort::text_align::right);
             table.column(4).set_cell_text_align(fort::text_align::right);
             table.column(5).set_cell_text_align(fort::text_align::center);
+            table.column(6).set_cell_text_align(fort::text_align::center);
 
             // Per-step rows
             for (const auto &step : summary.step_stats)
@@ -3497,6 +3660,7 @@ namespace llaminar2::test::parity
                       << fmt_f6(step.kl_divergence)
                       << llaminar_ss.str()
                       << step.pytorch_token
+                      << status_str(step.top3_match)
                       << status_str(step.passed)
                       << fort::endr;
             }
@@ -3511,9 +3675,11 @@ namespace llaminar2::test::parity
                 summary_table.set_border_style(FT_DOUBLE2_STYLE);
 
                 std::ostringstream summary_ss;
+                int k = config_.pytorch_top1_in_topk > 0 ? config_.pytorch_top1_in_topk : 3;
                 summary_ss << "SUMMARY:  Steps=" << summary.steps_passed << "/" << summary.steps_total
                            << "  AvgCosine=" << fmt_f4(summary.avg_cosine)
                            << "  Top1=" << fmt_f1(summary.top1_accuracy) << "%"
+                           << "  RefInTop" << k << "=" << summary.top3_matches << "/" << summary.steps_total
                            << "  Top5=" << fmt_f1(summary.top5_accuracy) << "%"
                            << "  " << (summary.overall_passed ? "✓ PASSED" : "✗ FAILED");
 
@@ -3559,6 +3725,13 @@ namespace llaminar2::test::parity
             EXPECT_GE(summary.avg_cosine, config_.decode_cosine_threshold)
                 << "Average cosine too low: " << summary.avg_cosine
                 << " (required: " << config_.decode_cosine_threshold << ")";
+
+            if (config_.pytorch_top1_in_topk > 0)
+            {
+                EXPECT_EQ(summary.top3_matches, summary.steps_total)
+                    << "PyTorch's top-1 token must appear in llaminar's top-" << config_.pytorch_top1_in_topk << " for every decode step. "
+                    << "Failed: " << summary.top3_matches << "/" << summary.steps_total;
+            }
         }
     };
 
