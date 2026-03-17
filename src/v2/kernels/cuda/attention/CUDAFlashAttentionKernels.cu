@@ -73,11 +73,23 @@ namespace
     constexpr int FA2_NUM_STAGES = 2;       // Double buffering
     constexpr int FA2_PRODUCER_WARPS = 2;   // Warps dedicated to loading (fixed)
     constexpr int FA2_TILE_KV_DEFAULT = 64; // Default KV tile size
-    // Shared-memory padding constants. QKV padding is critical for avoiding
-    // bank conflicts on WMMA load_matrix_sync: with head_dim=128, stride=128
-    // halves=256B maps ALL rows to bank 0 (32-way conflict). Padding 8
-    // shifts stride to 136 halves=272B giving 4-way conflicts instead.
-    constexpr int FA2_SCORES_LD_PAD = 16;
+    // Shared-memory padding constants.
+    //
+    // WMMA constraint: ldm must be a multiple of 8 (for half) or 8 (for float).
+    // This eliminates pad values like 2, 4, 12, etc.
+    //
+    // QKV padding (half precision, ldm = head_dim + pad, must be multiple of 8):
+    //   pad=0:  stride=128, 64 words, 64 mod 32=0  → 32-way conflict
+    //   pad=8:  stride=136, 68 words, 68 mod 32=4  → 2-way conflict (best achievable)
+    //   pad=16: stride=144, 72 words, 72 mod 32=8  → 4-way conflict (worse)
+    //
+    // Scores padding (float precision, ldm = tile_kv + pad, must be multiple of 8):
+    //   tile_kv=16, pad=0:  ld=16, 4 words/row, 4 mod 32=4  → 2-way conflict
+    //   tile_kv=16, pad=8:  ld=24, 6 words/row, 6 mod 32=6  → 0 conflicts
+    //   tile_kv=16, pad=16: ld=32, 8 words/row, 8 mod 32=8  → 4-way conflict
+    //   tile_kv=32, pad=8:  ld=40, 10 words/row, 10 mod 32=10 → 0 conflicts
+    //   tile_kv=64, pad=8:  ld=72, 18 words/row, 18 mod 32=18 → 0 conflicts
+    constexpr int FA2_SCORES_LD_PAD = 8;
     constexpr int FA2_QKV_PAD = 8;
 
     // =========================================================================

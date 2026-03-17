@@ -39,7 +39,7 @@ namespace llaminar2
         explicit KVCacheGatherStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
-        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        ComputeStageType type() const override { return ComputeStageType::KV_CACHE_GATHER; }
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         bool isGraphCapturable() const override { return false; } // KV lengths change each step
         StageBufferRequirements getBufferRequirements() const override;

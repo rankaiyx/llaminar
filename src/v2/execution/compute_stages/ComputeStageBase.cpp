@@ -104,6 +104,14 @@ namespace llaminar2
             return "QK_NORM";
         case ComputeStageType::FUSED_RESIDUAL_NORM:
             return "FUSED_RESIDUAL_NORM";
+        case ComputeStageType::KV_CACHE_APPEND:
+            return "KV_CACHE_APPEND";
+        case ComputeStageType::KV_CACHE_GATHER:
+            return "KV_CACHE_GATHER";
+        case ComputeStageType::ATTENTION_COMPUTE:
+            return "ATTENTION_COMPUTE";
+        case ComputeStageType::QUANTIZE_Q16_1:
+            return "QUANTIZE_Q16_1";
         default:
             return "UNKNOWN";
         }

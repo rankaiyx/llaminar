@@ -78,7 +78,7 @@ namespace llaminar2
         explicit KVCacheAppendStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
-        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        ComputeStageType type() const override { return ComputeStageType::KV_CACHE_APPEND; }
         StageBufferContract bufferContract() const override;
         // KV cache append is graph-capturable when the KV cache supports
         // device-side head parameters. The H2D memcpy + dynamic kernel are
