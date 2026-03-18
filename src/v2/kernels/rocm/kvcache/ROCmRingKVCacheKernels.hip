@@ -21,7 +21,6 @@
 #include <hip/hip_bfloat16.h>
 #include "../../../tensors/BlockStructures.h"
 #include "../../../tensors/TensorType.h"
-#include "../gemm/ROCmFastpackQuant.h"
 
 namespace llaminar2
 {
@@ -244,6 +243,7 @@ namespace llaminar2
         const float x = in_bounds ? to_float_device(src[row * cols + col]) : 0.0f;
 
         __shared__ float s_absmax[Q8_1Block::BLOCK_SIZE];
+        __shared__ int s_q[Q8_1Block::BLOCK_SIZE];
         __shared__ int s_sum[Q8_1Block::BLOCK_SIZE];
 
         s_absmax[lane] = fabsf(x);
@@ -260,12 +260,15 @@ namespace llaminar2
 
         const float absmax = s_absmax[0];
         const float d = (absmax > 0.0f) ? (absmax / 127.0f) : 0.0f;
-        const float inv_d = (d > 0.0f) ? (127.0f / absmax) : 0.0f;
+        int q = 0;
+        if (d > 0.0f)
+        {
+            q = __float2int_rn(x / d);
+            q = max(-127, min(127, q));
+        }
 
-        // GFX906 fastpack: v_cvt_pk_u8_f32 replaces __float2int_rn + clamp + cast
-        int8_t q8 = (d > 0.0f) ? rocm::fastpack_q8_scalar(x, inv_d) : 0;
-
-        s_sum[lane] = static_cast<int>(q8);
+        s_q[lane] = q;
+        s_sum[lane] = q;
         __syncthreads();
 
         for (int stride = Q8_1Block::BLOCK_SIZE / 2; stride > 0; stride >>= 1)
@@ -284,7 +287,7 @@ namespace llaminar2
             out.sum_qs = static_cast<int16_t>(s_sum[0]);
         }
 
-        dst[row * blocks_per_row + block_col].qs[lane] = q8;
+        dst[row * blocks_per_row + block_col].qs[lane] = static_cast<int8_t>(s_q[lane]);
     }
 
     // =========================================================================

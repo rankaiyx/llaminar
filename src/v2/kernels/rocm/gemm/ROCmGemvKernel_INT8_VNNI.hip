@@ -29,8 +29,6 @@
 #include <atomic>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
-#include "../../../utils/DebugEnv.h"
-#include "ROCmFastpackQuant.h"
 
 // Tile width: number of output columns per workgroup
 // 256 threads per block — each thread does one output column
@@ -3183,8 +3181,14 @@ __global__ void gemv_fused_fp32_int8_vnni_kernel_t(
         const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
         const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
 
-        // --- Phase 3: Fast-pack quantize FP32 → INT8 in shared memory ---
-        llaminar2::rocm::fastpack_lds_tile(s_A_fp32, s_A_int8, tid, tile_len, inv_scale);
+        // --- Phase 3: Cooperative quantize FP32 → INT8 in shared memory ---
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            float val = s_A_fp32[i] * inv_scale;
+            int q = static_cast<int>(rintf(val));
+            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+            s_A_int8[i] = static_cast<int8_t>(q);
+        }
         __syncthreads();
 
         // --- Phase 4: INT8 dot product using v_dot4_i32_i8 ---
@@ -3336,8 +3340,14 @@ __global__ void gemv_fused_scatter_int8_vnni_kernel_t(
         const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
         const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
 
-        // Phase 3: Fast-pack quantize FP32 → INT8 in shared memory
-        llaminar2::rocm::fastpack_lds_tile(s_A_fp32, s_A_int8, tid, tile_len, inv_scale);
+        // Phase 3: Cooperative quantize FP32 → INT8 in shared memory
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            float val = s_A_fp32[i] * inv_scale;
+            int q = static_cast<int>(rintf(val));
+            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+            s_A_int8[i] = static_cast<int8_t>(q);
+        }
         __syncthreads();
 
         // Phase 4: INT8 dot product using v_dot4_i32_i8
@@ -3525,8 +3535,14 @@ __global__ void gemv_fused_scatter_selfreduce_int8_vnni_kernel_t(
         const float scale = (absmax > 0.0f) ? (absmax / 127.0f) : 1.0f;
         const float inv_scale = (absmax > 0.0f) ? (127.0f / absmax) : 0.0f;
 
-        // Phase 3: Fast-pack quantize FP32 → INT8 in shared memory
-        llaminar2::rocm::fastpack_lds_tile(s_A_fp32, s_A_int8, tid, tile_len, inv_scale);
+        // Phase 3: Cooperative quantize FP32 → INT8 in shared memory
+        for (int i = tid; i < tile_len; i += THREADS)
+        {
+            float val = s_A_fp32[i] * inv_scale;
+            int q = static_cast<int>(rintf(val));
+            q = (q < -127) ? -127 : ((q > 127) ? 127 : q);
+            s_A_int8[i] = static_cast<int8_t>(q);
+        }
         __syncthreads();
 
         // Phase 4: INT8 dot product using v_dot4_i32_i8
@@ -5456,7 +5472,6 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
 // =============================================================================
 //
 // Replaces the 3-kernel decode pipeline:
-
 //   OLD: quantizeActivations → rocmGemv_int8_int8_int32_vnni → applyScaling
 //   NEW: rocmGemv_fused_fp32_int8_vnni (single launch, directly FP32→FP32)
 //
