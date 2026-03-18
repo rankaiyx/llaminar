@@ -90,7 +90,10 @@ namespace
         double std_mean_us;
         double sk_min_us;
         double sk_mean_us;
-        double speedup; // std_min / sk_min (>1 = stream-K wins)
+        double sk2_min_us; // two-pass stream-K
+        double sk2_mean_us;
+        double speedup;     // std_min / sk_min (>1 = one-pass SK wins)
+        double speedup_sk2; // std_min / sk2_min (>1 = two-pass SK wins)
     };
 
     class CUDAStreamKABPerf : public ::testing::Test
@@ -188,7 +191,19 @@ namespace
                     r.sk_mean_us = rr.mean_us;
                 }
 
+                // --- Stream-K Two-Pass (mode 2) ---
+                cudaNativeVNNIPrefill_setStreamKMode(2);
+                {
+                    auto weights = create_q40(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
+                    RunResult rr = runKernel(weights.get(), m, shape.n, shape.k,
+                                             RunPath::NativeVNNITensorCore,
+                                             cfg.warmup_runs, cfg.bench_runs, 0);
+                    r.sk2_min_us = rr.min_us;
+                    r.sk2_mean_us = rr.mean_us;
+                }
+
                 r.speedup = (r.sk_min_us > 0.0) ? (r.std_min_us / r.sk_min_us) : 0.0;
+                r.speedup_sk2 = (r.sk2_min_us > 0.0) ? (r.std_min_us / r.sk2_min_us) : 0.0;
                 results.push_back(r);
             }
         }
@@ -201,26 +216,42 @@ namespace
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
               << "Shape" << "M" << "N" << "K" << "Tiles" << "Slots"
-              << "Wave%" << "Std (us)" << "SK (us)" << "Speedup" << "Winner"
+              << "Wave%" << "Std (us)" << "SK1 (us)" << "SK2 (us)" << "SK1 Spd" << "SK2 Spd" << "Winner"
               << fort::endr;
 
         table.column(0).set_cell_text_align(fort::text_align::left);
-        for (int c = 1; c <= 10; ++c)
+        for (int c = 1; c <= 12; ++c)
             table.column(c).set_cell_text_align(fort::text_align::right);
 
         for (const auto &r : results)
         {
-            char wave_pct[16], std_us[16], sk_us[16], spd[16];
+            char wave_pct[16], std_us[16], sk_us[16], sk2_us[16], spd[16], spd2[16];
             std::snprintf(wave_pct, sizeof(wave_pct), "%.1f%%", r.wave_eff * 100.0f);
             std::snprintf(std_us, sizeof(std_us), "%.1f", r.std_min_us);
             std::snprintf(sk_us, sizeof(sk_us), "%.1f", r.sk_min_us);
+            std::snprintf(sk2_us, sizeof(sk2_us), "%.1f", r.sk2_min_us);
             std::snprintf(spd, sizeof(spd), "%.3fx", r.speedup);
+            std::snprintf(spd2, sizeof(spd2), "%.3fx", r.speedup_sk2);
 
-            const char *winner = (r.speedup > 1.02) ? "SK" : (r.speedup < 0.98) ? "STD"
-                                                                                : "TIE";
+            const char *winner;
+            double best = r.std_min_us;
+            winner = "STD";
+            if (r.sk_min_us < best)
+            {
+                best = r.sk_min_us;
+                winner = "SK1";
+            }
+            if (r.sk2_min_us < best)
+            {
+                best = r.sk2_min_us;
+                winner = "SK2";
+            }
+            // TIE if best is within 2% of std
+            if (best > r.std_min_us * 0.98)
+                winner = "TIE";
 
             table << r.shape_name << r.m << r.n << r.k << r.tiles << r.sm_slots
-                  << wave_pct << std_us << sk_us << spd << winner << fort::endr;
+                  << wave_pct << std_us << sk_us << sk2_us << spd << spd2 << winner << fort::endr;
         }
 
         std::fprintf(stderr, "\n%s\n", table.to_string().c_str());
@@ -231,15 +262,27 @@ namespace
             FILE *fp = std::fopen(cfg.csv_path.c_str(), "w");
             if (fp)
             {
-                std::fprintf(fp, "shape,m,n,k,tiles,slots,wave_eff,std_min_us,std_mean_us,sk_min_us,sk_mean_us,speedup,winner\n");
+                std::fprintf(fp, "shape,m,n,k,tiles,slots,wave_eff,std_min_us,std_mean_us,sk_min_us,sk_mean_us,sk2_min_us,sk2_mean_us,speedup_sk1,speedup_sk2,winner\n");
                 for (const auto &r : results)
                 {
-                    const char *winner = (r.speedup > 1.02) ? "SK" : (r.speedup < 0.98) ? "STD"
-                                                                                        : "TIE";
-                    std::fprintf(fp, "%s,%d,%d,%d,%d,%d,%.4f,%.2f,%.2f,%.2f,%.2f,%.4f,%s\n",
+                    double best = r.std_min_us;
+                    const char *winner = "STD";
+                    if (r.sk_min_us < best)
+                    {
+                        best = r.sk_min_us;
+                        winner = "SK1";
+                    }
+                    if (r.sk2_min_us < best)
+                    {
+                        best = r.sk2_min_us;
+                        winner = "SK2";
+                    }
+                    if (best > r.std_min_us * 0.98)
+                        winner = "TIE";
+                    std::fprintf(fp, "%s,%d,%d,%d,%d,%d,%.4f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%s\n",
                                  r.shape_name.c_str(), r.m, r.n, r.k, r.tiles, r.sm_slots,
                                  r.wave_eff, r.std_min_us, r.std_mean_us, r.sk_min_us, r.sk_mean_us,
-                                 r.speedup, winner);
+                                 r.sk2_min_us, r.sk2_mean_us, r.speedup, r.speedup_sk2, winner);
                 }
                 std::fclose(fp);
                 std::fprintf(stderr, "\n[StreamK-AB] Results written to %s\n", cfg.csv_path.c_str());
@@ -250,18 +293,32 @@ namespace
         cudaNativeVNNIPrefill_freeStreamKFixup();
 
         // Summary: count wins
-        int sk_wins = 0, std_wins = 0, ties = 0;
+        int sk1_wins = 0, sk2_wins = 0, std_wins = 0, ties = 0;
         for (const auto &r : results)
         {
-            if (r.speedup > 1.02)
-                ++sk_wins;
-            else if (r.speedup < 0.98)
-                ++std_wins;
-            else
+            double best = r.std_min_us;
+            int who = 0; // 0=std, 1=sk1, 2=sk2
+            if (r.sk_min_us < best)
+            {
+                best = r.sk_min_us;
+                who = 1;
+            }
+            if (r.sk2_min_us < best)
+            {
+                best = r.sk2_min_us;
+                who = 2;
+            }
+            if (best > r.std_min_us * 0.98)
                 ++ties;
+            else if (who == 2)
+                ++sk2_wins;
+            else if (who == 1)
+                ++sk1_wins;
+            else
+                ++std_wins;
         }
-        std::fprintf(stderr, "\n[StreamK-AB] Summary: Stream-K wins=%d, Standard wins=%d, Ties=%d\n",
-                     sk_wins, std_wins, ties);
+        std::fprintf(stderr, "\n[StreamK-AB] Summary: SK1 wins=%d, SK2 wins=%d, STD wins=%d, Ties=%d\n",
+                     sk1_wins, sk2_wins, std_wins, ties);
     }
 }
 

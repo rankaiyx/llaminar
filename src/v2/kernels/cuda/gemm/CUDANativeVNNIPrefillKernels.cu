@@ -593,16 +593,20 @@ namespace
     template <uint8_t CODEBOOK_ID, int BM, int BN, int WARPS_M, int WARPS_N, int SPLIT_K = 1,
               int STAGES_ = 2,
               bool STREAM_K = false,
+              bool FIXUP_TWO_PASS = false,
               int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32,
-              // Stream-K needs extra live registers for tile loop bookkeeping
-              // (kbc, kbc_stop, tile coordinates, atomicAdd epilogue) beyond the
-              // standard kernel. With 512-thread blocks, there's a register cliff:
-              //   ≤64 regs → 2 blocks/SM (66.67% occupancy)
-              //   65-128 regs → 1 block/SM (33.33% occupancy)
-              // MIN_BLOCKS_HINT=2 forces ≤64 regs which causes massive spilling.
-              // MIN_BLOCKS_HINT=1 allows up to 128 regs. The stream-K launcher
-              // queries cudaOccupancyMaxActiveBlocksPerMultiprocessor to set grid
-              // size based on actual achieved occupancy.
+              // Stream-K tile loop: the outer while-loop keeps all global-memory
+              // pointer registers (~16 GP regs) alive across iterations, requiring
+              // ~124 regs total. With MIN_BLOCKS=2 (64-reg cap), this causes
+              // catastrophic spilling. MIN_BLOCKS=1 (128-reg cap) avoids spills.
+              //
+              // COMPILER INSIGHT: A bounded for-loop (e.g. `for(i=0;i<4;i++)`) with
+              // compile-time-constant upper bound achieves REG:64 STACK:0 — the
+              // compiler can drop/reload pointers from ld.param between iterations.
+              // However, the k-loop compute pipeline itself degrades at 64 regs:
+              // 32 accumulator regs (WM=2×WN=4×4) leave only 32 for pipeline state,
+              // shared memory pointers, and ILP — resulting in 2× slower per-tile
+              // throughput that 2× occupancy cannot overcome.
               int MIN_BLOCKS_HINT = STREAM_K ? 1
                                     : (STAGES_ == 1)
                                         ? ((BLOCK_SIZE_ >= 256) ? 3 : 4)
@@ -646,6 +650,7 @@ namespace
         static_assert(WARP_M % 16 == 0);
         static_assert(WARP_N % 8 == 0);
         static_assert(!STREAM_K || SPLIT_K == 1, "Stream-K and Split-K are mutually exclusive");
+        static_assert(!FIXUP_TWO_PASS || STREAM_K, "FIXUP_TWO_PASS requires STREAM_K");
 
         const int warp_id = threadIdx.x >> 5;
         const int lane_id = threadIdx.x & 31;
@@ -1606,155 +1611,214 @@ namespace
         // ── Dispatch: stream-K tile loop or standard single-tile ─────
         if constexpr (STREAM_K)
         {
-            // -- Stream-K lambdas (defined here to avoid capture overhead on standard path) --
-            auto zero_acc = [&]() __attribute__((always_inline))
-            {
-#pragma unroll
-                for (int i = 0; i < WM; ++i)
-#pragma unroll
-                    for (int j = 0; j < WN; ++j)
-#pragma unroll
-                        for (int e = 0; e < 4; ++e)
-                            acc[i][j][e] = 0.0f;
-            };
-
-            auto run_pipeline = [&]() __attribute__((always_inline))
-            {
-                if constexpr (STAGES_ == 1)
-                {
-                    for (int ki = 0; ki < num_k_iters; ++ki)
-                    {
-                        const int kt = kt_begin + ki;
-                        load_A_tile(0, kt);
-                        cp_async_commit();
-                        decode_B_direct(0, kt);
-                        load_scales_A(0, kt);
-                        cp_async_wait<0>();
-                        __syncthreads();
-                        if (is_interior_tile_mut)
-                            compute_k_tile_interior(0, kt);
-                        else
-                            compute_k_tile_border(0, kt);
-                        if (ki + 1 < num_k_iters)
-                            __syncthreads();
-                    }
-                }
-                else
-                {
-                    load_A_tile(0, kt_begin);
-                    cp_async_commit();
-                    decode_B_direct(0, kt_begin);
-                    load_scales_A(0, kt_begin);
-                    cp_async_wait<0>();
-                    __syncthreads();
-                    for (int ki = 0; ki < num_k_iters; ++ki)
-                    {
-                        const int stage = ki & 1;
-                        const int kt = kt_begin + ki;
-                        if (ki + 1 < num_k_iters)
-                        {
-                            load_A_tile(stage ^ 1, kt + 1);
-                            cp_async_commit();
-                            decode_B_direct(stage ^ 1, kt + 1);
-                            load_scales_A(stage ^ 1, kt + 1);
-                        }
-                        if (is_interior_tile_mut)
-                            compute_k_tile_interior(stage, kt);
-                        else
-                            compute_k_tile_border(stage, kt);
-                        if (ki + 1 < num_k_iters)
-                        {
-                            cp_async_wait<0>();
-                            __syncthreads();
-                        }
-                    }
-                }
-            };
-
-            // Stream-K uses atomicAdd on pre-zeroed C — no need for beta/bias epilogue.
-            // Suppress unused-parameter warnings for kernel args only used by write_epilogue
-            // (which doesn't exist in the stream-K path). Also helps the register allocator
-            // by signaling these captures are truly dead.
+            // Stream-K uses atomicAdd on pre-zeroed buffer — no need for beta/bias epilogue.
             (void)beta;
             (void)C_existing;
             (void)bias;
-            (void)tmp_fixup;
+            if constexpr (!FIXUP_TWO_PASS)
+                (void)tmp_fixup;
 
-            auto write_to_fixup = [&]() __attribute__((always_inline))
+            // ── Stream-K tile loop (optimized) ──────────────────────────
+            // Key optimizations vs naive stream-K:
+            // 1. Full tiles (this CTA owns entire K-reduction) use direct store
+            //    with interior fast path — matches standard epilogue exactly.
+            // 2. Partial tiles (K-range split across CTAs) use atomicAdd on
+            //    pre-zeroed C.
+            // 3. Integer division (kbc → tile_idx, kt_begin) computed ONCE for
+            //    the first tile; subsequent tiles use incremental tile_idx++.
             {
-            // Atomically accumulate partial sums directly into C.
-            // This eliminates the fixup buffer and the separate fixup kernel,
-            // reducing memory traffic from 3× (write fixup + read fixup + write C)
-            // to 1× (atomic on C). SM 8.6+ has hardware float atomicAdd.
-            //
-            // Keep all three loops fully unrolled (#pragma unroll): the 16-wide
-            // atomicAdd ILP is critical for performance. Partial unrolling
-            // (e.g., #pragma unroll 1 on outer loops) eliminates the ~8K spills
-            // but serializes the atomics, losing ~10% on winning shapes.
-#pragma unroll
-                for (int wj = 0; wj < WN; ++wj)
-                {
-                    const int tile_n = block_n + wc * WARP_N + wj * 8;
-                    const int gc0 = tile_n + frag_col(lane_id, 0);
-                    const int gc1 = tile_n + frag_col(lane_id, 1);
-#pragma unroll
-                    for (int wi = 0; wi < WM; ++wi)
-                    {
-                        const int tile_m = block_m + wr * WARP_M + wi * 16;
-#pragma unroll
-                        for (int e = 0; e < 4; ++e)
-                        {
-                            const int gr = tile_m + frag_row(lane_id, e);
-                            const int gc = (e & 1) ? gc1 : gc0;
-                            if (gr < M && gc < N)
-                            {
-                                atomicAdd(&C[gr * N + gc], acc[wi][wj][e] * alpha);
-                            }
-                        }
-                    }
-                }
-            };
+                const int ntx = (N + BN - 1) / BN;
+                const int nty = (M + BM - 1) / BM;
+                const int total_work = nty * ntx * num_k_tiles_total;
+                int kbc = static_cast<int>(
+                    (long long)blockIdx.x * total_work / gridDim.x);
+                const int kbc_stop = static_cast<int>(
+                    (long long)(blockIdx.x + 1) * total_work / gridDim.x);
 
-            // Stream-K tile loop — uses int arithmetic (safe: total_work < 2^31
-            // for practical GEMM shapes, max ~60M for N=100K, M=10K, K=64K).
-            const int ntx = (N + BN - 1) / BN;
-            const int nty = (M + BM - 1) / BM;
-            const int num_k_tiles = num_k_tiles_total;
-            const int total_work = nty * ntx * num_k_tiles;
-            int kbc = static_cast<int>((long long)blockIdx.x * total_work / gridDim.x);
-            const int kbc_stop = static_cast<int>((long long)(blockIdx.x + 1) * total_work / gridDim.x);
+                // First tile: compute tile index and K-offset via division (only once)
+                int cur_tile_idx = kbc / num_k_tiles_total;
+                int cur_kt_begin = kbc % num_k_tiles_total;
 
 #pragma unroll 1
-            while (kbc < kbc_stop)
-            {
-                // Compute tile coordinates in a scope so intermediates die early
+                while (kbc < kbc_stop)
                 {
-                    const int tile_idx = kbc / num_k_tiles;
-                    const int local_kt_begin = kbc % num_k_tiles;
-                    const int local_kt_end = min(num_k_tiles,
-                                                 local_kt_begin + (kbc_stop - kbc));
-                    const int ty = tile_idx / ntx;
-                    const int tx = tile_idx % ntx;
+                    const int local_kt_end = min(num_k_tiles_total,
+                                                 cur_kt_begin + (kbc_stop - kbc));
+                    const int ty = cur_tile_idx / ntx;
+                    const int tx = cur_tile_idx % ntx;
                     block_m = ty * BM;
                     block_n = tx * BN;
-                    kt_begin = local_kt_begin;
+                    kt_begin = cur_kt_begin;
                     kt_end = local_kt_end;
                     num_k_iters = kt_end - kt_begin;
                     is_interior_tile_mut = (block_m + BM <= M) && (block_n + BN <= N);
+
+                    // Full tile: this CTA owns the complete K-reduction (no sharing)
+                    const bool is_full_tile = (cur_kt_begin == 0) &&
+                                              (local_kt_end == num_k_tiles_total);
+
+                    // ── Inline zero_acc ──
+#pragma unroll
+                    for (int i = 0; i < WM; ++i)
+#pragma unroll
+                        for (int j = 0; j < WN; ++j)
+#pragma unroll
+                            for (int e = 0; e < 4; ++e)
+                                acc[i][j][e] = 0.0f;
+
+                    // ── Inline k-loop (run_pipeline) ──
+                    if constexpr (STAGES_ == 1)
+                    {
+                        for (int ki = 0; ki < num_k_iters; ++ki)
+                        {
+                            const int kt = kt_begin + ki;
+                            load_A_tile(0, kt);
+                            cp_async_commit();
+                            decode_B_direct(0, kt);
+                            load_scales_A(0, kt);
+                            cp_async_wait<0>();
+                            __syncthreads();
+                            if (is_interior_tile_mut)
+                                compute_k_tile_interior(0, kt);
+                            else
+                                compute_k_tile_border(0, kt);
+                            if (ki + 1 < num_k_iters)
+                                __syncthreads();
+                        }
+                    }
+                    else
+                    {
+                        load_A_tile(0, kt_begin);
+                        cp_async_commit();
+                        decode_B_direct(0, kt_begin);
+                        load_scales_A(0, kt_begin);
+                        cp_async_wait<0>();
+                        __syncthreads();
+                        for (int ki = 0; ki < num_k_iters; ++ki)
+                        {
+                            const int stage = ki & 1;
+                            const int kt = kt_begin + ki;
+                            if (ki + 1 < num_k_iters)
+                            {
+                                load_A_tile(stage ^ 1, kt + 1);
+                                cp_async_commit();
+                                decode_B_direct(stage ^ 1, kt + 1);
+                                load_scales_A(stage ^ 1, kt + 1);
+                            }
+                            if (is_interior_tile_mut)
+                                compute_k_tile_interior(stage, kt);
+                            else
+                                compute_k_tile_border(stage, kt);
+                            if (ki + 1 < num_k_iters)
+                            {
+                                cp_async_wait<0>();
+                                __syncthreads();
+                            }
+                        }
+                    }
+
+                    // ── Epilogue: direct store for full tiles, atomicAdd for partials ──
+                    if constexpr (FIXUP_TWO_PASS)
+                    {
+                        const int ntx_local = (N + BN - 1) / BN;
+                        const int tile_idx_f = (block_m / BM) * ntx_local + (block_n / BN);
+                        float *__restrict__ tile_base = tmp_fixup + static_cast<long long>(tile_idx_f) * (BM * BN);
+#pragma unroll
+                        for (int wj = 0; wj < WN; ++wj)
+                        {
+                            const int local_n = wc * WARP_N + wj * 8;
+                            const int lc0 = local_n + frag_col(lane_id, 0);
+                            const int lc1 = local_n + frag_col(lane_id, 1);
+#pragma unroll
+                            for (int wi = 0; wi < WM; ++wi)
+                            {
+                                const int local_m = wr * WARP_M + wi * 16;
+#pragma unroll
+                                for (int e = 0; e < 4; ++e)
+                                {
+                                    const int lr = local_m + frag_row(lane_id, e);
+                                    const int lc = (e & 1) ? lc1 : lc0;
+                                    atomicAdd(&tile_base[lr * BN + lc], acc[wi][wj][e] * alpha);
+                                }
+                            }
+                        }
+                    }
+                    else if (is_full_tile)
+                    {
+                        // ── Full tile: direct store (matches standard epilogue) ──
+                        // This CTA owns the complete K-reduction — no other CTA
+                        // writes to these output elements. Use direct store with
+                        // interior fast path (no bounds check, no atomicAdd).
+#pragma unroll
+                        for (int wj = 0; wj < WN; ++wj)
+                        {
+                            const int tile_n = block_n + wc * WARP_N + wj * 8;
+                            const int gc0 = tile_n + frag_col(lane_id, 0);
+                            const int gc1 = tile_n + frag_col(lane_id, 1);
+#pragma unroll
+                            for (int wi = 0; wi < WM; ++wi)
+                            {
+                                const int tile_m = block_m + wr * WARP_M + wi * 16;
+
+                                if (is_interior_tile_mut)
+                                {
+                                    // Interior fast path: 4 direct stores, no bounds check
+                                    const int out_idx0 = (tile_m + frag_row(lane_id, 0)) * N + gc0;
+                                    const int out_idx1 = (tile_m + frag_row(lane_id, 1)) * N + gc1;
+                                    const int out_idx2 = (tile_m + frag_row(lane_id, 2)) * N + gc0;
+                                    const int out_idx3 = (tile_m + frag_row(lane_id, 3)) * N + gc1;
+                                    C[out_idx0] = acc[wi][wj][0] * alpha;
+                                    C[out_idx1] = acc[wi][wj][1] * alpha;
+                                    C[out_idx2] = acc[wi][wj][2] * alpha;
+                                    C[out_idx3] = acc[wi][wj][3] * alpha;
+                                }
+                                else
+                                {
+                                    // Border: direct store with bounds check
+#pragma unroll
+                                    for (int e = 0; e < 4; ++e)
+                                    {
+                                        const int gr = tile_m + frag_row(lane_id, e);
+                                        const int gc = (e & 1) ? gc1 : gc0;
+                                        if (gr < M && gc < N)
+                                            C[gr * N + gc] = acc[wi][wj][e] * alpha;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // ── Partial tile: atomicAdd on pre-zeroed C ──
+                        // K-range is split across CTAs; use atomicAdd for correctness.
+#pragma unroll
+                        for (int wj = 0; wj < WN; ++wj)
+                        {
+                            const int tile_n = block_n + wc * WARP_N + wj * 8;
+                            const int gc0 = tile_n + frag_col(lane_id, 0);
+                            const int gc1 = tile_n + frag_col(lane_id, 1);
+#pragma unroll
+                            for (int wi = 0; wi < WM; ++wi)
+                            {
+                                const int tile_m = block_m + wr * WARP_M + wi * 16;
+#pragma unroll
+                                for (int e = 0; e < 4; ++e)
+                                {
+                                    const int gr = tile_m + frag_row(lane_id, e);
+                                    const int gc = (e & 1) ? gc1 : gc0;
+                                    if (gr < M && gc < N)
+                                        atomicAdd(&C[gr * N + gc], acc[wi][wj][e] * alpha);
+                                }
+                            }
+                        }
+                    }
+
+                    // Advance to next tile (no division needed — incremental tracking)
+                    kbc += (num_k_tiles_total - cur_kt_begin);
+                    cur_tile_idx++;
+                    cur_kt_begin = 0; // all subsequent tiles start at K=0
+                    __syncthreads();
                 }
-
-                zero_acc();
-                run_pipeline();
-
-                // Stream-K: ALL blocks atomicAdd their partial sums into C
-                // (which was pre-zeroed by the launcher). This is safe regardless
-                // of execution order between blocks sharing a tile. Direct writes
-                // (write_epilogue) would race with atomicAdds from other blocks.
-                write_to_fixup();
-
-                __syncthreads(); // ensure smem safe before next tile
-
-                kbc += (num_k_tiles - kt_begin);
             }
         }
         else
@@ -2394,6 +2458,22 @@ namespace
         return count;
     }
 
+    // =========================================================================
+    // Tile/split-k force: override the heuristic for sweep benchmarks.
+    //   g_force_tile_id: -1 = auto (heuristic), 0..5 = TileId enum value
+    //   g_force_split_k:  0 = auto (heuristic), 1..8 = forced split-K value
+    // =========================================================================
+    static int g_force_tile_id = -1;
+    static int g_force_split_k = 0;
+
+    // BK256 mode: 0=auto (heuristic), 1=force ON, -1=force OFF
+    // Set via LLAMINAR_BK256_MODE env var or extern C API.
+    static int g_bk256_force_mode = []()
+    {
+        const char *env = std::getenv("LLAMINAR_BK256_MODE");
+        return env ? std::atoi(env) : 0;
+    }();
+
     // ─── Sweep-derived tile + split_k heuristic ───────────────────────
     // Fills-first strategy: prefer the largest tile family that fills the
     // GPU without split_k, only adding split_k when no family fills.
@@ -2403,6 +2483,13 @@ namespace
     //   otherwise   → w2x4 (default, 8 warps for ILP)
     TileChoice chooseQ40PrefillTile(int M, int N, int K)
     {
+        // Force-tile override for sweep benchmarks
+        if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+        {
+            const int sk = (g_force_split_k > 0) ? g_force_split_k : 1;
+            return {static_cast<TileId>(g_force_tile_id), sk};
+        }
+
         const int SM = getSmCount();
         constexpr int HBK = 128; // heuristic block-K unit (analysis granularity)
         const int ki = K / HBK;
@@ -2417,7 +2504,10 @@ namespace
         // Helper: pick 64×128 warp config from real tile count
         auto pick_warp = [&](int real_tiles, int k_iters) -> TileId
         {
-            if (real_tiles >= 112)
+            // w2x2 (4 warps/block) for very high tile counts where more
+            // blocks improve wave fill; 2*SM threshold from sweep data
+            // across 0.5B/3B/7B/14B shapes.
+            if (real_tiles >= 2 * SM)
                 return TileId::T64x128_w2x2;
             if (k_iters <= 7)
                 return TileId::T64x128_w4x2;
@@ -2432,6 +2522,18 @@ namespace
             if (ki <= 7 && t128 > 2 * SM)
                 use_128 = false;
             else if (ki <= 16 && t128 > 3 * SM)
+                use_128 = false;
+            // Short K-loop (ki 8-16) + abundant 64×128 tiles → T64x128 has
+            // better SM utilization. T128x128 register overhead can't be
+            // amortized with few K-iterations. Sweep: 3B_FFN_Up M=128,256.
+            else if (ki > 7 && ki <= 16 && t64x128 >= 2 * SM)
+                use_128 = false;
+            // Marginal T128 wave fill (<1.5 waves) + T64x128 fills well (≥2 waves)
+            // → demote. T64x128's higher occupancy wins over T128's larger
+            // tile when T128 can't fill a second wave efficiently.
+            // Sweep: 7B_Attn M=512 (ki=28), 7B_FFN_Down M=512 (ki=148).
+            // Safe: 7B_FFN_Up M=128 has t128=148 > 3*SM/2, keeps T128.
+            else if (ki > 16 && t128 < 3 * SM / 2 && t64x128 >= 2 * SM)
                 use_128 = false;
 
             if (use_128)
@@ -2715,8 +2817,29 @@ namespace
     // =========================================================================
     // Stream-K force mode: 0 = auto (heuristic), 1 = force ON, -1 = force OFF
     // Controllable from tests via extern "C" cudaNativeVNNIPrefill_setStreamKMode()
+    // Also controllable via LLAMINAR_STREAM_K env var (0=auto, 1=force, -1=off, 2=two-pass)
     // =========================================================================
-    static int g_stream_k_force_mode = 0;
+    static int g_stream_k_force_mode = []()
+    {
+        const char *env = std::getenv("LLAMINAR_STREAM_K");
+        return env ? std::atoi(env) : 0;
+    }();
+
+    // =========================================================================
+    // Bias-add kernel: adds per-column bias to C (launched after stream-K GEMM)
+    // C[row, col] += bias[col] for all (row, col) in [M, N].
+    // =========================================================================
+    __global__ void streamk_add_bias(
+        float *__restrict__ C,
+        const float *__restrict__ bias,
+        int M,
+        int N)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = M * N;
+        if (idx < total)
+            C[idx] += bias[idx % N];
+    }
 
     // =========================================================================
     // Stream-K launch helper: launches the persistent GEMM kernel with nsm
@@ -2763,10 +2886,10 @@ namespace
         (void)cudaGetLastError();
 
         // Stream-K with atomicAdd requires C to be zeroed so that all blocks
-        // can safely atomicAdd their partial sums.  Beta/bias are not supported
+        // can safely atomicAdd their partial sums.  Beta is not supported
         // because there is no ordering guarantee on which block writes first.
-        // (In practice, all transformer GEMMs use beta=0, bias=nullptr.)
-        if (beta != 0.0f || d_bias != nullptr)
+        // Bias is handled as a post-hoc add after the GEMM completes.
+        if (beta != 0.0f)
             return false;
 
         cudaMemsetAsync(d_C_fp32, 0, static_cast<size_t>(M) * N * sizeof(float), cuda_stream);
@@ -2784,16 +2907,197 @@ namespace
             d_emins,
             d_C_fp32,
             d_scales_A_block,
+            nullptr, // d_C_existing: not supported with stream-K
+            nullptr, // d_bias: applied post-hoc below
+            M, N, K,
+            alpha, 0.0f,
+            nullptr); // No fixup buffer needed — partials use atomicAdd on C
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[StreamK] Kernel launch failed: %s (M=%d N=%d K=%d grid=%d occ_mult=%d)\n",
+                    cudaGetErrorString(err), M, N, K, grid_blocks, occ_mult);
+            return false;
+        }
+
+        // Post-hoc bias add: safe because GEMM writes are complete before
+        // this kernel reads C (CUDA stream ordering guarantees).
+        if (d_bias != nullptr)
+        {
+            const int total_elems = M * N;
+            constexpr int BIAS_THREADS = 256;
+            const int bias_blocks = (total_elems + BIAS_THREADS - 1) / BIAS_THREADS;
+            streamk_add_bias<<<bias_blocks, BIAS_THREADS, 0, cuda_stream>>>(
+                d_C_fp32, d_bias, M, N);
+            err = cudaGetLastError();
+            if (err != cudaSuccess)
+            {
+                fprintf(stderr, "[StreamK] Bias-add kernel failed: %s\n", cudaGetErrorString(err));
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // =========================================================================
+    // Stream-K two-pass fixup kernel: copies tile-indexed fixup buffer to C
+    // with M/N bounds checking. One thread block per output tile.
+    // =========================================================================
+    template <int BM, int BN>
+    __global__ void streamk_fixup_copy(
+        const float *__restrict__ fixup,
+        float *__restrict__ C,
+        int M,
+        int N,
+        int ntx)
+    {
+        const int tile_idx = blockIdx.x;
+        const int ty = tile_idx / ntx;
+        const int tx = tile_idx % ntx;
+        const int block_m = ty * BM;
+        const int block_n = tx * BN;
+
+        const float *__restrict__ tile_data = fixup + tile_idx * (BM * BN);
+
+        // Each thread handles multiple elements via grid-stride within the tile
+        for (int i = threadIdx.x; i < BM * BN; i += blockDim.x)
+        {
+            const int lr = i / BN; // BN is power of 2 → compiler uses shift
+            const int lc = i % BN; // BN is power of 2 → compiler uses mask
+            const int gr = block_m + lr;
+            const int gc = block_n + lc;
+            if (gr < M && gc < N)
+                C[gr * N + gc] = tile_data[i];
+        }
+    }
+
+    // =========================================================================
+    // Cached fixup buffer for two-pass stream-K. Grows as needed, freed
+    // explicitly via cudaNativeVNNIPrefill_freeStreamKFixup().
+    // =========================================================================
+    static float *g_streamk_fixup_buf = nullptr;
+    static size_t g_streamk_fixup_buf_size = 0;
+    static int g_streamk_fixup_device = -1;
+
+    static float *getOrAllocFixupBuffer(size_t required_bytes, cudaStream_t stream)
+    {
+        // Track which device owns the buffer to prevent cross-device access
+        int current_device = -1;
+        cudaGetDevice(&current_device);
+
+        if (g_streamk_fixup_buf && g_streamk_fixup_device != current_device)
+        {
+            // Buffer was allocated on a different device — free and reallocate
+            cudaSetDevice(g_streamk_fixup_device);
+            cudaFree(g_streamk_fixup_buf);
+            cudaSetDevice(current_device);
+            g_streamk_fixup_buf = nullptr;
+            g_streamk_fixup_buf_size = 0;
+            g_streamk_fixup_device = -1;
+        }
+
+        if (g_streamk_fixup_buf_size < required_bytes)
+        {
+            if (g_streamk_fixup_buf)
+                cudaFree(g_streamk_fixup_buf);
+            g_streamk_fixup_buf = nullptr;
+            g_streamk_fixup_buf_size = 0;
+            if (cudaMalloc(&g_streamk_fixup_buf, required_bytes) != cudaSuccess)
+                return nullptr;
+            g_streamk_fixup_buf_size = required_bytes;
+            g_streamk_fixup_device = current_device;
+        }
+        cudaMemsetAsync(g_streamk_fixup_buf, 0, required_bytes, stream);
+        return g_streamk_fixup_buf;
+    }
+
+    // =========================================================================
+    // Stream-K two-pass launch helper: main kernel writes partial sums to a
+    // flat tile-indexed fixup buffer (atomicAdd, no M/N bounds check), then a
+    // lightweight fixup kernel copies fixup→C with bounds checking.
+    //
+    // The main kernel uses MIN_BLOCKS_HINT=2, targeting ≤64 regs/thread for
+    // 2 blocks/SM (66.67% occupancy) on 512-thread tiles. The simpler epilogue
+    // (no runtime N multiply, no M/N bounds checks) eliminates ~12 gap
+    // registers that forced the one-pass variant to 128 regs / 1 block/SM.
+    // =========================================================================
+    template <uint8_t CODEBOOK_ID, int BM, int BN, int WM, int WN>
+    bool launchNativeVNNITC_BK64_StreamK_TwoPass(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        const uint16_t *d_mins,
+        const uint32_t *d_emins,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        int M,
+        int N,
+        int K,
+        float alpha,
+        float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        cudaStream_t cuda_stream)
+    {
+        // Two-pass stream-K only supports beta=0, no bias (same constraint as one-pass)
+        if (beta != 0.0f || d_bias != nullptr)
+            return false;
+
+        const int nsm = getSmCount();
+        const int ntx = (N + BN - 1) / BN;
+        const int nty = (M + BM - 1) / BM;
+        const int total_tiles = ntx * nty;
+
+        // Query occupancy for the two-pass kernel (FIXUP_TWO_PASS=true → MIN_BLOCKS_HINT=2)
+        constexpr int BLOCK_SIZE_SK = WM * WN * 32;
+        int max_blocks_per_sm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &max_blocks_per_sm,
+            nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, 1, 2, /*STREAM_K=*/true, /*FIXUP_TWO_PASS=*/true>,
+            BLOCK_SIZE_SK, 0);
+        const int occ_mult = max(1, min(max_blocks_per_sm, 2));
+        const int grid_blocks = occ_mult * nsm;
+
+        (void)cudaGetLastError();
+
+        // Allocate tile-indexed fixup buffer: total_tiles × BM × BN floats
+        const size_t fixup_bytes = static_cast<size_t>(total_tiles) * BM * BN * sizeof(float);
+        float *fixup_buf = getOrAllocFixupBuffer(fixup_bytes, cuda_stream);
+        if (!fixup_buf)
+            return false;
+
+        // Main kernel: writes partial sums to fixup buffer via atomicAdd.
+        // No M/N bounds checks — fixup buffer covers full padded tiles.
+        const dim3 grid(grid_blocks, 1, 1);
+        const dim3 block(BLOCK_SIZE_SK);
+
+        nativeVnniTC_BK64<CODEBOOK_ID, BM, BN, WM, WN, /*SPLIT_K=*/1, /*STAGES_=*/2,
+                          /*STREAM_K=*/true, /*FIXUP_TWO_PASS=*/true><<<grid, block, 0, cuda_stream>>>(
+            d_A_int8,
+            d_payload,
+            d_scales,
+            d_mins,
+            d_emins,
+            d_C_fp32,
+            d_scales_A_block,
             d_C_existing,
             d_bias,
             M, N, K,
             alpha, beta,
-            nullptr); // No fixup buffer needed — partials use atomicAdd on C
+            fixup_buf);
 
         if (cudaGetLastError() != cudaSuccess)
             return false;
 
-        return true;
+        // Fixup kernel: copy from tile-indexed fixup buffer to C with M/N bounds checking.
+        // One thread block per output tile, 256 threads each.
+        constexpr int FIXUP_THREADS = 256;
+        streamk_fixup_copy<BM, BN><<<total_tiles, FIXUP_THREADS, 0, cuda_stream>>>(
+            fixup_buf, d_C_fp32, M, N, ntx);
+
+        return cudaGetLastError() == cudaSuccess;
     }
 
     // =========================================================================
@@ -2831,17 +3135,17 @@ namespace
         const int nsm = getSmCount();
         const int total_tiles = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
 
-        // Stream-K only helps with 128×128+ tiles (compiled with relaxed
-        // launch_bounds; smaller tiles already have high occupancy).
-        if (bm < 128 || bn < 128)
-            return false;
-
-        // Need at least 1 wave of tiles (otherwise standard is fine)
+        // Need at least 1 SM-wave of tiles (otherwise standard is fine)
         if (total_tiles < nsm)
             return false;
 
-        // Compute wave tail efficiency (how full is the last wave)
-        const float waves = static_cast<float>(total_tiles) / static_cast<float>(nsm);
+        // Estimate occupancy: T128x128 (bm≥128) → 2 blocks/SM; T64x128 → 3.
+        // This matches the actual max_blocks_per_sm queried in the launch helper.
+        const int occ = (bm >= 128) ? 2 : 3;
+        const int total_slots = nsm * occ;
+
+        // Compute wave tail efficiency using actual concurrent slot count
+        const float waves = static_cast<float>(total_tiles) / static_cast<float>(total_slots);
         const float frac = waves - static_cast<float>(static_cast<int>(waves));
         const float wave_eff = (frac < 0.001f) ? 1.0f : frac;
 
@@ -2850,7 +3154,13 @@ namespace
         const int num_k_tiles = (K / 32 + 1) / 2;
         const long long total_work = static_cast<long long>(total_tiles) * num_k_tiles;
 
-        return wave_eff < 0.70f && waves < 3.0f && total_work >= 8000;
+        // Output matrix must fit in L2 cache for atomicAdd to be efficient.
+        // RTX 3090 has 6MB L2; output > 4MB causes DRAM atomicAdd contention.
+        const long long output_bytes = static_cast<long long>(M) * N * sizeof(float);
+        if (output_bytes > 4LL * 1024 * 1024)
+            return false;
+
+        return wave_eff < 0.70f && total_work >= 8000;
     }
 
     int chooseSplitK_BK64(Q40PrefillShape shape, int M, int N, int K, int bm, int bn)
@@ -2970,23 +3280,17 @@ namespace
     {
         const int grid_blocks = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
         const int num_outer_tiles = (K / 32 + 7) / 8;
-        const bool k_rich = (K >= 2 * N);
-        const bool recover_underfill =
-            grid_blocks < MIN_GRID_BLOCKS &&
-            num_outer_tiles >= 4;
 
-        if (!k_rich && !recover_underfill)
+        // BK256 split-K is capped at 2: sweep data (0.5B-14B) shows sk=4/8
+        // alias to sk=1/sk=2 performance due to a kernel partitioning bug.
+        // sk=2 consistently matches or beats sk=1 across all FFN_Down shapes,
+        // so use sk=2 when there's enough K-work to split and the grid is underfilled.
+        if (num_outer_tiles < 4)
             return 1;
-        if (!recover_underfill && grid_blocks >= MIN_GRID_BLOCKS)
-            return 1;
-        if (num_outer_tiles < 2)
-            return 1;
-
-        const int needed = (MIN_GRID_BLOCKS + grid_blocks - 1) / grid_blocks;
-        int split_k = roundUpPow2Clamped(needed, 8);
-        while (split_k > 1 && (num_outer_tiles / split_k) < 2)
-            split_k >>= 1;
-        return std::max(1, split_k);
+        const int SM = getSmCount();
+        if (grid_blocks >= SM)
+            return 1; // Already enough blocks for good utilization
+        return 2;
     }
 }
 
@@ -3023,41 +3327,82 @@ extern "C"
         const Q40PrefillShape shape = classifyQ40PrefillShape(M, N, K);
         recordQ40PrefillShape(shape);
 
+        // ─── BK256 path: large-K shapes benefit from 4× fewer K-iterations ──
+        // BK256 processes 256 K-elements per outer tile (vs 64 for BK64),
+        // reducing barrier overhead and improving data reuse for shapes like
+        // FFN_Down (K=18944). Uses 1 block/SM with max register budget.
+        // However, BK256's low occupancy (1 block/SM) means it only helps
+        // when BK64 can't fill the GPU. At larger M, BK64 has enough tiles.
+        {
+            const bool bk256_forced = (g_bk256_force_mode > 0);
+            const bool bk256_disabled = (g_bk256_force_mode < 0);
+            const int SM = getSmCount();
+            const int t64x128_check = ((M + 63) / 64) * ((N + 127) / 128);
+            // Auto heuristic: BK256 for K-heavy shapes where BK64 tiles
+            // can't fill the GPU. Sweep data (0.5B-14B, single GPU):
+            // K > 2*N selects FFN_Down; t64x128 < SM ensures GPU is underfilled.
+            // At larger M (t64x128 >= SM), BK64 has better occupancy.
+            const bool bk256_auto = !bk256_disabled && (K > 2 * N) && (t64x128_check < SM);
+            if (bk256_forced || bk256_auto)
+            {
+                const int sk = chooseSplitK_BK256(shape, M, N, K, 128, 128);
+                bool ok = false;
+                // Only sk=1 and sk=2 are meaningful; sk=4/8 alias to sk=1/2
+                // due to a kernel partitioning bug (see chooseSplitK_BK256 comment).
+                if (sk >= 2)
+                    ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 2>(
+                        d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
+                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+                else
+                    ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 1>(
+                        d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
+                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);
+                if (ok)
+                    return true;
+                // Fall through to BK64 dispatch if BK256 failed
+            }
+        }
+
         // ─── Sweep-derived dispatch ───────────────────────────────────
         const TileChoice tc = chooseQ40PrefillTile(M, N, K);
 
 // Macro to fan out split_k for a given tile config (avoids 24-way copy-paste)
-#define Q40_DISPATCH_SK(CB, BM_, BN_, WM_, WN_)                             \
-    do                                                                      \
-    {                                                                       \
-        if (tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_))         \
-            return launchNativeVNNITC_BK64_StreamK<CB, BM_, BN_, WM_, WN_>( \
-                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
-                d_C_fp32, d_scales_A_block,                                 \
-                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
-        switch (tc.split_k)                                                 \
-        {                                                                   \
-        case 8:                                                             \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(      \
-                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
-                d_C_fp32, d_scales_A_block,                                 \
-                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
-        case 4:                                                             \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(      \
-                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
-                d_C_fp32, d_scales_A_block,                                 \
-                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
-        case 2:                                                             \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(      \
-                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
-                d_C_fp32, d_scales_A_block,                                 \
-                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
-        default:                                                            \
-            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(      \
-                d_A_int8, d_payload, d_scales, nullptr, nullptr,            \
-                d_C_fp32, d_scales_A_block,                                 \
-                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);   \
-        }                                                                   \
+#define Q40_DISPATCH_SK(CB, BM_, BN_, WM_, WN_)                                     \
+    do                                                                              \
+    {                                                                               \
+        if (tc.split_k == 1 && g_stream_k_force_mode == 2)                          \
+            return launchNativeVNNITC_BK64_StreamK_TwoPass<CB, BM_, BN_, WM_, WN_>( \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,                    \
+                d_C_fp32, d_scales_A_block,                                         \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);           \
+        if (tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_))                 \
+            return launchNativeVNNITC_BK64_StreamK<CB, BM_, BN_, WM_, WN_>(         \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,                    \
+                d_C_fp32, d_scales_A_block,                                         \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);           \
+        switch (tc.split_k)                                                         \
+        {                                                                           \
+        case 8:                                                                     \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(              \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,                    \
+                d_C_fp32, d_scales_A_block,                                         \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);           \
+        case 4:                                                                     \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(              \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,                    \
+                d_C_fp32, d_scales_A_block,                                         \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);           \
+        case 2:                                                                     \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(              \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,                    \
+                d_C_fp32, d_scales_A_block,                                         \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);           \
+        default:                                                                    \
+            return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(              \
+                d_A_int8, d_payload, d_scales, nullptr, nullptr,                    \
+                d_C_fp32, d_scales_A_block,                                         \
+                M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream);           \
+        }                                                                           \
     } while (0)
 
         switch (tc.tile)
@@ -3109,9 +3454,82 @@ extern "C"
         return g_stream_k_force_mode;
     }
 
+    // BK256 force mode: 0=auto(heuristic), 1=force ON, -1=force OFF
+    void cudaNativeVNNIPrefill_setBK256Mode(int mode)
+    {
+        g_bk256_force_mode = mode;
+    }
+
+    int cudaNativeVNNIPrefill_getBK256Mode()
+    {
+        return g_bk256_force_mode;
+    }
+
     void cudaNativeVNNIPrefill_freeStreamKFixup()
     {
-        // No-op: fixup buffer removed in favor of atomicAdd approach
+        if (g_streamk_fixup_buf)
+        {
+            // Free on the device that owns the buffer
+            if (g_streamk_fixup_device >= 0)
+            {
+                int current_device = -1;
+                cudaGetDevice(&current_device);
+                if (current_device != g_streamk_fixup_device)
+                    cudaSetDevice(g_streamk_fixup_device);
+                cudaFree(g_streamk_fixup_buf);
+                if (current_device != g_streamk_fixup_device)
+                    cudaSetDevice(current_device);
+            }
+            else
+            {
+                cudaFree(g_streamk_fixup_buf);
+            }
+            g_streamk_fixup_buf = nullptr;
+            g_streamk_fixup_buf_size = 0;
+            g_streamk_fixup_device = -1;
+        }
+    }
+
+    // Force-tile/split-k override for sweep benchmarks.
+    //   tile_id: -1 = auto, 0..5 = TileId enum (T64x64_w2x2 .. T128x128_w4x4)
+    //   split_k: 0 = auto, 1..8 = forced split-K value
+    void cudaNativeVNNIPrefill_setForceTile(int tile_id, int split_k)
+    {
+        g_force_tile_id = tile_id;
+        g_force_split_k = split_k;
+    }
+
+    void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k)
+    {
+        if (tile_id)
+            *tile_id = g_force_tile_id;
+        if (split_k)
+            *split_k = g_force_split_k;
+    }
+
+    // Return the number of tiles for a given tile config + shape
+    int cudaNativeVNNIPrefill_getTileCount(int tile_id, int M, int N)
+    {
+        int bm = 64, bn = 64;
+        switch (static_cast<TileId>(tile_id))
+        {
+        case TileId::T64x64_w2x2:
+            bm = 64;
+            bn = 64;
+            break;
+        case TileId::T64x128_w2x2:
+        case TileId::T64x128_w4x2:
+        case TileId::T64x128_w2x4:
+            bm = 64;
+            bn = 128;
+            break;
+        case TileId::T128x128_w4x2:
+        case TileId::T128x128_w4x4:
+            bm = 128;
+            bn = 128;
+            break;
+        }
+        return ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
     }
 
     bool cudaNativeVNNIPrefillIQ4NL_fp32(

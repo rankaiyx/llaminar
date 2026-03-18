@@ -297,6 +297,18 @@ namespace llaminar2
                 const float *d_bias,
                 int cuda_device_id,
                 void *stream);
+
+            // cuBLAS FP16 GEMM for Q4_0 native VNNI weights (CUDAcuBLASQuantGemm.cu)
+            bool cudaCuBLAS_fp16_gemm_q40(
+                const uint8_t *d_payload,
+                const uint16_t *d_scales_B,
+                const float *d_A_fp32,
+                float *d_C_fp32,
+                int M, int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                int cuda_device_id,
+                void *stream);
         }
 
         // =====================================================================
@@ -452,6 +464,19 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream)
             {
+                // Guard: NativeVNNI-only mode skips INT8 expanded weight upload,
+                // so d_weights_int8 and d_scales_B are null.  Return false to
+                // let the caller report the error instead of crashing inside
+                // the blockwise kernel with a null-pointer dereference.
+                if (!d_weights_int8 || !d_scales_B)
+                {
+                    LOG_WARN("[CUDAQuantisedGemmKernel] Blockwise fallback skipped: "
+                             "d_weights_int8="
+                             << static_cast<const void *>(d_weights_int8)
+                             << " d_scales_B=" << static_cast<const void *>(d_scales_B)
+                             << " (NativeVNNI-only mode?)");
+                    return false;
+                }
                 return cudaQuantGemm_blockwiseGemm(
                     d_A_int8,
                     d_weights_int8,
@@ -493,6 +518,31 @@ namespace llaminar2
                     return true;
                 default:
                     return false;
+                }
+            }
+
+            // Returns true only for codebooks where the NativeVNNI prefill path
+            // succeeds unconditionally (no profitability gate).  Dual-scale
+            // codebooks (8,9,10,13,14,17) have a runtime profitability check
+            // that can reject large-M or K-poor shapes, so the expanded weight
+            // fallback must remain available for those.
+            bool nativeVNNIPrefillAlwaysSucceeds(uint8_t cb)
+            {
+                switch (cb)
+                {
+                case 0:  // Q4_0
+                case 4:  // IQ4_NL
+                case 5:  // Q4_1 / Q4_K / Q5_K
+                case 6:  // Q5_0
+                case 7:  // Q5_1
+                case 11: // IQ3_S
+                case 12: // IQ3_XXS
+                case 15: // IQ2_XXS
+                case 16: // IQ1_S
+                case 18: // Q8_0
+                    return true;
+                default:
+                    return false; // dual-scale: 8,9,10,13,14,17
                 }
             }
 
@@ -919,7 +969,7 @@ namespace llaminar2
                         !g_force_cutlass_fallback &&
                         (packed_->K % 32) == 0 &&
                         cudaNativeVNNIGemvTuned_supportsCodebook(packed_->native_codebook_id) &&
-                        nativeVNNIPrefillSupportsCodebook(packed_->native_codebook_id) &&
+                        nativeVNNIPrefillAlwaysSucceeds(packed_->native_codebook_id) &&
                         [&]()
                     {
                         cudaDeviceProp prop;
@@ -2244,6 +2294,40 @@ namespace llaminar2
 
             // Ensure weights converted
             ensureWeightsConverted();
+
+            // ──── cuBLAS FP16 GEMM path (LLAMINAR_CUBLAS_GEMM=1) ────────────
+            // Dequant Q4_0 native VNNI weights → FP16 per-call,
+            // convert FP32 activations → FP16,
+            // then cuBLAS FP16 tensor-core GEMM with FP32 accumulation.
+            static const bool use_cublas_gemm = []()
+            {
+                const char *env = std::getenv("LLAMINAR_CUBLAS_GEMM");
+                return (env && atoi(env) == 1);
+            }();
+
+            if (use_cublas_gemm && m > 1 && impl_->d_weights_native_vnni && impl_->d_weights_native_scales)
+            {
+                static std::once_flag cublas_gemm_once;
+                std::call_once(cublas_gemm_once, []()
+                               { LOG_INFO("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM path active (Q4_0 native dequant)"); });
+
+                const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
+                bool ok = cudaCuBLAS_fp16_gemm_q40(
+                    impl_->d_weights_native_vnni,
+                    impl_->d_weights_native_scales,
+                    d_A, d_C,
+                    m, n, k,
+                    alpha, beta,
+                    d_C_existing,
+                    cuda_device_id_, gpu_stream_);
+                if (ok)
+                {
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (cuBLAS FP16 Q4_0)");
+                    return true;
+                }
+                LOG_WARN("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM failed, falling back");
+            }
 
             // Use blockwise quantization for prefill and for decode when a native
             // payload GEMV path is available.

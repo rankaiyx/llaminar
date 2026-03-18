@@ -3981,15 +3981,7 @@ add_executable(v2_perf_cuda_native_vnni_gemm performance/kernels/cuda/gemm/Perf_
 target_link_libraries(v2_perf_cuda_native_vnni_gemm llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Perf_CUDANativeVNNIGemm
     COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_gemm>
-    LABELS "V2;Performance;CUDA;GEMM;NativeVNNI;Prefill;Qwen;Tuning"
-    MPI_PROCS 1
-)
-
-add_executable(v2_perf_cuda_streamk_ab performance/kernels/cuda/gemm/Perf__CUDAStreamKAB.cpp)
-target_link_libraries(v2_perf_cuda_streamk_ab llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Perf_CUDAStreamKAB
-    COMMAND $<TARGET_FILE:v2_perf_cuda_streamk_ab>
-    LABELS "V2;Performance;CUDA;GEMM;StreamK;Prefill;Qwen"
+    LABELS "V2;Performance;CUDA;GEMM;NativeVNNI;Prefill;Qwen;Tuning;StreamK"
     MPI_PROCS 1
 )
 

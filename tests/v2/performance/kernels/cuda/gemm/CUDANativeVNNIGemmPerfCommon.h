@@ -427,8 +427,17 @@ namespace llaminar2::test::native_vnni_gemm_perf
         std::unique_ptr<DeviceWorkspaceManager> workspace;
         if (workspace_consumer)
         {
-            workspace = std::make_unique<DeviceWorkspaceManager>(device, 512ull * 1024ull * 1024ull);
             const auto reqs = workspace_consumer->getWorkspaceRequirements(m, n, k);
+            // Compute actual budget from requirements instead of hardcoding
+            size_t needed = 0;
+            for (const auto &buf : reqs.buffers)
+            {
+                needed = (needed + buf.alignment - 1) & ~(buf.alignment - 1);
+                needed += buf.size_bytes;
+            }
+            // Add 10% headroom for alignment padding
+            const size_t budget = std::max(needed + needed / 10, size_t{64} * 1024 * 1024);
+            workspace = std::make_unique<DeviceWorkspaceManager>(device, budget);
             if (!workspace->allocate(reqs))
                 throw std::runtime_error("Failed to allocate CUDA GEMM workspace");
             workspace_consumer->bindWorkspace(workspace.get());
