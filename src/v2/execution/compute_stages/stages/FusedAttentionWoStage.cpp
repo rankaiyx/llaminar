@@ -739,6 +739,28 @@ namespace llaminar2
             auto *output_base = asTensorBase(params_.output, "output");
             auto *context_snapshot_base = asTensorBase(params_.context_snapshot, "context_snapshot");
 
+            // Override K/V from KV cache at execute time for decode mode.
+            // When the forward graph is cached (built during first forward with
+            // cached_tokens=0), params_.K/V point to activation scratch buffers
+            // which only contain the current token's projections. During decode
+            // (effective_kv_len > seq_len), we need the full KV history from the cache.
+            // This mirrors the Q16_INTEGER path which always overrides K/V from cache.
+            if (params_.kv_cache && params_.layer_idx >= 0 && effective_kv_len > params_.seq_len)
+            {
+                auto *cache_k = dynamic_cast<TensorBase *>(params_.kv_cache->get_k(params_.layer_idx, 0));
+                auto *cache_v = dynamic_cast<TensorBase *>(params_.kv_cache->get_v(params_.layer_idx, 0));
+                if (cache_k && cache_v)
+                {
+                    LOG_DEBUG("[FusedAttentionWoStage] Q8_1 decode: overriding K/V from KV cache"
+                              << " (effective_kv_len=" << effective_kv_len
+                              << " seq_len=" << params_.seq_len
+                              << " K: " << static_cast<const void*>(K_base) << " → " << static_cast<const void*>(cache_k)
+                              << " V: " << static_cast<const void*>(V_base) << " → " << static_cast<const void*>(cache_v) << ")");
+                    K_base = cache_k;
+                    V_base = cache_v;
+                }
+            }
+
             success = kernel_->compute(
                 Q_base,
                 K_base,

@@ -15,6 +15,8 @@
  *   - Graph cache invalidation on clear_cache() (eeca83dd)
  *   - KernelFactory::resetAllDynamicState() lifecycle (8666332f)
  *   - Session epoch reset (8666332f)
+ *   - Stale activation buffer K/V in decode after graph cache reuse
+ *     (AttentionComputeStage decode-mode KV cache override)
  *
  * Requires: models/qwen2.5-0.5b-instruct-q4_0.gguf
  */
@@ -238,10 +240,12 @@ TEST_P(Test__MultiTurnSessionReset, Three_Consecutive_Sessions_AllValid)
     ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()));
 }
 
-// Regression: different-length prompts across sessions.
-// Exercises the token count change path in the memcmp guard:
-//   dynamic_token_count_ != num_tokens → force re-upload.
-// Verifies all sessions produce valid (non-garbage) output.
+// Regression: different-length prompts across sessions must be deterministic.
+// Root cause: the forward graph cache reuses a graph built during prefill
+// (when cached_tokens=0, K/V wired to activation scratch buffers) for decode
+// steps (when the attention needs full KV history from the KV cache).
+// Fix: AttentionComputeStage/FusedAttentionWoStage override K/V from KV
+// cache at execute time in decode mode.
 TEST_P(Test__MultiTurnSessionReset, DifferentLengthPrompts_AcrossSessions)
 {
     // Short prompt (1 token)
@@ -249,26 +253,28 @@ TEST_P(Test__MultiTurnSessionReset, DifferentLengthPrompts_AcrossSessions)
     // Longer prompt (3 tokens)
     std::vector<int32_t> long_prompt = {9707, 3838, 25402};
 
+    // Session 1: Short prompt
     auto tokens_short = runInference(short_prompt, 3);
     ASSERT_FALSE(tokens_short.empty());
     ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()));
 
     runner_->clearCache();
 
+    // Session 2: Long prompt (different seq_len exercises graph cache paths)
     auto tokens_long = runInference(long_prompt, 3);
     ASSERT_FALSE(tokens_long.empty());
     ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()));
 
     runner_->clearCache();
 
-    // Re-run short prompt — must produce VALID output (not garbage).
-    // Note: strict determinism (tokens_short == tokens_short2) holds on GPU
-    // but may not hold on CPU due to pipeline state management differences.
+    // Session 3: Short prompt again — must match session 1
     auto tokens_short2 = runInference(short_prompt, 3);
     ASSERT_FALSE(tokens_short2.empty())
         << "Short prompt after long prompt session must still generate tokens";
     ASSERT_TRUE(logitsAreValid(runner_->lastLogits(), runner_->vocabSize()))
-        << "Logits must be valid (not NaN/Inf) after different-length session";
+        << "Logits must be valid after different-length session";
+    EXPECT_EQ(tokens_short, tokens_short2)
+        << "Same prompt with greedy sampling must produce identical tokens across sessions";
 }
 
 // ============================================================================

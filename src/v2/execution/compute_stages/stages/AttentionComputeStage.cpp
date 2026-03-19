@@ -92,20 +92,30 @@ namespace llaminar2
         // buffers, eliminating the Q8_1→FP32→FP16 triple conversion.
         ITensor *effective_K = params_.K;
         ITensor *effective_V = params_.V;
-        if (params_.read_kv_from_cache && params_.kv_cache && params_.layer_idx >= 0)
+        if (params_.kv_cache && params_.layer_idx >= 0)
         {
-            ITensor *cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
-            ITensor *cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
-            if (cache_k && cache_v)
+            // Always override K/V from KV cache when:
+            // 1. read_kv_from_cache is set (GPU optimization for type conversion), OR
+            // 2. We're in decode mode (effective_kv_len > seq_len) - the graph may have
+            //    been built during prefill (cached_tokens=0) with K/V wired to activation
+            //    scratch buffers. During decode, those buffers only hold the current token's
+            //    projection. The full KV history lives in the cache (populated by
+            //    KVCacheAppendStage which runs before this stage).
+            if (params_.read_kv_from_cache || effective_kv_len > params_.seq_len)
             {
-                effective_K = cache_k;
-                effective_V = cache_v;
-                LOG_TRACE("[AttentionComputeStage] Using cache K/V ("
-                          << cache_k->dtype_name() << ") for layer " << params_.layer_idx);
-            }
-            else
-            {
-                LOG_TRACE("[AttentionComputeStage] Cache K/V not available yet, using wired tensors");
+                ITensor *cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+                ITensor *cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
+                if (cache_k && cache_v)
+                {
+                    effective_K = cache_k;
+                    effective_V = cache_v;
+                    LOG_TRACE("[AttentionComputeStage] Using cache K/V ("
+                              << cache_k->dtype_name() << ") for layer " << params_.layer_idx);
+                }
+                else
+                {
+                    LOG_TRACE("[AttentionComputeStage] Cache K/V not available yet, using wired tensors");
+                }
             }
         }
 

@@ -2414,54 +2414,12 @@ namespace llaminar2
 
         // Verify all outputs (NaN/Inf/null checks)
         // IMPORTANT: Sync outputs from GPU BEFORE reading data
-
-        // DEBUG: Log coherence state BEFORE ensureOutputsOnHost
-        for (const auto &output : dump_info.outputs)
-        {
-            if (output.tensor)
-            {
-                auto *tb = dynamic_cast<TensorBase *>(output.tensor);
-                if (tb)
-                {
-                    LOG_WARN("[VERIFY-DIAG] PRE-SYNC stage=" << node.name
-                                                             << " output=" << (output.name ? output.name : "?")
-                                                             << " isOnCPU=" << tb->isOnCPU()
-                                                             << " isDeviceValid=" << tb->isDeviceValid()
-                                                             << " gpu_device=" << (tb->current_device().has_value() ? tb->current_device()->to_string() : "none")
-                                                             << " rows=" << output.rows << " cols=" << output.cols
-                                                             << " raw_data=" << output.data);
-                }
-            }
-        }
-
         dump_info.ensureOutputsOnHost();
 
         for (const auto &output : dump_info.outputs)
         {
             if (!output.data)
                 continue;
-
-            // DEBUG: Log first few values after sync
-            {
-                const float *fp = static_cast<const float *>(output.data);
-                size_t total = output.rows * output.cols;
-                size_t check = std::min(total, static_cast<size_t>(4));
-                bool all_zero = true;
-                std::ostringstream vals;
-                for (size_t i = 0; i < check; ++i)
-                {
-                    vals << fp[i];
-                    if (i + 1 < check)
-                        vals << ",";
-                    if (fp[i] != 0.0f)
-                        all_zero = false;
-                }
-                LOG_WARN("[VERIFY-DIAG] POST-SYNC stage=" << node.name
-                                                          << " output=" << (output.name ? output.name : "?")
-                                                          << " first_vals=[" << vals.str() << "]"
-                                                          << " all_zero=" << all_zero
-                                                          << " total_elements=" << total);
-            }
 
             auto result = verifyRawBuffer(
                 output.data, output.rows, output.cols,
