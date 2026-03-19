@@ -585,8 +585,8 @@ namespace
             DeviceId::cpu());
 
         // Verify KV cache append stage exists
-        EXPECT_TRUE(hasStageType(attn_graph, ComputeStageType::COPY))
-            << "Expected KVCacheAppendStage (type=COPY) in graph with KV cache";
+        EXPECT_TRUE(hasStageType(attn_graph, ComputeStageType::KV_CACHE_APPEND))
+            << "Expected KVCacheAppendStage (type=KV_CACHE_APPEND) in graph with KV cache";
     }
 
     // ============================================================================
@@ -628,7 +628,7 @@ namespace
         for (const auto &name : order)
         {
             const ComputeNode *node = attn_graph.getNode(name);
-            if (node && node->stage && node->stage->type() == ComputeStageType::COPY)
+            if (node && node->stage && node->stage->type() == ComputeStageType::KV_CACHE_APPEND)
             {
                 auto *kv_stage = dynamic_cast<KVCacheAppendStage *>(node->stage.get());
                 if (kv_stage)
@@ -672,7 +672,7 @@ namespace
         for (const auto &name : order)
         {
             const ComputeNode *node = attn_graph.getNode(name);
-            if (node && node->stage && node->stage->type() == ComputeStageType::COPY)
+            if (node && node->stage && node->stage->type() == ComputeStageType::KV_CACHE_APPEND)
             {
                 auto *kv_stage = dynamic_cast<KVCacheAppendStage *>(node->stage.get());
                 if (kv_stage)
