@@ -2122,7 +2122,12 @@ namespace llaminar2
                     attn_params.layer_idx = layer_idx - config_.pp_layer_offset;
                     // GPU prefill: read K/V from cache at execution time to get FP16
                     // tensors directly, avoiding Q8_1→FP32→FP16 triple conversion.
-                    attn_params.read_kv_from_cache = device.is_gpu();
+                    // Exception: Q8_1 KV cache — reading from cache during prefill forces
+                    // an FP32→Q8_1→FP32 round-trip that degrades attention accuracy.
+                    // For Q8_1, use the direct FP32 K/V wired from projections during prefill;
+                    // the decode path handles cache reads via effective_kv_len > seq_len.
+                    attn_params.read_kv_from_cache = device.is_gpu() &&
+                        (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1);
                     attn_params.position_offset = position_ids ? position_ids[0] : 0;
                     attn_params.mpi_ctx = mpi_ctx_.get();
                     attn_params.device_id = device;
