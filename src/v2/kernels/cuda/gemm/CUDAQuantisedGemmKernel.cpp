@@ -1679,6 +1679,11 @@ namespace llaminar2
             validateWorkspace();
             int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
 
+            // Ensure the LEADING kernel's weights are converted before checking
+            // blockwise eligibility. canUseNativeVNNIBlockwise() reads impl_->
+            // d_weights_native_vnni which is only populated after ensureWeightsConverted().
+            ensureWeightsConverted();
+
             // Use blockwise quantization for prefill and for decode when a native
             // payload GEMV path is available.
             const bool use_blockwise = (k % 32 == 0) && (m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));

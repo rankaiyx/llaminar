@@ -370,6 +370,402 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_TwoDomainsPP)
     }
 }
 
+// ============================================================================
+// LOCAL PP with TP-in-PP Composition Tests
+//
+// When a single rank owns multiple PP stages where each stage has a multi-
+// device TP domain, the builder must populate local_pp_stage_tp_info
+// and intentionally leave local_tp_devices EMPTY. This prevents the
+// graph builder from dispatching to the TP path instead of the PP path.
+// ============================================================================
+
+/**
+ * @brief LOCAL PP with TP-in-PP: verify local_pp_stage_tp_info is populated
+ *        and local_tp_devices is intentionally empty.
+ *
+ * Scenario: Single rank owns 2 PP stages, each with 2-device TP domain.
+ * The TP-in-PP guard must prevent global local_tp_devices from being set.
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_LocalPP_TPInPP_GuardPreventsGlobalTP)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::CUDA, 0}, {DeviceType::CUDA, 1}, {DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .build();
+
+    // Two TP domains, both on rank 0
+    DomainDefinition cuda_tp;
+    cuda_tp.name = "cuda_tp";
+    cuda_tp.devices = {GlobalDeviceAddress::cuda(0, 0), GlobalDeviceAddress::cuda(1, 0)};
+    cuda_tp.backend = CollectiveBackendType::NCCL;
+
+    DomainDefinition rocm_tp;
+    rocm_tp.name = "rocm_tp";
+    rocm_tp.devices = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(1, 0)};
+    rocm_tp.backend = CollectiveBackendType::RCCL;
+
+    config.domain_definitions = {cuda_tp, rocm_tp};
+
+    // Two PP stages on the same rank
+    PPStageDefinition stage0;
+    stage0.stage_id = 0;
+    stage0.domain_name = "cuda_tp";
+    stage0.first_layer = 0;
+    stage0.last_layer = 13;
+
+    PPStageDefinition stage1;
+    stage1.stage_id = 1;
+    stage1.domain_name = "rocm_tp";
+    stage1.first_layer = 14;
+    stage1.last_layer = 27;
+
+    config.pp_stage_definitions = {stage0, stage1};
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    // Critical: local_tp_devices must be EMPTY (TP-in-PP guard)
+    EXPECT_TRUE(plan.local_tp_devices.empty())
+        << "local_tp_devices must be empty when TP-in-PP is active. "
+           "Non-empty would cause buildComputeGraph() to dispatch to TP mode "
+           "instead of PP mode.";
+
+    // local_pp_stage_tp_info must be populated with per-stage TP domains
+    ASSERT_EQ(plan.local_pp_stage_tp_info.size(), 2);
+
+    // Stage 0: CUDA TP domain
+    EXPECT_EQ(plan.local_pp_stage_tp_info[0].devices.size(), 2);
+    EXPECT_EQ(plan.local_pp_stage_tp_info[0].tp_backend, CollectiveBackendType::NCCL);
+
+    // Stage 1: ROCm TP domain
+    EXPECT_EQ(plan.local_pp_stage_tp_info[1].devices.size(), 2);
+    EXPECT_EQ(plan.local_pp_stage_tp_info[1].tp_backend, CollectiveBackendType::RCCL);
+
+    // LOCAL PP devices should be populated (primary device per stage)
+    EXPECT_EQ(plan.local_pp_devices.size(), 2);
+
+    // Must be identified as LOCAL PP
+    EXPECT_TRUE(plan.usesLocalPP());
+
+    // Must NOT be identified as LOCAL TP (TP is per-stage, not global)
+    EXPECT_FALSE(plan.usesLocalTP());
+}
+
+/**
+ * @brief LOCAL PP with single-device stages: local_tp_devices IS populated
+ *        because no TP-in-PP guard fires.
+ *
+ * Scenario: Single rank owns 2 PP stages, each with 1-device domain.
+ * No TP composition, so no TP-in-PP guard.
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_LocalPP_SingleDeviceStages_NoTPGuard)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::CUDA, 0}, {DeviceType::CUDA, 1}})
+                       .build();
+
+    DomainDefinition gpu0;
+    gpu0.name = "gpu0";
+    gpu0.devices = {GlobalDeviceAddress::cuda(0, 0)};
+    gpu0.backend = CollectiveBackendType::NCCL;
+
+    DomainDefinition gpu1;
+    gpu1.name = "gpu1";
+    gpu1.devices = {GlobalDeviceAddress::cuda(1, 0)};
+    gpu1.backend = CollectiveBackendType::NCCL;
+
+    config.domain_definitions = {gpu0, gpu1};
+
+    PPStageDefinition stage0;
+    stage0.stage_id = 0;
+    stage0.domain_name = "gpu0";
+    stage0.first_layer = 0;
+    stage0.last_layer = 13;
+
+    PPStageDefinition stage1;
+    stage1.stage_id = 1;
+    stage1.domain_name = "gpu1";
+    stage1.first_layer = 14;
+    stage1.last_layer = 27;
+
+    config.pp_stage_definitions = {stage0, stage1};
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    // Single-device stages: local_pp_stage_tp_info has entries but each has 1 device
+    ASSERT_EQ(plan.local_pp_stage_tp_info.size(), 2);
+    EXPECT_EQ(plan.local_pp_stage_tp_info[0].devices.size(), 1);
+    EXPECT_EQ(plan.local_pp_stage_tp_info[1].devices.size(), 1);
+
+    // LOCAL PP still active (2 stages on 1 rank)
+    EXPECT_TRUE(plan.usesLocalPP());
+    EXPECT_EQ(plan.local_pp_devices.size(), 2);
+}
+
+/**
+ * @brief LOCAL PP with TP-in-PP: verify per-stage layer boundaries.
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_LocalPP_LayerBoundaries)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::CUDA, 0}, {DeviceType::CUDA, 1}})
+                       .build();
+
+    DomainDefinition gpu0;
+    gpu0.name = "gpu0";
+    gpu0.devices = {GlobalDeviceAddress::cuda(0, 0)};
+
+    DomainDefinition gpu1;
+    gpu1.name = "gpu1";
+    gpu1.devices = {GlobalDeviceAddress::cuda(1, 0)};
+
+    config.domain_definitions = {gpu0, gpu1};
+
+    PPStageDefinition stage0;
+    stage0.stage_id = 0;
+    stage0.domain_name = "gpu0";
+    stage0.first_layer = 0;
+    stage0.last_layer = 13; // inclusive
+
+    PPStageDefinition stage1;
+    stage1.stage_id = 1;
+    stage1.domain_name = "gpu1";
+    stage1.first_layer = 14;
+    stage1.last_layer = 27; // inclusive
+
+    config.pp_stage_definitions = {stage0, stage1};
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    // Layer boundaries: [stage0_first, stage1_first, total_layers]
+    ASSERT_EQ(plan.local_pp_layer_boundaries.size(), 3)
+        << "Expected 2 stage starts + 1 sentinel";
+    EXPECT_EQ(plan.local_pp_layer_boundaries[0], 0);
+    EXPECT_EQ(plan.local_pp_layer_boundaries[1], 14);
+    EXPECT_EQ(plan.local_pp_layer_boundaries[2], model.n_layers);
+
+    // Global layer range spans all stages
+    EXPECT_EQ(plan.first_layer, 0);
+    EXPECT_EQ(plan.last_layer, 27);
+}
+
+/**
+ * @brief LOCAL PP with TP-in-PP: verify TP weights propagate per-stage.
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_LocalPP_TPWeightsPropagate)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::CUDA, 0}, {DeviceType::CUDA, 1}, {DeviceType::ROCm, 0}})
+                       .build();
+
+    DomainDefinition mixed;
+    mixed.name = "mixed_tp";
+    mixed.devices = {GlobalDeviceAddress::cuda(0, 0), GlobalDeviceAddress::rocm(0, 0)};
+    mixed.weights = {0.7f, 0.3f};
+    mixed.backend = CollectiveBackendType::PCIE_BAR;
+
+    DomainDefinition single;
+    single.name = "single_gpu";
+    single.devices = {GlobalDeviceAddress::cuda(1, 0)};
+
+    config.domain_definitions = {mixed, single};
+
+    PPStageDefinition stage0;
+    stage0.stage_id = 0;
+    stage0.domain_name = "mixed_tp";
+    stage0.first_layer = 0;
+    stage0.last_layer = 13;
+
+    PPStageDefinition stage1;
+    stage1.stage_id = 1;
+    stage1.domain_name = "single_gpu";
+    stage1.first_layer = 14;
+    stage1.last_layer = 27;
+
+    config.pp_stage_definitions = {stage0, stage1};
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    ASSERT_EQ(plan.local_pp_stage_tp_info.size(), 2);
+
+    // Stage 0: mixed TP with weights
+    EXPECT_EQ(plan.local_pp_stage_tp_info[0].devices.size(), 2);
+    ASSERT_EQ(plan.local_pp_stage_tp_info[0].tp_weights.size(), 2);
+    EXPECT_FLOAT_EQ(plan.local_pp_stage_tp_info[0].tp_weights[0], 0.7f);
+    EXPECT_FLOAT_EQ(plan.local_pp_stage_tp_info[0].tp_weights[1], 0.3f);
+    EXPECT_EQ(plan.local_pp_stage_tp_info[0].tp_backend, CollectiveBackendType::PCIE_BAR);
+
+    // Stage 1: single device (no TP weights)
+    EXPECT_EQ(plan.local_pp_stage_tp_info[1].devices.size(), 1);
+    EXPECT_TRUE(plan.local_pp_stage_tp_info[1].tp_weights.empty());
+
+    // TP-in-PP guard: stage 0 has 2 devices → local_tp_devices must be empty
+    EXPECT_TRUE(plan.local_tp_devices.empty());
+}
+
+/**
+ * @brief LOCAL PP with TP-in-PP: 3-stage split with heterogeneous TP degrees.
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_LocalPP_ThreeStage_HeterogeneousTP)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::CUDA, 0}, {DeviceType::CUDA, 1}, {DeviceType::CUDA, 2}, {DeviceType::ROCm, 0}})
+                       .build();
+
+    // Stage 0: 2-way CUDA TP
+    DomainDefinition cuda_tp;
+    cuda_tp.name = "cuda_tp";
+    cuda_tp.devices = {GlobalDeviceAddress::cuda(0, 0), GlobalDeviceAddress::cuda(1, 0)};
+    cuda_tp.backend = CollectiveBackendType::NCCL;
+
+    // Stage 1: single ROCm device (no TP)
+    DomainDefinition rocm_single;
+    rocm_single.name = "rocm_single";
+    rocm_single.devices = {GlobalDeviceAddress::rocm(0, 0)};
+
+    // Stage 2: single CUDA device (no TP)
+    DomainDefinition cuda_single;
+    cuda_single.name = "cuda_single";
+    cuda_single.devices = {GlobalDeviceAddress::cuda(2, 0)};
+
+    config.domain_definitions = {cuda_tp, rocm_single, cuda_single};
+
+    // 28 layers → 10 + 9 + 9
+    PPStageDefinition stage0;
+    stage0.stage_id = 0;
+    stage0.domain_name = "cuda_tp";
+    stage0.first_layer = 0;
+    stage0.last_layer = 9;
+
+    PPStageDefinition stage1;
+    stage1.stage_id = 1;
+    stage1.domain_name = "rocm_single";
+    stage1.first_layer = 10;
+    stage1.last_layer = 18;
+
+    PPStageDefinition stage2;
+    stage2.stage_id = 2;
+    stage2.domain_name = "cuda_single";
+    stage2.first_layer = 19;
+    stage2.last_layer = 27;
+
+    config.pp_stage_definitions = {stage0, stage1, stage2};
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    // 3 LOCAL PP stages
+    EXPECT_TRUE(plan.usesLocalPP());
+    EXPECT_EQ(plan.local_pp_devices.size(), 3);
+
+    // 3 stage TP info entries
+    ASSERT_EQ(plan.local_pp_stage_tp_info.size(), 3);
+    EXPECT_EQ(plan.local_pp_stage_tp_info[0].devices.size(), 2); // CUDA TP
+    EXPECT_EQ(plan.local_pp_stage_tp_info[1].devices.size(), 1); // ROCm single
+    EXPECT_EQ(plan.local_pp_stage_tp_info[2].devices.size(), 1); // CUDA single
+
+    // Layer boundaries
+    ASSERT_EQ(plan.local_pp_layer_boundaries.size(), 4);
+    EXPECT_EQ(plan.local_pp_layer_boundaries[0], 0);
+    EXPECT_EQ(plan.local_pp_layer_boundaries[1], 10);
+    EXPECT_EQ(plan.local_pp_layer_boundaries[2], 19);
+    EXPECT_EQ(plan.local_pp_layer_boundaries[3], model.n_layers);
+
+    // TP-in-PP guard fires (stage 0 has 2 devices)
+    EXPECT_TRUE(plan.local_tp_devices.empty());
+
+    // Embedding/LM head ownership
+    EXPECT_TRUE(plan.has_embedding);
+    EXPECT_TRUE(plan.has_lm_head);
+}
+
+/**
+ * @brief Cross-rank PP does NOT populate local_pp_stage_tp_info.
+ *
+ * When 2 stages are on 2 different ranks, each rank has only 1 stage,
+ * so my_stages.size() == 1 and no LOCAL PP info is populated.
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_CrossRankPP_NoLocalPPInfo)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {{DeviceType::CUDA, 0}, {DeviceType::CUDA, 1}})
+                       .addRank(1, "localhost", 1, {{DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .build();
+
+    DomainDefinition cuda_tp;
+    cuda_tp.name = "cuda_tp";
+    cuda_tp.devices = {GlobalDeviceAddress::cuda(0, 0), GlobalDeviceAddress::cuda(1, 0)};
+    cuda_tp.backend = CollectiveBackendType::NCCL;
+
+    DomainDefinition rocm_tp;
+    rocm_tp.name = "rocm_tp";
+    rocm_tp.devices = {GlobalDeviceAddress::rocm(0, 1), GlobalDeviceAddress::rocm(1, 1)};
+    rocm_tp.backend = CollectiveBackendType::RCCL;
+
+    config.domain_definitions = {cuda_tp, rocm_tp};
+
+    PPStageDefinition stage0;
+    stage0.stage_id = 0;
+    stage0.domain_name = "cuda_tp";
+    stage0.first_layer = 0;
+    stage0.last_layer = 13;
+
+    PPStageDefinition stage1;
+    stage1.stage_id = 1;
+    stage1.domain_name = "rocm_tp";
+    stage1.first_layer = 14;
+    stage1.last_layer = 27;
+
+    config.pp_stage_definitions = {stage0, stage1};
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 2);
+
+    // Rank 0: single stage → no LOCAL PP
+    EXPECT_FALSE(plans[0].usesLocalPP());
+    EXPECT_TRUE(plans[0].local_pp_devices.empty());
+    EXPECT_TRUE(plans[0].local_pp_stage_tp_info.empty());
+    EXPECT_TRUE(plans[0].local_pp_layer_boundaries.empty());
+
+    // Rank 0: cross-rank TP IS populated (single stage, no TP-in-PP guard)
+    EXPECT_EQ(plans[0].local_tp_devices.size(), 2);
+    EXPECT_TRUE(plans[0].usesLocalTP());
+
+    // Rank 1: same — no LOCAL PP, has LOCAL TP
+    EXPECT_FALSE(plans[1].usesLocalPP());
+    EXPECT_TRUE(plans[1].local_pp_devices.empty());
+    EXPECT_EQ(plans[1].local_tp_devices.size(), 2);
+    EXPECT_TRUE(plans[1].usesLocalTP());
+
+    // PP chain
+    EXPECT_TRUE(plans[0].has_embedding);
+    EXPECT_FALSE(plans[0].has_lm_head);
+    EXPECT_FALSE(plans[1].has_embedding);
+    EXPECT_TRUE(plans[1].has_lm_head);
+}
+
+// ============================================================================
+// Named Domain Tests (Scenario 7 Style) - Original Tests
+// ============================================================================
+
 TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomains_MixedVendorTP)
 {
     auto cluster = ClusterInventoryBuilder()

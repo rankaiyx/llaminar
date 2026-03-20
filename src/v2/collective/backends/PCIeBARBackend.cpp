@@ -20,6 +20,12 @@
 #include <cuda.h> // For cuCtxSetCurrent, cuDevicePrimaryCtxRetain
 #endif
 
+// HIP headers cannot co-exist with CUDA headers in the same TU due to
+// type redefinition conflicts (dim3, vector types, etc.).
+// ROCm event operations are accessed via hipEventQuery/hipEventSynchronize
+// from a separate TU (ROCmBackend) or via dlsym at runtime.
+// For waitForROCmEvent, we use the ROCm backend abstraction instead.
+
 namespace llaminar2
 {
 
@@ -372,7 +378,7 @@ namespace llaminar2
                 float *out = static_cast<float *>(warmup_buf1);
                 const float *in2 = static_cast<const float *>(warmup_buf2);
 
-                auto warmup_future = submitCUDAWork([this, out, in2]() -> bool
+                auto warmup_future = submitCUDAWork(cuda_device_.ordinal, [this, out, in2]() -> bool
                                                     {
                     cudaError_t err = cudaSetDevice(cuda_device_.ordinal);
                     if (err != cudaSuccess) return false;
@@ -605,12 +611,24 @@ namespace llaminar2
         bar_total_mapped_size_ = p2p_engine_->getBarMappedSize();
         bar_alloc_offset_ = 0;
 
-        // Start CUDA worker thread
-        if (!startCUDAWorker())
+        // Start per-device CUDA worker pool
+        if (!startCUDAWorkers())
         {
-            LOG_ERROR("[PCIeBARBackend::initializeMultiPair] Failed to start CUDA worker thread");
+            LOG_ERROR("[PCIeBARBackend::initializeMultiPair] Failed to start CUDA workers");
             device_pairs_.clear();
             return false;
+        }
+
+        // Pre-allocate per-pair GPU resources (streams, events, temp buffers)
+        for (size_t i = 0; i < pairs.size(); ++i)
+        {
+            if (!initializePairResources(i, pairs[i].cuda_device.ordinal))
+            {
+                LOG_ERROR("[PCIeBARBackend::initializeMultiPair] Failed to init pair "
+                          << i << " resources");
+                device_pairs_.clear();
+                return false;
+            }
         }
 
         // Create persistent stream for reduction operations
@@ -705,8 +723,15 @@ namespace llaminar2
             s_instance_ = nullptr;
         }
 
-        // Stop CUDA worker thread first (before freeing resources it might use)
-        stopCUDAWorker();
+        // Stop CUDA worker pool first (before freeing resources it might use)
+        stopCUDAWorkers();
+
+        // Destroy per-pair resources
+        for (auto &pr : pair_resources_)
+        {
+            destroyPairResources(pr);
+        }
+        pair_resources_.clear();
 
         // Destroy reduction stream
         if (cuda_reduction_stream_)
@@ -1494,13 +1519,6 @@ namespace llaminar2
                                                    << count_per_pair << " elements ("
                                                    << bytes_per_pair << " bytes) per pair");
 
-        // Ensure temp buffer is large enough for one pair's data
-        if (!ensureTempBuffer(bytes_per_pair))
-        {
-            LOG_ERROR("[allreduceMultiPair] Failed to allocate temp buffer");
-            return false;
-        }
-
         // Get BAR pointer for transfers
         void *cuda_bar_ptr = p2p_engine_->getCudaBarPointer();
         if (!cuda_bar_ptr)
@@ -1509,206 +1527,126 @@ namespace llaminar2
             return false;
         }
 
-        // For multi-pair, we launch all pairs in parallel using async operations
-        // Each pair performs:
-        // 1. Read ROCm data via BAR (async)
-        // 2. Perform reduction on CUDA (async)
-        // 3. Write result back to ROCm via BAR (async)
-        //
-        // Note: Currently using the same streams for all pairs (serialized per-stream).
-        // Future optimization: Create per-pair streams for true parallelism.
-
-        cudaStream_t read_stream = cuda_read_stream_
-                                       ? static_cast<cudaStream_t>(cuda_read_stream_)
-                                       : nullptr;
-        cudaStream_t compute_stream = cuda_reduction_stream_
-                                          ? static_cast<cudaStream_t>(cuda_reduction_stream_)
-                                          : nullptr;
-        cudaStream_t write_stream = cuda_write_stream_
-                                        ? static_cast<cudaStream_t>(cuda_write_stream_)
-                                        : nullptr;
-
-        // Use events for synchronization between phases
-        cudaEvent_t read_complete, compute_complete;
-        cudaError_t err = cudaEventCreateWithFlags(&read_complete, cudaEventDisableTiming);
-        if (err != cudaSuccess)
+        // Ensure per-pair resources exist and temp buffers are large enough.
+        // For single-pair fallback, use pair_resources_[0] with primary device.
+        if (pair_resources_.empty())
         {
-            LOG_ERROR("[allreduceMultiPair] Failed to create read_complete event");
-            return false;
+            int primary_ordinal = device_pairs_.empty()
+                                      ? cuda_device_.ordinal
+                                      : device_pairs_[0].cuda_device.ordinal;
+            if (!initializePairResources(0, primary_ordinal))
+            {
+                LOG_ERROR("[allreduceMultiPair] Failed to init default pair resources");
+                return false;
+            }
         }
 
-        err = cudaEventCreateWithFlags(&compute_complete, cudaEventDisableTiming);
-        if (err != cudaSuccess)
+        for (size_t i = 0; i < num_pairs; ++i)
         {
-            cudaEventDestroy(read_complete);
-            LOG_ERROR("[allreduceMultiPair] Failed to create compute_complete event");
-            return false;
+            if (i >= pair_resources_.size())
+            {
+                int ordinal = (i < device_pairs_.size())
+                                  ? device_pairs_[i].cuda_device.ordinal
+                                  : cuda_device_.ordinal;
+                if (!initializePairResources(i, ordinal))
+                {
+                    LOG_ERROR("[allreduceMultiPair] Failed to init pair " << i << " resources");
+                    return false;
+                }
+            }
+            if (!ensurePairTempBuffer(pair_resources_[i], bytes_per_pair))
+            {
+                LOG_ERROR("[allreduceMultiPair] Failed to ensure temp buffer for pair " << i);
+                return false;
+            }
         }
+
+        // Launch all pairs in parallel using per-pair streams + events.
+        // Different pairs use different CUDA devices and stream sets, so they
+        // execute concurrently on the GPU without serialization.
 
         bool success = true;
 
-        // Process all pairs - launching async operations for each
         for (size_t pair_idx = 0; pair_idx < num_pairs && success; ++pair_idx)
         {
+            auto &pr = pair_resources_[pair_idx];
             void *cuda_buf = cuda_buffers[pair_idx];
             void *rocm_buf = rocm_buffers[pair_idx];
 
-            // For multi-pair mode, ROCm buffers should be at specific BAR offsets
-            // Currently assumes all ROCm buffers are allocated via allocateInBarRegion()
-            // and their offsets can be computed from their positions in BAR allocations.
-            //
-            // For now, we use a simple approach: assume all ROCm buffers are at
-            // contiguous offsets starting from 0 (pair 0), bytes_per_pair (pair 1), etc.
-            // This works for the initial implementation where buffers are pre-allocated.
+            // Resolve ROCm BAR offset
             size_t rocm_bar_offset = pair_idx * bytes_per_pair;
-
-            // Find actual offset if buffer is registered
-            bool found_offset = false;
             for (const auto &alloc : bar_allocations_)
             {
                 if (alloc.ptr == rocm_buf)
                 {
                     rocm_bar_offset = alloc.offset;
-                    found_offset = true;
                     break;
                 }
             }
 
-            if (!found_offset && rocm_buf != nullptr)
-            {
-                LOG_DEBUG("[allreduceMultiPair] Pair " << pair_idx
-                                                       << ": ROCm buffer not in BAR allocations, using computed offset "
-                                                       << rocm_bar_offset);
-            }
-
             LOG_DEBUG("[allreduceMultiPair] Pair " << pair_idx
                                                    << ": cuda_buf=" << cuda_buf
-                                                   << ", rocm_offset=" << rocm_bar_offset);
+                                                   << ", rocm_offset=" << rocm_bar_offset
+                                                   << ", cuda_device=" << pr.cuda_ordinal);
 
-            // Set CUDA device for this pair (use primary device for now)
-            // Future: Each pair could use its own CUDA device
-            cudaSetDevice(cuda_device_.ordinal);
+            cudaSetDevice(pr.cuda_ordinal);
 
-            // Phase 1: Read ROCm data to temp buffer via BAR (async)
+            cudaStream_t read_stream = static_cast<cudaStream_t>(pr.read_stream);
+            cudaStream_t compute_stream = static_cast<cudaStream_t>(pr.compute_stream);
+            cudaStream_t write_stream = static_cast<cudaStream_t>(pr.write_stream);
+            cudaEvent_t read_complete = static_cast<cudaEvent_t>(pr.read_events[0]);
+            cudaEvent_t compute_complete = static_cast<cudaEvent_t>(pr.compute_events[0]);
+
+            // Phase 1: Read ROCm data to pair temp buffer via BAR (async)
             void *bar_src = static_cast<char *>(cuda_bar_ptr) + rocm_bar_offset;
-            err = cudaMemcpyAsync(cuda_temp_buffer_, bar_src, bytes_per_pair,
-                                  cudaMemcpyDeviceToDevice,
-                                  read_stream ? read_stream : nullptr);
+            cudaError_t err = cudaMemcpyAsync(pr.temp_buffer, bar_src, bytes_per_pair,
+                                              cudaMemcpyDeviceToDevice, read_stream);
             if (err != cudaSuccess)
             {
                 LOG_ERROR("[allreduceMultiPair] Pair " << pair_idx
-                                                       << ": Failed to read from BAR: " << cudaGetErrorString(err));
+                          << ": BAR read failed: " << cudaGetErrorString(err));
                 success = false;
                 break;
             }
 
-            // Record event when read completes
-            if (read_stream)
-            {
-                cudaEventRecord(read_complete, read_stream);
-            }
+            cudaEventRecord(read_complete, read_stream);
 
             // Phase 2: Wait for read, then reduce (async)
-            if (read_stream && compute_stream)
-            {
-                cudaStreamWaitEvent(compute_stream, read_complete, 0);
-            }
-            else if (read_stream)
-            {
-                cudaStreamSynchronize(read_stream);
-            }
+            cudaStreamWaitEvent(compute_stream, read_complete, 0);
 
-            // Launch reduction kernel: cuda_buf = cuda_buf + temp_buffer
-            bool reduce_ok = false;
-            switch (dtype)
-            {
-            case CollectiveDataType::FLOAT32:
-                reduce_ok = cuda::launchVectorAddInplace_f32(
-                    static_cast<float *>(cuda_buf),
-                    static_cast<const float *>(cuda_temp_buffer_),
-                    count_per_pair,
-                    compute_stream);
-                break;
-
-            case CollectiveDataType::FLOAT16:
-                reduce_ok = cuda::launchVectorAddInplace_f16(
-                    cuda_buf, cuda_temp_buffer_, count_per_pair, compute_stream);
-                break;
-
-            case CollectiveDataType::BFLOAT16:
-                reduce_ok = cuda::launchVectorAddInplace_bf16(
-                    cuda_buf, cuda_temp_buffer_, count_per_pair, compute_stream);
-                break;
-
-            case CollectiveDataType::INT8:
-                reduce_ok = cuda::launchVectorAddInplace_i8(
-                    static_cast<int8_t *>(cuda_buf),
-                    static_cast<const int8_t *>(cuda_temp_buffer_),
-                    count_per_pair,
-                    compute_stream);
-                break;
-
-            case CollectiveDataType::INT32:
-                reduce_ok = cuda::launchVectorAddInplace_i32(
-                    static_cast<int32_t *>(cuda_buf),
-                    static_cast<const int32_t *>(cuda_temp_buffer_),
-                    count_per_pair,
-                    compute_stream);
-                break;
-
-            default:
-                LOG_ERROR("[allreduceMultiPair] Unsupported dtype: " << static_cast<int>(dtype));
-                success = false;
-                break;
-            }
-
+            bool reduce_ok = reduceOnCUDAAsync(
+                cuda_buf, pr.temp_buffer, count_per_pair, dtype, compute_stream);
             if (!reduce_ok)
             {
-                LOG_ERROR("[allreduceMultiPair] Pair " << pair_idx << ": Reduction kernel failed");
+                LOG_ERROR("[allreduceMultiPair] Pair " << pair_idx << ": Reduction failed");
                 success = false;
                 break;
             }
 
-            // Record event when compute completes
-            if (compute_stream)
-            {
-                cudaEventRecord(compute_complete, compute_stream);
-            }
+            cudaEventRecord(compute_complete, compute_stream);
 
-            // Phase 3: Wait for compute, then write result back to ROCm (async)
-            if (compute_stream && write_stream)
-            {
-                cudaStreamWaitEvent(write_stream, compute_complete, 0);
-            }
-            else if (compute_stream)
-            {
-                cudaStreamSynchronize(compute_stream);
-            }
+            // Phase 3: Wait for compute, then write back via BAR (async)
+            cudaStreamWaitEvent(write_stream, compute_complete, 0);
 
             void *bar_dst = static_cast<char *>(cuda_bar_ptr) + rocm_bar_offset;
             err = cudaMemcpyAsync(bar_dst, cuda_buf, bytes_per_pair,
-                                  cudaMemcpyDeviceToDevice,
-                                  write_stream ? write_stream : nullptr);
+                                  cudaMemcpyDeviceToDevice, write_stream);
             if (err != cudaSuccess)
             {
                 LOG_ERROR("[allreduceMultiPair] Pair " << pair_idx
-                                                       << ": Failed to write to BAR: " << cudaGetErrorString(err));
+                          << ": BAR write failed: " << cudaGetErrorString(err));
                 success = false;
                 break;
             }
         }
 
-        // Synchronize all streams
-        if (read_stream)
-            cudaStreamSynchronize(read_stream);
-        if (compute_stream)
-            cudaStreamSynchronize(compute_stream);
-        if (write_stream)
-            cudaStreamSynchronize(write_stream);
-
-        // Cleanup events
-        cudaEventDestroy(read_complete);
-        cudaEventDestroy(compute_complete);
+        // Synchronize all pairs' write streams to ensure completion
+        for (size_t i = 0; i < num_pairs; ++i)
+        {
+            auto &pr = pair_resources_[i];
+            cudaSetDevice(pr.cuda_ordinal);
+            cudaStreamSynchronize(static_cast<cudaStream_t>(pr.write_stream));
+        }
 
         if (success)
         {
@@ -2098,281 +2036,469 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // CUDA Worker Thread Implementation
+    // CUDA Worker Pool Implementation — Per-Device Workers
     // =========================================================================
     //
-    // When running heterogeneous CUDA+ROCm LOCAL TP, the ROCm executor thread
-    // may need to wait for CUDA events. Direct cudaEventSynchronize() fails
-    // with "context is destroyed" from a HIP-contaminated thread.
-    // This worker thread provides a clean CUDA context for event waits.
+    // Each distinct CUDA device gets its own worker thread with a clean CUDA
+    // context. Hot-path event waits use an allocation-free WorkSlot. Rare /
+    // general-purpose work falls back to a std::packaged_task overflow queue.
     // =========================================================================
 
-    bool PCIeBARBackend::startCUDAWorker()
+    bool PCIeBARBackend::startCUDAWorkers()
     {
-        if (cuda_worker_running_.load())
-        {
-            return true; // Already running
-        }
+        // Ensure primary device always has a worker
+        if (!startCUDAWorkerFor(cuda_device_.ordinal))
+            return false;
 
-        cuda_worker_stop_.store(false);
+        // Create workers for every additional CUDA device in multi-pair configs
+        for (const auto &pair : device_pairs_)
+        {
+            if (!startCUDAWorkerFor(pair.cuda_device.ordinal))
+                return false;
+        }
+        return true;
+    }
+
+    void PCIeBARBackend::stopCUDAWorkers()
+    {
+        for (auto &[ordinal, w] : cuda_workers_)
+        {
+            if (!w || !w->running.load())
+                continue;
+            {
+                std::lock_guard<std::mutex> lock(w->mutex);
+                w->stop.store(true);
+            }
+            w->cv.notify_one();
+            if (w->thread.joinable())
+                w->thread.join();
+            w->running.store(false);
+            LOG_TRACE("[PCIeBARBackend] CUDA worker for device " << ordinal << " stopped");
+        }
+        cuda_workers_.clear();
+    }
+
+    bool PCIeBARBackend::startCUDAWorkerFor(int cuda_ordinal)
+    {
+        // Already have a worker for this device?
+        if (cuda_workers_.count(cuda_ordinal) && cuda_workers_[cuda_ordinal]->running.load())
+            return true;
+
+        auto w = std::make_unique<CUDADeviceWorker>();
+        w->cuda_ordinal = cuda_ordinal;
+        w->stop.store(false);
+        w->running.store(false);
+        w->slot.reset();
+
+        auto *raw = w.get();
+        cuda_workers_[cuda_ordinal] = std::move(w);
 
         try
         {
-            cuda_worker_thread_ = std::thread(&PCIeBARBackend::cudaWorkerLoop, this);
-
-            // Wait for worker to signal it's ready
-            std::unique_lock<std::mutex> lock(cuda_work_mutex_);
-            cuda_work_cv_.wait(lock, [this]()
-                               { return cuda_worker_running_.load(); });
-
-            LOG_TRACE("[PCIeBARBackend] CUDA worker thread started");
+            raw->thread = std::thread(&PCIeBARBackend::cudaDeviceWorkerLoop, this, raw);
+            // Wait for ready
+            std::unique_lock<std::mutex> lock(raw->mutex);
+            raw->cv.wait(lock, [raw]() { return raw->running.load(); });
+            LOG_TRACE("[PCIeBARBackend] CUDA worker for device " << cuda_ordinal << " started");
             return true;
         }
         catch (const std::exception &e)
         {
-            LOG_ERROR("[PCIeBARBackend] Failed to start CUDA worker thread: " << e.what());
+            LOG_ERROR("[PCIeBARBackend] Failed to start CUDA worker for device "
+                      << cuda_ordinal << ": " << e.what());
+            cuda_workers_.erase(cuda_ordinal);
             return false;
         }
     }
 
-    void PCIeBARBackend::stopCUDAWorker()
+    void PCIeBARBackend::cudaDeviceWorkerLoop(CUDADeviceWorker *w)
     {
-        if (!cuda_worker_running_.load())
-        {
-            return; // Not running
-        }
-
-        // Signal worker to stop
-        {
-            std::lock_guard<std::mutex> lock(cuda_work_mutex_);
-            cuda_worker_stop_.store(true);
-        }
-        cuda_work_cv_.notify_one();
-
-        // Wait for worker to finish
-        if (cuda_worker_thread_.joinable())
-        {
-            cuda_worker_thread_.join();
-        }
-
-        cuda_worker_running_.store(false);
-        LOG_TRACE("[PCIeBARBackend] CUDA worker thread stopped");
-    }
-
-    std::future<bool> PCIeBARBackend::submitCUDAWork(std::function<bool()> work)
-    {
-        std::packaged_task<bool()> task(std::move(work));
-        std::future<bool> future = task.get_future();
-
-        {
-            std::lock_guard<std::mutex> lock(cuda_work_mutex_);
-            cuda_work_queue_.push(std::move(task));
-        }
-        cuda_work_cv_.notify_one();
-
-        return future;
-    }
-
-    void PCIeBARBackend::cudaWorkerLoop()
-    {
-        // CRITICAL: This thread must initialize CUDA before any HIP contamination.
-        // Use driver API to retain primary context, ensuring it won't be destroyed.
-
-        // First, set the runtime API device
-        cudaError_t err = cudaSetDevice(cuda_device_.ordinal);
+        // Initialize clean CUDA context for this device
+        cudaError_t err = cudaSetDevice(w->cuda_ordinal);
         if (err != cudaSuccess)
         {
-            LOG_ERROR("[PCIeBARBackend] CUDA worker failed to set device " << cuda_device_.ordinal
-                                                                           << ": " << cudaGetErrorString(err));
-            cuda_worker_running_.store(true); // Signal ready (will fail operations)
-            cuda_work_cv_.notify_all();
+            LOG_ERROR("[PCIeBARBackend] Worker for device " << w->cuda_ordinal
+                      << " failed cudaSetDevice: " << cudaGetErrorString(err));
+            w->running.store(true); // Signal ready (will fail ops)
+            w->cv.notify_all();
             return;
         }
 
-        // Also set the driver API context for robustness
+        // Retain primary context via driver API for robustness
         CUdevice cu_device;
-        CUresult cu_err = cuDeviceGet(&cu_device, cuda_device_.ordinal);
+        CUcontext ctx = nullptr;
+        CUresult cu_err = cuDeviceGet(&cu_device, w->cuda_ordinal);
         if (cu_err == CUDA_SUCCESS)
         {
-            CUcontext ctx;
             cu_err = cuDevicePrimaryCtxRetain(&ctx, cu_device);
             if (cu_err == CUDA_SUCCESS)
             {
-                cu_err = cuCtxSetCurrent(ctx);
-                if (cu_err == CUDA_SUCCESS)
-                {
-                    LOG_TRACE("[PCIeBARBackend] CUDA worker thread retained primary context");
-                }
-                else
-                {
-                    LOG_WARN("[PCIeBARBackend] cuCtxSetCurrent failed: " << cu_err);
-                }
+                cuCtxSetCurrent(ctx);
+                LOG_TRACE("[PCIeBARBackend] Worker device " << w->cuda_ordinal
+                          << " retained primary context");
             }
-            else
-            {
-                LOG_WARN("[PCIeBARBackend] cuDevicePrimaryCtxRetain failed: " << cu_err);
-            }
-        }
-        else
-        {
-            LOG_WARN("[PCIeBARBackend] cuDeviceGet failed: " << cu_err);
         }
 
-        // Create a dedicated stream for worker operations (non-blocking)
+        // Create non-blocking stream
         cudaStream_t stream;
         err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
         if (err == cudaSuccess)
         {
-            cuda_worker_stream_ = stream;
+            w->stream = stream;
         }
         else
         {
-            LOG_WARN("[PCIeBARBackend] Failed to create worker stream: " << cudaGetErrorString(err));
-            cuda_worker_stream_ = nullptr;
+            LOG_WARN("[PCIeBARBackend] Worker device " << w->cuda_ordinal
+                     << " failed to create stream: " << cudaGetErrorString(err));
+            w->stream = nullptr;
         }
 
         // Signal ready
-        cuda_worker_running_.store(true);
-        cuda_work_cv_.notify_all();
+        w->running.store(true);
+        w->cv.notify_all();
 
-        // Work loop
+        // Main loop: check fast-path slot first, then overflow queue
         while (true)
         {
-            std::packaged_task<bool()> task;
-
+            // Fast path: check allocation-free WorkSlot (spin briefly)
+            if (w->slot.ready.load(std::memory_order_acquire))
             {
-                std::unique_lock<std::mutex> lock(cuda_work_mutex_);
-                cuda_work_cv_.wait(lock, [this]()
-                                   { return cuda_worker_stop_.load() || !cuda_work_queue_.empty(); });
-
-                if (cuda_worker_stop_.load() && cuda_work_queue_.empty())
+                bool res = false;
+                if (w->slot.fn)
                 {
-                    break;
+                    res = w->slot.fn(w->slot.event, w->slot.device_id, w->stream);
                 }
+                w->slot.result = res;
+                w->slot.done.store(true, std::memory_order_release);
+                continue; // Check again immediately
+            }
 
-                if (!cuda_work_queue_.empty())
+            // Slow path: wait on CV for overflow queue or stop signal
+            std::packaged_task<bool()> task;
+            {
+                std::unique_lock<std::mutex> lock(w->mutex);
+                w->cv.wait_for(lock, std::chrono::microseconds(50), [w]()
                 {
-                    task = std::move(cuda_work_queue_.front());
-                    cuda_work_queue_.pop();
+                    return w->stop.load() ||
+                           !w->overflow_queue.empty() ||
+                           w->slot.ready.load(std::memory_order_relaxed);
+                });
+
+                if (w->stop.load() && w->overflow_queue.empty())
+                    break;
+
+                // Check fast-path slot again after wakeup (may have been set)
+                if (w->slot.ready.load(std::memory_order_acquire))
+                    continue;
+
+                if (!w->overflow_queue.empty())
+                {
+                    task = std::move(w->overflow_queue.front());
+                    w->overflow_queue.pop();
                 }
             }
 
             if (task.valid())
-            {
-                // Execute the task (context is already set on this thread)
                 task();
-            }
         }
 
-        // Cleanup stream
-        if (cuda_worker_stream_)
+        // Cleanup
+        if (w->stream)
         {
-            cudaStreamDestroy(static_cast<cudaStream_t>(cuda_worker_stream_));
-            cuda_worker_stream_ = nullptr;
+            cudaStreamDestroy(static_cast<cudaStream_t>(w->stream));
+            w->stream = nullptr;
         }
     }
 
+    bool PCIeBARBackend::submitEventWait(int cuda_ordinal, void *event)
+    {
+        auto it = cuda_workers_.find(cuda_ordinal);
+        if (it == cuda_workers_.end() || !it->second->running.load())
+        {
+            LOG_ERROR("[PCIeBARBackend::submitEventWait] No worker for CUDA device " << cuda_ordinal);
+            return false;
+        }
+
+        auto *w = it->second.get();
+        auto &slot = w->slot;
+
+        // Static function that the worker executes — no captures, no heap.
+        // Uses cuEventSynchronize directly because it works across CUDA contexts
+        // (the event may have been created in a different context than the worker's).
+        // cuEventQuery fails with CUDA_ERROR_INVALID_HANDLE for cross-context events.
+        static constexpr WorkSlot::Fn event_wait_fn =
+            [](void *ev, int dev_id, void * /*stream*/) -> bool
+        {
+            CUevent cu_event = static_cast<CUevent>(ev);
+
+            CUresult cu_err = cuEventSynchronize(cu_event);
+            if (cu_err == CUDA_SUCCESS)
+                return true;
+
+            // Event sync failed — fall back to full device sync
+            LOG_WARN("[waitForCUDAEvent/worker] cuEventSynchronize failed: " << cu_err
+                     << ", falling back to cuCtxSynchronize");
+            return cuCtxSynchronize() == CUDA_SUCCESS;
+        };
+
+        // Fill the slot (producer side)
+        slot.fn = event_wait_fn;
+        slot.event = event;
+        slot.device_id = cuda_ordinal;
+        slot.done.store(false, std::memory_order_relaxed);
+        slot.ready.store(true, std::memory_order_release);
+
+        // Wake the worker
+        w->cv.notify_one();
+
+        // Spin-wait for completion (event waits are typically <1μs for completed events)
+        while (!slot.done.load(std::memory_order_acquire))
+        {
+            // Yield to avoid burning CPU if the event isn't ready yet
+            std::this_thread::yield();
+        }
+
+        bool result = slot.result;
+        slot.reset();
+        return result;
+    }
+
+    std::future<bool> PCIeBARBackend::submitCUDAWork(int cuda_ordinal, std::function<bool()> work)
+    {
+        auto it = cuda_workers_.find(cuda_ordinal);
+        if (it == cuda_workers_.end() || !it->second->running.load())
+        {
+            LOG_ERROR("[PCIeBARBackend::submitCUDAWork] No worker for CUDA device " << cuda_ordinal);
+            std::promise<bool> p;
+            p.set_value(false);
+            return p.get_future();
+        }
+
+        auto *w = it->second.get();
+        std::packaged_task<bool()> task(std::move(work));
+        auto future = task.get_future();
+        {
+            std::lock_guard<std::mutex> lock(w->mutex);
+            w->overflow_queue.push(std::move(task));
+        }
+        w->cv.notify_one();
+        return future;
+    }
+
+    // Legacy compat wrappers
+    bool PCIeBARBackend::startCUDAWorker() { return startCUDAWorkers(); }
+    void PCIeBARBackend::stopCUDAWorker() { stopCUDAWorkers(); }
+    bool PCIeBARBackend::isCUDAWorkerRunning() const
+    {
+        for (const auto &[ordinal, w] : cuda_workers_)
+        {
+            if (w && w->running.load())
+                return true;
+        }
+        return false;
+    }
+
+    bool PCIeBARBackend::hasCUDAWorkerFor(int cuda_ordinal) const
+    {
+        auto it = cuda_workers_.find(cuda_ordinal);
+        return it != cuda_workers_.end() && it->second && it->second->running.load();
+    }
+
     // =========================================================================
-    // CUDA Event Wait Implementation (via Worker Thread)
+    // Per-Pair Resources Management
     // =========================================================================
-    //
-    // Routes CUDA event waits through the dedicated worker thread to avoid
-    // HIP runtime contamination issues.
+
+    bool PCIeBARBackend::initializePairResources(size_t pair_index, int cuda_ordinal)
+    {
+        if (pair_index >= pair_resources_.size())
+            pair_resources_.resize(pair_index + 1);
+
+        auto &pr = pair_resources_[pair_index];
+        if (pr.initialized)
+            return true;
+
+        pr.cuda_ordinal = cuda_ordinal;
+
+        cudaError_t err = cudaSetDevice(cuda_ordinal);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[PCIeBARBackend] initializePairResources: cudaSetDevice(" << cuda_ordinal
+                      << ") failed: " << cudaGetErrorString(err));
+            return false;
+        }
+
+        // Create 3 non-blocking streams
+        auto make_stream = [&](void *&s, const char *name) -> bool
+        {
+            cudaStream_t st;
+            err = cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[PCIeBARBackend] Pair " << pair_index << " failed to create "
+                          << name << " stream: " << cudaGetErrorString(err));
+                return false;
+            }
+            s = st;
+            return true;
+        };
+
+        if (!make_stream(pr.read_stream, "read") ||
+            !make_stream(pr.compute_stream, "compute") ||
+            !make_stream(pr.write_stream, "write"))
+        {
+            destroyPairResources(pr);
+            return false;
+        }
+
+        // Create ping-pong events (2 per type = 4 total)
+        for (int i = 0; i < 2; ++i)
+        {
+            cudaEvent_t re, ce;
+            err = cudaEventCreateWithFlags(&re, cudaEventDisableTiming);
+            if (err != cudaSuccess)
+            {
+                destroyPairResources(pr);
+                return false;
+            }
+            pr.read_events[i] = re;
+
+            err = cudaEventCreateWithFlags(&ce, cudaEventDisableTiming);
+            if (err != cudaSuccess)
+            {
+                destroyPairResources(pr);
+                return false;
+            }
+            pr.compute_events[i] = ce;
+        }
+
+        pr.initialized = true;
+        LOG_DEBUG("[PCIeBARBackend] Pair " << pair_index << " resources initialized on CUDA:"
+                  << cuda_ordinal << " (3 streams, 4 events)");
+        return true;
+    }
+
+    void PCIeBARBackend::destroyPairResources(PairResources &pr)
+    {
+        if (pr.cuda_ordinal >= 0)
+            cudaSetDevice(pr.cuda_ordinal);
+
+        auto destroy_stream = [](void *&s)
+        {
+            if (s)
+            {
+                cudaStreamDestroy(static_cast<cudaStream_t>(s));
+                s = nullptr;
+            }
+        };
+        destroy_stream(pr.read_stream);
+        destroy_stream(pr.compute_stream);
+        destroy_stream(pr.write_stream);
+
+        for (int i = 0; i < 2; ++i)
+        {
+            if (pr.read_events[i])
+            {
+                cudaEventDestroy(static_cast<cudaEvent_t>(pr.read_events[i]));
+                pr.read_events[i] = nullptr;
+            }
+            if (pr.compute_events[i])
+            {
+                cudaEventDestroy(static_cast<cudaEvent_t>(pr.compute_events[i]));
+                pr.compute_events[i] = nullptr;
+            }
+        }
+
+        if (pr.temp_buffer)
+        {
+            cudaFree(pr.temp_buffer);
+            pr.temp_buffer = nullptr;
+        }
+        if (pr.temp_buffer2)
+        {
+            cudaFree(pr.temp_buffer2);
+            pr.temp_buffer2 = nullptr;
+        }
+        pr.temp_buffer_size = 0;
+        pr.initialized = false;
+    }
+
+    bool PCIeBARBackend::ensurePairTempBuffer(PairResources &pr, size_t bytes)
+    {
+        if (pr.temp_buffer && pr.temp_buffer_size >= bytes)
+            return true; // Already large enough
+
+        cudaSetDevice(pr.cuda_ordinal);
+
+        // Free old buffers
+        if (pr.temp_buffer)
+            cudaFree(pr.temp_buffer);
+        if (pr.temp_buffer2)
+            cudaFree(pr.temp_buffer2);
+
+        cudaError_t err = cudaMalloc(&pr.temp_buffer, bytes);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[PCIeBARBackend] ensurePairTempBuffer: cudaMalloc(" << bytes
+                      << ") failed: " << cudaGetErrorString(err));
+            pr.temp_buffer = nullptr;
+            pr.temp_buffer2 = nullptr;
+            pr.temp_buffer_size = 0;
+            return false;
+        }
+
+        err = cudaMalloc(&pr.temp_buffer2, bytes);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[PCIeBARBackend] ensurePairTempBuffer: cudaMalloc2(" << bytes
+                      << ") failed: " << cudaGetErrorString(err));
+            cudaFree(pr.temp_buffer);
+            pr.temp_buffer = nullptr;
+            pr.temp_buffer2 = nullptr;
+            pr.temp_buffer_size = 0;
+            return false;
+        }
+
+        pr.temp_buffer_size = bytes;
+        LOG_DEBUG("[PCIeBARBackend] Pair cuda:" << pr.cuda_ordinal << " temp buffers: "
+                  << bytes << " bytes each");
+        return true;
+    }
+
+    // =========================================================================
+    // CUDA Event Wait Implementation (via Per-Device Worker)
     // =========================================================================
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 
     bool PCIeBARBackend::waitForCUDAEvent(void *event, int device_id)
     {
-        if (!cuda_worker_running_.load())
+        if (!isCUDAWorkerRunning())
         {
-            LOG_ERROR("[PCIeBARBackend::waitForCUDAEvent] CUDA worker thread not running");
+            LOG_ERROR("[PCIeBARBackend::waitForCUDAEvent] No CUDA workers running");
             return false;
         }
 
         if (!event)
-        {
-            // No event to wait for - consider this success
+            return true; // No event to wait for
+
+        return submitEventWait(device_id, event);
+    }
+
+    bool PCIeBARBackend::waitForROCmEvent(void *event, int device_id)
+    {
+        if (!event)
             return true;
+
+        // Route through the ROCm backend abstraction to avoid HIP/CUDA
+        // header conflicts in this TU.
+        IBackend *rocm_backend = getROCmBackend();
+        if (!rocm_backend)
+        {
+            LOG_ERROR("[PCIeBARBackend::waitForROCmEvent] ROCm backend not available");
+            return false;
         }
 
-        cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
-        int captured_device_id = device_id;
-
-        // Submit the event wait to the worker thread
-        auto future = submitCUDAWork([cuda_event, captured_device_id, this]() -> bool
-                                     {
-            // Use CUDA Driver API for more robust context handling.
-            // The runtime API's cudaSetDevice may not properly restore context
-            // after HIP has contaminated the process.
-            
-            // First, try to get/set the primary context via driver API
-            CUdevice cu_device;
-            CUresult cu_err = cuDeviceGet(&cu_device, captured_device_id);
-            if (cu_err != CUDA_SUCCESS)
-            {
-                LOG_ERROR("[waitForCUDAEvent/worker] cuDeviceGet(" << captured_device_id 
-                          << ") failed: " << cu_err);
-                return false;
-            }
-
-            // Retain and set the primary context explicitly
-            CUcontext ctx;
-            cu_err = cuDevicePrimaryCtxRetain(&ctx, cu_device);
-            if (cu_err != CUDA_SUCCESS)
-            {
-                LOG_ERROR("[waitForCUDAEvent/worker] cuDevicePrimaryCtxRetain failed: " << cu_err);
-                return false;
-            }
-
-            cu_err = cuCtxSetCurrent(ctx);
-            if (cu_err != CUDA_SUCCESS)
-            {
-                LOG_ERROR("[waitForCUDAEvent/worker] cuCtxSetCurrent failed: " << cu_err);
-                cuDevicePrimaryCtxRelease(cu_device);
-                return false;
-            }
-
-            // Use driver API for event synchronization instead of runtime API.
-            // This is more robust when HIP has contaminated the process.
-            CUevent cu_event = static_cast<CUevent>(cuda_event);
-            
-            // Check event status
-            cu_err = cuEventQuery(cu_event);
-            if (cu_err != CUDA_SUCCESS && cu_err != CUDA_ERROR_NOT_READY)
-            {
-                // If the event is somehow invalid, try a full device sync instead
-                LOG_WARN("[waitForCUDAEvent/worker] cuEventQuery failed: " << cu_err
-                          << ", falling back to full device sync");
-                cu_err = cuCtxSynchronize();
-                if (cu_err != CUDA_SUCCESS)
-                {
-                    LOG_ERROR("[waitForCUDAEvent/worker] cuCtxSynchronize failed: " << cu_err);
-                    cuDevicePrimaryCtxRelease(cu_device);
-                    return false;
-                }
-                return true;
-            }
-
-            // Wait for event to complete
-            cu_err = cuEventSynchronize(cu_event);
-            if (cu_err != CUDA_SUCCESS)
-            {
-                LOG_WARN("[waitForCUDAEvent/worker] cuEventSynchronize failed: " << cu_err
-                          << ", falling back to full device sync");
-                cu_err = cuCtxSynchronize();
-                if (cu_err != CUDA_SUCCESS)
-                {
-                    LOG_ERROR("[waitForCUDAEvent/worker] cuCtxSynchronize fallback failed: " << cu_err);
-                    cuDevicePrimaryCtxRelease(cu_device);
-                    return false;
-                }
-            }
-            
-            return true; });
-
-        // Wait for worker to complete
-        return future.get();
+        return rocm_backend->waitForEvent(event, device_id);
     }
 
     // =========================================================================

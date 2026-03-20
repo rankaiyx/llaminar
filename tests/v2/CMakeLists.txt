@@ -721,6 +721,25 @@ if(HAVE_CUDA AND HAVE_ROCM)
         RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
+    # Test: PCIeBARBackend Worker Pool - Per-device worker threads, allocation-free
+    # event waits, per-pair resources, and ROCm event integration.
+    add_executable(v2_integration_pcie_bar_backend_worker_pool integration/collective/backends/Test__PCIeBARBackend_WorkerPool.cpp)
+    target_link_libraries(v2_integration_pcie_bar_backend_worker_pool
+        llaminar2_core
+        device_benchmarks
+        GTest::gtest
+        GTest::gtest_main
+    )
+    target_include_directories(v2_integration_pcie_bar_backend_worker_pool PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/utils
+    )
+    add_v2_test(V2_Integration_PCIeBARBackend_WorkerPool
+        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend_worker_pool>
+        LABELS "V2;Integration;Collective;PCIeBARBackend;WorkerPool;P2P;CUDA;ROCm;CrossVendor;TensorParallel;AllReduce"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+
     # Test: BAR-backed HIP allocation - Exploratory test for HIP memory in BAR
     # DISABLED: This was an exploratory test that exhaustively tested all HIP/HSA/CUDA APIs
     # for direct kernel access to PCIe BAR memory. Key findings:
@@ -9232,6 +9251,21 @@ add_v2_test(V2_Perf_PCIeBARPipelinedAllreduce
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added PCIeBAR pipelined allreduce performance benchmarks")
+
+# Performance: 3-Backend AllReduce Latency Comparison
+# =============================================================================
+# Side-by-side allreduce latency comparison across NCCL, RCCL, and PCIeBAR
+# backends via ICollectiveBackend abstractions. Tests the full Llaminar code
+# path for each backend at various message sizes (256B to 8.5MB).
+add_executable(v2_perf_allreduce_3backend performance/collective/Perf__AllreduceLatency_3Backend.cpp)
+target_link_libraries(v2_perf_allreduce_3backend llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_AllreduceLatency_3Backend
+    COMMAND $<TARGET_FILE:v2_perf_allreduce_3backend>
+    LABELS "V2;Performance;CUDA;ROCm;NCCL;RCCL;PCIeBAR;Allreduce;Latency;CrossVendor;Benchmark"
+    MPI_PROCS 1
+    TIMEOUT 600
+)
+message(STATUS "V2 Tests: Added 3-backend allreduce latency comparison benchmarks")
 
 # Performance: HeterogeneousBackend Pipeline Benchmark
 # =============================================================================

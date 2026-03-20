@@ -150,6 +150,11 @@ namespace llaminar2
         /// to CUDA devices in subsequent PP stages.
         bool use_bar_backed_hidden = false;
 
+        /// PP stage config for nested TP-in-PP runners.
+        /// When set, the factory uses partial weight loading (only embedding/lm_head
+        /// as indicated by the PP stage config) and sets pp_layer_offset on the graph.
+        std::optional<FactoryPPStageConfig> pp_stage_config;
+
         /**
          * @brief Canonical factory: build InferenceRunnerConfig from a RankExecutionPlan
          *

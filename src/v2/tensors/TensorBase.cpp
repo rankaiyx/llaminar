@@ -1810,7 +1810,7 @@ namespace llaminar2
         if (gpu_device.is_cuda())
         {
             auto *pcie_backend = PCIeBARBackend::getInstance();
-            if (pcie_backend && pcie_backend->isPCIeBarActive())
+            if (pcie_backend && pcie_backend->isPCIeBarActive() && pcie_backend->hasCUDAWorkerFor(device_id))
             {
                 LOG_TRACE("[waitForEventWithProxy] Routing CUDA event wait through PCIeBAR worker");
                 return pcie_backend->waitForCUDAEvent(event, device_id);
@@ -2062,11 +2062,15 @@ namespace llaminar2
                 bool all_zero = true;
                 for (size_t i = 0; i < check_count; ++i)
                 {
-                    if (fp[i] != 0.0f) { all_zero = false; break; }
+                    if (fp[i] != 0.0f)
+                    {
+                        all_zero = false;
+                        break;
+                    }
                 }
                 if (all_zero && check_count > 0 && bytes >= 1024)
                 {
-                    LOG_WARN("[TensorBase::ensureOnHost] D2H ALL ZEROS: tensor=" 
+                    LOG_WARN("[TensorBase::ensureOnHost] D2H ALL ZEROS: tensor="
                              << (debug_name_.empty() ? "(unnamed)" : debug_name_)
                              << " bytes=" << bytes
                              << " device=" << gpu_device_->toString()

@@ -328,15 +328,29 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Wait for a CUDA event (direct call)
+         * @brief Wait for a CUDA event via per-device worker thread
          *
-         * This function establishes proper CUDA context and waits for the event.
+         * Routes the wait through a dedicated CUDA worker thread for the target
+         * device, avoiding HIP context contamination. Multiple CUDA devices are
+         * served by separate worker threads in parallel.
          *
          * @param event CUDA event to wait for (cudaEvent_t)
-         * @param device_id CUDA device ID
+         * @param device_id CUDA device ordinal
          * @return true if wait succeeded
          */
         bool waitForCUDAEvent(void *event, int device_id);
+
+        /**
+         * @brief Wait for a ROCm (HIP) event
+         *
+         * Synchronises on a HIP event using hipEventSynchronize.
+         * Called from the main/CUDA threads that may not have a HIP context.
+         *
+         * @param event HIP event to wait for (hipEvent_t)
+         * @param device_id ROCm device ordinal
+         * @return true if wait succeeded
+         */
+        bool waitForROCmEvent(void *event, int device_id);
 
         /**
          * @brief Get the global PCIeBARBackend instance (if any)
@@ -524,6 +538,13 @@ namespace llaminar2
             return p2p_engine_.get();
         }
 
+        /// Whether at least one CUDA device worker thread is active.
+        /// Public for integration testing.
+        bool isCUDAWorkerRunning() const;
+
+        /// Whether a CUDA worker exists and is running for a specific device ordinal.
+        bool hasCUDAWorkerFor(int cuda_ordinal) const;
+
     private:
         // Use shared_ptr to leverage the process-wide singleton
         // This prevents BAR resource cleanup/re-init issues between tests
@@ -573,53 +594,110 @@ namespace llaminar2
         double measured_bandwidth_gbps_ = 0.0;
 
         // =====================================================================
-        // CUDA Worker Thread for HIP-safe Event Waits
+        // CUDA Worker Pool — Per-Device Workers for HIP-safe Event Waits
         // =====================================================================
-        // When running heterogeneous CUDA+ROCm LOCAL TP, the ROCm executor thread
-        // may need to wait for CUDA events. Direct cudaEventSynchronize() fails
-        // with "context is destroyed" from a HIP-contaminated thread.
-        // This worker thread provides a clean CUDA context for event waits.
+        //
+        // When running heterogeneous CUDA+ROCm LOCAL TP, HIP-contaminated threads
+        // cannot safely call cudaEventSynchronize. Each distinct CUDA device gets
+        // its own worker thread with a clean CUDA context. Workers use a fixed-size
+        // work slot (no heap allocation) for the hot-path event-wait case.
 
-        /**
-         * @brief Start the CUDA worker thread
-         */
+        /// Allocation-free work item for the hot path.
+        /// Stores a (function ptr, device_id, event) triple that the worker can
+        /// execute without any std::function / packaged_task heap traffic.
+        struct alignas(64) WorkSlot
+        {
+            /// Opaque function: returns bool, takes (event, device_id, worker_stream)
+            using Fn = bool (*)(void *event, int device_id, void *worker_stream);
+
+            std::atomic<bool> ready{false};   ///< Producer sets after filling
+            std::atomic<bool> done{false};    ///< Worker sets after executing
+            bool result = false;              ///< Execution result
+            Fn fn = nullptr;                  ///< Function to execute
+            void *event = nullptr;            ///< CUDA event argument
+            int device_id = -1;               ///< Device ordinal argument
+
+            void reset()
+            {
+                ready.store(false, std::memory_order_relaxed);
+                done.store(false, std::memory_order_relaxed);
+                result = false;
+                fn = nullptr;
+                event = nullptr;
+                device_id = -1;
+            }
+        };
+
+        /// Per-CUDA-device worker thread with pre-initialized context.
+        struct CUDADeviceWorker
+        {
+            int cuda_ordinal = -1;
+            std::thread thread;
+            void *stream = nullptr;    ///< Non-blocking CUDA stream
+
+            // Allocation-free fast-path slot (single producer, single consumer)
+            WorkSlot slot;
+
+            // Overflow: general-purpose queue for rare / non-hot-path work
+            std::queue<std::packaged_task<bool()>> overflow_queue;
+            std::mutex mutex;
+            std::condition_variable cv;
+            std::atomic<bool> stop{false};
+            std::atomic<bool> running{false};
+        };
+
+        /// Lookup: CUDA ordinal → worker
+        std::unordered_map<int, std::unique_ptr<CUDADeviceWorker>> cuda_workers_;
+
+        bool startCUDAWorkers();
+        void stopCUDAWorkers();
+        bool startCUDAWorkerFor(int cuda_ordinal);
+        void cudaDeviceWorkerLoop(CUDADeviceWorker *w);
+
+        /// Submit an event-wait to the right per-device worker (allocation-free hot path).
+        bool submitEventWait(int cuda_ordinal, void *event);
+
+        /// Submit general work to a device worker (heap-allocating fallback).
+        std::future<bool> submitCUDAWork(int cuda_ordinal, std::function<bool()> work);
+
+        // Legacy single-worker compat (routes to primary device worker)
         bool startCUDAWorker();
-
-        /**
-         * @brief Stop the CUDA worker thread
-         */
         void stopCUDAWorker();
 
-        /**
-         * @brief Submit work to the CUDA worker thread
-         */
-        std::future<bool> submitCUDAWork(std::function<bool()> work);
+        // =====================================================================
+        // Per-Pair Resources (pre-allocated during initializeMultiPair)
+        // =====================================================================
 
-        /**
-         * @brief Main loop for CUDA worker thread
-         */
-        void cudaWorkerLoop();
+        /// Pre-allocated GPU resources for a single CUDA↔ROCm pair.
+        /// Created once at init; no allocations on the hot path.
+        struct PairResources
+        {
+            int cuda_ordinal = -1;
+            int rocm_ordinal = -1;
 
-        /// Worker thread for CUDA operations
-        std::thread cuda_worker_thread_;
+            // Three CUDA streams per pair for pipelined allreduce
+            void *read_stream = nullptr;
+            void *compute_stream = nullptr;
+            void *write_stream = nullptr;
 
-        /// Work queue for CUDA operations
-        std::queue<std::packaged_task<bool()>> cuda_work_queue_;
+            // Ping-pong events (2 per type)
+            void *read_events[2] = {nullptr, nullptr};
+            void *compute_events[2] = {nullptr, nullptr};
 
-        /// Mutex for work queue
-        std::mutex cuda_work_mutex_;
+            // Temp buffers on CUDA side (double-buffered for pipelining)
+            void *temp_buffer = nullptr;
+            void *temp_buffer2 = nullptr;
+            size_t temp_buffer_size = 0;
 
-        /// Condition variable for work queue
-        std::condition_variable cuda_work_cv_;
+            bool initialized = false;
+        };
 
-        /// Flag to stop worker thread
-        std::atomic<bool> cuda_worker_stop_{false};
+        /// Per-pair resources indexed by pair_index
+        std::vector<PairResources> pair_resources_;
 
-        /// Flag indicating worker is running
-        std::atomic<bool> cuda_worker_running_{false};
-
-        /// CUDA stream for worker thread operations (created on worker thread)
-        void *cuda_worker_stream_ = nullptr;
+        bool initializePairResources(size_t pair_index, int cuda_ordinal);
+        void destroyPairResources(PairResources &pr);
+        bool ensurePairTempBuffer(PairResources &pr, size_t bytes);
 
         // =====================================================================
         // BAR Allocator State
@@ -798,6 +876,7 @@ namespace llaminar2
         double getMeasuredBandwidthGBps() const { return 0.0; }
         bool isPCIeBarActive() const { return false; }
         bool waitForCUDAEvent(void *, int) { return false; }
+        bool waitForROCmEvent(void *, int) { return false; }
         static PCIeBARBackend *getInstance() { return nullptr; }
 
         std::optional<std::pair<void *, size_t>> allocateInBarRegion(size_t) { return std::nullopt; }

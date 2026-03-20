@@ -1655,6 +1655,12 @@ namespace llaminar2
         graph_config.kv_cache_scale = config.kv_cache_scale;
         graph_config.kv_cache_precision = config.kv_cache_precision;
 
+        // PP layer offset for nested TP-in-PP (partial graph with layer offset)
+        if (config.pp_stage_config.has_value())
+        {
+            graph_config.pp_layer_offset = config.pp_stage_config->first_layer;
+        }
+
         // Check for LOCAL TP configuration
         ILocalTPContext *local_tp_ctx = config.local_tp_ctx;
         const int local_tp_device_idx = config.local_tp_device_index;
@@ -1709,21 +1715,51 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Configure weights via polymorphic builder
-        // Captures model_ctx and device by value for lambda lifetime safety
-        auto weights = config_builder->buildWeights(
-            [model_ctx, device](const std::string &name)
-            {
-                return model_ctx->getWeightForDevice(name, device);
-            });
-
-        if (!weights.embedding_table || !weights.final_norm || !weights.lm_head)
+        // Configure weights: PP-aware vs full
+        if (config.pp_stage_config.has_value())
         {
-            LOG_ERROR("[InferenceRunner] Missing global weights from IModelContext");
-            return nullptr;
-        }
+            // Nested TP-in-PP: use standard TP-sharded weight loading but with
+            // partial global weight requirements
+            const auto &pp_cfg = config.pp_stage_config.value();
+            orchestrator->setPPStageConfig(pp_cfg);
 
-        orchestrator->setWeights(weights);
+            auto weights = config_builder->buildWeights(
+                [model_ctx, device](const std::string &name)
+                {
+                    return model_ctx->getWeightForDevice(name, device);
+                });
+
+            // Only check for global weights this PP stage actually owns
+            if (pp_cfg.has_embedding && !weights.embedding_table)
+            {
+                LOG_ERROR("[InferenceRunner] PP stage has_embedding=true but embedding missing");
+                return nullptr;
+            }
+            if (pp_cfg.has_lm_head && (!weights.final_norm || !weights.lm_head))
+            {
+                LOG_ERROR("[InferenceRunner] PP stage has_lm_head=true but final_norm/lm_head missing");
+                return nullptr;
+            }
+
+            orchestrator->setWeights(weights);
+        }
+        else
+        {
+            // Full model: load all global weights
+            auto weights = config_builder->buildWeights(
+                [model_ctx, device](const std::string &name)
+                {
+                    return model_ctx->getWeightForDevice(name, device);
+                });
+
+            if (!weights.embedding_table || !weights.final_norm || !weights.lm_head)
+            {
+                LOG_ERROR("[InferenceRunner] Missing global weights from IModelContext");
+                return nullptr;
+            }
+
+            orchestrator->setWeights(weights);
+        }
         LOG_INFO("[InferenceRunner] Testable DeviceGraphOrchestrator created successfully");
 
         return orchestrator;

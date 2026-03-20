@@ -253,6 +253,18 @@ namespace llaminar2
         /// Backend for LOCAL PP (auto-select based on device types)
         CollectiveBackendType local_pp_backend = CollectiveBackendType::AUTO;
 
+        /// Per-stage TP domain info for LOCAL PP with TP composition.
+        /// Parallel to local_pp_devices. When non-empty, each entry contains
+        /// the full device list for that PP stage (enabling TP_PP mode).
+        /// Empty entries or empty vector → single-device PP stages.
+        struct LocalPPStageTPInfo
+        {
+            std::vector<GlobalDeviceAddress> devices; ///< All devices for this stage
+            std::vector<float> tp_weights;            ///< TP weights (empty = equal)
+            CollectiveBackendType tp_backend = CollectiveBackendType::AUTO;
+        };
+        std::vector<LocalPPStageTPInfo> local_pp_stage_tp_info;
+
         // GLOBAL TP (participation in cross-rank TP)
         std::optional<int> global_tp_domain_id;
         int global_tp_rank_in_domain = 0;

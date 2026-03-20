@@ -839,6 +839,14 @@ namespace llaminar2
             return true;
         }
 
+        // When LOCAL PP with TP domains is active, TP is per-stage (each PP stage
+        // creates its own TP context inside the nested MDO). Skip global TP context.
+        if (plan_.usesLocalPP())
+        {
+            LOG_DEBUG("LOCAL PP active — TP will be handled per-stage by nested MDOs");
+            return true;
+        }
+
         // Create LOCAL TP context using factory function
         local_tp_ctx_ = createLocalTPContext(
             plan_.local_tp_devices,
@@ -988,16 +996,17 @@ namespace llaminar2
     {
         ScopedWeightLoadTimer timer(WeightLoadPhase::GRAPH_BUILD);
 
+        // Check if LOCAL PP is configured (takes priority over TP, because
+        // TP-in-PP composition creates per-stage TP contexts inside the MDO)
+        if (plan_.usesLocalPP())
+        {
+            return buildLocalPPComputeGraph();
+        }
+
         // Check if LOCAL TP is configured (multiple devices within this rank)
         if (hasLocalTP())
         {
             return buildMultiDeviceComputeGraph();
-        }
-
-        // Check if LOCAL PP is configured (multiple PP stages within this rank)
-        if (plan_.usesLocalPP())
-        {
-            return buildLocalPPComputeGraph();
         }
 
         // Single-device path

@@ -24,42 +24,42 @@ using namespace llaminar2;
 namespace
 {
 
-/// Create a simple valid config for tests that need a baseline
-PipelineConfig createValidTwoStageConfig()
-{
-    PipelineConfig config;
-    config.total_layers = 24;
+    /// Create a simple valid config for tests that need a baseline
+    PipelineConfig createValidTwoStageConfig()
+    {
+        PipelineConfig config;
+        config.total_layers = 24;
 
-    // Two domains
-    TPDomainConfig domain0;
-    domain0.name = "gpu0";
-    domain0.devices.push_back(DeviceId::cuda(0));
-    domain0.tp_backend = CollectiveBackendType::AUTO;
-    config.tp_domains.push_back(std::move(domain0));
+        // Two domains
+        TPDomainConfig domain0;
+        domain0.name = "gpu0";
+        domain0.devices.push_back(DeviceId::cuda(0));
+        domain0.tp_backend = CollectiveBackendType::AUTO;
+        config.tp_domains.push_back(std::move(domain0));
 
-    TPDomainConfig domain1;
-    domain1.name = "gpu1";
-    domain1.devices.push_back(DeviceId::cuda(1));
-    domain1.tp_backend = CollectiveBackendType::AUTO;
-    config.tp_domains.push_back(std::move(domain1));
+        TPDomainConfig domain1;
+        domain1.name = "gpu1";
+        domain1.devices.push_back(DeviceId::cuda(1));
+        domain1.tp_backend = CollectiveBackendType::AUTO;
+        config.tp_domains.push_back(std::move(domain1));
 
-    // Two stages
-    config.pp_stages.push_back(PPStageConfig::firstStage(0, "gpu0", 0, 12));
-    config.pp_stages.push_back(PPStageConfig::lastStage(1, "gpu1", 12, 24));
+        // Two stages
+        config.pp_stages.push_back(PPStageConfig::firstStage(0, "gpu0", 0, 12));
+        config.pp_stages.push_back(PPStageConfig::lastStage(1, "gpu1", 12, 24));
 
-    config.pp_transfer_backends[{0, 1}] = CollectiveBackendType::PCIE_BAR;
+        config.pp_transfer_backends[{0, 1}] = CollectiveBackendType::PCIE_BAR;
 
-    return config;
-}
+        return config;
+    }
 
-/// Create a valid config with 2-way TP
-PipelineConfig createValidTPConfig()
-{
-    return PipelineConfig::tensorParallel(
-        24,
-        {DeviceId::cuda(0), DeviceId::cuda(1)},
-        CollectiveBackendType::NCCL);
-}
+    /// Create a valid config with 2-way TP
+    PipelineConfig createValidTPConfig()
+    {
+        return PipelineConfig::tensorParallel(
+            24,
+            {DeviceId::cuda(0), DeviceId::cuda(1)},
+            CollectiveBackendType::NCCL);
+    }
 
 } // anonymous namespace
 
@@ -1019,6 +1019,278 @@ TEST(Test__PipelineConfig, AutoSelectBackends_CPUToCPUGetsHOST)
 }
 
 // =============================================================================
+// Cross-Vendor PP Transfer Backend Tests
+// =============================================================================
+
+TEST(Test__PipelineConfig, AutoSelectBackends_CUDAToROCmGetsPCIeBAR)
+{
+    // Cross-vendor GPU PP transfer: CUDA → ROCm should get PCIe BAR
+    PipelineConfig config;
+    config.total_layers = 28;
+
+    TPDomainConfig cuda_domain;
+    cuda_domain.name = "cuda_stage";
+    cuda_domain.devices.push_back(DeviceId::cuda(0));
+    config.tp_domains.push_back(std::move(cuda_domain));
+
+    TPDomainConfig rocm_domain;
+    rocm_domain.name = "rocm_stage";
+    rocm_domain.devices.push_back(DeviceId::rocm(0));
+    config.tp_domains.push_back(std::move(rocm_domain));
+
+    config.pp_stages.push_back(PPStageConfig::firstStage(0, "cuda_stage", 0, 14));
+    config.pp_stages.push_back(PPStageConfig::lastStage(1, "rocm_stage", 14, 28));
+
+    config.autoSelectBackends();
+
+    auto backend = config.pp_transfer_backends[{0, 1}];
+    EXPECT_EQ(backend, CollectiveBackendType::PCIE_BAR);
+}
+
+TEST(Test__PipelineConfig, AutoSelectBackends_ROCmToROCmGetsRCCL)
+{
+    // Same-vendor ROCm PP transfer should get RCCL
+    PipelineConfig config;
+    config.total_layers = 28;
+
+    TPDomainConfig domain0;
+    domain0.name = "rocm0";
+    domain0.devices.push_back(DeviceId::rocm(0));
+    config.tp_domains.push_back(std::move(domain0));
+
+    TPDomainConfig domain1;
+    domain1.name = "rocm1";
+    domain1.devices.push_back(DeviceId::rocm(1));
+    config.tp_domains.push_back(std::move(domain1));
+
+    config.pp_stages.push_back(PPStageConfig::firstStage(0, "rocm0", 0, 14));
+    config.pp_stages.push_back(PPStageConfig::lastStage(1, "rocm1", 14, 28));
+
+    config.autoSelectBackends();
+
+    auto backend = config.pp_transfer_backends[{0, 1}];
+    EXPECT_EQ(backend, CollectiveBackendType::RCCL);
+}
+
+TEST(Test__PipelineConfig, AutoSelectBackends_GPUToCPUGetsHOST)
+{
+    // GPU → CPU PP transfer should get HOST
+    PipelineConfig config;
+    config.total_layers = 28;
+
+    TPDomainConfig cuda_domain;
+    cuda_domain.name = "cuda_0";
+    cuda_domain.devices.push_back(DeviceId::cuda(0));
+    config.tp_domains.push_back(std::move(cuda_domain));
+
+    TPDomainConfig cpu_domain;
+    cpu_domain.name = "cpu_0";
+    cpu_domain.devices.push_back(DeviceId::cpu());
+    config.tp_domains.push_back(std::move(cpu_domain));
+
+    config.pp_stages.push_back(PPStageConfig::firstStage(0, "cuda_0", 0, 14));
+    config.pp_stages.push_back(PPStageConfig::lastStage(1, "cpu_0", 14, 28));
+
+    config.autoSelectBackends();
+
+    auto backend = config.pp_transfer_backends[{0, 1}];
+    EXPECT_EQ(backend, CollectiveBackendType::HOST);
+}
+
+TEST(Test__PipelineConfig, AutoSelectBackends_ThreeStageChain_MixedVendors)
+{
+    // 3-stage chain: CUDA → ROCm → CPU with auto-selected backends
+    PipelineConfig config;
+    config.total_layers = 27;
+
+    TPDomainConfig cuda_d;
+    cuda_d.name = "cuda";
+    cuda_d.devices.push_back(DeviceId::cuda(0));
+    config.tp_domains.push_back(std::move(cuda_d));
+
+    TPDomainConfig rocm_d;
+    rocm_d.name = "rocm";
+    rocm_d.devices.push_back(DeviceId::rocm(0));
+    config.tp_domains.push_back(std::move(rocm_d));
+
+    TPDomainConfig cpu_d;
+    cpu_d.name = "cpu";
+    cpu_d.devices.push_back(DeviceId::cpu());
+    config.tp_domains.push_back(std::move(cpu_d));
+
+    config.pp_stages.push_back(PPStageConfig::firstStage(0, "cuda", 0, 9));
+    config.pp_stages.push_back(PPStageConfig::middleStage(1, "rocm", 9, 18));
+    config.pp_stages.push_back(PPStageConfig::lastStage(2, "cpu", 18, 27));
+
+    config.autoSelectBackends();
+
+    // CUDA → ROCm: PCIeBAR
+    auto backend_0_1 = config.pp_transfer_backends[{0, 1}];
+    EXPECT_EQ(backend_0_1, CollectiveBackendType::PCIE_BAR);
+    // ROCm → CPU: HOST
+    auto backend_1_2 = config.pp_transfer_backends[{1, 2}];
+    EXPECT_EQ(backend_1_2, CollectiveBackendType::HOST);
+}
+
+TEST(Test__PipelineConfig, AutoSelectBackends_MixedTPDomainAutoSelectsPCIeBAR)
+{
+    // TP domain with CUDA + ROCm should auto-select PCIe BAR
+    PipelineConfig config;
+    config.total_layers = 28;
+
+    TPDomainConfig mixed;
+    mixed.name = "mixed_tp";
+    mixed.devices.push_back(DeviceId::cuda(0));
+    mixed.devices.push_back(DeviceId::rocm(0));
+    mixed.tp_backend = CollectiveBackendType::AUTO;
+    config.tp_domains.push_back(std::move(mixed));
+
+    config.pp_stages.push_back(PPStageConfig::fullModel(28, "mixed_tp"));
+
+    config.autoSelectBackends();
+
+    EXPECT_EQ(config.tp_domains[0].tp_backend, CollectiveBackendType::PCIE_BAR);
+}
+
+// =============================================================================
+// PP+TP Composition Validation Edge Cases
+// =============================================================================
+
+TEST(Test__PipelineConfig, Validate_PPWithTPDomain_DifferentTPDegrees)
+{
+    // PP where stage 0 has 2-way TP and stage 1 has no TP (1 device)
+    PipelineConfig config;
+    config.total_layers = 28;
+
+    TPDomainConfig tp_domain;
+    tp_domain.name = "cuda_tp";
+    tp_domain.devices.push_back(DeviceId::cuda(0));
+    tp_domain.devices.push_back(DeviceId::cuda(1));
+    tp_domain.tp_backend = CollectiveBackendType::NCCL;
+    config.tp_domains.push_back(std::move(tp_domain));
+
+    TPDomainConfig single_domain;
+    single_domain.name = "rocm_single";
+    single_domain.devices.push_back(DeviceId::rocm(0));
+    config.tp_domains.push_back(std::move(single_domain));
+
+    config.pp_stages.push_back(PPStageConfig::firstStage(0, "cuda_tp", 0, 14));
+    config.pp_stages.push_back(PPStageConfig::lastStage(1, "rocm_single", 14, 28));
+
+    config.pp_transfer_backends[{0, 1}] = CollectiveBackendType::HOST;
+
+    std::string error;
+    EXPECT_TRUE(config.validate(&error)) << error;
+    EXPECT_EQ(config.maxTPDegree(), 2);
+    EXPECT_TRUE(config.hasTP());
+    EXPECT_TRUE(config.hasPP());
+}
+
+TEST(Test__PipelineConfig, Validate_SingleLayerStages)
+{
+    // Each stage has exactly 1 layer — should be valid
+    PipelineConfig config;
+    config.total_layers = 3;
+
+    TPDomainConfig d0, d1, d2;
+    d0.name = "d0";
+    d0.devices.push_back(DeviceId::cuda(0));
+    d1.name = "d1";
+    d1.devices.push_back(DeviceId::cuda(1));
+    d2.name = "d2";
+    d2.devices.push_back(DeviceId::cuda(2));
+    config.tp_domains.push_back(std::move(d0));
+    config.tp_domains.push_back(std::move(d1));
+    config.tp_domains.push_back(std::move(d2));
+
+    config.pp_stages.push_back(PPStageConfig::firstStage(0, "d0", 0, 1));
+    config.pp_stages.push_back(PPStageConfig::middleStage(1, "d1", 1, 2));
+    config.pp_stages.push_back(PPStageConfig::lastStage(2, "d2", 2, 3));
+
+    std::string error;
+    EXPECT_TRUE(config.validate(&error)) << error;
+    EXPECT_EQ(config.numStages(), 3);
+}
+
+TEST(Test__PipelineConfig, Validate_NonContiguousStageIds)
+{
+    // Stage IDs 0 and 5 (non-contiguous) — should be valid as long as layers match
+    PipelineConfig config;
+    config.total_layers = 24;
+
+    TPDomainConfig d0, d1;
+    d0.name = "d0";
+    d0.devices.push_back(DeviceId::cuda(0));
+    d1.name = "d1";
+    d1.devices.push_back(DeviceId::cuda(1));
+    config.tp_domains.push_back(std::move(d0));
+    config.tp_domains.push_back(std::move(d1));
+
+    PPStageConfig stage0;
+    stage0.stage_id = 0;
+    stage0.domain_name = "d0";
+    stage0.first_layer = 0;
+    stage0.last_layer = 12;
+    stage0.has_embedding = true;
+
+    PPStageConfig stage5;
+    stage5.stage_id = 5;
+    stage5.domain_name = "d1";
+    stage5.first_layer = 12;
+    stage5.last_layer = 24;
+    stage5.has_lm_head = true;
+
+    config.pp_stages.push_back(stage0);
+    config.pp_stages.push_back(stage5);
+
+    std::string error;
+    EXPECT_TRUE(config.validate(&error)) << error;
+}
+
+TEST(Test__PipelineConfig, Validate_StagesShareSameDomain)
+{
+    // Two PP stages referencing the same domain — valid (shared device)
+    PipelineConfig config;
+    config.total_layers = 24;
+
+    TPDomainConfig shared;
+    shared.name = "shared_gpu";
+    shared.devices.push_back(DeviceId::cuda(0));
+    config.tp_domains.push_back(std::move(shared));
+
+    config.pp_stages.push_back(PPStageConfig::firstStage(0, "shared_gpu", 0, 12));
+    config.pp_stages.push_back(PPStageConfig::lastStage(1, "shared_gpu", 12, 24));
+
+    std::string error;
+    EXPECT_TRUE(config.validate(&error)) << error;
+
+    // Both stages use same device
+    EXPECT_EQ(config.getDeviceForLayer(0), config.getDeviceForLayer(20));
+}
+
+TEST(Test__PipelineConfig, Validate_OutOfOrderStagesStillValidIfLayersCover)
+{
+    // Stages added in reverse order — validation should still work
+    PipelineConfig config;
+    config.total_layers = 24;
+
+    TPDomainConfig d0, d1;
+    d0.name = "first";
+    d0.devices.push_back(DeviceId::cuda(0));
+    d1.name = "second";
+    d1.devices.push_back(DeviceId::cuda(1));
+    config.tp_domains.push_back(std::move(d0));
+    config.tp_domains.push_back(std::move(d1));
+
+    // Add last stage first
+    config.pp_stages.push_back(PPStageConfig::lastStage(1, "second", 12, 24));
+    config.pp_stages.push_back(PPStageConfig::firstStage(0, "first", 0, 12));
+
+    std::string error;
+    EXPECT_TRUE(config.validate(&error)) << error;
+}
+
+// =============================================================================
 // Auto-Completion Tests - completeAndValidate
 // =============================================================================
 
@@ -1061,14 +1333,14 @@ TEST(Test__PipelineConfig, CompleteAndValidate_InvalidConfigFails)
     stage0.stage_id = 0;
     stage0.domain_name = "default";
     stage0.first_layer = 0;
-    stage0.last_layer = 14;  // Overlaps with stage1
+    stage0.last_layer = 14; // Overlaps with stage1
     stage0.has_embedding = true;
     config.pp_stages.push_back(stage0);
 
     PPStageConfig stage1;
     stage1.stage_id = 1;
     stage1.domain_name = "default";
-    stage1.first_layer = 10;  // Overlap! Should be 14
+    stage1.first_layer = 10; // Overlap! Should be 14
     stage1.last_layer = 24;
     stage1.has_lm_head = true;
     config.pp_stages.push_back(stage1);

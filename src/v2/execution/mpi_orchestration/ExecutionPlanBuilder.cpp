@@ -582,12 +582,20 @@ namespace llaminar2
             {
                 for (const auto *stage : my_stages)
                 {
-                    // Find the domain for this stage and pick its device
+                    // Find the domain for this stage
                     for (const auto &domain : domains)
                     {
                         if (domain.name == stage->domain_name && !domain.devices.empty())
                         {
+                            // Use primary device for flat PP device list
                             plan.local_pp_devices.push_back(domain.devices[0]);
+
+                            // Preserve full domain info for TP-in-PP composition
+                            RankExecutionPlan::LocalPPStageTPInfo tp_info;
+                            tp_info.devices = domain.devices;
+                            tp_info.tp_weights = domain.weights;
+                            tp_info.tp_backend = domain.backend;
+                            plan.local_pp_stage_tp_info.push_back(std::move(tp_info));
                             break;
                         }
                     }
@@ -632,7 +640,21 @@ namespace llaminar2
         }
 
         // Set up local TP devices (devices within this rank)
-        if (primary_domain)
+        // IMPORTANT: When LOCAL PP with TP domains is active, TP is per-stage
+        // (handled by nested MDOs), so we must NOT populate global local_tp_devices.
+        // Populating it here would cause buildComputeGraph() to dispatch to the TP
+        // path instead of the PP path, losing the pipeline parallelism entirely.
+        bool has_tp_in_pp = false;
+        for (const auto &tp_info : plan.local_pp_stage_tp_info)
+        {
+            if (tp_info.devices.size() > 1)
+            {
+                has_tp_in_pp = true;
+                break;
+            }
+        }
+
+        if (primary_domain && !has_tp_in_pp)
         {
             // Collect devices on this rank's host
             for (const auto &device : primary_domain->devices)
@@ -659,6 +681,10 @@ namespace llaminar2
         if (!plan.local_tp_devices.empty())
         {
             plan.primary_device = plan.local_tp_devices[0];
+        }
+        else if (!plan.local_pp_devices.empty())
+        {
+            plan.primary_device = plan.local_pp_devices[0];
         }
         else if (rank < static_cast<int>(cluster_inventory.ranks.size()))
         {

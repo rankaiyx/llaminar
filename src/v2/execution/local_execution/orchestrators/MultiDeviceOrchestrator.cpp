@@ -246,6 +246,7 @@ namespace llaminar2
 
             const auto &pp_devices = plan.local_pp_devices;
             const auto &boundaries = plan.local_pp_layer_boundaries;
+            const auto &stage_tp_info = plan.local_pp_stage_tp_info;
 
             for (size_t i = 0; i < pp_devices.size(); ++i)
             {
@@ -254,11 +255,31 @@ namespace llaminar2
                 stage_cfg.last_layer = boundaries[i + 1]; // exclusive
                 stage_cfg.has_embedding = (i == 0);
                 stage_cfg.has_lm_head = (i == pp_devices.size() - 1);
-                stage_cfg.stage_devices = {pp_devices[i]};
+
+                // Use per-stage TP info if available (TP-in-PP composition)
+                if (i < stage_tp_info.size() && stage_tp_info[i].devices.size() > 1)
+                {
+                    stage_cfg.stage_devices = stage_tp_info[i].devices;
+                    stage_cfg.tp_weights = stage_tp_info[i].tp_weights;
+                    stage_cfg.tp_backend = stage_tp_info[i].tp_backend;
+                }
+                else
+                {
+                    stage_cfg.stage_devices = {pp_devices[i]};
+                }
 
                 // Cross-vendor detection for BAR-backed hidden state transfer
+                // Compare primary devices of adjacent stages
+                auto primaryDeviceType = [&](size_t idx) -> DeviceType
+                {
+                    if (idx < stage_tp_info.size() && !stage_tp_info[idx].devices.empty())
+                        return stage_tp_info[idx].devices[0].device_type;
+                    if (idx < pp_devices.size())
+                        return pp_devices[idx].device_type;
+                    return DeviceType::CPU;
+                };
                 if (i + 1 < pp_devices.size() &&
-                    pp_devices[i].device_type != pp_devices[i + 1].device_type)
+                    primaryDeviceType(i) != primaryDeviceType(i + 1))
                 {
                     stage_cfg.requires_bar_backed_hidden = true;
                 }
@@ -619,6 +640,12 @@ namespace llaminar2
                                                  // Set LOCAL TP parameters
                                                  runner_config.local_tp_ctx = tp_ctx_.get();
                                                  runner_config.local_tp_device_index = device_idx;
+
+                                                 // Pass PP stage config for nested TP-in-PP
+                                                 if (config_.nested_pp_stage_config.has_value())
+                                                 {
+                                                     runner_config.pp_stage_config = config_.nested_pp_stage_config;
+                                                 }
 
                                                  // Create the inference runner
                                                  result.runner = createTestableInferenceRunner(model_ctx_, device_id, runner_config);

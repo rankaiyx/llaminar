@@ -1548,9 +1548,9 @@ namespace llaminar2
         {
             InferenceMode inference_mode(config_.activation_precision);
 
-            if (device.is_gpu() && !inference_mode.isHybridQ16() && layer_idx > 0)
+            if (device.is_gpu() && !inference_mode.isHybridQ16() && layer_idx > config_.pp_layer_offset)
             {
-                // GPU path for layers 1+: Fused ResidualAdd + RMSNorm
+                // GPU path for non-first layers: Fused ResidualAdd + RMSNorm
                 // Combines previous layer's ffn_residual with this layer's attn_norm
                 FusedResidualNormStage::Params fused_params;
                 fused_params.device_id = device;
@@ -2127,7 +2127,7 @@ namespace llaminar2
                     // For Q8_1, use the direct FP32 K/V wired from projections during prefill;
                     // the decode path handles cache reads via effective_kv_len > seq_len.
                     attn_params.read_kv_from_cache = device.is_gpu() &&
-                        (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1);
+                                                     (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1);
                     attn_params.position_offset = position_ids ? position_ids[0] : 0;
                     attn_params.mpi_ctx = mpi_ctx_.get();
                     attn_params.device_id = device;
@@ -2295,7 +2295,7 @@ namespace llaminar2
                 // Replaces separate attn_residual + ffn_norm with one kernel pass
                 FusedResidualNormStage::Params fused_params;
                 fused_params.device_id = device;
-                fused_params.input = buffers.attn_proj;       // Wo output (to be added)
+                fused_params.input = buffers.attn_proj;         // Wo output (to be added)
                 fused_params.residual = buffers.current_hidden; // Hidden state (in-place update)
                 fused_params.gamma = layer.ffn_norm;            // FFN norm gamma
                 fused_params.norm_output = buffers.normalized;
@@ -2464,7 +2464,7 @@ namespace llaminar2
         // Stage 5: Residual connection
         // On GPU (non-last layers): Skip - fused into next layer's FusedResidualNormStage attn_norm
         // Last layer must keep ffn_residual since final_norm doesn't include residual add
-        const bool skip_ffn_residual = device.is_gpu() && (layer_idx < config_.n_layers - 1);
+        const bool skip_ffn_residual = device.is_gpu() && (layer_idx < config_.pp_layer_offset + config_.n_layers - 1);
         if (env.execution.exec_residual && !skip_ffn_residual)
         {
             // For HybridQ16, FFN residual uses Q16_1 residual buffer
