@@ -5,7 +5,8 @@
 #   cp .githooks/pre-commit .git/hooks/pre-commit
 #   chmod +x .git/hooks/pre-commit
 #
-# This hook builds and runs unit tests before allowing a commit.
+# This hook builds, runs unit tests, and runs Qwen2 parity tests
+# before allowing a commit to catch accuracy regressions early.
 # Override with: git commit --no-verify
 
 set -e
@@ -18,7 +19,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}======================================================${NC}"
-echo -e "${BLUE}Pre-commit Hook: Build & Unit Test${NC}"
+echo -e "${BLUE}Pre-commit Hook: Build, Unit Test & Parity${NC}"
 echo -e "${BLUE}======================================================${NC}"
 echo ""
 
@@ -26,7 +27,7 @@ echo ""
 BUILD_V2_INTEGRATION="build_v2_integration"
 
 # Step 1: Build Integration (Release optimizations + debug symbols + assertions)
-echo -e "${YELLOW}[1/2] Building V2 Integration...${NC}"
+echo -e "${YELLOW}[1/3] Building V2 Integration...${NC}"
 if ! cmake -B "$BUILD_V2_INTEGRATION" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration > /dev/null 2>&1; then
     echo -e "${RED}❌ CMake configuration failed (Integration)${NC}"
     exit 1
@@ -41,29 +42,57 @@ echo -e "${GREEN}✓ Integration build successful${NC}"
 echo ""
 
 # Step 2: Run Unit Tests (Integration build — fast, isolated component tests only)
-echo -e "${YELLOW}[2/2] Running V2 unit tests (Integration build)...${NC}"
+echo -e "${YELLOW}[2/3] Running V2 unit tests (Integration build)...${NC}"
 echo ""
 
 # Filter: ^V2_Unit_ matches all unit tests (excludes Integration, E2E, Performance)
 # --parallel: Run unit tests in parallel for faster execution
-# NOTE: Integration tests are excluded here to keep pre-commit fast.
-#       Run integration tests manually: ctest --test-dir build_v2_integration -R "^V2_Integration_" --output-on-failure --parallel
 set +e
 ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Unit_" --output-on-failure --parallel
 UNIT_EXIT_CODE=$?
 set -e
 
+if [ $UNIT_EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo -e "${RED}❌ Unit tests failed.${NC}"
+    echo ""
+    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
+    echo -e "${YELLOW}  git commit --no-verify${NC}"
+    echo -e "${YELLOW}to skip this check.${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Unit tests passed${NC}"
+echo ""
+
+# Step 3: Run Qwen2 SingleDevice Prefill Parity Tests (~75s)
+# Validates inference accuracy across CPU/CUDA/ROCm with multiple KV cache configs.
+# Catches accuracy regressions in attention, GEMM, and graph wiring.
+# NOTE: DecodeParity excluded — pre-existing CUDA decode segfault (null ITensor in
+#       layer0_attention coherence). Re-enable when that bug is fixed.
+echo -e "${YELLOW}[3/3] Running Qwen2 SingleDevice prefill parity tests...${NC}"
+echo ""
+
+set +e
+GTEST_FILTER="*PrefillParity*" \
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice$" --output-on-failure --timeout 300
+PARITY_EXIT_CODE=$?
+set -e
+
 echo ""
 echo "================================================"
-if [ $UNIT_EXIT_CODE -eq 0 ]; then
+if [ $PARITY_EXIT_CODE -eq 0 ]; then
     echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
     echo -e "${GREEN}  • Integration build: OK${NC}"
     echo -e "${GREEN}  • Unit tests: OK${NC}"
+    echo -e "${GREEN}  • Qwen2 parity: OK${NC}"
     echo ""
     echo -e "${GREEN}Proceeding with commit...${NC}"
     exit 0
 else
-    echo -e "${RED}❌ Unit tests failed.${NC}"
+    echo -e "${RED}❌ Qwen2 parity tests failed — possible accuracy regression.${NC}"
+    echo ""
+    echo -e "${YELLOW}Run manually for details:${NC}"
+    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R V2_Integration_Parity_Qwen2_SingleDevice -V${NC}"
     echo ""
     echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
     echo -e "${YELLOW}  git commit --no-verify${NC}"
