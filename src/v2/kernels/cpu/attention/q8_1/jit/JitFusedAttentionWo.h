@@ -415,7 +415,7 @@ namespace llaminar::v2::kernels::jit
         float *context_snapshot);
 
     // External helper for packed VNNI Wo projection.
-    // Wo points to a gemm_v4::QuantisedPackedWeights, A is FP32 context [m,k], C is FP32 output [m,n].
+    // Wo points to a gemm::QuantisedPackedWeights, A is FP32 context [m,k], C is FP32 output [m,n].
     extern "C" void llaminar2_wo_q8_1_vnni_packed_gemm(
         const void *wo_packed,
         const float *A,
@@ -443,8 +443,8 @@ namespace llaminar::v2::kernels::jit
         const void *scales;
         const void *mins;
         void (*quantize_func)(const float *, void *, int);
-        int N;                       // Output dimension (for QuantisedGemmKernel)
-        int K;                       // Input dimension (for QuantisedGemmKernel)
+        int N;                       // Output dimension (for CPUQuantisedGemmKernel)
+        int K;                       // Input dimension (for CPUQuantisedGemmKernel)
         const void *original_packed; // Original QuantisedPackedWeights* for GEMM kernel
     };
 

@@ -26,7 +26,7 @@ namespace llaminar2
      * input by quantizing the input once and reusing the Q8_1 buffer for all
      * projections. This avoids redundant quantization and improves cache locality.
      *
-     * This stage delegates to QuantisedGemmKernel::multiply_fused_multi(), which
+     * This stage delegates to CPUQuantisedGemmKernel::multiply_fused_multi(), which
      * handles the quantization and multi-projection execution internally.
      *
      * Implements IWorkspaceConsumerStage to delegate workspace requirements to the

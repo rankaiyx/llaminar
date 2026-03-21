@@ -29,10 +29,10 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
+#include "kernels/cpu/gemm/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 /**
  * @brief Model attention configuration

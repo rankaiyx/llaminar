@@ -9,7 +9,7 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
-#include "../../../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../../../kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
 namespace llaminar2
@@ -216,7 +216,7 @@ namespace llaminar2
 
         // GPU fused SwiGLU path: silu(gate)*up quantized in one kernel, then GEMM.
         // This avoids the separate SwiGLU write + quant read (saves ~4.6ms/iter).
-        // Try BEFORE qgemm cast since CUDA kernels don't inherit from QuantisedGemmKernel.
+        // Try BEFORE qgemm cast since CUDA kernels don't inherit from CPUQuantisedGemmKernel.
         if (params_.gate_input)
         {
             auto *gate_base = requireTensorBase(params_.gate_input, "gate input");
@@ -235,8 +235,8 @@ namespace llaminar2
             // Fall through to CPU path below
         }
 
-        // Cast to QuantisedGemmKernel for full API access
-        auto *qgemm = dynamic_cast<gemm_v4::QuantisedGemmKernel *>(gemm);
+        // Cast to CPUQuantisedGemmKernel for full API access
+        auto *qgemm = dynamic_cast<gemm::CPUQuantisedGemmKernel *>(gemm);
 
         // Dimension validation
         if (qgemm)

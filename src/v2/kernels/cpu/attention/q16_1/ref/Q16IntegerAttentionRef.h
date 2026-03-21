@@ -59,8 +59,8 @@
 #include <cmath>
 #include "tensors/BlockStructures.h"
 
-// Forward declaration for VNNI packed weights (in gemm_v4 namespace)
-namespace llaminar2::gemm_v4
+// Forward declaration for VNNI packed weights (in gemm namespace)
+namespace llaminar2::gemm
 {
     struct QuantisedPackedWeights;
 }
@@ -68,7 +68,7 @@ namespace llaminar2::gemm_v4
 namespace llaminar2::kernels::q16_1
 {
     // Import VNNI packed weights type for use in this namespace
-    using llaminar2::gemm_v4::QuantisedPackedWeights;
+    using llaminar2::gemm::QuantisedPackedWeights;
 
     // ============================================================================
     // Block Size Configuration (use canonical types from BlockStructures.h)

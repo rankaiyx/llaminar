@@ -34,7 +34,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/SIMDHelpers.h"
-#include "kernels/cpu/gemm_v4/QuantisedAttentionJit_Q8_1_Fused.h"
+#include "kernels/cpu/gemm/QuantisedAttentionJit_Q8_1_Fused.h"
 #include "kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include "utils/CPUFeatures.h"
 #include "loaders/ModelContext.h"
@@ -45,7 +45,7 @@
 #include "models/qwen/Qwen2Schema.h"
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 namespace
 {

@@ -5,9 +5,9 @@
  */
 
 #include "KernelFactory.h"
-#include "cpu/gemm_v4/QuantisedGemmKernel.h"
-#include "cpu/gemm_v4/FloatingPointGemmKernel.h"
-#include "cpu/gemm_v4/FusedGEMM.h"
+#include "cpu/gemm/CPUQuantisedGemmKernel.h"
+#include "cpu/gemm/FloatingPointGemmKernel.h"
+#include "cpu/gemm/FusedGEMM.h"
 #include "../tensors/TensorSlice.h"
 #include "cpu/ops/CPURoPEKernelT.h"
 #include "cpu/ops/CPUSwiGLUKernelT.h"
@@ -611,7 +611,7 @@ namespace llaminar
                 const llaminar2::TensorBase *tensor, DeviceType dev_type, int device_ordinal)
             {
                 // Two-way dispatch based on interface:
-                // 1. IINT8Unpackable → QuantisedGemmKernel (quantized weights)
+                // 1. IINT8Unpackable → CPUQuantisedGemmKernel (quantized weights)
                 // 2. Otherwise → FloatingPointGemmKernel (FP32/FP16/BF16)
 
                 const auto *quantized = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
@@ -623,8 +623,9 @@ namespace llaminar
                     {
                     case DeviceType::CPU:
                     {
+                        // CPUQuantisedGemmKernel handles M=1 → NativeVNNI routing internally
                         auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                        return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                        return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed, tensor);
                     }
 #ifdef HAVE_CUDA
                     case DeviceType::CUDA:
@@ -653,7 +654,7 @@ namespace llaminar
                     switch (dev_type)
                     {
                     case DeviceType::CPU:
-                        return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(tensor);
+                        return std::make_unique<llaminar2::gemm::FloatingPointGemmKernel>(tensor);
 #ifdef HAVE_CUDA
                     case DeviceType::CUDA:
                     {
@@ -699,7 +700,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -734,7 +735,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return new llaminar2::gemm_v4::QuantisedGemmKernel(packed);
+                    return new llaminar2::gemm::CPUQuantisedGemmKernel(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -767,7 +768,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -812,7 +813,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -847,7 +848,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -882,7 +883,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -917,7 +918,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -952,7 +953,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -987,7 +988,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1022,7 +1023,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1057,7 +1058,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1092,7 +1093,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1127,7 +1128,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1162,7 +1163,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1197,7 +1198,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1232,7 +1233,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1267,7 +1268,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1302,7 +1303,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1337,7 +1338,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1372,7 +1373,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1407,7 +1408,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1442,7 +1443,7 @@ namespace llaminar
                 case DeviceType::CPU:
                 {
                     auto *packed = ensurePackedWeightsInTensorCache(tensor);
-                    return std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(packed);
+                    return std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(packed);
                 }
 
 #ifdef HAVE_CUDA
@@ -1475,7 +1476,7 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(tensor);
+                    return std::make_unique<llaminar2::gemm::FloatingPointGemmKernel>(tensor);
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -1517,7 +1518,7 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(tensor);
+                    return std::make_unique<llaminar2::gemm::FloatingPointGemmKernel>(tensor);
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -1549,7 +1550,7 @@ namespace llaminar
                 switch (dev_type)
                 {
                 case DeviceType::CPU:
-                    return std::make_unique<llaminar2::gemm_v4::FloatingPointGemmKernel>(tensor);
+                    return std::make_unique<llaminar2::gemm::FloatingPointGemmKernel>(tensor);
 
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
@@ -2918,7 +2919,7 @@ namespace llaminar
              */
             struct TensorPackedWeightsCache
             {
-                llaminar2::gemm_v4::QuantisedPackedWeights packed;
+                llaminar2::gemm::QuantisedPackedWeights packed;
             };
 
             /**
@@ -2933,7 +2934,7 @@ namespace llaminar
              * @return Pointer to packed weights (stored in tensor's cache_)
              * @throws std::runtime_error if packing fails
              */
-            const llaminar2::gemm_v4::QuantisedPackedWeights *
+            const llaminar2::gemm::QuantisedPackedWeights *
             KernelFactory::ensurePackedWeightsInTensorCache(const llaminar2::TensorBase *tensor)
             {
                 std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
@@ -2957,7 +2958,7 @@ namespace llaminar
 
                 // Pack weights into tensor's cache_
                 auto new_cache = std::make_shared<TensorPackedWeightsCache>();
-                if (!llaminar2::gemm_v4::QuantisedGemmKernel::packWeightsInto(
+                if (!llaminar2::gemm::CPUQuantisedGemmKernel::packWeightsInto(
                         tensor, new_cache->packed, 0, -1))
                 {
                     LOG_ERROR("[KernelFactory] Failed to pack weights for tensor type "
@@ -3155,8 +3156,13 @@ namespace llaminar
                 }
 
                 // Create sliced kernel using row-range constructor
-                auto kernel = std::make_unique<llaminar2::gemm_v4::QuantisedGemmKernel>(
-                    tensor, static_cast<int>(row_start), static_cast<int>(row_end));
+                // CPUQuantisedGemmKernel handles M=1 → NativeVNNI routing internally
+                std::unique_ptr<llaminar2::ITensorGemm> kernel;
+
+                {
+                    kernel = std::make_unique<llaminar2::gemm::CPUQuantisedGemmKernel>(
+                        tensor, static_cast<int>(row_start), static_cast<int>(row_end));
+                }
 
                 auto *raw_ptr = kernel.get();
                 sliced_cache_[key] = std::move(kernel);
@@ -3415,7 +3421,7 @@ namespace llaminar
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 size_t total_bytes = 0;
-                // Note: Can't easily compute packed_bytes without RTTI to QuantisedGemmKernel
+                // Note: Can't easily compute packed_bytes without RTTI to CPUQuantisedGemmKernel
                 // For now, just return count (includes all caches)
                 return {sliced_cache_.size() + fused_qkv_cache_.size() + fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + device_kernel_registry_.size() + prepared_gemm_registry_.size(), total_bytes};
             }
@@ -4701,7 +4707,7 @@ namespace llaminar
                 }
 
                 // Q8_1 activations ONLY work with quantized weights
-                // (QuantisedGemmKernel uses INT8×INT8 dot products)
+                // (CPUQuantisedGemmKernel uses INT8×INT8 dot products)
                 if (activation_type == llaminar2::TensorType::Q8_1)
                 {
                     // Q8_1 activations can work with any quantized weight type
@@ -4724,7 +4730,7 @@ namespace llaminar
                 if (activation_type == llaminar2::TensorType::Q8_1 && isFloatingPointType(weight_type))
                 {
                     return std::string("Q8_1 activation precision requires quantized weights, but got ") +
-                           wgt_name + " weights. The QuantisedGemmKernel uses INT8×INT8 VNNI " +
+                           wgt_name + " weights. The CPUQuantisedGemmKernel uses INT8×INT8 VNNI " +
                            "instructions which cannot process floating-point weights. Either:\n" +
                            "  1. Use FP32 activation precision (slower but compatible with any weights)\n" +
                            "  2. Use a quantized model (Q8_0, Q4_0, IQ4_NL, etc.)";

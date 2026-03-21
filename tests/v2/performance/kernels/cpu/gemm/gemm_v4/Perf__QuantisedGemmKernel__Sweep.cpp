@@ -1,6 +1,6 @@
 /**
  * @file Perf__QuantisedGemmKernel__Sweep.cpp
- * @brief Parameter sweep for QuantisedGemmKernel tuning
+ * @brief Parameter sweep for CPUQuantisedGemmKernel tuning
  * @author David Sanftenberg
  */
 
@@ -20,7 +20,7 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "utils/DebugEnv.h"
 
 using namespace llaminar2;

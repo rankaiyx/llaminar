@@ -41,7 +41,7 @@
 
 // OneDNN for reference GEMM (much better than naive loop!)
 #ifdef HAVE_ONEDNN
-#include "kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include <dnnl.hpp>
 #endif
 
@@ -1446,7 +1446,7 @@ namespace llaminar2
                 // OneDNN matmul: A[M,K] × B[K,N] = C[M,N]
                 // With transpose_B=true: A[M,K] × B^T[K,N] where B is stored as [N,K]
                 // This matches: C[m,n] = sum_k(A[m,k] * W[n,k])
-                ASSERT_TRUE(gemm_v4::run_onednn_fp32_matmul(
+                ASSERT_TRUE(gemm::run_onednn_fp32_matmul(
                     h_activations,    // A [M×K]
                     h_weights_fp32,   // B [N×K] (will be transposed)
                     reference.data(), // C [M×N]
@@ -1529,7 +1529,7 @@ namespace llaminar2
 
                 std::vector<float> reference(M * N, 0.0f);
 #ifdef HAVE_ONEDNN
-                ASSERT_TRUE(gemm_v4::run_onednn_fp32_matmul(
+                ASSERT_TRUE(gemm::run_onednn_fp32_matmul(
                     h_activations,    // A [M×K]
                     h_weights_fp32,   // B [N×K] (will be transposed)
                     reference.data(), // C [M×N]
@@ -1616,7 +1616,7 @@ namespace llaminar2
                 std::vector<float> reference(M * N, 0.0f);
 
 #ifdef HAVE_ONEDNN
-                if (!gemm_v4::run_onednn_fp32_matmul(
+                if (!gemm::run_onednn_fp32_matmul(
                         h_activations, h_weights_fp32, reference.data(),
                         M, N, K, true, 1.0f, 0.0f))
                 {

@@ -22,7 +22,7 @@
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoRef.h"
 #include "kernels/cpu/attention/q8_1/FusedAttentionWoTiled.h"
 #include "kernels/cpu/attention/q8_1/jit/JitFusedAttentionWo.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "tensors/SIMDHelpers.h"
 #include "kernels/KernelFactory.h"
 #include "utils/DebugEnv.h"
@@ -597,7 +597,7 @@ namespace llaminar2
             // streaming dequantization.
             if (wo_format == WoFormat::Q8_1_VNNI_PACKED || wo_format == WoFormat::FP32_STREAMING_DEQUANT)
             {
-                const auto *packed = static_cast<const llaminar2::gemm_v4::QuantisedPackedWeights *>(params.Wo);
+                const auto *packed = static_cast<const llaminar2::gemm::QuantisedPackedWeights *>(params.Wo);
                 packed_params.packed_data = packed->packed_data.data();
                 packed_params.compensation = packed->compensation.data();
                 packed_params.scales = packed->scales.data();
@@ -605,7 +605,7 @@ namespace llaminar2
                 packed_params.quantize_func = &quantize_row_q8_1_helper;
                 packed_params.N = packed->N;
                 packed_params.K = packed->K;
-                packed_params.original_packed = packed; // For QuantisedGemmKernel in extern C thunk
+                packed_params.original_packed = packed; // For CPUQuantisedGemmKernel in extern C thunk
                 wo_ptr = &packed_params;
                 LOG_DEBUG("FusedAttentionWoKernel: packed_params @ " << &packed_params
                                                                      << " wo_ptr=" << wo_ptr << " N=" << packed_params.N << " K=" << packed_params.K

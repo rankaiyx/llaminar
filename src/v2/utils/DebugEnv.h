@@ -426,7 +426,7 @@ namespace llaminar2
 
         // Wo projection mode (JIT backend only)
         // When enabled, Wo weights are expected to be passed as packed QuantisedPackedWeights
-        // and Wo projection is executed via gemm_v4 (AVX-512 VNNI) with on-the-fly activation quantization.
+        // and Wo projection is executed via gemm (AVX-512 VNNI) with on-the-fly activation quantization.
         bool wo_vnni_packed = false;
 
         // Fused Attention + Wo (JIT backend only)

@@ -417,7 +417,7 @@ int main(int argc, char **argv)
                 v = dist_wo(rng);
 
             std::shared_ptr<llaminar2::Q8_1Tensor> wo_q8_tensor;
-            const llaminar2::gemm_v4::QuantisedPackedWeights *wo_packed = nullptr;
+            const llaminar2::gemm::QuantisedPackedWeights *wo_packed = nullptr;
             const void *wo_ptr = nullptr;
 
             if (opt.wo == "fp32")
@@ -624,7 +624,7 @@ int main(int argc, char **argv)
     // For Q8_1 and packed-VNNI modes, use the canonical Q8_1Tensor quantizer + packer so layout matches
     // production paths.
     std::shared_ptr<llaminar2::Q8_1Tensor> wo_q8_tensor;
-    const llaminar2::gemm_v4::QuantisedPackedWeights *wo_packed = nullptr;
+    const llaminar2::gemm::QuantisedPackedWeights *wo_packed = nullptr;
     const void *wo_ptr = nullptr;
 
     if (opt.wo == "fp32")

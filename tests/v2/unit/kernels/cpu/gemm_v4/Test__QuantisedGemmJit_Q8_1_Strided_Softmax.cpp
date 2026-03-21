@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include "v2/kernels/cpu/gemm_v4/QuantisedGemmJit_Q8_1_Strided_Softmax.h"
+#include "v2/kernels/cpu/gemm/QuantisedGemmJit_Q8_1_Strided_Softmax.h"
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/FP16Utils.h"
 #include <vector>
@@ -8,7 +8,7 @@
 #include <algorithm>
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 // Helper to quantize FP32 to Q8_1
 void quantize_q8_1(const float *src, Q8_1Block *dst, int count)

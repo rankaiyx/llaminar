@@ -73,7 +73,7 @@ namespace llaminar2
                 weight,
                 llaminar2::DeviceId(llaminar2::DeviceType::CPU, 0));
             auto *gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-            auto *quantised_gemm = dynamic_cast<gemm_v4::QuantisedGemmKernel *>(gemm);
+            auto *quantised_gemm = dynamic_cast<gemm::CPUQuantisedGemmKernel *>(gemm);
             if (!quantised_gemm)
             {
                 throw std::runtime_error("[FusedGEMM] Weight tensor returned non-QuantisedGemmKernel from prepared GEMM engine resolution");

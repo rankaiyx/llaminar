@@ -26,7 +26,7 @@
 #include "../CPUKernelBase.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
-#include "../gemm_v4/QuantisedGemmKernel.h"
+#include "../gemm/CPUQuantisedGemmKernel.h"
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -322,7 +322,7 @@ namespace llaminar2
         /// + device-engine APIs.
         /// Kernel lifetime is managed by KernelFactory caches and tied to the
         /// underlying tensor/prepared lifecycle, not FusedGEMM's lifetime.
-        std::vector<gemm_v4::QuantisedGemmKernel *> gemm_kernels_;
+        std::vector<gemm::CPUQuantisedGemmKernel *> gemm_kernels_;
         std::vector<std::string> projection_names_;
         int k_dim_; ///< Shared input dimension
     };

@@ -16,7 +16,7 @@
 #include <fstream>
 #include "v2/utils/MPIContext.h"
 #include "v2/tensors/TensorFactory.h"
-#include "v2/kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
 
 namespace llaminar2
 {
@@ -360,7 +360,7 @@ namespace llaminar2
         /**
          * @brief Quantized GEMM vs FP32 GEMM Parity Test for Q6_K
          *
-         * Compares QuantisedGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
+         * Compares CPUQuantisedGemmKernel (INT8) against FloatingPointGemmKernel (FP32 OneDNN)
          * using randomly initialized Q6_K weights. Validates that quantization introduces
          * acceptable error (< 1% relative L2).
          */
@@ -436,7 +436,7 @@ namespace llaminar2
                 m, n, k));
 
             // Run FP32 GEMM (OneDNN reference)
-            gemm_v4::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());
+            gemm::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());
             ASSERT_TRUE(fp32_gemm.multiply(
                 input_data,
                 output_fp32->mutable_data(),

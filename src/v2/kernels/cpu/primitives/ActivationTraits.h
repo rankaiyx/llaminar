@@ -288,7 +288,7 @@ namespace llaminar2::primitives
          * @brief Create GEMM kernel for Q8_1 activations
          *
          * NOTE: Q8_1 attention dequantizes to FP32 before GEMM, so we use FP32 GEMM kernel.
-         * The QuantisedGemmKernel is for weight matrices, not activation GEMM.
+         * The CPUQuantisedGemmKernel is for weight matrices, not activation GEMM.
          */
         static std::unique_ptr<ITensorGemm> create_activation_gemm()
         {

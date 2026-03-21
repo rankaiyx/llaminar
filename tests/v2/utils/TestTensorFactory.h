@@ -1377,7 +1377,7 @@ namespace llaminar2::test
          *   auto wo_packed = TestTensorFactory::packToVNNI(wo_q8.get());
          *   params.Wo_packed = wo_packed;
          */
-        static const llaminar2::gemm_v4::QuantisedPackedWeights *packToVNNI(
+        static const llaminar2::gemm::QuantisedPackedWeights *packToVNNI(
             const TensorBase *tensor)
         {
             return llaminar::v2::kernels::KernelFactory::ensurePackedWeightsInTensorCache(tensor);

@@ -20,12 +20,12 @@
 #include <algorithm>
 #include <cstring>
 
-#include "kernels/cpu/gemm_v4/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
+#include "kernels/cpu/gemm/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 /**
  * @brief Test fixture for Q8_1 OnlineSoftmax unit tests

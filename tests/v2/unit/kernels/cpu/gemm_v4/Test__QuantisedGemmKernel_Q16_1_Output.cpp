@@ -1,6 +1,6 @@
 /**
  * @file Test__QuantisedGemmKernel_Q16_1_Output.cpp
- * @brief Unit tests for Q16_1 output epilogue in QuantisedGemmKernel JIT kernels
+ * @brief Unit tests for Q16_1 output epilogue in CPUQuantisedGemmKernel JIT kernels
  *
  * Tests the fused Q16_1 requantization epilogue added to M1/M2 JIT kernels.
  * This verifies that GEMM results can be directly written to Q16_1 format,
@@ -17,7 +17,7 @@
 
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include <vector>
 #include <random>
 #include <cmath>
@@ -28,7 +28,7 @@
 #include <algorithm>
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 /**
  * @brief Helper to dequantize Q16_1 blocks (64-element) to FP32 for comparison
@@ -134,7 +134,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, SingleRow_M1Kernel)
     auto kernel = weights_tensor->createGemm();
     ASSERT_NE(kernel, nullptr);
 
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     // Create random input
@@ -206,7 +206,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, TwoRows_M2Kernel)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     std::vector<float> A(M * K);
@@ -280,7 +280,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, PreservesPrecisionBetterThanQ8_1)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     // Create input that also has high dynamic range
@@ -391,7 +391,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, MultipleBlocks_N128)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     std::vector<float> A(M * K);
@@ -455,7 +455,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, OddRows_M3)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     std::vector<float> A(M * K);
@@ -519,7 +519,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, ProductionDimensions_Qwen2)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     std::vector<float> A(M * K);
@@ -582,7 +582,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, ProductionDimensions_Prefill)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     std::vector<float> A(M * K);
@@ -649,7 +649,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, EdgeCase_ZeroInput)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     // All-zero input
@@ -697,7 +697,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, EdgeCase_SmallValues)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     // Small input values
@@ -762,7 +762,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, EdgeCase_LargeValues)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     // Large input values
@@ -860,7 +860,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, BlockStructure_ScaleNonNegative)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     std::vector<float> A(M * K);
@@ -921,7 +921,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, BlockStructure_SumQsCorrect)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     std::vector<float> A(M * K);
@@ -988,7 +988,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, BlockStructure_QsWithinRange)
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     std::vector<float> A(M * K);
@@ -1059,7 +1059,7 @@ TEST(Test__QuantisedGemmKernel_Q16_1_Output, BlockStructure_ReconstructionAccura
     auto weights_tensor = Q8_1Tensor::quantize_from_fp32(
         weights_fp32.data(), {static_cast<size_t>(N), static_cast<size_t>(K)});
     auto kernel = weights_tensor->createGemm();
-    auto *q_kernel = dynamic_cast<QuantisedGemmKernel *>(kernel.get());
+    auto *q_kernel = dynamic_cast<CPUQuantisedGemmKernel *>(kernel.get());
     ASSERT_NE(q_kernel, nullptr);
 
     std::vector<float> A(M * K);

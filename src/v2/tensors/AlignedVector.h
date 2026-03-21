@@ -228,6 +228,28 @@ namespace llaminar2
             size_ = new_size;
         }
 
+        /// Resize without initializing new elements (NUMA-friendly).
+        /// On multi-socket systems, avoids binding all pages to one NUMA node
+        /// via single-threaded zero-init. Caller MUST write all elements before
+        /// reading (e.g., via an OMP parallel first-touch loop).
+        void resize_uninitialized(size_t new_size)
+        {
+            if (new_size > capacity_)
+            {
+                reserve(new_size);
+            }
+
+            if (new_size < size_)
+            {
+                for (size_t i = new_size; i < size_; ++i)
+                {
+                    data_[i].~T();
+                }
+            }
+
+            size_ = new_size;
+        }
+
         /// Clear all elements
         void clear()
         {

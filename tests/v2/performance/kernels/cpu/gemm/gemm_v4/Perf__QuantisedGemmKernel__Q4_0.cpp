@@ -1,6 +1,6 @@
 /**
  * @file Perf__QuantisedGemmKernel__Q4_0.cpp
- * @brief Performance benchmark for QuantisedGemmKernel with Q4_0 weights
+ * @brief Performance benchmark for CPUQuantisedGemmKernel with Q4_0 weights
  *
  * This test benchmarks Q4_0 quantized matrix multiplication performance
  * (Q4_0 weights x Q8_1 activations). It measures:
@@ -31,7 +31,7 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 
 using namespace llaminar2;
 

@@ -16,14 +16,14 @@
 
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include <vector>
 #include <random>
 #include <cmath>
 #include <numeric>
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 namespace
 {

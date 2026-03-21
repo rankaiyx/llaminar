@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "kernels/KernelFactory.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "tensors/Tensors.h"
 
 extern "C" void llaminar2_wo_q8_1_vnni_packed_gemm(

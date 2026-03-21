@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 #include "v2/tensors/Tensors.h"
-#include "v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "v2/kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include <vector>
 #include <random>
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 TEST(Test__Q4_0_Mins, VerifyMinsAreZero) {
     // Create a Q4_0 tensor
@@ -27,7 +27,7 @@ TEST(Test__Q4_0_Mins, VerifyMinsAreZero) {
 
     // Pack weights
     QuantisedPackedWeights packed;
-    bool success = QuantisedGemmKernel::packWeightsInto(&tensor, packed);
+    bool success = CPUQuantisedGemmKernel::packWeightsInto(&tensor, packed);
     ASSERT_TRUE(success);
 
     // Verify mins are all zero
@@ -59,7 +59,7 @@ TEST(Test__Q4_0_Mins, VerifyQ4_1_SetsFlag) {
 
     // Pack weights
     QuantisedPackedWeights packed;
-    bool success = QuantisedGemmKernel::packWeightsInto(&tensor, packed);
+    bool success = CPUQuantisedGemmKernel::packWeightsInto(&tensor, packed);
     ASSERT_TRUE(success);
 
     EXPECT_TRUE(packed.has_mins) << "has_mins should be true for Q4_1 with non-zero min";

@@ -6,7 +6,7 @@
  */
 
 #include "TensorClasses.h"
-#include "../kernels/cpu/gemm_v4/FusedGEMM.h"
+#include "../kernels/cpu/gemm/FusedGEMM.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
 #include "FP16Utils.h"

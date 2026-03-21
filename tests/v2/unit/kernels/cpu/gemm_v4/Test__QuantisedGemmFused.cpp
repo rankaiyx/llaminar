@@ -1,13 +1,13 @@
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include <vector>
 #include <random>
 #include <cmath>
 #include <mpi.h>
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 void RunSoftmaxTest(int M)
 {
@@ -28,7 +28,7 @@ void RunSoftmaxTest(int M)
     // Create kernel
     MPIContext ctx(0, 1, MPI_COMM_WORLD);
     auto generic_kernel = weights_tensor->createGemm();
-    auto kernel = dynamic_cast<QuantisedGemmKernel *>(generic_kernel.get());
+    auto kernel = dynamic_cast<CPUQuantisedGemmKernel *>(generic_kernel.get());
     ASSERT_NE(kernel, nullptr);
 
     // Create random input A (M x K)

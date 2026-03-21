@@ -252,7 +252,7 @@ namespace llaminar2
          *
          * Quantizes the entire activation buffer [m, k] to Q8_1 blocks for use
          * in integer GEMM operations. This is the optimized bulk quantization
-         * path used by QuantisedGemmKernel.
+         * path used by CPUQuantisedGemmKernel.
          *
          * **Design Pattern ("quantize once, use many times")**:
          * - Activation quantized to Q8_1 once before multi-head attention

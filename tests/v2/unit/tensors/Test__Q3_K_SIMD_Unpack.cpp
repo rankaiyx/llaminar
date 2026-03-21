@@ -2,9 +2,11 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/SIMDHelpers.h"
 #include "v2/tensors/FP16Utils.h"
+#include "v2/utils/CPUFeatures.h"
 
 using namespace llaminar2;
 
@@ -184,3 +186,175 @@ TEST_F(Test__Q3_K_SIMD_Unpack, DecodeSubBlock_Scales)
     EXPECT_FLOAT_EQ(output[0], 12.0f);
     EXPECT_FLOAT_EQ(output[16], 18.0f);
 }
+
+// ============================================================================
+// Superblock SIMD Parity Tests
+// ============================================================================
+
+class Q3_K_Superblock_SIMD_Parity : public ::testing::Test
+{
+protected:
+    std::mt19937 gen_{42};
+
+    Q3_KBlock create_random_block()
+    {
+        Q3_KBlock block;
+        std::uniform_int_distribution<uint8_t> dist(0, 255);
+        for (int i = 0; i < 32; ++i) block.hmask[i] = dist(gen_);
+        for (int i = 0; i < 64; ++i) block.qs[i] = dist(gen_);
+        for (int i = 0; i < 12; ++i) block.scales[i] = dist(gen_);
+        block.d = fp32_to_fp16(0.5f + 0.5f * (dist(gen_) / 255.0f));
+        return block;
+    }
+
+    void verify_arrays_near(const int8_t *expected, const int8_t *actual, size_t count, int tolerance, const std::string &context)
+    {
+        for (size_t i = 0; i < count; ++i)
+        {
+            EXPECT_NEAR(static_cast<int>(expected[i]), static_cast<int>(actual[i]), tolerance)
+                << context << ": Mismatch at index " << i
+                << " (expected " << static_cast<int>(expected[i])
+                << ", got " << static_cast<int>(actual[i]) << ")";
+        }
+    }
+};
+
+TEST_F(Q3_K_Superblock_SIMD_Parity, ScalarReference_Random)
+{
+    for (int trial = 0; trial < 100; ++trial)
+    {
+        Q3_KBlock block = create_random_block();
+        alignas(64) int8_t output[256];
+        alignas(64) float scales[8], mins[8];
+
+        simd::unpack_q3_k_superblock_to_int8_scalar(block, output, scales, mins);
+
+        for (int i = 0; i < 256; ++i)
+        {
+            EXPECT_GE(output[i], -128) << "Value below range at " << i << " trial " << trial;
+            EXPECT_LE(output[i], 127) << "Value above range at " << i << " trial " << trial;
+        }
+    }
+}
+
+#if defined(__AVX2__)
+TEST_F(Q3_K_Superblock_SIMD_Parity, AVX2_vs_Scalar_Random)
+{
+    if (!cpu_supports_avx2()) GTEST_SKIP() << "AVX2 not supported";
+
+    for (int trial = 0; trial < 100; ++trial)
+    {
+        Q3_KBlock block = create_random_block();
+        alignas(64) int8_t scalar_out[256], avx2_out[256];
+        alignas(64) float scalar_scales[8], scalar_mins[8];
+        alignas(64) float avx2_scales[8], avx2_mins[8];
+
+        simd::unpack_q3_k_superblock_to_int8_scalar(block, scalar_out, scalar_scales, scalar_mins);
+        simd::unpack_q3_k_superblock_to_int8_avx2(block, avx2_out, avx2_scales, avx2_mins);
+
+        verify_arrays_near(scalar_out, avx2_out, 256, 1, "AVX2 vs Scalar trial " + std::to_string(trial));
+
+        for (int i = 0; i < 8; ++i)
+        {
+            EXPECT_NEAR(scalar_scales[i], avx2_scales[i], 1e-3f) << "Scale mismatch at " << i;
+            EXPECT_NEAR(scalar_mins[i], avx2_mins[i], 1e-3f) << "Min mismatch at " << i;
+        }
+    }
+}
+
+TEST_F(Q3_K_Superblock_SIMD_Parity, AVX2_vs_Scalar_EdgeCases)
+{
+    if (!cpu_supports_avx2()) GTEST_SKIP() << "AVX2 not supported";
+
+    // All zeros
+    {
+        Q3_KBlock block;
+        std::memset(&block, 0, sizeof(block));
+        block.d = fp32_to_fp16(1.0f);
+
+        alignas(64) int8_t scalar_out[256], avx2_out[256];
+        alignas(64) float ss[8], sm[8], as[8], am[8];
+
+        simd::unpack_q3_k_superblock_to_int8_scalar(block, scalar_out, ss, sm);
+        simd::unpack_q3_k_superblock_to_int8_avx2(block, avx2_out, as, am);
+
+        verify_arrays_near(scalar_out, avx2_out, 256, 1, "AVX2 vs Scalar (zeros)");
+    }
+
+    // All 0xFF
+    {
+        Q3_KBlock block;
+        std::memset(&block, 0xFF, sizeof(block));
+        block.d = fp32_to_fp16(1.0f);
+
+        alignas(64) int8_t scalar_out[256], avx2_out[256];
+        alignas(64) float ss[8], sm[8], as[8], am[8];
+
+        simd::unpack_q3_k_superblock_to_int8_scalar(block, scalar_out, ss, sm);
+        simd::unpack_q3_k_superblock_to_int8_avx2(block, avx2_out, as, am);
+
+        verify_arrays_near(scalar_out, avx2_out, 256, 1, "AVX2 vs Scalar (0xFF)");
+    }
+}
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+TEST_F(Q3_K_Superblock_SIMD_Parity, AVX512_vs_Scalar_Random)
+{
+    if (!cpu_supports_avx512()) GTEST_SKIP() << "AVX-512 not supported";
+
+    for (int trial = 0; trial < 100; ++trial)
+    {
+        Q3_KBlock block = create_random_block();
+        alignas(64) int8_t scalar_out[256], avx512_out[256];
+        alignas(64) float scalar_scales[8], scalar_mins[8];
+        alignas(64) float avx512_scales[8], avx512_mins[8];
+
+        simd::unpack_q3_k_superblock_to_int8_scalar(block, scalar_out, scalar_scales, scalar_mins);
+        simd::unpack_q3_k_superblock_to_int8_avx512(block, avx512_out, avx512_scales, avx512_mins);
+
+        verify_arrays_near(scalar_out, avx512_out, 256, 1, "AVX512 vs Scalar trial " + std::to_string(trial));
+
+        for (int i = 0; i < 8; ++i)
+        {
+            EXPECT_NEAR(scalar_scales[i], avx512_scales[i], 1e-3f) << "Scale mismatch at " << i;
+            EXPECT_NEAR(scalar_mins[i], avx512_mins[i], 1e-3f) << "Min mismatch at " << i;
+        }
+    }
+}
+
+TEST_F(Q3_K_Superblock_SIMD_Parity, AVX512_vs_Scalar_EdgeCases)
+{
+    if (!cpu_supports_avx512()) GTEST_SKIP() << "AVX-512 not supported";
+
+    // All zeros
+    {
+        Q3_KBlock block;
+        std::memset(&block, 0, sizeof(block));
+        block.d = fp32_to_fp16(1.0f);
+
+        alignas(64) int8_t scalar_out[256], avx512_out[256];
+        alignas(64) float ss[8], sm[8], as[8], am[8];
+
+        simd::unpack_q3_k_superblock_to_int8_scalar(block, scalar_out, ss, sm);
+        simd::unpack_q3_k_superblock_to_int8_avx512(block, avx512_out, as, am);
+
+        verify_arrays_near(scalar_out, avx512_out, 256, 1, "AVX512 vs Scalar (zeros)");
+    }
+
+    // All 0xFF
+    {
+        Q3_KBlock block;
+        std::memset(&block, 0xFF, sizeof(block));
+        block.d = fp32_to_fp16(1.0f);
+
+        alignas(64) int8_t scalar_out[256], avx512_out[256];
+        alignas(64) float ss[8], sm[8], as[8], am[8];
+
+        simd::unpack_q3_k_superblock_to_int8_scalar(block, scalar_out, ss, sm);
+        simd::unpack_q3_k_superblock_to_int8_avx512(block, avx512_out, as, am);
+
+        verify_arrays_near(scalar_out, avx512_out, 256, 1, "AVX512 vs Scalar (0xFF)");
+    }
+}
+#endif

@@ -10,24 +10,26 @@
  * - Buffer requirements
  * - Parameter validation
  * - Single-device no-op behavior
+ * - Multi-device delegation and failure propagation
  *
- * Note: Full collective testing requires integration tests with real devices.
+ * Uses MockLocalTPContext to avoid GPU hardware dependencies.
  */
 
 #include <gtest/gtest.h>
 #include <vector>
 
 #include "execution/compute_stages/stages/LocalTPAllreduceStage.h"
-#include "collective/LocalTPContext.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "utils/MPIContext.h"
 #include "../../../../mocks/MockComputeStage.h"
+#include "../../../../mocks/MockLocalTPContext.h"
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
+using namespace llaminar2::test;
 
 // =============================================================================
 // Test Fixture
@@ -53,6 +55,17 @@ protected:
         test_tensor_ = factory.createFP32({4, 128}, DeviceId::cpu());
     }
 
+    /// Create a MockLocalTPContext with the given devices
+    std::shared_ptr<MockLocalTPContext> createMockTPContext(
+        std::vector<GlobalDeviceAddress> devices,
+        CollectiveBackendType backend = CollectiveBackendType::NCCL)
+    {
+        auto mock = std::make_shared<MockLocalTPContext>();
+        mock->setDevices(std::move(devices));
+        mock->setBackend(backend);
+        return mock;
+    }
+
     GlobalDeviceAddress cuda0_;
     GlobalDeviceAddress cuda1_;
     std::shared_ptr<MPIContext> mpi_ctx_;
@@ -69,7 +82,7 @@ protected:
  */
 TEST_F(Test__LocalTPAllreduceStage, StageTypeIsAllreduce)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -85,7 +98,7 @@ TEST_F(Test__LocalTPAllreduceStage, StageTypeIsAllreduce)
  */
 TEST_F(Test__LocalTPAllreduceStage, StageNameCorrect)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -101,7 +114,7 @@ TEST_F(Test__LocalTPAllreduceStage, StageNameCorrect)
  */
 TEST_F(Test__LocalTPAllreduceStage, RequiresAllreduce)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -116,7 +129,7 @@ TEST_F(Test__LocalTPAllreduceStage, RequiresAllreduce)
  */
 TEST_F(Test__LocalTPAllreduceStage, CoherencePolicyIsNone)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -131,7 +144,7 @@ TEST_F(Test__LocalTPAllreduceStage, CoherencePolicyIsNone)
  */
 TEST_F(Test__LocalTPAllreduceStage, SupportsAllBackends)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -152,7 +165,7 @@ TEST_F(Test__LocalTPAllreduceStage, SupportsAllBackends)
  */
 TEST_F(Test__LocalTPAllreduceStage, GetTPContextReturnsCorrect)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto tp_ctx = createMockTPContext({cuda0_, cuda1_});
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -168,7 +181,7 @@ TEST_F(Test__LocalTPAllreduceStage, GetTPContextReturnsCorrect)
  */
 TEST_F(Test__LocalTPAllreduceStage, GetTensorReturnsCorrect)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
     auto *tensor = test_tensor_.get();
 
     LocalTPAllreduceStage::Params params;
@@ -189,7 +202,7 @@ TEST_F(Test__LocalTPAllreduceStage, GetTensorReturnsCorrect)
  */
 TEST_F(Test__LocalTPAllreduceStage, BufferRequirementsWithTensor)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
     auto *tensor = test_tensor_.get();
 
     LocalTPAllreduceStage::Params params;
@@ -212,7 +225,7 @@ TEST_F(Test__LocalTPAllreduceStage, BufferRequirementsWithTensor)
  */
 TEST_F(Test__LocalTPAllreduceStage, BufferRequirementsWithNullTensor)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -248,7 +261,7 @@ TEST_F(Test__LocalTPAllreduceStage, ExecuteFailsWithNullContext)
  */
 TEST_F(Test__LocalTPAllreduceStage, ExecuteFailsWithNullTensor)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto tp_ctx = createMockTPContext({cuda0_, cuda1_});
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -264,7 +277,7 @@ TEST_F(Test__LocalTPAllreduceStage, ExecuteFailsWithNullTensor)
  */
 TEST_F(Test__LocalTPAllreduceStage, ExecuteSucceedsSingleDevice)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
 
     // Initialize tensor with known values
     auto *tensor = test_tensor_.get();
@@ -288,19 +301,18 @@ TEST_F(Test__LocalTPAllreduceStage, ExecuteSucceedsSingleDevice)
     {
         EXPECT_FLOAT_EQ(data[i], static_cast<float>(i));
     }
+
+    // No allreduce should have been called (degree == 1 early return)
+    EXPECT_EQ(tp_ctx->allreduceCallCount(), 0);
 }
 
 /**
- * @test Execute with multi-device context fails when tensor not on any TP device
- *
- * The tensor is on CPU but the LocalTPContext has CUDA devices, so the
- * allreduce correctly fails because the tensor's device isn't in the TP context.
- * Full collective testing with proper device placement requires integration tests.
+ * @test Execute with multi-device context delegates to allreduce and succeeds
  */
-TEST_F(Test__LocalTPAllreduceStage, ExecuteMultiDeviceFailsWhenTensorNotOnTPDevice)
+TEST_F(Test__LocalTPAllreduceStage, ExecuteMultiDeviceDelegatesToAllreduce)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
-    auto *tensor = test_tensor_.get(); // tensor is on CPU, not cuda0_ or cuda1_
+    auto tp_ctx = createMockTPContext({cuda0_, cuda1_});
+    auto *tensor = test_tensor_.get();
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();
@@ -308,8 +320,55 @@ TEST_F(Test__LocalTPAllreduceStage, ExecuteMultiDeviceFailsWhenTensorNotOnTPDevi
 
     auto stage = std::make_unique<LocalTPAllreduceStage>(params);
 
-    // Should fail: tensor device (CPU) not found in LocalTPContext devices (cuda0_, cuda1_)
+    EXPECT_TRUE(stage->execute(ctx_.get()));
+    EXPECT_EQ(tp_ctx->allreduceCallCount(), 1);
+
+    auto calls = tp_ctx->getAllreduceCalls();
+    ASSERT_EQ(calls.size(), 1);
+    EXPECT_EQ(calls[0].tensor, tensor);
+}
+
+/**
+ * @test Execute propagates allreduce failure from context
+ */
+TEST_F(Test__LocalTPAllreduceStage, ExecuteFailsWhenAllreduceFails)
+{
+    auto tp_ctx = createMockTPContext({cuda0_, cuda1_});
+    tp_ctx->setAllreduceShouldFail(true);
+    auto *tensor = test_tensor_.get();
+
+    LocalTPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = tensor;
+
+    auto stage = std::make_unique<LocalTPAllreduceStage>(params);
+
     EXPECT_FALSE(stage->execute(ctx_.get()));
+    EXPECT_EQ(tp_ctx->allreduceCallCount(), 1);
+}
+
+/**
+ * @test Execute passes stage_name and count to allreduce
+ */
+TEST_F(Test__LocalTPAllreduceStage, ExecutePassesStageName)
+{
+    auto tp_ctx = createMockTPContext({cuda0_, cuda1_});
+    auto *tensor = test_tensor_.get();
+
+    LocalTPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = tensor;
+    params.stage_name = "layer0_attn_output";
+    params.count = 256;
+
+    auto stage = std::make_unique<LocalTPAllreduceStage>(params);
+
+    EXPECT_TRUE(stage->execute(ctx_.get()));
+
+    auto calls = tp_ctx->getAllreduceCalls();
+    ASSERT_EQ(calls.size(), 1);
+    EXPECT_EQ(calls[0].stage_name, "layer0_attn_output");
+    EXPECT_EQ(calls[0].count, 256);
 }
 
 // =============================================================================
@@ -321,7 +380,7 @@ TEST_F(Test__LocalTPAllreduceStage, ExecuteMultiDeviceFailsWhenTensorNotOnTPDevi
  */
 TEST_F(Test__LocalTPAllreduceStage, DumpInfoIncludesTensor)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto tp_ctx = createMockTPContext({cuda0_, cuda1_});
     auto *tensor = test_tensor_.get();
 
     LocalTPAllreduceStage::Params params;
@@ -342,7 +401,7 @@ TEST_F(Test__LocalTPAllreduceStage, DumpInfoIncludesTensor)
  */
 TEST_F(Test__LocalTPAllreduceStage, DumpInfoIncludesScalars)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto tp_ctx = createMockTPContext({cuda0_, cuda1_});
     auto *tensor = test_tensor_.get();
 
     LocalTPAllreduceStage::Params params;
@@ -366,7 +425,7 @@ TEST_F(Test__LocalTPAllreduceStage, DumpInfoIncludesScalars)
  */
 TEST_F(Test__LocalTPAllreduceStage, SetParamsUpdatesTensor)
 {
-    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+    auto tp_ctx = createMockTPContext({cuda0_});
 
     LocalTPAllreduceStage::Params params;
     params.tp_ctx = tp_ctx.get();

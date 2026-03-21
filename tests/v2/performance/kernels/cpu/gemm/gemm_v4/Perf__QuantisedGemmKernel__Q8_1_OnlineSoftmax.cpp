@@ -1,6 +1,6 @@
 /**
  * @file Perf__QuantisedGemmKernel__Q8_1_OnlineSoftmax.cpp
- * @brief Performance benchmark for QuantisedGemmKernel with Q8_1 Online Softmax (attention kernel)
+ * @brief Performance benchmark for CPUQuantisedGemmKernel with Q8_1 Online Softmax (attention kernel)
  *
  * This test benchmarks the Q8_1 x Q8_1 attention JIT kernel with fused online softmax.
  * It measures throughput and correctness for:
@@ -29,10 +29,10 @@
 // V2 includes
 #include "tensors/Tensors.h"
 #include "tensors/BlockStructures.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
+#include "kernels/cpu/gemm/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 /**
  * @brief Model attention configuration

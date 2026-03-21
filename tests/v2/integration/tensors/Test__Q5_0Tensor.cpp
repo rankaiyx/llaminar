@@ -18,8 +18,8 @@
 #include "v2/utils/MPIContext.h"
 #include "v2/tensors/TensorFactory.h"
 #include "v2/tensors/FP16Utils.h"
-#include "v2/kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
-#include "v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#include "v2/kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 
 namespace llaminar2
 {
@@ -277,7 +277,7 @@ namespace llaminar2
         }
 
         /**
-         * @brief Compare QuantisedGemmKernel (INT8) vs FloatingPointGemmKernel (FP32) for Q5_0.
+         * @brief Compare CPUQuantisedGemmKernel (INT8) vs FloatingPointGemmKernel (FP32) for Q5_0.
          *
          * This test verifies that the quantized GEMM kernel produces results close to
          * the FP32 reference implementation using OneDNN.
@@ -348,7 +348,7 @@ namespace llaminar2
                 m, n, k));
 
             // Run FP32 GEMM (OneDNN reference)
-            gemm_v4::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());
+            gemm::FloatingPointGemmKernel fp32_gemm(fp32_weights.get());
             ASSERT_TRUE(fp32_gemm.multiply(
                 input_data,
                 output_fp32->mutable_data(),

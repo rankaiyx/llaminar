@@ -42,7 +42,7 @@
 #include "utils/Logger.h"
 
 #ifdef HAVE_ONEDNN
-#include "kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #endif
 
 #ifdef HAVE_ROCM
@@ -184,7 +184,7 @@ protected:
     {
 #ifdef HAVE_ONEDNN
         // OneDNN: A[M,K] × B^T[K,N] where B stored as [N,K]
-        gemm_v4::run_onednn_fp32_matmul(A, B, C, M, N, K, true, 1.0f, 0.0f);
+        gemm::run_onednn_fp32_matmul(A, B, C, M, N, K, true, 1.0f, 0.0f);
 #else
         // Naive fallback
         for (int m = 0; m < M; ++m)

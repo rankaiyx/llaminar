@@ -9,8 +9,8 @@
 #include "../../../../src/v2/tensors/TensorFactory.h"
 #include "../../../../src/v2/utils/MPIContext.h"
 #include "../../../../src/v2/tensors/FP16Utils.h"
-#include "../../../../src/v2/kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
-#include "../../../../src/v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../../../../src/v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#include "../../../../src/v2/kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include <vector>
 #include <cstring>
 #include <cmath>
@@ -109,7 +109,7 @@ TEST_F(IQ1_M_GEMM_Integration, QuantizedVsFP32Parity)
     // Test dimensions: M=4, N=64, K=256
     // A: Q8_1 activation (will be quantized from FP32)
     // B: IQ1_M weight
-    // Compare: QuantisedGemmKernel vs FloatingPointGemmKernel on FP32
+    // Compare: CPUQuantisedGemmKernel vs FloatingPointGemmKernel on FP32
 
     int m = 4;
     int n = 64;
@@ -179,15 +179,15 @@ TEST_F(IQ1_M_GEMM_Integration, QuantizedVsFP32Parity)
     auto C_ref = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_ref->mutable_data(), m * n, 0.0f);
 
-    gemm_v4::FloatingPointGemmKernel fp_kernel(B_fp32.get());
+    gemm::FloatingPointGemmKernel fp_kernel(B_fp32.get());
     // B is [N, K], so transpose_B=true to compute A @ B^T
     fp_kernel.multiply(A_fp32->data(), C_ref->mutable_data(), m, n, k, true);
 
-    // === Test: QuantisedGemmKernel with IQ1_M weights ===
+    // === Test: CPUQuantisedGemmKernel with IQ1_M weights ===
     auto C_quant = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_quant->mutable_data(), m * n, 0.0f);
 
-    gemm_v4::QuantisedGemmKernel quant_kernel(B_iq1m.get());
+    gemm::CPUQuantisedGemmKernel quant_kernel(B_iq1m.get());
     quant_kernel.multiply(A_fp32->data(), C_quant->mutable_data(), m, n, k, true, 1.0f, 0.0f, nullptr, -1);
 
     // === Compare results ===

@@ -1088,7 +1088,7 @@ message(STATUS "V2: BLAS backend: OpenBLAS (FP32 only)")
 
 # Define GEMM script path for microkernel generation
 # =============================================================================
-# GEMM v1, v2, and v3 have been removed - only gemm_v4 (OneDNN-based) remains
+# GEMM v1, v2, and v3 have been removed - only gemm (OneDNN-based) remains
 # All legacy GEMM microkernel generation and integer GEMM implementations are obsolete
 # =============================================================================
 
@@ -1328,7 +1328,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/primitives/SwiGLUPrimitives.cpp
     kernels/cpu/primitives/Q16HeadNormalization.cpp
     # CPU GEMM kernels and auto-tuning infrastructure
-    # NOTE: Legacy GEMM implementations (v1/v2/v3) removed - only gemm_v4 (OneDNN) remains
+    # NOTE: Legacy GEMM implementations (v1/v2/v3) removed - only gemm (OneDNN) remains
     # All old GEMM kernels removed: GemmAutoTuner, SmartGemmSearch, QuantizedGemm,
     # BF16PackedGemm, FP16PackedGemm, Q8_1GemmKernelInit, VNNIGemmKernelInit
     kernels/cpu/ops/CPURoPEKernelT.cpp     # Typed RoPE with fused precision conversion (FP32/BF16/FP16/Q8_1)
@@ -1358,7 +1358,7 @@ add_library(llaminar2_core STATIC
     kernels/cpu/attention/q16_1/ref/microkernels/OnlineSoftmax.cpp       # v2: FlashDecode online softmax microkernel
     kernels/cpu/attention/q16_1/ref/microkernels/MLAAttention.cpp        # v2: MLA (DeepSeek V3/Kimi K2) dual NOPE+ROPE attention
     # Fused kernels (operator fusion framework)
-    kernels/cpu/gemm_v4/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
+    kernels/cpu/gemm/FusedGEMM.cpp           # Unified fused GEMM kernel (supports Gate/Up and Q/K/V patterns)
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
     # Universal device kernel cache (hipBLAS, cuBLAS handles, etc.)

@@ -26,7 +26,7 @@
 #include <chrono>
 #include <mpi.h>
 
-#include "kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
+#include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
 #include "tensors/SIMDHelpers.h"
@@ -266,7 +266,7 @@ namespace llaminar2
             std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)});
         std::memcpy(weights->mutable_data(), weights_data.data(), weights_data.size() * sizeof(float));
 
-        gemm_v4::FloatingPointGemmKernel kernel(weights.get());
+        gemm::FloatingPointGemmKernel kernel(weights.get());
 
         std::vector<float> A(m * k);
         std::vector<float> C(m * n, 0.0f);
@@ -321,7 +321,7 @@ namespace llaminar2
             std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)});
         std::memcpy(K_tensor->mutable_data(), K.data(), K.size() * sizeof(float));
 
-        gemm_v4::FloatingPointGemmKernel kernel(K_tensor.get());
+        gemm::FloatingPointGemmKernel kernel(K_tensor.get());
 
         // Reference
         float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -377,7 +377,7 @@ namespace llaminar2
         test::reference_gemm_transposed(A_fp32.data(), weights_fp32.data(), C_ref.data(), m, n, k);
 
         // Kernel computation
-        gemm_v4::FloatingPointGemmKernel kernel(weights.get());
+        gemm::FloatingPointGemmKernel kernel(weights.get());
         ASSERT_TRUE(kernel.multiply_tensor(A.get(), C.get(), true));
 
         // BF16 has ~3 decimal digits of precision
@@ -442,7 +442,7 @@ namespace llaminar2
         test::reference_gemm_transposed(Q_cont.data(), K_cont.data(), scores_ref.data(), m, n, k);
 
         // Kernel: use strided interface
-        gemm_v4::FloatingPointGemmKernel kernel(nullptr);
+        gemm::FloatingPointGemmKernel kernel(nullptr);
         ASSERT_TRUE(kernel.multiply_activations_strided(
             Q_head, K_head, scores.data(),
             m, n, k,
@@ -474,7 +474,7 @@ namespace llaminar2
             std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)});
         std::memcpy(K_tensor->mutable_data(), K.data(), K.size() * sizeof(float));
 
-        gemm_v4::FloatingPointGemmKernel kernel(K_tensor.get());
+        gemm::FloatingPointGemmKernel kernel(K_tensor.get());
 
         std::vector<float> scores(m * n, 0.0f);
         std::vector<float> scores_ref(m * n, 0.0f);
@@ -530,7 +530,7 @@ namespace llaminar2
             std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)});
         std::memcpy(K_tensor->mutable_data(), K.data(), K.size() * sizeof(float));
 
-        gemm_v4::FloatingPointGemmKernel kernel(K_tensor.get());
+        gemm::FloatingPointGemmKernel kernel(K_tensor.get());
 
         std::vector<float> scores(m * n, 0.0f);
         std::vector<float> scores_ref(m * n, 0.0f);
@@ -612,7 +612,7 @@ namespace llaminar2
         test::reference_gemm(scores.data(), V_fp32.data(), output_ref.data(), m, n, k);
 
         // Kernel: FP32 × BF16 strided
-        gemm_v4::FloatingPointGemmKernel kernel(nullptr);
+        gemm::FloatingPointGemmKernel kernel(nullptr);
         ASSERT_TRUE(kernel.multiply_activations_strided_typed_impl(
             scores.data(), V_bf16.data(), output.data(),
             m, n, k,
@@ -645,7 +645,7 @@ namespace llaminar2
             std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)});
         std::memcpy(weights->mutable_data(), weights_data.data(), weights_data.size() * sizeof(float));
 
-        gemm_v4::FloatingPointGemmKernel kernel(weights.get());
+        gemm::FloatingPointGemmKernel kernel(weights.get());
 
         for (int b = 0; b < batch_size; ++b)
         {
@@ -686,7 +686,7 @@ namespace llaminar2
                 std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)});
             std::memcpy(weights->mutable_data(), weights_data.data(), weights_data.size() * sizeof(float));
 
-            gemm_v4::FloatingPointGemmKernel kernel(weights.get());
+            gemm::FloatingPointGemmKernel kernel(weights.get());
 
             std::vector<float> A(m * k);
             std::vector<float> C(m * n, 0.0f);
@@ -713,7 +713,7 @@ namespace llaminar2
             std::vector<size_t>{static_cast<size_t>(n), static_cast<size_t>(k)});
         std::memcpy(weights->mutable_data(), weights_data.data(), weights_data.size() * sizeof(float));
 
-        gemm_v4::FloatingPointGemmKernel kernel(weights.get());
+        gemm::FloatingPointGemmKernel kernel(weights.get());
 
         std::vector<float> A(m * k);
         test::fill_random_fp32(A.data(), A.size(), 1.0f, 456);

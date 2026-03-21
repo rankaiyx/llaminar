@@ -18,7 +18,7 @@
 #include <random>
 #include <memory>
 
-#include "kernels/cpu/gemm_v4/FusedGEMM.h"
+#include "kernels/cpu/gemm/FusedGEMM.h"
 #include "tensors/Tensors.h"
 #include "tensors/IQQuantTables.h"
 #include "tensors/FP16Utils.h"
@@ -40,7 +40,7 @@ namespace llaminar2
         }
 
         // Helper: Create mock IQ4_NL weight tensor for testing
-        // IQ4_NL implements IINT8Unpackable which QuantisedGemmKernel requires
+        // IQ4_NL implements IINT8Unpackable which CPUQuantisedGemmKernel requires
         std::unique_ptr<TensorBase> create_mock_weights(int rows, int cols, unsigned seed = 123)
         {
             std::vector<size_t> shape = {static_cast<size_t>(rows), static_cast<size_t>(cols)};
@@ -106,7 +106,7 @@ namespace llaminar2
     // Dual GEMM Tests (FFN gate/up)
     // =============================================================================
 
-    // NOTE: IQ4_NL tensors don't implement IINT8Unpackable interface that QuantisedGemmKernel requires.
+    // NOTE: IQ4_NL tensors don't implement IINT8Unpackable interface that CPUQuantisedGemmKernel requires.
     // These tests verify the kernel handles unsupported tensor types gracefully.
     // When IQ4_NL or other tensors implement IINT8Unpackable, these tests should produce non-zero outputs.
 

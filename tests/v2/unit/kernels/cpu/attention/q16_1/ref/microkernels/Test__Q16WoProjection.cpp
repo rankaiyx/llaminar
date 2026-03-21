@@ -21,7 +21,7 @@
 #include <numeric>
 
 #include "kernels/cpu/attention/q16_1/ref/microkernels/WoProjection.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "kernels/KernelFactory.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/Tensors.h"
@@ -81,7 +81,7 @@ namespace llaminar2::kernels::q16_1::microkernels
 
         // Pack FP32 weights to QuantisedPackedWeights (Q8_1 format for VNNI)
         // Uses the production path: FP32 → Q8_1Tensor → VNNI packing
-        std::pair<std::shared_ptr<Q8_1Tensor>, const gemm_v4::QuantisedPackedWeights *> packWeights(
+        std::pair<std::shared_ptr<Q8_1Tensor>, const gemm::QuantisedPackedWeights *> packWeights(
             const std::vector<float> &weights, int N, int K)
         {
             // Step 1: Quantize FP32 to Q8_1Tensor

@@ -166,5 +166,6 @@
         "/.*/": true
     },
     "chat.todoListTool.enabled": true,
-    "markdown.validate.enabled": true
+    "markdown.validate.enabled": true,
+    "github.copilot.selectedCompletionModel": "claude-haiku-4.5"
 }

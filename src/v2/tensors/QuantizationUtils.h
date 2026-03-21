@@ -3,7 +3,7 @@
  * @brief Shared quantization utilities for FP32 <-> Q8_1 conversion
  *
  * This file provides common quantization operations used across:
- * - QuantisedGemmKernel (activation quantization)
+ * - CPUQuantisedGemmKernel (activation quantization)
  * - FusedAttentionWoKernel (Hybrid mode Q tensor conversion)
  * - Any other component needing FP32 → Q8_1 conversion
  *

@@ -81,7 +81,7 @@ protected:
     /**
      * @brief Decode Q4_0 block to FP32 (ground truth)
      *
-     * Uses SPLIT LAYOUT to match SIMD unpacking for QuantisedGemmKernel:
+     * Uses SPLIT LAYOUT to match SIMD unpacking for CPUQuantisedGemmKernel:
      * - output[0..15]: low nibbles from qs[0..15]
      * - output[16..31]: high nibbles from qs[0..15]
      */
@@ -104,7 +104,7 @@ protected:
     /**
      * @brief Unpack Q4_0 block to native int8 range [-8, 7] (REFERENCE IMPLEMENTATION)
      *
-     * Uses SPLIT LAYOUT to match SIMD unpacking for QuantisedGemmKernel:
+     * Uses SPLIT LAYOUT to match SIMD unpacking for CPUQuantisedGemmKernel:
      * - output[0..15]: low nibbles from qs[0..15]
      * - output[16..31]: high nibbles from qs[0..15]
      */

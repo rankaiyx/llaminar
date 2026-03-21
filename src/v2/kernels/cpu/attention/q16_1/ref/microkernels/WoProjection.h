@@ -42,10 +42,10 @@
 #include <algorithm>
 
 // Forward declaration for VNNI packed weights
-namespace llaminar2::gemm_v4
+namespace llaminar2::gemm
 {
     struct QuantisedPackedWeights;
-} // namespace llaminar2::gemm_v4
+} // namespace llaminar2::gemm
 
 namespace llaminar2::kernels::q16_1::microkernels
 {
@@ -56,7 +56,7 @@ namespace llaminar2::kernels::q16_1::microkernels
     using llaminar2::Q16BlockSize;
 
     // Import VNNI packed weights type
-    using llaminar2::gemm_v4::QuantisedPackedWeights;
+    using llaminar2::gemm::QuantisedPackedWeights;
 
     // ============================================================================
     // Wo Projection Cache-Aware Tile Configuration
@@ -407,7 +407,7 @@ namespace llaminar2::kernels::q16_1::microkernels
      *
      * @param context_int32 INT32 context from attention [input_dim]
      * @param context_scale Scale factor for context (from softmax normalization)
-     * @param Wo_packed VNNI-packed Wo weights from QuantisedGemmKernel
+     * @param Wo_packed VNNI-packed Wo weights from CPUQuantisedGemmKernel
      * @param output Q16_1 output blocks [d_model / block_size]
      * @param d_model Output dimension (must equal Wo_packed->N)
      * @param input_dim Input dimension (must equal Wo_packed->K)

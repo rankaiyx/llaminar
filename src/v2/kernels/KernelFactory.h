@@ -30,7 +30,7 @@
  *
  * **CRITICAL**: Not all activation types work with all weight types!
  *
- * The QuantisedGemmKernel uses INT8 VNNI instructions (vpdpbusd) which require:
+ * The CPUQuantisedGemmKernel uses INT8 VNNI instructions (vpdpbusd) which require:
  * - Activations quantized to Q8_1 format (8-bit with scale+sum)
  * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
  *
@@ -127,10 +127,10 @@ namespace llaminar2
 
     enum class TensorType; // Forward declare from Tensors.h
 
-    namespace gemm_v4
+    namespace gemm
     {
         struct QuantisedPackedWeights;
-    } // namespace gemm_v4
+    } // namespace gemm
 
     namespace cuda
     {
@@ -386,7 +386,7 @@ namespace llaminar
                  * @brief Check if an activation type is compatible with a weight type for GEMM
                  *
                  * **Design Rationale**:
-                 * The QuantisedGemmKernel uses INT8 VNNI instructions which require:
+                 * The CPUQuantisedGemmKernel uses INT8 VNNI instructions which require:
                  * - Activations in Q8_1 format (8-bit with scale+sum per block)
                  * - Weights in quantized format (Q8_0, Q4_0, IQ4_NL, etc.)
                  *
@@ -1249,7 +1249,7 @@ namespace llaminar
                  * @return Pointer to packed weights (stored in tensor's cache_)
                  * @throws std::runtime_error if packing fails
                  */
-                static const llaminar2::gemm_v4::QuantisedPackedWeights *
+                static const llaminar2::gemm::QuantisedPackedWeights *
                 ensurePackedWeightsInTensorCache(const llaminar2::TensorBase *tensor);
 
 #ifdef HAVE_CUDA

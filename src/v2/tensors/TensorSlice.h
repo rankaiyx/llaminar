@@ -34,7 +34,7 @@
 
 #include "Tensors.h"
 #include "../backends/DeviceId.h"
-#include "../kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "../kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "../utils/Logger.h"
 #include <memory>
 #include <cstring>
@@ -162,7 +162,7 @@ namespace llaminar2
      * - Only slice data (inner_is_presliced=true): memory efficient, requires sliced loading
      *
      * Also implements IINT8Unpackable by forwarding to inner tensor if it supports it.
-     * This enables QuantisedGemmKernel to work with sliced quantized tensors.
+     * This enables CPUQuantisedGemmKernel to work with sliced quantized tensors.
      */
     class TensorSlice : public TensorBase, public IINT8Unpackable
     {
@@ -357,7 +357,7 @@ namespace llaminar2
         /**
          * @brief Create a GEMM kernel for this slice
          *
-         * For row-parallel slices with full inner data, creates a QuantisedGemmKernel
+         * For row-parallel slices with full inner data, creates a CPUQuantisedGemmKernel
          * that only packs the slice rows. Otherwise delegates to inner tensor.
          *
          * IMPORTANT: When inner tensor's raw data has been released (after first
@@ -380,7 +380,7 @@ namespace llaminar2
                 LOG_DEBUG("TensorSlice: Creating row-sliced kernel ["
                           << metadata_.slice_start << ", " << metadata_.slice_end
                           << ") from full inner tensor");
-                return std::make_unique<gemm_v4::QuantisedGemmKernel>(
+                return std::make_unique<gemm::CPUQuantisedGemmKernel>(
                     inner(),
                     static_cast<int>(metadata_.slice_start),
                     static_cast<int>(metadata_.slice_end));

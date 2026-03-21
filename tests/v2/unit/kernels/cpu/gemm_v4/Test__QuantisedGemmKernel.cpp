@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "backends/DeviceId.h"
 #include <vector>
@@ -10,7 +10,7 @@
 #include <iostream>
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 TEST(Test__QuantisedGemmKernel, BasicMatMul)
 {

@@ -1,9 +1,9 @@
 /**
  * @file Test__QuantisedGemmFused.cpp
- * @brief Integration tests for QuantisedGemmKernel fused operations
+ * @brief Integration tests for CPUQuantisedGemmKernel fused operations
  * @author David Sanftenberg
  *
- * Tests mathematical correctness of fused operations in QuantisedGemmKernel:
+ * Tests mathematical correctness of fused operations in CPUQuantisedGemmKernel:
  * - GEMM with bias
  * - GEMM with mask
  * - GEMM with fused softmax (parity with separate GEMM + softmax primitives)
@@ -22,7 +22,7 @@
 #include <algorithm>
 #include <mpi.h>
 
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "kernels/cpu/primitives/SoftmaxPrimitives_New.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "tensors/Tensors.h"
@@ -272,7 +272,7 @@ namespace llaminar2
         {
             // Use attention-like dimensions (K must be multiple of 32 for Q4_0)
             m_ = 8;  // seq_len
-            n_ = 64; // Must be >= 64 for QuantisedGemmKernel blocking
+            n_ = 64; // Must be >= 64 for CPUQuantisedGemmKernel blocking
             k_ = 64; // head_dim (multiple of 32)
 
             input_.resize(m_ * k_);
@@ -324,7 +324,7 @@ namespace llaminar2
         {
             // Attention-like dimensions (K must be multiple of 32, N >= 64 for kernel blocking)
             m_ = 8;  // seq_len (queries)
-            n_ = 64; // seq_len (keys) - must be >= 64 for QuantisedGemmKernel
+            n_ = 64; // seq_len (keys) - must be >= 64 for CPUQuantisedGemmKernel
             k_ = 64; // head_dim (multiple of 32)
 
             input_.resize(m_ * k_);
@@ -410,7 +410,7 @@ namespace llaminar2
             // Test with causal flag instead of explicit mask
             // K must be multiple of 32, N >= 64 for kernel blocking
             m_ = 8;
-            n_ = 64; // Must be >= 64 for QuantisedGemmKernel
+            n_ = 64; // Must be >= 64 for CPUQuantisedGemmKernel
             k_ = 64; // Multiple of 32
 
             input_.resize(m_ * k_);
@@ -612,7 +612,7 @@ namespace llaminar2
         {
             // K must be multiple of 32, N >= 64 for kernel blocking
             m_ = 8;
-            n_ = 64; // Must be >= 64 for QuantisedGemmKernel
+            n_ = 64; // Must be >= 64 for CPUQuantisedGemmKernel
             k_ = 64; // Multiple of 32
 
             input_.resize(m_ * k_);

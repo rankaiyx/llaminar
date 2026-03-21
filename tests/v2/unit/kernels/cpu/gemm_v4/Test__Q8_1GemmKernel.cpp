@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/Q8_1GemmKernel.h"
+#include "kernels/cpu/gemm/Q8_1GemmKernel.h"
 #include <vector>
 #include <random>
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 TEST(Test__Q8_1GemmKernel, BasicMatMul)
 {

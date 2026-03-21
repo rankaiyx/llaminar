@@ -231,6 +231,21 @@ namespace
                 kernel.unbindWorkspace();
             }
         }
+
+        /// Upload input/output to GPU, run multiply_tensor, mark output device-dirty.
+        /// This ensures the M=1 GEMV fast path is used (requires use_gpu_path=true).
+        bool runGemvOnGpu(ROCmQuantisedGemmKernel &kernel,
+                          TensorBase *input, TensorBase *output,
+                          int M, int N, int K)
+        {
+            const auto device = DeviceId::rocm(0);
+            if (!input->ensureOnDevice(device) || !output->ensureOnDevice(device))
+                return false;
+            bool ok = kernel.multiply_tensor(input, output, M, N, K);
+            if (ok)
+                output->mark_device_dirty();
+            return ok;
+        }
 #endif
     };
 
@@ -287,7 +302,7 @@ namespace
             {static_cast<size_t>(M), static_cast<size_t>(N)});
 
         // 6. Run GPU GEMV (uses native-VNNI for M=1 with alpha=1, beta=0)
-        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_gpu.get(), M, N, K))
+        ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K))
             << fmt.name << ": multiply_tensor failed";
 
         // 7. CPU FP32 reference
@@ -368,7 +383,7 @@ namespace
         auto output_gpu = TestTensorFactory::createFP32(
             {static_cast<size_t>(M), static_cast<size_t>(N)});
 
-        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_gpu.get(), M, N, K));
+        ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
 
         std::vector<float> ref(static_cast<size_t>(N));
         cpuFP32Gemv(input->data(), W_fp32.data(), ref.data(), N, K);
@@ -413,7 +428,7 @@ namespace
         auto output_gpu = TestTensorFactory::createFP32(
             {static_cast<size_t>(M), static_cast<size_t>(N)});
 
-        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_gpu.get(), M, N, K));
+        ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
 
         std::vector<float> ref(static_cast<size_t>(N));
         cpuFP32Gemv(input->data(), W_fp32.data(), ref.data(), N, K);
@@ -458,7 +473,7 @@ namespace
         auto output_gpu = TestTensorFactory::createFP32(
             {static_cast<size_t>(M), static_cast<size_t>(N)});
 
-        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_gpu.get(), M, N, K));
+        ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
 
         std::vector<float> ref(static_cast<size_t>(N));
         cpuFP32Gemv(input->data(), W_fp32.data(), ref.data(), N, K);
@@ -503,7 +518,7 @@ namespace
         auto output_gpu = TestTensorFactory::createFP32(
             {static_cast<size_t>(M), static_cast<size_t>(N)});
 
-        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_gpu.get(), M, N, K));
+        ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
 
         std::vector<float> ref(static_cast<size_t>(N));
         cpuFP32Gemv(input->data(), W_fp32.data(), ref.data(), N, K);
@@ -579,7 +594,7 @@ namespace
             auto output_gpu = TestTensorFactory::createFP32(
                 {static_cast<size_t>(M), static_cast<size_t>(N)});
 
-            bool ok = kernel.multiply_tensor(input.get(), output_gpu.get(), M, N, K);
+            bool ok = runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K);
             if (!ok)
             {
                 cleanupWorkspace(kernel);

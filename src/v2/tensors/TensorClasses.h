@@ -259,7 +259,7 @@ namespace llaminar2
          *
          * Quantizes the entire activation buffer [m, k] to Q8_1 blocks for use
          * in integer GEMM operations. This is the optimized bulk quantization
-         * path used by QuantisedGemmKernel.
+         * path used by CPUQuantisedGemmKernel.
          *
          * **Design Pattern ("quantize once, use many times")**:
          * - Activation quantized to Q8_1 once before multi-head attention
@@ -420,8 +420,8 @@ namespace llaminar2
          * @brief Get native-VNNI format metadata for this tensor type
          *
          * Returns intrinsic encoding properties (codebook ID, payload size,
-         * symmetry, etc.) that describe how this format is packed for GPU VNNI
-         * kernels. Only native-VNNI formats (≤6-bit) return non-null.
+         * symmetry, etc.) that describe how this format is packed for VNNI
+         * kernels. Formats returning non-null are routed to NativeVNNI GEMV/GEMM.
          *
          * @return Pointer to static metadata, or nullptr for non-VNNI formats (Q8_0, Q8_1)
          */
@@ -3403,10 +3403,10 @@ namespace llaminar2
 
         size_t superblock_size() const override { return 256; }
 
-        // NativeVNNI support: codebook 18, 32-byte payload (raw int8 blocks)
+        // NativeVNNI support: codebook 19, 32-byte payload (raw int8 blocks)
         const NativeVnniFormatInfo *vnniFormatInfo() const override
         {
-            static constexpr NativeVnniFormatInfo info{18, 32, false, false, false, 127.0f};
+            static constexpr NativeVnniFormatInfo info{19, 32, false, false, false, 127.0f};
             return &info;
         }
         void packVnniBlock(const VnniPackContext &ctx, int n, int b) const override;
@@ -3705,6 +3705,13 @@ namespace llaminar2
         }
 
         size_t superblock_size() const override { return 256; }
+
+        // NativeVNNI support: codebook 20, 32-byte payload (raw int8 blocks)
+        const NativeVnniFormatInfo *vnniFormatInfo() const override
+        {
+            static constexpr NativeVnniFormatInfo info{20, 32, false, false, false, 127.0f};
+            return &info;
+        }
 
         /// Efficient override: reads Q8_1 blocks directly via typed_data()
         /// without virtual dispatch per block.

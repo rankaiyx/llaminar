@@ -9,11 +9,11 @@
 
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "utils/MPIContext.h"
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 class QuantisedGemmPackingPerf : public ::testing::Test
 {
@@ -64,7 +64,7 @@ protected:
             auto start = std::chrono::high_resolution_clock::now();
 
             // Measure constructor time (which does packing)
-            QuantisedGemmKernel kernel(&tensor);
+            CPUQuantisedGemmKernel kernel(&tensor);
 
             auto end = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -99,7 +99,7 @@ TEST_F(QuantisedGemmPackingPerf, PackingBenchmark)
     const size_t COLS = 4096;
     const int ITERS = 10;
 
-    std::cout << "\n=== QuantisedGemmKernel Packing Benchmark ===" << std::endl;
+    std::cout << "\n=== CPUQuantisedGemmKernel Packing Benchmark ===" << std::endl;
     std::cout << "Matrix: " << ROWS << " x " << COLS << " (" << (ROWS * COLS / 1e6) << " M elements)" << std::endl;
     std::cout << "Iterations: " << ITERS << std::endl;
     std::cout << "\n";

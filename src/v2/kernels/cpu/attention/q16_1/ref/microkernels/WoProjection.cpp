@@ -7,7 +7,7 @@
  */
 
 #include "WoProjection.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmJit_M1.h" // For QuantisedPackedWeights
+#include "kernels/cpu/gemm/QuantisedGemmJit_M1.h" // For QuantisedPackedWeights
 #include "utils/Logger.h"
 
 #include <algorithm>

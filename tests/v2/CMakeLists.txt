@@ -2970,6 +2970,58 @@ add_v2_test(V2_Unit_Q4_0_SIMD_Unpack
     MPI_PROCS 1
 )
 
+# Test: Q4_K SIMD Unpacking (AVX-512, AVX2, Scalar)
+add_executable(v2_test_q4_k_simd_unpack unit/tensors/Test__Q4_K_SIMD_Unpack.cpp)
+target_link_libraries(v2_test_q4_k_simd_unpack 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q4_K_SIMD_Unpack 
+    COMMAND $<TARGET_FILE:v2_test_q4_k_simd_unpack>
+    LABELS "V2;Unit;TensorOperations;Q4_K;Quantization;SIMD;AVX512;AVX2;Unpack"
+    MPI_PROCS 1
+)
+
+# Test: Q5_K SIMD Unpacking (AVX-512, AVX2, Scalar)
+add_executable(v2_test_q5_k_simd_unpack unit/tensors/Test__Q5_K_SIMD_Unpack.cpp)
+target_link_libraries(v2_test_q5_k_simd_unpack 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q5_K_SIMD_Unpack 
+    COMMAND $<TARGET_FILE:v2_test_q5_k_simd_unpack>
+    LABELS "V2;Unit;TensorOperations;Q5_K;Quantization;SIMD;AVX512;AVX2;Unpack"
+    MPI_PROCS 1
+)
+
+# Test: Q6_K SIMD Unpacking (AVX-512, AVX2, Scalar)
+add_executable(v2_test_q6_k_simd_unpack unit/tensors/Test__Q6_K_SIMD_Unpack.cpp)
+target_link_libraries(v2_test_q6_k_simd_unpack 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q6_K_SIMD_Unpack 
+    COMMAND $<TARGET_FILE:v2_test_q6_k_simd_unpack>
+    LABELS "V2;Unit;TensorOperations;Q6_K;Quantization;SIMD;AVX512;AVX2;Unpack"
+    MPI_PROCS 1
+)
+
+# Test: Q5_0 SIMD Unpacking (AVX-512, AVX2, Scalar)
+add_executable(v2_test_q5_0_simd_unpack unit/tensors/Test__Q5_0_SIMD_Unpack.cpp)
+target_link_libraries(v2_test_q5_0_simd_unpack 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q5_0_SIMD_Unpack 
+    COMMAND $<TARGET_FILE:v2_test_q5_0_simd_unpack>
+    LABELS "V2;Unit;TensorOperations;Q5_0;Quantization;SIMD;AVX512;AVX2;Unpack"
+    MPI_PROCS 1
+)
+
 # Test: Q5_0 Transcoding and SIMD Unpacking
 add_executable(v2_test_q5_0_transcode unit/tensors/Test__Q5_0_Transcode.cpp)
 target_link_libraries(v2_test_q5_0_transcode 
@@ -3498,6 +3550,19 @@ add_v2_test(V2_Unit_Q5_1_SIMD
     COMMAND $<TARGET_FILE:v2_test_q5_1_simd>
     MPI_PROCS 1
     LABELS "V2;Unit;TensorOperations;Q5_1;Quantization;SIMD;AVX2;AVX512;Equivalency;HighBit;FMA"
+)
+
+# Test: Q5_1 SIMD Unpack
+add_executable(v2_test_q5_1_simd_unpack unit/tensors/Test__Q5_1_SIMD_Unpack.cpp)
+target_link_libraries(v2_test_q5_1_simd_unpack 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q5_1_SIMD_Unpack 
+    COMMAND $<TARGET_FILE:v2_test_q5_1_simd_unpack>
+    LABELS "V2;Unit;TensorOperations;Quantization;Q5_1;SIMD"
+    MPI_PROCS 1
 )
 
 # Test: Q6_K SIMD Equivalency
@@ -6795,6 +6860,60 @@ add_v2_test(V2_Perf_CpuGemvDecode
     MPI_PROCS 1
 )
 
+# Integration Test: CPU NativeVNNI GEMV/GEMM Correctness (Q4_0, IQ4_NL)
+add_executable(v2_integration_cpu_native_vnni_gemv integration/kernels/cpu/native_vnni/Test__CPUNativeVNNI_GEMV.cpp)
+target_link_libraries(v2_integration_cpu_native_vnni_gemv
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_integration_cpu_native_vnni_gemv PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
+)
+add_v2_test(V2_Integration_CPUNativeVNNI_GEMV
+    COMMAND $<TARGET_FILE:v2_integration_cpu_native_vnni_gemv>
+    LABELS "V2;Integration;GEMM;GEMV;NativeVNNI;CPU;Q4_0;IQ4_NL;Decode"
+    MPI_PROCS 1
+)
+
+# Performance Test: CPU NativeVNNI GEMV/GEMM Sweep (Q4_0, all model shapes)
+add_executable(v2_perf_cpu_native_vnni_sweep performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_Sweep.cpp)
+target_link_libraries(v2_perf_cpu_native_vnni_sweep
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_perf_cpu_native_vnni_sweep PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
+)
+add_v2_test(V2_Perf_CPUNativeVNNI_Sweep
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_sweep>
+    LABELS "V2;Performance;GEMM;GEMV;NativeVNNI;CPU;Q4_0;Decode;Prefill;Qwen;Tuning"
+    MPI_PROCS 1
+)
+
+# Performance Test: NativeVNNI vs oneDNN Reference (INT8 matmul baseline comparison)
+if(ONEDNN_LIB)
+    add_executable(v2_perf_onednn_reference performance/kernels/cpu/native_vnni/Perf__OneDNN_Reference.cpp)
+    target_link_libraries(v2_perf_onednn_reference
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+        ${ONEDNN_LIB}
+    )
+    target_include_directories(v2_perf_onednn_reference PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_v2_test(V2_Perf_OneDNN_Reference
+        COMMAND $<TARGET_FILE:v2_perf_onednn_reference>
+        LABELS "V2;Performance;GEMV;NativeVNNI;CPU;OneDNN;Reference"
+        MPI_PROCS 1
+    )
+    message(STATUS "oneDNN reference benchmark: ${ONEDNN_LIB}")
+else()
+    message(STATUS "oneDNN not available - skipping V2_Perf_OneDNN_Reference")
+endif()
+
 # Performance Test: Q8_1 Quantize SIMD (Scalar/AVX2/AVX512 throughput comparison)
 add_executable(v2_perf_q8_1_quantize_simd performance/Perf__Q8_1_QuantizeSIMD.cpp)
 target_link_libraries(v2_perf_q8_1_quantize_simd 
@@ -7103,6 +7222,69 @@ add_v2_test(V2_Perf_Q3K_Unpack
     LABELS "V2;Performance;Q3_K;Unpack"
 )
 
+# Performance Test: Q4_K Unpack (Scalar/AVX2/AVX-512)
+add_executable(v2_perf_q4_k_unpack performance/Perf__Q4_K_Unpack.cpp)
+target_link_libraries(v2_perf_q4_k_unpack llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_Q4_K_Unpack
+    COMMAND $<TARGET_FILE:v2_perf_q4_k_unpack>
+    LABELS "V2;Performance;Q4_K;Unpack"
+)
+
+# Performance Test: Q5_K Unpack (Scalar/AVX2/AVX-512)
+add_executable(v2_perf_q5_k_unpack performance/Perf__Q5_K_Unpack.cpp)
+target_link_libraries(v2_perf_q5_k_unpack llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_Q5_K_Unpack
+    COMMAND $<TARGET_FILE:v2_perf_q5_k_unpack>
+    LABELS "V2;Performance;Q5_K;Unpack"
+)
+
+# Performance Test: Q6_K Unpack (Scalar/AVX2/AVX-512)
+add_executable(v2_perf_q6_k_unpack performance/Perf__Q6_K_Unpack.cpp)
+target_link_libraries(v2_perf_q6_k_unpack llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_Q6_K_Unpack
+    COMMAND $<TARGET_FILE:v2_perf_q6_k_unpack>
+    LABELS "V2;Performance;Q6_K;Unpack"
+)
+
+# Performance Test: Q2_K Unpack (Scalar/AVX2/AVX-512)
+add_executable(v2_perf_q2_k_unpack performance/Perf__Q2_K_Unpack.cpp)
+target_link_libraries(v2_perf_q2_k_unpack llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_Q2_K_Unpack
+    COMMAND $<TARGET_FILE:v2_perf_q2_k_unpack>
+    LABELS "V2;Performance;Q2_K;Unpack"
+)
+
+# Performance Test: Q4_0 Unpack (Scalar/AVX2/AVX-512)
+add_executable(v2_perf_q4_0_unpack performance/Perf__Q4_0_Unpack.cpp)
+target_link_libraries(v2_perf_q4_0_unpack llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_Q4_0_Unpack
+    COMMAND $<TARGET_FILE:v2_perf_q4_0_unpack>
+    LABELS "V2;Performance;Q4_0;Unpack"
+)
+
+# Performance Test: Q4_1 Unpack (Scalar/AVX2/AVX-512)
+add_executable(v2_perf_q4_1_unpack performance/Perf__Q4_1_Unpack.cpp)
+target_link_libraries(v2_perf_q4_1_unpack llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_Q4_1_Unpack
+    COMMAND $<TARGET_FILE:v2_perf_q4_1_unpack>
+    LABELS "V2;Performance;Q4_1;Unpack"
+)
+
+# Performance Test: Q5_0 Unpack (Scalar/AVX2/AVX-512)
+add_executable(v2_perf_q5_0_unpack performance/Perf__Q5_0_Unpack.cpp)
+target_link_libraries(v2_perf_q5_0_unpack llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_Q5_0_Unpack
+    COMMAND $<TARGET_FILE:v2_perf_q5_0_unpack>
+    LABELS "V2;Performance;Q5_0;Unpack"
+)
+
+# Performance Test: Q5_1 Unpack (Scalar/AVX2/AVX-512)
+add_executable(v2_perf_q5_1_unpack performance/Perf__Q5_1_Unpack.cpp)
+target_link_libraries(v2_perf_q5_1_unpack llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Perf_Q5_1_Unpack
+    COMMAND $<TARGET_FILE:v2_perf_q5_1_unpack>
+    LABELS "V2;Performance;Q5_1;Unpack"
+)
 
 # Performance Test: CPURMSNormKernelT (typed residuals performance)
 add_executable(v2_perf_rmsnorm_typed performance/kernels/cpu/ops/Perf__CPURMSNormKernelT.cpp)

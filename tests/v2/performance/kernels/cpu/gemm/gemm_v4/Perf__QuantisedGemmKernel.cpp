@@ -1,8 +1,8 @@
 /**
  * @file Perf__QuantisedGemmKernel.cpp
- * @brief Performance benchmark for QuantisedGemmKernel (M1/M2 JIT projection kernels)
+ * @brief Performance benchmark for CPUQuantisedGemmKernel (M1/M2 JIT projection kernels)
  *
- * This test benchmarks the QuantisedGemmKernel class which uses QuantisedGemmJit_M1
+ * This test benchmarks the CPUQuantisedGemmKernel class which uses QuantisedGemmJit_M1
  * and QuantisedGemmJit_M2 JIT kernels for quantized matrix multiplication.
  * Used for FFN projections, QKV projections, output projections, etc.
  *
@@ -34,7 +34,7 @@
 
 // V2 includes
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 
 using namespace llaminar2;
 

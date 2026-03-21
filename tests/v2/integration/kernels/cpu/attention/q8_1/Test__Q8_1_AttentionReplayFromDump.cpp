@@ -30,13 +30,13 @@
 #include <fstream>
 #include <limits>
 
-#include "../../src/v2/kernels/cpu/gemm_v4/AttentionInputDumper.h"
-#include "../../src/v2/kernels/cpu/gemm_v4/QuantisedAttentionJit_Q8_1_Fused.h"
+#include "../../src/v2/kernels/cpu/gemm/AttentionInputDumper.h"
+#include "../../src/v2/kernels/cpu/gemm/QuantisedAttentionJit_Q8_1_Fused.h"
 #include "../../src/v2/tensors/SIMDHelpers.h"
 #include "../../src/v2/utils/Logger.h"
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 namespace
 {
@@ -112,7 +112,7 @@ namespace
         return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
     }
 
-    // Use the library's gemm_v4::fused_q8_1_attention_reference directly
+    // Use the library's gemm::fused_q8_1_attention_reference directly
     // (it includes Q/K normalization that the JIT kernel uses)
 
 } // namespace
@@ -178,7 +178,7 @@ TEST_F(Test__Q8_1_AttentionReplayFromDump, Layer0Head4_JitVsReference)
     LOG_INFO("Running C++ reference...");
     // Run C++ reference (uses library's reference with Q/K normalization)
     LOG_INFO("Running C++ reference...");
-    gemm_v4::fused_q8_1_attention_reference(
+    gemm::fused_q8_1_attention_reference(
         dump.Q_blocks.data(),
         dump.K_blocks.data(),
         dump.V_blocks.data(),

@@ -21,10 +21,10 @@
 #include "../CPUKernelBase.h"
 #include "../primitives/ActivationTraits.h"
 #include "../primitives/SoftmaxPrimitivesImpl.h"
-#include "../gemm_v4/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
-#include "../gemm_v4/QuantisedGemmJit_FP32_x_Q8_1.h"
-#include "../gemm_v4/QuantisedAttentionJit_Q8_1_Fused.h"
-#include "../gemm_v4/AttentionInputDumper.h"
+#include "../gemm/QuantisedGemmJit_Q8_1_OnlineSoftmax.h"
+#include "../gemm/QuantisedGemmJit_FP32_x_Q8_1.h"
+#include "../gemm/QuantisedAttentionJit_Q8_1_Fused.h"
+#include "../gemm/AttentionInputDumper.h"
 #include "AttentionUtils.h"
 #include "../../../execution/config/RuntimeConfig.h"
 #include "../../../utils/Logger.h"
@@ -645,11 +645,11 @@ namespace llaminar2
 
             // Get or create the fused JIT kernel for this head_dim
             // Note: head_dim is typically 64 or 128, so we use a simple cache
-            static std::unique_ptr<gemm_v4::QuantisedAttentionJit_Q8_1_Fused> jit_fused_64;
-            static std::unique_ptr<gemm_v4::QuantisedAttentionJit_Q8_1_Fused> jit_fused_128;
+            static std::unique_ptr<gemm::QuantisedAttentionJit_Q8_1_Fused> jit_fused_64;
+            static std::unique_ptr<gemm::QuantisedAttentionJit_Q8_1_Fused> jit_fused_128;
             static std::mutex jit_mutex;
 
-            gemm_v4::QuantisedAttentionJit_Q8_1_Fused *jit_kernel = nullptr;
+            gemm::QuantisedAttentionJit_Q8_1_Fused *jit_kernel = nullptr;
 
             {
                 std::lock_guard<std::mutex> lock(jit_mutex);
@@ -657,7 +657,7 @@ namespace llaminar2
                 {
                     if (!jit_fused_64)
                     {
-                        jit_fused_64 = std::make_unique<gemm_v4::QuantisedAttentionJit_Q8_1_Fused>(64);
+                        jit_fused_64 = std::make_unique<gemm::QuantisedAttentionJit_Q8_1_Fused>(64);
                     }
                     jit_kernel = jit_fused_64.get();
                 }
@@ -665,7 +665,7 @@ namespace llaminar2
                 {
                     if (!jit_fused_128)
                     {
-                        jit_fused_128 = std::make_unique<gemm_v4::QuantisedAttentionJit_Q8_1_Fused>(128);
+                        jit_fused_128 = std::make_unique<gemm::QuantisedAttentionJit_Q8_1_Fused>(128);
                     }
                     jit_kernel = jit_fused_128.get();
                 }
@@ -699,7 +699,7 @@ namespace llaminar2
                         const Q8_1Block *V_h = V + kv_h * head_dim_blocks;
                         Q8_1Block *out_h = output_q8 + h * head_dim_blocks;
 
-                        gemm_v4::fused_q8_1_attention_reference(
+                        gemm::fused_q8_1_attention_reference(
                             Q_h, K_h, V_h, out_h,
                             seq_len, kv_len, head_dim,
                             q_blocks_per_row, k_blocks_per_row, k_blocks_per_row, out_blocks_per_row,
@@ -747,8 +747,8 @@ namespace llaminar2
                     const int out_stride_bytes = out_blocks_per_row * static_cast<int>(sizeof(Q8_1Block));
 
                     // Build params for fused kernel using volatile to prevent optimization issues
-                    // This mirrors the fix applied to QuantisedGemmKernel for -O3 compatibility
-                    volatile gemm_v4::FusedQ8_1AttentionParams params_v;
+                    // This mirrors the fix applied to CPUQuantisedGemmKernel for -O3 compatibility
+                    volatile gemm::FusedQ8_1AttentionParams params_v;
                     params_v.Q = Q_h;
                     params_v.K = K_h;
                     params_v.V = V_h;
@@ -765,14 +765,14 @@ namespace llaminar2
                     params_v.mask_stride = kv_len;
 
                     // Copy to non-volatile for kernel call (workaround for -O3 optimization issue)
-                    gemm_v4::FusedQ8_1AttentionParams params;
-                    std::memcpy(&params, const_cast<gemm_v4::FusedQ8_1AttentionParams *>(&params_v), sizeof(params));
+                    gemm::FusedQ8_1AttentionParams params;
+                    std::memcpy(&params, const_cast<gemm::FusedQ8_1AttentionParams *>(&params_v), sizeof(params));
 
                     // Memory barrier to prevent reordering
                     asm volatile("" ::: "memory");
 
                     // Dump inputs for debugging (compile-time optional)
-                    gemm_v4::dump_attention_inputs(params, h, -1);
+                    gemm::dump_attention_inputs(params, h, -1);
 
                     // Execute fused kernel
                     auto func = jit_kernel->get_kernel();

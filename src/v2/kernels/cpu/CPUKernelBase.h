@@ -18,7 +18,7 @@
  *
  * Example for a kernel that needs workspace:
  * ```cpp
- * class QuantisedGemmKernel : public ITensorGemm, public CPUKernelBase {
+ * class CPUQuantisedGemmKernel : public ITensorGemm, public CPUKernelBase {
  * public:
  *     WorkspaceRequirements getWorkspaceRequirements(int m, int n, int k) const override {
  *         WorkspaceRequirements req;

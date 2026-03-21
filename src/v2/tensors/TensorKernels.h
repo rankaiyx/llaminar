@@ -481,7 +481,7 @@ namespace llaminar2
          * @return true on success, false if not supported
          *
          * @note Default implementation returns false (not supported).
-         *       Kernels like QuantisedGemmKernel override with optimized implementation.
+         *       Kernels like CPUQuantisedGemmKernel override with optimized implementation.
          */
         virtual bool multiply_to_q8_1(
             const float *A,
@@ -519,9 +519,14 @@ namespace llaminar2
             int m, int n, int k,
             float alpha = 1.0f, float beta = 0.0f)
         {
-            (void)gate; (void)up; (void)output;
-            (void)m; (void)n; (void)k;
-            (void)alpha; (void)beta;
+            (void)gate;
+            (void)up;
+            (void)output;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)alpha;
+            (void)beta;
             return false; // Default: not supported, fall back to separate path
         }
 
@@ -577,7 +582,7 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace = nullptr)
         {
             // Default implementation: run each projection separately
-            // Subclasses (e.g., QuantisedGemmKernel) can override for optimized fusion
+            // Subclasses (e.g., CPUQuantisedGemmKernel) can override for optimized fusion
             for (const auto &proj : projections)
             {
                 if (!proj.kernel)
@@ -604,7 +609,7 @@ namespace llaminar2
                 if (proj.bias || proj.do_swiglu)
                 {
                     // Cannot apply bias/SwiGLU in fallback - would need full TensorBase definition
-                    // Real kernels (QuantisedGemmKernel, CUDAQuantisedGemmKernel) override this
+                    // Real kernels (CPUQuantisedGemmKernel, CUDAQuantisedGemmKernel) override this
                 }
             }
             return true;
@@ -1332,7 +1337,7 @@ namespace llaminar2
          * @return true on success, false if not supported (e.g., non-quantized kernel)
          *
          * @note This is a no-op for floating-point kernels that don't need quantization.
-         *       For QuantisedGemmKernel, this performs the FP32→Q8_1 conversion.
+         *       For CPUQuantisedGemmKernel, this performs the FP32→Q8_1 conversion.
          *
          * @note Thread safety: This method is thread-safe. The output buffer can be
          *       thread-local to avoid contention.
@@ -1900,7 +1905,7 @@ namespace llaminar2
     // Forward Declarations for Fused Attention
     // =========================================================================
 
-    namespace gemm_v4
+    namespace gemm
     {
         struct QuantisedPackedWeights;
     }
@@ -1948,7 +1953,7 @@ namespace llaminar2
          * Created from Q8_1 via KernelFactory::ensurePackedWeightsInTensorCache()
          * For FP32 implementations, this may be nullptr (use FP32 Wo instead)
          */
-        const gemm_v4::QuantisedPackedWeights *Wo_packed = nullptr;
+        const gemm::QuantisedPackedWeights *Wo_packed = nullptr;
 
         /**
          * @brief FP32 Wo weights [d_model × d_model] for FP32 implementations

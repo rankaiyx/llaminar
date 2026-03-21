@@ -26,12 +26,12 @@
 #include <algorithm>
 #include <cstring>
 
-#include "kernels/cpu/gemm_v4/QuantisedAttentionJit_Q8_1_Fused.h"
+#include "kernels/cpu/gemm/QuantisedAttentionJit_Q8_1_Fused.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/FP16Utils.h"
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 /**
  * @brief Test fixture for QuantisedAttentionJit_Q8_1_Fused unit tests

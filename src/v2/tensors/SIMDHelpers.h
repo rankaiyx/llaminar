@@ -3891,7 +3891,7 @@ namespace llaminar2
         // Single-Block Q8_1 Quantization (SIMD-optimized)
         // ==========================================
         // These functions quantize a single 32-element block with SIMD optimization.
-        // Used by FP32Tensor::quantize_to_q8_1() and QuantisedGemmKernel::quantize_activations()
+        // Used by FP32Tensor::quantize_to_q8_1() and CPUQuantisedGemmKernel::quantize_activations()
         // for row-wise 2D tensor quantization with proper boundary handling.
 
         /**
@@ -8065,7 +8065,7 @@ namespace llaminar2
         /**
          * @brief Unpack IQ3_S sub-block to INT8 (transcoding via Q8_0)
          *
-         * Used by IINT8Unpackable interface for QuantisedGemmKernel.
+         * Used by IINT8Unpackable interface for CPUQuantisedGemmKernel.
          * Decodes IQ3_S to FP32 then quantizes to Q8_0 (INT8).
          *
          * @param block Source IQ3_S super-block
@@ -8084,7 +8084,7 @@ namespace llaminar2
         /**
          * @brief Get scale for IQ3_S sub-block (transcoding via Q8_0)
          *
-         * Used by IINT8Unpackable interface for QuantisedGemmKernel.
+         * Used by IINT8Unpackable interface for CPUQuantisedGemmKernel.
          * Decodes IQ3_S to FP32 then quantizes to Q8_0 to find the scale.
          *
          * @param block Source IQ3_S super-block
@@ -9840,6 +9840,47 @@ namespace llaminar2
          * @param scales Optional output buffer for 8 float scales
          * @param mins Optional output buffer for 8 float mins
          */
+        /**
+         * @brief Unpack Q3_K superblock to int8 - scalar version
+         */
+        inline void unpack_q3_k_superblock_to_int8_scalar(
+            const Q3_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                float s, m;
+                transcode_q3_k_to_int8_scalar(block, i, output + i * 32, &s, &m);
+                if (scales) scales[i] = s;
+                if (mins) mins[i] = m;
+            }
+        }
+
+#if defined(__AVX2__)
+        /**
+         * @brief Unpack Q3_K superblock to int8 - AVX2 version
+         */
+        inline void unpack_q3_k_superblock_to_int8_avx2(
+            const Q3_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                float s, m;
+                transcode_q3_k_to_int8_avx2(block, i, output + i * 32, &s, &m);
+                if (scales) scales[i] = s;
+                if (mins) mins[i] = m;
+            }
+        }
+#endif
+
+        /**
+         * @brief Unpack Q3_K superblock to int8 - auto dispatch
+         */
         inline void unpack_q3_k_superblock_to_int8(
             const Q3_KBlock &block,
             int8_t *output,
@@ -9859,29 +9900,12 @@ namespace llaminar2
             static const bool has_avx2 = cpu_supports_avx2();
             if (has_avx2)
             {
-                for (int i = 0; i < 8; ++i)
-                {
-                    float s, m;
-                    transcode_q3_k_to_int8_avx2(block, i, output + i * 32, &s, &m);
-                    if (scales)
-                        scales[i] = s;
-                    if (mins)
-                        mins[i] = m;
-                }
+                unpack_q3_k_superblock_to_int8_avx2(block, output, scales, mins);
                 return;
             }
 #endif
 
-            // Scalar fallback
-            for (int i = 0; i < 8; ++i)
-            {
-                float s, m;
-                transcode_q3_k_to_int8_scalar(block, i, output + i * 32, &s, &m);
-                if (scales)
-                    scales[i] = s;
-                if (mins)
-                    mins[i] = m;
-            }
+            unpack_q3_k_superblock_to_int8_scalar(block, output, scales, mins);
         }
 
         /**
@@ -10286,66 +10310,14 @@ namespace llaminar2
 #endif
 
         /**
-         * @brief Unpack entire Q4_K super-block to int8 (256 elements)
-         *
-         * Optimized version that processes all 8 sub-blocks with single CPU dispatch.
-         *
-         * @param block Source Q4_K super-block
-         * @param output Output buffer for 256 int8 values
-         * @param scales Optional output buffer for 8 float scales
-         * @param mins Optional output buffer for 8 float mins
+         * @brief Unpack entire Q4_K super-block to int8 (256 elements) - scalar version
          */
-        inline void unpack_q4_k_superblock_to_int8(
+        inline void unpack_q4_k_superblock_to_int8_scalar(
             const Q4_KBlock &block,
             int8_t *output,
             float *scales,
             float *mins)
         {
-#if defined(__AVX2__)
-            static const bool has_avx2 = cpu_supports_avx2();
-            if (has_avx2)
-            {
-                const float d = fp16_to_fp32(block.d);
-                const float dmin = fp16_to_fp32(block.dmin);
-                const __m256i mask = _mm256_set1_epi8(0xF);
-
-                for (int i = 0; i < 4; ++i)
-                {
-                    const uint8_t *q = block.qs + i * 32;
-                    const __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q));
-
-                    // Sub-block 2*i (Low nibbles)
-                    const __m256i low = _mm256_and_si256(data, mask);
-                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + (2 * i) * 32), low);
-
-                    // Sub-block 2*i+1 (High nibbles)
-                    const __m256i high = _mm256_and_si256(_mm256_srli_epi16(data, 4), mask);
-                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + (2 * i + 1) * 32), high);
-
-                    // Scales and mins
-                    if (scales || mins)
-                    {
-                        uint8_t sc, m;
-                        // Sub-block 2*i
-                        get_scale_min_k4(2 * i, block.scales, &sc, &m);
-                        if (scales)
-                            scales[2 * i] = d * sc;
-                        if (mins)
-                            mins[2 * i] = -dmin * m;
-
-                        // Sub-block 2*i+1
-                        get_scale_min_k4(2 * i + 1, block.scales, &sc, &m);
-                        if (scales)
-                            scales[2 * i + 1] = d * sc;
-                        if (mins)
-                            mins[2 * i + 1] = -dmin * m;
-                    }
-                }
-                return;
-            }
-#endif
-
-            // Scalar fallback
             for (int i = 0; i < 8; ++i)
             {
                 float s, m;
@@ -10355,6 +10327,127 @@ namespace llaminar2
                 if (mins)
                     mins[i] = m;
             }
+        }
+
+#if defined(__AVX2__)
+        /**
+         * @brief Unpack entire Q4_K super-block to int8 (256 elements) - AVX2 version
+         */
+        inline void unpack_q4_k_superblock_to_int8_avx2(
+            const Q4_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            const float d = fp16_to_fp32(block.d);
+            const float dmin = fp16_to_fp32(block.dmin);
+            const __m256i mask = _mm256_set1_epi8(0xF);
+
+            for (int i = 0; i < 4; ++i)
+            {
+                const uint8_t *q = block.qs + i * 32;
+                const __m256i data = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q));
+
+                const __m256i low = _mm256_and_si256(data, mask);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + (2 * i) * 32), low);
+
+                const __m256i high = _mm256_and_si256(_mm256_srli_epi16(data, 4), mask);
+                _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + (2 * i + 1) * 32), high);
+
+                if (scales || mins)
+                {
+                    uint8_t sc, m;
+                    get_scale_min_k4(2 * i, block.scales, &sc, &m);
+                    if (scales)
+                        scales[2 * i] = d * sc;
+                    if (mins)
+                        mins[2 * i] = -dmin * m;
+
+                    get_scale_min_k4(2 * i + 1, block.scales, &sc, &m);
+                    if (scales)
+                        scales[2 * i + 1] = d * sc;
+                    if (mins)
+                        mins[2 * i + 1] = -dmin * m;
+                }
+            }
+        }
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        /**
+         * @brief Unpack entire Q4_K super-block to int8 (256 elements) - AVX-512 version
+         */
+        inline void unpack_q4_k_superblock_to_int8_avx512(
+            const Q4_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            const __m512i mask512 = _mm512_set1_epi8(0xF);
+
+            // Load both 64-byte chunks simultaneously for ILP
+            const __m512i data0 = _mm512_loadu_si512(block.qs);
+            const __m512i data1 = _mm512_loadu_si512(block.qs + 64);
+
+            // Extract nibbles — interleaved for 2-port execution
+            const __m512i low0  = _mm512_and_si512(data0, mask512);
+            const __m512i low1  = _mm512_and_si512(data1, mask512);
+            const __m512i high0 = _mm512_and_si512(_mm512_srli_epi16(data0, 4), mask512);
+            const __m512i high1 = _mm512_and_si512(_mm512_srli_epi16(data1, 4), mask512);
+
+            // Store all 8 subblocks — interleaved to keep store port busy
+            _mm256_storeu_si256((__m256i *)(output + 0 * 32), _mm512_castsi512_si256(low0));
+            _mm256_storeu_si256((__m256i *)(output + 1 * 32), _mm512_castsi512_si256(high0));
+            _mm256_storeu_si256((__m256i *)(output + 4 * 32), _mm512_castsi512_si256(low1));
+            _mm256_storeu_si256((__m256i *)(output + 5 * 32), _mm512_castsi512_si256(high1));
+            _mm256_storeu_si256((__m256i *)(output + 2 * 32), _mm512_extracti64x4_epi64(low0, 1));
+            _mm256_storeu_si256((__m256i *)(output + 3 * 32), _mm512_extracti64x4_epi64(high0, 1));
+            _mm256_storeu_si256((__m256i *)(output + 6 * 32), _mm512_extracti64x4_epi64(low1, 1));
+            _mm256_storeu_si256((__m256i *)(output + 7 * 32), _mm512_extracti64x4_epi64(high1, 1));
+
+            if (scales || mins)
+            {
+                const float d = fp16_to_fp32(block.d);
+                const float dmin = fp16_to_fp32(block.dmin);
+                for (int i = 0; i < 8; ++i)
+                {
+                    uint8_t sc, m;
+                    get_scale_min_k4(i, block.scales, &sc, &m);
+                    if (scales) scales[i] = d * sc;
+                    if (mins)   mins[i] = -dmin * m;
+                }
+            }
+        }
+#endif
+
+        /**
+         * @brief Unpack entire Q4_K super-block to int8 - auto dispatch
+         */
+        inline void unpack_q4_k_superblock_to_int8(
+            const Q4_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_q4_k_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+#endif
+
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
+            {
+                unpack_q4_k_superblock_to_int8_avx2(block, output, scales, mins);
+                return;
+            }
+#endif
+
+            unpack_q4_k_superblock_to_int8_scalar(block, output, scales, mins);
         }
 
         inline void transcode_q4_k_to_int8(
@@ -11343,6 +11436,266 @@ namespace llaminar2
         }
 #endif
 
+#if defined(__AVX2__)
+        /**
+         * @brief AVX2 implementation of Q6_K superblock unpacking to INT8
+         *
+         * Uses the same fixed-point factor approach as the AVX-512 version,
+         * but processes 16 elements at a time (YMM) instead of 32 (ZMM).
+         * Each 32-element subblock is split into two 16-element halves.
+         */
+        inline void unpack_q6_k_superblock_to_int8_avx2(
+            const Q6_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            const float d = fp16_to_fp32(block.d);
+
+            // Precompute scale factors for all 8 subblocks (16 half-factors)
+            // Same fixed-point approach as AVX-512: fold d, per-subblock scales,
+            // and INT8 normalization into a single 8.8 fixed-point multiplier
+            alignas(32) int16_t factors_fixed[16];
+            alignas(32) float out_scales[8];
+
+            for (int half = 0; half < 2; ++half)
+            {
+                const int8_t *sc_base = block.scales + half * 8;
+                for (int sb = 0; sb < 4; ++sb)
+                {
+                    const int8_t sc0 = sc_base[sb * 2 + 0];
+                    const int8_t sc1 = sc_base[sb * 2 + 1];
+                    const float max_sc = std::max(std::abs((float)sc0), std::abs((float)sc1));
+
+                    const int idx = half * 4 + sb;
+                    if (max_sc == 0.0f)
+                    {
+                        out_scales[idx] = 0.0f;
+                        factors_fixed[idx * 2 + 0] = 0;
+                        factors_fixed[idx * 2 + 1] = 0;
+                    }
+                    else
+                    {
+                        out_scales[idx] = d * max_sc * 32.0f / 127.0f;
+                        factors_fixed[idx * 2 + 0] = (int16_t)std::nearbyint(
+                            (float)sc0 * 127.0f * 256.0f / (max_sc * 32.0f));
+                        factors_fixed[idx * 2 + 1] = (int16_t)std::nearbyint(
+                            (float)sc1 * 127.0f * 256.0f / (max_sc * 32.0f));
+                    }
+                }
+            }
+
+            if (scales)
+                _mm256_storeu_ps(scales, _mm256_loadu_ps(out_scales));
+            if (mins)
+                _mm256_storeu_ps(mins, _mm256_setzero_ps());
+
+            // Constants
+            const __m256i v0F = _mm256_set1_epi8(0x0F);
+            const __m256i v03 = _mm256_set1_epi8(0x03);
+            const __m256i v32_16 = _mm256_set1_epi16(32);
+            const __m256i v128_16 = _mm256_set1_epi16(128);
+
+            // Process 2 halves (4 subblocks each, 128 elements per half)
+            for (int half = 0; half < 2; ++half)
+            {
+                const __m256i vql_0 = _mm256_loadu_si256((const __m256i *)(block.ql + half * 64));
+                const __m256i vql_1 = _mm256_loadu_si256((const __m256i *)(block.ql + half * 64 + 32));
+                const __m256i vqh   = _mm256_loadu_si256((const __m256i *)(block.qh + half * 32));
+
+                // --- Subblock 0: low nibbles of vql_0, qh bits [1:0] ---
+                {
+                    __m256i vql_sb = _mm256_and_si256(vql_0, v0F);
+                    __m256i vqh_sb = _mm256_and_si256(vqh, v03);
+                    __m256i vq = _mm256_or_si256(vql_sb, _mm256_slli_epi16(vqh_sb, 4));
+
+                    int sb_idx = half * 4 + 0;
+                    __m256i lo16 = _mm256_sub_epi16(
+                        _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vq)), v32_16);
+                    __m256i hi16 = _mm256_sub_epi16(
+                        _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vq, 1)), v32_16);
+
+                    lo16 = _mm256_srai_epi16(_mm256_add_epi16(
+                        _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
+                        v128_16), 8);
+                    hi16 = _mm256_srai_epi16(_mm256_add_epi16(
+                        _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
+                        v128_16), 8);
+
+                    __m256i packed = _mm256_permute4x64_epi64(
+                        _mm256_packs_epi16(lo16, hi16), 0xD8);
+                    _mm256_storeu_si256((__m256i *)(output + half * 128 + 0), packed);
+                }
+
+                // --- Subblock 1: low nibbles of vql_1, qh bits [3:2] ---
+                {
+                    __m256i vql_sb = _mm256_and_si256(vql_1, v0F);
+                    __m256i vqh_sb = _mm256_and_si256(_mm256_srli_epi16(vqh, 2), v03);
+                    __m256i vq = _mm256_or_si256(vql_sb, _mm256_slli_epi16(vqh_sb, 4));
+
+                    int sb_idx = half * 4 + 1;
+                    __m256i lo16 = _mm256_sub_epi16(
+                        _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vq)), v32_16);
+                    __m256i hi16 = _mm256_sub_epi16(
+                        _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vq, 1)), v32_16);
+
+                    lo16 = _mm256_srai_epi16(_mm256_add_epi16(
+                        _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
+                        v128_16), 8);
+                    hi16 = _mm256_srai_epi16(_mm256_add_epi16(
+                        _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
+                        v128_16), 8);
+
+                    __m256i packed = _mm256_permute4x64_epi64(
+                        _mm256_packs_epi16(lo16, hi16), 0xD8);
+                    _mm256_storeu_si256((__m256i *)(output + half * 128 + 32), packed);
+                }
+
+                // --- Subblock 2: high nibbles of vql_0, qh bits [5:4] ---
+                {
+                    __m256i vql_sb = _mm256_and_si256(_mm256_srli_epi16(vql_0, 4), v0F);
+                    __m256i vqh_sb = _mm256_and_si256(_mm256_srli_epi16(vqh, 4), v03);
+                    __m256i vq = _mm256_or_si256(vql_sb, _mm256_slli_epi16(vqh_sb, 4));
+
+                    int sb_idx = half * 4 + 2;
+                    __m256i lo16 = _mm256_sub_epi16(
+                        _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vq)), v32_16);
+                    __m256i hi16 = _mm256_sub_epi16(
+                        _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vq, 1)), v32_16);
+
+                    lo16 = _mm256_srai_epi16(_mm256_add_epi16(
+                        _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
+                        v128_16), 8);
+                    hi16 = _mm256_srai_epi16(_mm256_add_epi16(
+                        _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
+                        v128_16), 8);
+
+                    __m256i packed = _mm256_permute4x64_epi64(
+                        _mm256_packs_epi16(lo16, hi16), 0xD8);
+                    _mm256_storeu_si256((__m256i *)(output + half * 128 + 64), packed);
+                }
+
+                // --- Subblock 3: high nibbles of vql_1, qh bits [7:6] ---
+                {
+                    __m256i vql_sb = _mm256_and_si256(_mm256_srli_epi16(vql_1, 4), v0F);
+                    __m256i vqh_sb = _mm256_and_si256(_mm256_srli_epi16(vqh, 6), v03);
+                    __m256i vq = _mm256_or_si256(vql_sb, _mm256_slli_epi16(vqh_sb, 4));
+
+                    int sb_idx = half * 4 + 3;
+                    __m256i lo16 = _mm256_sub_epi16(
+                        _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vq)), v32_16);
+                    __m256i hi16 = _mm256_sub_epi16(
+                        _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vq, 1)), v32_16);
+
+                    lo16 = _mm256_srai_epi16(_mm256_add_epi16(
+                        _mm256_mullo_epi16(lo16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 0])),
+                        v128_16), 8);
+                    hi16 = _mm256_srai_epi16(_mm256_add_epi16(
+                        _mm256_mullo_epi16(hi16, _mm256_set1_epi16(factors_fixed[sb_idx * 2 + 1])),
+                        v128_16), 8);
+
+                    __m256i packed = _mm256_permute4x64_epi64(
+                        _mm256_packs_epi16(lo16, hi16), 0xD8);
+                    _mm256_storeu_si256((__m256i *)(output + half * 128 + 96), packed);
+                }
+            }
+        }
+#endif
+
+        /**
+         * @brief Unpack Q6_K superblock to int8 - scalar version
+         */
+        inline void unpack_q6_k_superblock_to_int8_scalar(
+            const Q6_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            const float d = fp16_to_fp32(block.d);
+
+            // Precompute scale factors for all 8 subblocks, matching
+            // the AVX-512/AVX2 conservative formula: out_scale = d * max_sc * 32 / 127
+            alignas(64) float out_scales[8];
+            alignas(64) float factor0[8];
+            alignas(64) float factor1[8];
+
+            for (int half = 0; half < 2; ++half)
+            {
+                const int8_t *sc_base = block.scales + half * 8;
+                for (int sb = 0; sb < 4; ++sb)
+                {
+                    const int8_t sc0 = sc_base[sb * 2 + 0];
+                    const int8_t sc1 = sc_base[sb * 2 + 1];
+                    const float max_sc = std::max(std::abs((float)sc0), std::abs((float)sc1));
+                    const int idx = half * 4 + sb;
+
+                    if (max_sc == 0.0f)
+                    {
+                        out_scales[idx] = 0.0f;
+                        factor0[idx] = 0.0f;
+                        factor1[idx] = 0.0f;
+                    }
+                    else
+                    {
+                        out_scales[idx] = d * max_sc * 32.0f / 127.0f;
+                        factor0[idx] = (float)sc0 / (max_sc * 32.0f / 127.0f);
+                        factor1[idx] = (float)sc1 / (max_sc * 32.0f / 127.0f);
+                    }
+                }
+            }
+
+            if (scales)
+                std::memcpy(scales, out_scales, 8 * sizeof(float));
+            if (mins)
+                std::memset(mins, 0, 8 * sizeof(float));
+
+            for (int half = 0; half < 2; ++half)
+            {
+                const uint8_t *ql = block.ql + half * 64;
+                const uint8_t *qh = block.qh + half * 32;
+                int8_t *out = output + half * 128;
+
+                for (int sb = 0; sb < 4; ++sb)
+                {
+                    const uint8_t *ql_ptr;
+                    int ql_shift, qh_shift;
+
+                    if (sb == 0)      { ql_ptr = ql;      ql_shift = 0; qh_shift = 0; }
+                    else if (sb == 1) { ql_ptr = ql + 32;  ql_shift = 0; qh_shift = 2; }
+                    else if (sb == 2) { ql_ptr = ql;      ql_shift = 4; qh_shift = 4; }
+                    else              { ql_ptr = ql + 32;  ql_shift = 4; qh_shift = 6; }
+
+                    const int idx = half * 4 + sb;
+                    int8_t *dst = out + sb * 32;
+
+                    if (out_scales[idx] == 0.0f)
+                    {
+                        std::memset(dst, 0, 32);
+                    }
+                    else
+                    {
+                        const float f0 = factor0[idx];
+                        const float f1 = factor1[idx];
+                        for (int l = 0; l < 32; ++l)
+                        {
+                            uint8_t ql_val = (ql_ptr[l] >> ql_shift) & 0xF;
+                            uint8_t qh_val = (qh[l] >> qh_shift) & 3;
+                            int8_t q = static_cast<int8_t>(ql_val | (qh_val << 4)) - 32;
+                            float f = (l < 16) ? f0 : f1;
+                            float val = f * q;
+                            int32_t qi = static_cast<int32_t>(std::nearbyint(val));
+                            if (qi < -128) qi = -128;
+                            if (qi > 127) qi = 127;
+                            dst[l] = static_cast<int8_t>(qi);
+                        }
+                    }
+                }
+            }
+        }
+
+        /**
+         * @brief Unpack Q6_K superblock to int8 - auto dispatch
+         */
         inline void unpack_q6_k_superblock_to_int8(
             const Q6_KBlock &block,
             int8_t *output,
@@ -11358,102 +11711,16 @@ namespace llaminar2
             }
 #endif
 
-            const float d = fp16_to_fp32(block.d);
-
-            // Process 2 halves (128 elements each = 4 subblocks each)
-            for (int half = 0; half < 2; ++half)
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
             {
-                const uint8_t *ql = block.ql + half * 64;
-                const uint8_t *qh = block.qh + half * 32;
-                const int8_t *sc = block.scales + half * 8;
-                int8_t *out = output + half * 128;
-
-                // For each of 4 subblocks in this half
-                for (int sb = 0; sb < 4; ++sb)
-                {
-                    // Determine bit extraction parameters based on subblock
-                    const uint8_t *ql_ptr;
-                    int ql_shift, qh_shift;
-
-                    if (sb == 0)
-                    {
-                        ql_ptr = ql;
-                        ql_shift = 0;
-                        qh_shift = 0;
-                    }
-                    else if (sb == 1)
-                    {
-                        ql_ptr = ql + 32;
-                        ql_shift = 0;
-                        qh_shift = 2;
-                    }
-                    else if (sb == 2)
-                    {
-                        ql_ptr = ql;
-                        ql_shift = 4;
-                        qh_shift = 4;
-                    }
-                    else
-                    {
-                        ql_ptr = ql + 32;
-                        ql_shift = 4;
-                        qh_shift = 6;
-                    }
-
-                    // Scales for this subblock (2 scales per 32 elements)
-                    const float scale0 = d * sc[sb * 2 + 0];
-                    const float scale1 = d * sc[sb * 2 + 1];
-
-                    // Find max for INT8 quantization (process both 16-element halves)
-                    float max_abs = 0.0f;
-                    for (int l = 0; l < 32; ++l)
-                    {
-                        uint8_t ql_val = (ql_ptr[l] >> ql_shift) & 0xF;
-                        uint8_t qh_val = (qh[l] >> qh_shift) & 3;
-                        int8_t q = static_cast<int8_t>(ql_val | (qh_val << 4)) - 32;
-                        float s = (l < 16) ? scale0 : scale1;
-                        float val = std::fabs(s * q);
-                        if (val > max_abs)
-                            max_abs = val;
-                    }
-
-                    // Compute output scale
-                    float out_scale = max_abs / 127.0f;
-                    if (out_scale < 1e-10f)
-                        out_scale = 0.0f;
-
-                    int sb_idx = half * 4 + sb;
-                    if (scales)
-                        scales[sb_idx] = out_scale;
-                    if (mins)
-                        mins[sb_idx] = 0.0f;
-
-                    // Quantize to INT8
-                    int8_t *dst = out + sb * 32;
-                    if (out_scale == 0.0f)
-                    {
-                        std::memset(dst, 0, 32);
-                    }
-                    else
-                    {
-                        float inv_scale = 1.0f / out_scale;
-                        for (int l = 0; l < 32; ++l)
-                        {
-                            uint8_t ql_val = (ql_ptr[l] >> ql_shift) & 0xF;
-                            uint8_t qh_val = (qh[l] >> qh_shift) & 3;
-                            int8_t q = static_cast<int8_t>(ql_val | (qh_val << 4)) - 32;
-                            float s = (l < 16) ? scale0 : scale1;
-                            float val = s * q * inv_scale;
-                            int32_t qi = static_cast<int32_t>(std::nearbyint(val));
-                            if (qi < -128)
-                                qi = -128;
-                            if (qi > 127)
-                                qi = 127;
-                            dst[l] = static_cast<int8_t>(qi);
-                        }
-                    }
-                }
+                unpack_q6_k_superblock_to_int8_avx2(block, output, scales, mins);
+                return;
             }
+#endif
+
+            unpack_q6_k_superblock_to_int8_scalar(block, output, scales, mins);
         }
 
         // =====================================================================
@@ -12120,135 +12387,119 @@ namespace llaminar2
         {
             // Load qs[16] bytes
             __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
-            __m128i low_mask = _mm_set1_epi8(0x0F);
+            __m128i low_mask_128 = _mm_set1_epi8(0x0F);
 
-            // Extract low and high nibbles
-            __m128i low_nibbles = _mm_and_si128(qs, low_mask);                     // Elements 0-15 (low 4 bits)
-            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask); // Elements 16-31 (high 4 bits)
+            // Extract low and high nibbles into two 128-bit halves
+            __m128i low_nibbles = _mm_and_si128(qs, low_mask_128);
+            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask_128);
 
-            // Load qh as 32-bit integer
+            // Combine into single 256-bit register: [low_nibbles | high_nibbles]
+            __m256i nibbles = _mm256_set_m128i(high_nibbles, low_nibbles);
+
+            // Load qh[4] as 32-bit, broadcast all 4 bytes into a 256-bit register
+            // Low 16 outputs use qh bits 0-15, high 16 outputs use qh bits 16-31
             uint32_t qh;
             std::memcpy(&qh, block.qh, sizeof(qh));
 
-            // Bit mapping from scalar code analysis:
-            // output[j] (j=0..15): xh_0 = ((qh >> j) << 4) & 0x10 => bit j of qh
-            // output[j+16] (j=0..15): xh_1 = ((qh >> (j+12)) & 0x10 => bit (j+16) of qh (bit 4 of shifted result)
-            //
-            // So: low nibbles use qh bits 0-15, high nibbles use qh bits 16-31
+            // Build broadcast vector: lo half gets bytes 0,1, hi half gets bytes 2,3
+            __m256i qh_broadcast = _mm256_set_epi8(
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh));
 
-            // Bit mask for testing each bit position within a byte
-            __m128i bit_mask = _mm_set_epi8(
+            // Bit test mask: within each 8-element group, test bit positions 0-7
+            __m256i bit_mask = _mm256_set_epi8(
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
                 static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
                 static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
 
-            // Extract each byte of qh
-            uint8_t qh_byte0 = static_cast<uint8_t>(qh);       // bits 0-7
-            uint8_t qh_byte1 = static_cast<uint8_t>(qh >> 8);  // bits 8-15
-            uint8_t qh_byte2 = static_cast<uint8_t>(qh >> 16); // bits 16-23
-            uint8_t qh_byte3 = static_cast<uint8_t>(qh >> 24); // bits 24-31
+            // Test bits and convert to 0x10 where bit is set
+            __m256i bits_tested = _mm256_and_si256(qh_broadcast, bit_mask);
+            __m256i bits_set = _mm256_cmpeq_epi8(bits_tested, bit_mask);
+            __m256i add_16 = _mm256_and_si256(bits_set, _mm256_set1_epi8(0x10));
 
-            // Broadcast bytes for low nibbles (output 0-15 need qh bits 0-15)
-            __m128i qh_lo = _mm_set_epi8(
-                qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1,
-                qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0);
+            // Combine nibbles + high bit, subtract 16
+            __m256i result = _mm256_sub_epi8(_mm256_or_si256(nibbles, add_16),
+                                              _mm256_set1_epi8(16));
 
-            // Broadcast bytes for high nibbles (output 16-31 need qh bits 16-31)
-            __m128i qh_hi = _mm_set_epi8(
-                qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3,
-                qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2);
-
-            // Test each bit position
-            __m128i bits_lo = _mm_and_si128(qh_lo, bit_mask);
-            __m128i bits_hi = _mm_and_si128(qh_hi, bit_mask);
-
-            // Compare to get 0xFF where bit was set, 0x00 where not
-            bits_lo = _mm_cmpeq_epi8(bits_lo, bit_mask);
-            bits_hi = _mm_cmpeq_epi8(bits_hi, bit_mask);
-
-            // Convert 0xFF to 0x10 (bit 4 position)
-            __m128i pos4_mask = _mm_set1_epi8(0x10);
-            bits_lo = _mm_and_si128(bits_lo, pos4_mask);
-            bits_hi = _mm_and_si128(bits_hi, pos4_mask);
-
-            // Combine nibbles with high bits
-            __m128i result_lo = _mm_or_si128(low_nibbles, bits_lo);
-            __m128i result_hi = _mm_or_si128(high_nibbles, bits_hi);
-
-            // Subtract 16 (Q5_0 is symmetric around 0)
-            __m128i offset = _mm_set1_epi8(16);
-            result_lo = _mm_sub_epi8(result_lo, offset);
-            result_hi = _mm_sub_epi8(result_hi, offset);
-
-            // Store results
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), result_lo);
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), result_hi);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), result);
         }
 #endif
 
 #if defined(__AVX2__)
         /**
          * @brief AVX2 implementation for Q5_0 → int8 unpacking
+         *
+         * Uses 256-bit operations to process all 32 outputs in a single YMM register.
+         * Low 128 bits = low nibble outputs [0..15], high 128 bits = high nibble outputs [16..31].
          */
         inline void unpack_q5_0_to_int8_avx2(const Q5_0Block &block, int8_t *output)
         {
             // Load qs[16] bytes
             __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
-            __m128i low_mask = _mm_set1_epi8(0x0F);
+            __m128i low_mask_128 = _mm_set1_epi8(0x0F);
 
-            // Extract low and high nibbles
-            __m128i low_nibbles = _mm_and_si128(qs, low_mask);
-            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask);
+            // Extract low and high nibbles  
+            __m128i low_nibbles = _mm_and_si128(qs, low_mask_128);
+            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask_128);
 
-            // Load qh as 32-bit integer
+            // Combine into single 256-bit register: [low_nibbles | high_nibbles]
+            __m256i nibbles = _mm256_set_m128i(high_nibbles, low_nibbles);
+
+            // Load qh[4] as 32-bit
             uint32_t qh;
             std::memcpy(&qh, block.qh, sizeof(qh));
 
-            // Bit mask for testing each bit position within a byte
-            __m128i bit_mask = _mm_set_epi8(
+            // Build broadcast vector: lo half gets bytes 0,1, hi half gets bytes 2,3
+            __m256i qh_broadcast = _mm256_set_epi8(
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh));
+
+            // Bit test mask: within each 8-element group, test bit positions 7,6,5,...,0
+            __m256i bit_mask = _mm256_set_epi8(
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
                 static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
                 static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
 
-            // Extract each byte of qh
-            uint8_t qh_byte0 = static_cast<uint8_t>(qh);       // bits 0-7
-            uint8_t qh_byte1 = static_cast<uint8_t>(qh >> 8);  // bits 8-15
-            uint8_t qh_byte2 = static_cast<uint8_t>(qh >> 16); // bits 16-23
-            uint8_t qh_byte3 = static_cast<uint8_t>(qh >> 24); // bits 24-31
+            // Test bits and convert to 0x10 where bit is set
+            __m256i bits_tested = _mm256_and_si256(qh_broadcast, bit_mask);
+            __m256i bits_set = _mm256_cmpeq_epi8(bits_tested, bit_mask);
+            __m256i add_16 = _mm256_and_si256(bits_set, _mm256_set1_epi8(0x10));
 
-            // Broadcast bytes for low nibbles (output 0-15 need qh bits 0-15)
-            __m128i qh_lo = _mm_set_epi8(
-                qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1,
-                qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0);
+            // Combine nibbles + high bit, subtract 16
+            __m256i result = _mm256_sub_epi8(_mm256_or_si256(nibbles, add_16),
+                                              _mm256_set1_epi8(16));
 
-            // Broadcast bytes for high nibbles (output 16-31 need qh bits 16-31)
-            __m128i qh_hi = _mm_set_epi8(
-                qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3,
-                qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2);
-
-            // Test each bit position
-            __m128i bits_lo = _mm_and_si128(qh_lo, bit_mask);
-            __m128i bits_hi = _mm_and_si128(qh_hi, bit_mask);
-
-            // Compare to get 0xFF where bit was set, 0x00 where not
-            bits_lo = _mm_cmpeq_epi8(bits_lo, bit_mask);
-            bits_hi = _mm_cmpeq_epi8(bits_hi, bit_mask);
-
-            // Convert 0xFF to 0x10 (bit 4 position)
-            __m128i pos4_mask = _mm_set1_epi8(0x10);
-            bits_lo = _mm_and_si128(bits_lo, pos4_mask);
-            bits_hi = _mm_and_si128(bits_hi, pos4_mask);
-
-            // Combine nibbles with high bits
-            __m128i result_lo = _mm_or_si128(low_nibbles, bits_lo);
-            __m128i result_hi = _mm_or_si128(high_nibbles, bits_hi);
-
-            // Subtract 16 (Q5_0 is symmetric around 0)
-            __m128i offset = _mm_set1_epi8(16);
-            result_lo = _mm_sub_epi8(result_lo, offset);
-            result_hi = _mm_sub_epi8(result_hi, offset);
-
-            // Store results
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), result_lo);
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), result_hi);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), result);
         }
 #endif
 
@@ -12382,42 +12633,21 @@ namespace llaminar2
 
         /**
          * @brief AVX512 implementation for Q4_1 → int8 unpacking
+         *
+         * Uses the same efficient SSE byte-level operations as AVX2.
+         * Q4_1 blocks are only 16 bytes of qs → 32 int8 values,
+         * too small for 512-bit operations to be beneficial.
          */
         inline void unpack_q4_1_to_int8_avx512(const Q4_1Block &block, int8_t *output)
         {
-#if defined(__AVX512VL__)
-            // AVX512VL allows using 256-bit registers with AVX512 instructions
-            __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
-
-            // Expand to 16-bit (256-bit vector)
-            __m256i raw_16 = _mm256_cvtepu8_epi16(raw);
-
-            // Low nibbles
-            __m256i low_mask = _mm256_set1_epi16(0x0F);
-            __m256i low_nibbles = _mm256_and_si256(raw_16, low_mask);
-
-            // High nibbles
-            __m256i high_nibbles = _mm256_srli_epi16(raw_16, 4);
-
-            // Pack back to 8-bit (128-bit vector)
-            __m128i out_low = _mm256_cvtepi16_epi8(low_nibbles);
-            __m128i out_high = _mm256_cvtepi16_epi8(high_nibbles);
-
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), out_low);
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), out_high);
-#else
             __m128i raw = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
             __m128i low_mask = _mm_set1_epi8(0x0F);
 
             __m128i low_nibbles = _mm_and_si128(raw, low_mask);
-            __m128i high_nibbles = _mm_srli_epi16(raw, 4);
-            high_nibbles = _mm_and_si128(high_nibbles, low_mask);
-
-            // No bias subtraction for Q4_1
+            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(raw, 4), low_mask);
 
             _mm_storeu_si128(reinterpret_cast<__m128i *>(output), low_nibbles);
             _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), high_nibbles);
-#endif
         }
 #endif // AVX512F + AVX512BW
 
@@ -12876,6 +13106,44 @@ namespace llaminar2
          * @param scales Optional output buffer for 8 float scales
          * @param mins Optional output buffer for 8 float mins
          */
+        inline void unpack_q2_k_superblock_to_int8_scalar(
+            const Q2_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                float s, m;
+                transcode_q2_k_to_int8_scalar(block, i, output + i * 32, &s, &m);
+                if (scales) scales[i] = s;
+                if (mins) mins[i] = m;
+            }
+        }
+
+#if defined(__AVX2__)
+        /**
+         * @brief Unpack Q2_K superblock to int8 - AVX2 version
+         */
+        inline void unpack_q2_k_superblock_to_int8_avx2(
+            const Q2_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                float s, m;
+                transcode_q2_k_to_int8_avx2(block, i, output + i * 32, &s, &m);
+                if (scales) scales[i] = s;
+                if (mins) mins[i] = m;
+            }
+        }
+#endif
+
+        /**
+         * @brief Unpack Q2_K superblock to int8 - auto dispatch
+         */
         inline void unpack_q2_k_superblock_to_int8(
             const Q2_KBlock &block,
             int8_t *output,
@@ -12895,29 +13163,12 @@ namespace llaminar2
             static const bool has_avx2 = cpu_supports_avx2();
             if (has_avx2)
             {
-                for (int i = 0; i < 8; ++i)
-                {
-                    float s, m;
-                    transcode_q2_k_to_int8_avx2(block, i, output + i * 32, &s, &m);
-                    if (scales)
-                        scales[i] = s;
-                    if (mins)
-                        mins[i] = m;
-                }
+                unpack_q2_k_superblock_to_int8_avx2(block, output, scales, mins);
                 return;
             }
 #endif
 
-            // Scalar fallback
-            for (int i = 0; i < 8; ++i)
-            {
-                float s, m;
-                transcode_q2_k_to_int8_scalar(block, i, output + i * 32, &s, &m);
-                if (scales)
-                    scales[i] = s;
-                if (mins)
-                    mins[i] = m;
-            }
+            unpack_q2_k_superblock_to_int8_scalar(block, output, scales, mins);
         }
 
         /**
@@ -13107,63 +13358,54 @@ namespace llaminar2
         {
             // Load qs[16] bytes
             __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
-            __m128i low_mask = _mm_set1_epi8(0x0F);
+            __m128i low_mask_128 = _mm_set1_epi8(0x0F);
 
-            // Extract low and high nibbles
-            __m128i low_nibbles = _mm_and_si128(qs, low_mask);
-            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask);
+            // Extract low and high nibbles into two 128-bit halves
+            __m128i low_nibbles = _mm_and_si128(qs, low_mask_128);
+            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask_128);
 
-            // Load qh as 32-bit integer
+            // Combine into single 256-bit register: [low_nibbles | high_nibbles]
+            __m256i nibbles = _mm256_set_m128i(high_nibbles, low_nibbles);
+
+            // Load qh[4] as 32-bit
             uint32_t qh;
             std::memcpy(&qh, block.qh, sizeof(qh));
 
-            // Bit mapping from scalar code analysis:
-            // output[j] (j=0..15): xh_0 = ((qh >> j) << 4) & 0x10 => bit j of qh
-            // output[j+16] (j=0..15): xh_1 = ((qh >> (j+12)) & 0x10 => bit (j+16) of qh
-            //
-            // So: low nibbles use qh bits 0-15, high nibbles use qh bits 16-31
+            // Build broadcast vector: lo half gets bytes 0,1, hi half gets bytes 2,3
+            __m256i qh_broadcast = _mm256_set_epi8(
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh));
 
-            // Bit mask for testing each bit position within a byte
-            __m128i bit_mask = _mm_set_epi8(
+            // Bit test mask: within each 8-element group, test bit positions 7,6,5,...,0
+            __m256i bit_mask = _mm256_set_epi8(
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
                 static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
                 static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
 
-            // Extract each byte of qh
-            uint8_t qh_byte0 = static_cast<uint8_t>(qh);       // bits 0-7
-            uint8_t qh_byte1 = static_cast<uint8_t>(qh >> 8);  // bits 8-15
-            uint8_t qh_byte2 = static_cast<uint8_t>(qh >> 16); // bits 16-23
-            uint8_t qh_byte3 = static_cast<uint8_t>(qh >> 24); // bits 24-31
+            // Test bits and convert to 0x10 where bit is set
+            __m256i bits_tested = _mm256_and_si256(qh_broadcast, bit_mask);
+            __m256i bits_set = _mm256_cmpeq_epi8(bits_tested, bit_mask);
+            __m256i add_16 = _mm256_and_si256(bits_set, _mm256_set1_epi8(0x10));
 
-            // Broadcast bytes for low nibbles (output 0-15 need qh bits 0-15)
-            __m128i qh_lo = _mm_set_epi8(
-                qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1,
-                qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0);
+            // Combine nibbles + high bit (no offset for Q5_1 - asymmetric [0,31])
+            __m256i result = _mm256_or_si256(nibbles, add_16);
 
-            // Broadcast bytes for high nibbles (output 16-31 need qh bits 16-31)
-            __m128i qh_hi = _mm_set_epi8(
-                qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3,
-                qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2);
-
-            // Test each bit position
-            __m128i bits_lo = _mm_and_si128(qh_lo, bit_mask);
-            __m128i bits_hi = _mm_and_si128(qh_hi, bit_mask);
-
-            // Compare to get 0xFF where bit was set, 0x00 where not
-            bits_lo = _mm_cmpeq_epi8(bits_lo, bit_mask);
-            bits_hi = _mm_cmpeq_epi8(bits_hi, bit_mask);
-
-            // Convert 0xFF to 0x10 (bit 4 position)
-            __m128i pos4_mask = _mm_set1_epi8(0x10);
-            bits_lo = _mm_and_si128(bits_lo, pos4_mask);
-            bits_hi = _mm_and_si128(bits_hi, pos4_mask);
-
-            // Combine nibbles with high bits (no offset for Q5_1 - asymmetric [0,31])
-            __m128i result_lo = _mm_or_si128(low_nibbles, bits_lo);
-            __m128i result_hi = _mm_or_si128(high_nibbles, bits_hi);
-
-            // Store results
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), result_lo);
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), result_hi);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), result);
         }
 #endif
 
@@ -13175,57 +13417,54 @@ namespace llaminar2
         {
             // Load qs[16] bytes
             __m128i qs = _mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
-            __m128i low_mask = _mm_set1_epi8(0x0F);
+            __m128i low_mask_128 = _mm_set1_epi8(0x0F);
 
             // Extract low and high nibbles
-            __m128i low_nibbles = _mm_and_si128(qs, low_mask);
-            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask);
+            __m128i low_nibbles = _mm_and_si128(qs, low_mask_128);
+            __m128i high_nibbles = _mm_and_si128(_mm_srli_epi16(qs, 4), low_mask_128);
 
-            // Load qh as 32-bit integer
+            // Combine into single 256-bit register: [low_nibbles | high_nibbles]
+            __m256i nibbles = _mm256_set_m128i(high_nibbles, low_nibbles);
+
+            // Load qh[4] as 32-bit
             uint32_t qh;
             std::memcpy(&qh, block.qh, sizeof(qh));
 
-            // Bit mask for testing each bit position within a byte
-            __m128i bit_mask = _mm_set_epi8(
+            // Build broadcast vector: lo half gets bytes 0,1, hi half gets bytes 2,3
+            __m256i qh_broadcast = _mm256_set_epi8(
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 24), static_cast<char>(qh >> 24),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 16), static_cast<char>(qh >> 16),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh >> 8), static_cast<char>(qh >> 8),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh),
+                static_cast<char>(qh), static_cast<char>(qh));
+
+            // Bit test mask
+            __m256i bit_mask = _mm256_set_epi8(
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
+                static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
                 static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01,
                 static_cast<char>(0x80), 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
 
-            // Extract each byte of qh
-            uint8_t qh_byte0 = static_cast<uint8_t>(qh);       // bits 0-7
-            uint8_t qh_byte1 = static_cast<uint8_t>(qh >> 8);  // bits 8-15
-            uint8_t qh_byte2 = static_cast<uint8_t>(qh >> 16); // bits 16-23
-            uint8_t qh_byte3 = static_cast<uint8_t>(qh >> 24); // bits 24-31
+            // Test bits and convert to 0x10 where bit is set
+            __m256i bits_tested = _mm256_and_si256(qh_broadcast, bit_mask);
+            __m256i bits_set = _mm256_cmpeq_epi8(bits_tested, bit_mask);
+            __m256i add_16 = _mm256_and_si256(bits_set, _mm256_set1_epi8(0x10));
 
-            // Broadcast bytes for low nibbles (output 0-15 need qh bits 0-15)
-            __m128i qh_lo = _mm_set_epi8(
-                qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1, qh_byte1,
-                qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0, qh_byte0);
+            // Combine nibbles + high bit (no offset for Q5_1 - asymmetric [0,31])
+            __m256i result = _mm256_or_si256(nibbles, add_16);
 
-            // Broadcast bytes for high nibbles (output 16-31 need qh bits 16-31)
-            __m128i qh_hi = _mm_set_epi8(
-                qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3, qh_byte3,
-                qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2, qh_byte2);
-
-            // Test each bit position
-            __m128i bits_lo = _mm_and_si128(qh_lo, bit_mask);
-            __m128i bits_hi = _mm_and_si128(qh_hi, bit_mask);
-
-            // Compare to get 0xFF where bit was set, 0x00 where not
-            bits_lo = _mm_cmpeq_epi8(bits_lo, bit_mask);
-            bits_hi = _mm_cmpeq_epi8(bits_hi, bit_mask);
-
-            // Convert 0xFF to 0x10 (bit 4 position)
-            __m128i pos4_mask = _mm_set1_epi8(0x10);
-            bits_lo = _mm_and_si128(bits_lo, pos4_mask);
-            bits_hi = _mm_and_si128(bits_hi, pos4_mask);
-
-            // Combine nibbles with high bits (no offset for Q5_1 - asymmetric [0,31])
-            __m128i result_lo = _mm_or_si128(low_nibbles, bits_lo);
-            __m128i result_hi = _mm_or_si128(high_nibbles, bits_hi);
-
-            // Store results
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output), result_lo);
-            _mm_storeu_si128(reinterpret_cast<__m128i *>(output + 16), result_hi);
+            _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), result);
         }
 #endif
 
@@ -13348,87 +13587,12 @@ namespace llaminar2
          * @param scales Optional output buffer for 8 float scales
          * @param mins Optional output buffer for 8 float mins
          */
-        inline void unpack_q5_k_superblock_to_int8(
+        inline void unpack_q5_k_superblock_to_int8_scalar(
             const Q5_KBlock &block,
             int8_t *output,
             float *scales,
             float *mins)
         {
-#if defined(__AVX2__)
-            static const bool has_avx2 = cpu_supports_avx2();
-            if (has_avx2)
-            {
-                // Load high bits once (32 bytes) - contains high bits for all 8 sub-blocks
-                __m256i v_qh = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qh));
-                __m256i v_mask_0F = _mm256_set1_epi8(0x0F);
-                __m256i v_16 = _mm256_set1_epi8(16);
-                __m256i v_zero = _mm256_setzero_si256();
-
-                // Process 4 pairs of sub-blocks (8 sub-blocks total)
-                // Each iteration processes sub-blocks 2*i and 2*i+1
-                for (int i = 0; i < 4; ++i)
-                {
-                    // Load 32 bytes of qs (contains sub-blocks 2*i and 2*i+1)
-                    // qs has 128 bytes total. 32 bytes = 64 nibbles = 64 elements = 2 sub-blocks.
-                    const uint8_t *qs_ptr = block.qs + i * 32;
-                    __m256i v_qs = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qs_ptr));
-
-                    // Sub-block 2*i (Low nibbles)
-                    {
-                        int sb_idx = 2 * i;
-                        __m256i v_q_val = _mm256_and_si256(v_qs, v_mask_0F);
-
-                        // High bit extraction
-                        __m256i v_bit_mask = _mm256_set1_epi8(1 << sb_idx);
-                        __m256i v_high_bit = _mm256_and_si256(v_qh, v_bit_mask);
-                        __m256i v_is_zero = _mm256_cmpeq_epi8(v_high_bit, v_zero);
-                        __m256i v_add_16 = _mm256_andnot_si256(v_is_zero, v_16);
-                        v_q_val = _mm256_add_epi8(v_q_val, v_add_16);
-
-                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + sb_idx * 32), v_q_val);
-
-                        if (scales || mins)
-                        {
-                            float s, m;
-                            get_q5_k_scale_min(block, sb_idx, &s, &m);
-                            if (scales)
-                                scales[sb_idx] = s;
-                            if (mins)
-                                mins[sb_idx] = -m;
-                        }
-                    }
-
-                    // Sub-block 2*i+1 (High nibbles)
-                    {
-                        int sb_idx = 2 * i + 1;
-                        // Shift right by 4 bits (operating on 16-bit words, then masking)
-                        __m256i v_q_val = _mm256_and_si256(_mm256_srli_epi16(v_qs, 4), v_mask_0F);
-
-                        // High bit extraction
-                        __m256i v_bit_mask = _mm256_set1_epi8(1 << sb_idx);
-                        __m256i v_high_bit = _mm256_and_si256(v_qh, v_bit_mask);
-                        __m256i v_is_zero = _mm256_cmpeq_epi8(v_high_bit, v_zero);
-                        __m256i v_add_16 = _mm256_andnot_si256(v_is_zero, v_16);
-                        v_q_val = _mm256_add_epi8(v_q_val, v_add_16);
-
-                        _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + sb_idx * 32), v_q_val);
-
-                        if (scales || mins)
-                        {
-                            float s, m;
-                            get_q5_k_scale_min(block, sb_idx, &s, &m);
-                            if (scales)
-                                scales[sb_idx] = s;
-                            if (mins)
-                                mins[sb_idx] = -m;
-                        }
-                    }
-                }
-                return;
-            }
-#endif
-
-            // Scalar fallback
             for (int i = 0; i < 8; ++i)
             {
                 unpack_q5_k_to_int8_scalar(block, i, output + i * 32);
@@ -13442,6 +13606,200 @@ namespace llaminar2
                         mins[i] = -m;
                 }
             }
+        }
+
+#if defined(__AVX2__)
+        /**
+         * @brief Unpack Q5_K superblock to int8 - AVX2 version
+         */
+        inline void unpack_q5_k_superblock_to_int8_avx2(
+            const Q5_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            __m256i v_qh = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qh));
+            __m256i v_mask_0F = _mm256_set1_epi8(0x0F);
+            __m256i v_16 = _mm256_set1_epi8(16);
+            __m256i v_zero = _mm256_setzero_si256();
+
+            for (int i = 0; i < 4; ++i)
+            {
+                const uint8_t *qs_ptr = block.qs + i * 32;
+                __m256i v_qs = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(qs_ptr));
+
+                // Sub-block 2*i (Low nibbles)
+                {
+                    int sb_idx = 2 * i;
+                    __m256i v_q_val = _mm256_and_si256(v_qs, v_mask_0F);
+                    __m256i v_bit_mask = _mm256_set1_epi8(1 << sb_idx);
+                    __m256i v_high_bit = _mm256_and_si256(v_qh, v_bit_mask);
+                    __m256i v_is_zero = _mm256_cmpeq_epi8(v_high_bit, v_zero);
+                    __m256i v_add_16 = _mm256_andnot_si256(v_is_zero, v_16);
+                    v_q_val = _mm256_add_epi8(v_q_val, v_add_16);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + sb_idx * 32), v_q_val);
+
+                    if (scales || mins)
+                    {
+                        float s, m;
+                        get_q5_k_scale_min(block, sb_idx, &s, &m);
+                        if (scales) scales[sb_idx] = s;
+                        if (mins) mins[sb_idx] = -m;
+                    }
+                }
+
+                // Sub-block 2*i+1 (High nibbles)
+                {
+                    int sb_idx = 2 * i + 1;
+                    __m256i v_q_val = _mm256_and_si256(_mm256_srli_epi16(v_qs, 4), v_mask_0F);
+                    __m256i v_bit_mask = _mm256_set1_epi8(1 << sb_idx);
+                    __m256i v_high_bit = _mm256_and_si256(v_qh, v_bit_mask);
+                    __m256i v_is_zero = _mm256_cmpeq_epi8(v_high_bit, v_zero);
+                    __m256i v_add_16 = _mm256_andnot_si256(v_is_zero, v_16);
+                    v_q_val = _mm256_add_epi8(v_q_val, v_add_16);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i *>(output + sb_idx * 32), v_q_val);
+
+                    if (scales || mins)
+                    {
+                        float s, m;
+                        get_q5_k_scale_min(block, sb_idx, &s, &m);
+                        if (scales) scales[sb_idx] = s;
+                        if (mins) mins[sb_idx] = -m;
+                    }
+                }
+            }
+        }
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        /**
+         * @brief Unpack Q5_K superblock to int8 - AVX-512 version
+         *
+         * Fully unrolled: processes all 8 subblocks with interleaved loads/stores
+         * to exploit both 512-bit execution ports on Cascade Lake.
+         * Key optimization: batch qh bit extraction and nibble splitting
+         * without serial inner loops.
+         */
+        inline void unpack_q5_k_superblock_to_int8_avx512(
+            const Q5_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+            const __m256i v_qh = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(block.qh));
+            const __m256i v_16 = _mm256_set1_epi8(16);
+            const __m256i v_zero = _mm256_setzero_si256();
+            const __m512i v_mask_0F = _mm512_set1_epi8(0x0F);
+
+            // Load all 128 bytes of qs in two ZMM loads
+            const __m512i v_qs0 = _mm512_loadu_si512(block.qs);
+            const __m512i v_qs1 = _mm512_loadu_si512(block.qs + 64);
+
+            // Extract low and high nibbles for both halves — interleaved for ILP
+            const __m512i v_low0  = _mm512_and_si512(v_qs0, v_mask_0F);
+            const __m512i v_low1  = _mm512_and_si512(v_qs1, v_mask_0F);
+            const __m512i v_high0 = _mm512_and_si512(_mm512_srli_epi16(v_qs0, 4), v_mask_0F);
+            const __m512i v_high1 = _mm512_and_si512(_mm512_srli_epi16(v_qs1, 4), v_mask_0F);
+
+            // Extract 256-bit halves: sb0=low0_lo, sb1=high0_lo, sb2=low0_hi, sb3=high0_hi
+            //                         sb4=low1_lo, sb5=high1_lo, sb6=low1_hi, sb7=high1_hi
+            const __m256i v_sb0 = _mm512_castsi512_si256(v_low0);
+            const __m256i v_sb1 = _mm512_castsi512_si256(v_high0);
+            const __m256i v_sb2 = _mm512_extracti64x4_epi64(v_low0, 1);
+            const __m256i v_sb3 = _mm512_extracti64x4_epi64(v_high0, 1);
+            const __m256i v_sb4 = _mm512_castsi512_si256(v_low1);
+            const __m256i v_sb5 = _mm512_castsi512_si256(v_high1);
+            const __m256i v_sb6 = _mm512_extracti64x4_epi64(v_low1, 1);
+            const __m256i v_sb7 = _mm512_extracti64x4_epi64(v_high1, 1);
+
+            // Pre-compute all 8 bit masks and high-bit extractions
+            // Bit masks: sb0=0x01, sb1=0x02, sb2=0x04, sb3=0x08,
+            //            sb4=0x10, sb5=0x20, sb6=0x40, sb7=0x80
+            const __m256i v_bm0 = _mm256_set1_epi8(0x01);
+            const __m256i v_bm1 = _mm256_set1_epi8(0x02);
+            const __m256i v_bm2 = _mm256_set1_epi8(0x04);
+            const __m256i v_bm3 = _mm256_set1_epi8(0x08);
+            const __m256i v_bm4 = _mm256_set1_epi8(0x10);
+            const __m256i v_bm5 = _mm256_set1_epi8(0x20);
+            const __m256i v_bm6 = _mm256_set1_epi8(0x40);
+            const __m256i v_bm7 = _mm256_set1_epi8(static_cast<char>(0x80));
+
+            // Extract high bits: test qh & bit_mask, then convert to +16
+            // Interleave pairs for ILP on 2 execution ports
+            __m256i v_hb0 = _mm256_and_si256(v_qh, v_bm0);
+            __m256i v_hb1 = _mm256_and_si256(v_qh, v_bm1);
+            __m256i v_add0 = _mm256_andnot_si256(_mm256_cmpeq_epi8(v_hb0, v_zero), v_16);
+            __m256i v_add1 = _mm256_andnot_si256(_mm256_cmpeq_epi8(v_hb1, v_zero), v_16);
+
+            __m256i v_hb2 = _mm256_and_si256(v_qh, v_bm2);
+            __m256i v_hb3 = _mm256_and_si256(v_qh, v_bm3);
+            __m256i v_add2 = _mm256_andnot_si256(_mm256_cmpeq_epi8(v_hb2, v_zero), v_16);
+            __m256i v_add3 = _mm256_andnot_si256(_mm256_cmpeq_epi8(v_hb3, v_zero), v_16);
+
+            __m256i v_hb4 = _mm256_and_si256(v_qh, v_bm4);
+            __m256i v_hb5 = _mm256_and_si256(v_qh, v_bm5);
+            __m256i v_add4 = _mm256_andnot_si256(_mm256_cmpeq_epi8(v_hb4, v_zero), v_16);
+            __m256i v_add5 = _mm256_andnot_si256(_mm256_cmpeq_epi8(v_hb5, v_zero), v_16);
+
+            __m256i v_hb6 = _mm256_and_si256(v_qh, v_bm6);
+            __m256i v_hb7 = _mm256_and_si256(v_qh, v_bm7);
+            __m256i v_add6 = _mm256_andnot_si256(_mm256_cmpeq_epi8(v_hb6, v_zero), v_16);
+            __m256i v_add7 = _mm256_andnot_si256(_mm256_cmpeq_epi8(v_hb7, v_zero), v_16);
+
+            // Merge nibbles + high bits and store — interleaved pairs
+            _mm256_storeu_si256((__m256i *)(output + 0 * 32), _mm256_add_epi8(v_sb0, v_add0));
+            _mm256_storeu_si256((__m256i *)(output + 1 * 32), _mm256_add_epi8(v_sb1, v_add1));
+            _mm256_storeu_si256((__m256i *)(output + 2 * 32), _mm256_add_epi8(v_sb2, v_add2));
+            _mm256_storeu_si256((__m256i *)(output + 3 * 32), _mm256_add_epi8(v_sb3, v_add3));
+            _mm256_storeu_si256((__m256i *)(output + 4 * 32), _mm256_add_epi8(v_sb4, v_add4));
+            _mm256_storeu_si256((__m256i *)(output + 5 * 32), _mm256_add_epi8(v_sb5, v_add5));
+            _mm256_storeu_si256((__m256i *)(output + 6 * 32), _mm256_add_epi8(v_sb6, v_add6));
+            _mm256_storeu_si256((__m256i *)(output + 7 * 32), _mm256_add_epi8(v_sb7, v_add7));
+
+            // Compute scales/mins for all 8 subblocks
+            if (scales || mins)
+            {
+                const float d_val = fp16_to_fp32(block.d);
+                const float dmin_val = fp16_to_fp32(block.dmin);
+                for (int i = 0; i < 8; ++i)
+                {
+                    uint8_t sc, m;
+                    get_scale_min_k4(i, block.scales, &sc, &m);
+                    if (scales) scales[i] = d_val * sc;
+                    if (mins) mins[i] = -(dmin_val * m);
+                }
+            }
+        }
+#endif
+
+        /**
+         * @brief Unpack Q5_K superblock to int8 - auto dispatch
+         */
+        inline void unpack_q5_k_superblock_to_int8(
+            const Q5_KBlock &block,
+            int8_t *output,
+            float *scales,
+            float *mins)
+        {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+            static const bool has_avx512 = cpu_supports_avx512();
+            if (has_avx512)
+            {
+                unpack_q5_k_superblock_to_int8_avx512(block, output, scales, mins);
+                return;
+            }
+#endif
+
+#if defined(__AVX2__)
+            static const bool has_avx2 = cpu_supports_avx2();
+            if (has_avx2)
+            {
+                unpack_q5_k_superblock_to_int8_avx2(block, output, scales, mins);
+                return;
+            }
+#endif
+
+            unpack_q5_k_superblock_to_int8_scalar(block, output, scales, mins);
         }
 
         /**

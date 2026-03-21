@@ -2,7 +2,7 @@
 #include <vector>
 #include <memory>
 #include <cmath>
-#include "v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "v2/kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 #include "v2/tensors/Tensors.h"
 #include "v2/utils/MPIContext.h"
 
@@ -99,7 +99,7 @@ TEST(Test__QuantisedGemmKernel_Repro, AsymmetricQuantizationError)
     weights.set_block_min(0, 0, 10.0f);
 
     // Create kernel (packs weights)
-    gemm_v4::QuantisedGemmKernel kernel(&weights);
+    gemm::CPUQuantisedGemmKernel kernel(&weights);
 
     // Input A (all 1s)
     std::vector<float> A(M * K, 1.0f);
@@ -127,7 +127,7 @@ TEST(Test__QuantisedGemmKernel_Repro, TailTruncationBug)
     // Expected value = 1.0 * 1 + 0.0 = 1.0
 
     // Create kernel (packs weights)
-    gemm_v4::QuantisedGemmKernel kernel(&weights);
+    gemm::CPUQuantisedGemmKernel kernel(&weights);
 
     // Input A (all 1s)
     std::vector<float> A(M * K, 1.0f);

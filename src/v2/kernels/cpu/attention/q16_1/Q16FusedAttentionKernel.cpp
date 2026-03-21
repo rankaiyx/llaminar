@@ -250,7 +250,7 @@ namespace llaminar2
             ref_params.kv_head_scales = kv_scales.data();
 
             // Wo weights: Convert from FusedAttentionWoParams to Q16IntegerAttentionParams
-            // Both use llaminar2::gemm_v4::QuantisedPackedWeights
+            // Both use llaminar2::gemm::QuantisedPackedWeights
             ref_params.Wo_packed = params.Wo_packed;
 
             // Output buffer for Wo projection: MUST be a separate temporary buffer!

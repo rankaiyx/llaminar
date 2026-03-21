@@ -22,8 +22,8 @@
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
 #include "kernels/cpu/attention/CPUAttentionKernelT.h"
 #include "kernels/cpu/attention/q16_1/Q16FusedAttentionKernel.h"
-#include "kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 
 namespace llaminar2
 {

@@ -2,7 +2,7 @@
  * @file Perf__CpuGemvDecode.cpp
  * @brief Performance benchmark for CPU GEMV (M=1 decode) and GEMM (prefill) paths
  *
- * Benchmarks QuantisedGemmKernel with realistic Qwen model layer shapes:
+ * Benchmarks CPUQuantisedGemmKernel with realistic Qwen model layer shapes:
  *   - QKV projection (fused 3-way)
  *   - Attention output (Wo) projection
  *   - FFN gate+up (fused 2-way)
@@ -30,10 +30,10 @@
 
 #include "fort.hpp"
 #include "tensors/Tensors.h"
-#include "kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 
 using namespace llaminar2;
-using namespace llaminar2::gemm_v4;
+using namespace llaminar2::gemm;
 
 // ============================================================================
 // Model configurations (matching real Qwen architectures)
@@ -175,7 +175,7 @@ protected:
         auto weights = create_weights(N, K, gen);
         auto deq = dequantize(weights.get(), N, K);
 
-        QuantisedGemmKernel kernel(weights.get());
+        CPUQuantisedGemmKernel kernel(weights.get());
 
         std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
         std::vector<float> A(static_cast<size_t>(M) * K);

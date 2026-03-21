@@ -9,8 +9,8 @@
 #include "v2/tensors/TensorFactory.h"
 #include "v2/tensors/BlockStructures.h"
 #include "v2/tensors/FP16Utils.h"
-#include "v2/kernels/cpu/gemm_v4/FloatingPointGemmKernel.h"
-#include "v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h"
+#include "v2/kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#include "v2/kernels/cpu/gemm/CPUQuantisedGemmKernel.h"
 
 using namespace llaminar2;
 
@@ -178,7 +178,7 @@ TEST_F(Test__IQ4_NLTensor, GemmCorrectness_Negative)
 TEST_F(Test__IQ4_NLTensor, GemmCorrectness_Random)
 {
     // Dimensions
-    // Note: M > 1 currently fails with large errors in QuantisedGemmKernel.
+    // Note: M > 1 currently fails with large errors in CPUQuantisedGemmKernel.
     // Keeping M=1 for now to verify IQ4_NL decoding logic.
     int m = 1;
     int n = 32;
@@ -262,7 +262,7 @@ TEST_F(Test__IQ4_NLTensor, QuantizedVsFP32Parity)
     // Test dimensions: M=4, N=64, K=256
     // A: FP32 activation (random values)
     // B: IQ4_NL weight (random data with valid scales)
-    // Compare: QuantisedGemmKernel vs FloatingPointGemmKernel on FP32
+    // Compare: CPUQuantisedGemmKernel vs FloatingPointGemmKernel on FP32
 
     int m = 4;
     int n = 64;
@@ -312,15 +312,15 @@ TEST_F(Test__IQ4_NLTensor, QuantizedVsFP32Parity)
     auto C_ref = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_ref->mutable_data(), m * n, 0.0f);
 
-    gemm_v4::FloatingPointGemmKernel fp_kernel(B_fp32.get());
+    gemm::FloatingPointGemmKernel fp_kernel(B_fp32.get());
     // B is [N, K], so transpose_B=true to compute A @ B^T
     fp_kernel.multiply(A_fp32->data(), C_ref->mutable_data(), m, n, k, true);
 
-    // === Test: QuantisedGemmKernel with IQ4_NL weights ===
+    // === Test: CPUQuantisedGemmKernel with IQ4_NL weights ===
     auto C_quant = factory.createFP32({static_cast<size_t>(m), static_cast<size_t>(n)});
     std::fill_n(C_quant->mutable_data(), m * n, 0.0f);
 
-    gemm_v4::QuantisedGemmKernel quant_kernel(B_iq4nl.get());
+    gemm::CPUQuantisedGemmKernel quant_kernel(B_iq4nl.get());
     quant_kernel.multiply(A_fp32->data(), C_quant->mutable_data(), m, n, k, true, 1.0f, 0.0f, nullptr, -1);
 
     // === Compare results ===

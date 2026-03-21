@@ -41,7 +41,7 @@ namespace llaminar2::test
 
     using namespace llaminar2::kernels::q16_1::microkernels;
     using namespace llaminar2::simd;
-    using namespace llaminar2::gemm_v4;
+    using namespace llaminar2::gemm;
 
     /**
      * @brief Test fixture for Q16 attention output composition.

@@ -27,7 +27,7 @@ namespace llaminar2
      *
      * Pattern: input → [gate_proj, up_proj] → SwiGLU → down_proj
      *
-     * This stage delegates to QuantisedGemmKernel::multiply_fused_multi(), which
+     * This stage delegates to CPUQuantisedGemmKernel::multiply_fused_multi(), which
      * handles the quantization and multi-projection execution internally.
      *
      * **Workspace Management (Phase 4)**:
