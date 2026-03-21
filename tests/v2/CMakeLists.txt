@@ -6783,6 +6783,18 @@ add_v2_test(V2_Perf_QuantisedGemmKernel_Q4_0
     LABELS "V2;Performance;GEMM;Q4_0"
 )
 
+# Performance Test: CPU GEMV Decode (M=1) and Prefill (M>1) with model-sized shapes
+add_executable(v2_perf_cpu_gemv_decode performance/kernels/cpu/gemm/gemm_v4/Perf__CpuGemvDecode.cpp)
+target_link_libraries(v2_perf_cpu_gemv_decode 
+    llaminar2_core 
+    GTest::gtest
+)
+add_v2_test(V2_Perf_CpuGemvDecode
+    COMMAND $<TARGET_FILE:v2_perf_cpu_gemv_decode>
+    LABELS "V2;Performance;GEMM;GEMV;Q8_1;JIT;Decode;Prefill;CPU"
+    MPI_PROCS 1
+)
+
 # Performance Test: Q8_1 Quantize SIMD (Scalar/AVX2/AVX512 throughput comparison)
 add_executable(v2_perf_q8_1_quantize_simd performance/Perf__Q8_1_QuantizeSIMD.cpp)
 target_link_libraries(v2_perf_q8_1_quantize_simd 

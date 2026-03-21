@@ -1130,7 +1130,17 @@ namespace llaminar2
                     // Clamp to max_n_block (L2 cache constraint)
                     // Ensure even splitting if we clamp to avoid load imbalance (e.g. 832 vs 64)
                     int n_task_block;
-                    if (calc_block > max_n_block)
+                    if (m <= 1)
+                    {
+                        // For M=1 (GEMV), the L2 block size constraint serves no purpose:
+                        // there is only one row so B data is streamed once with no reuse
+                        // across rows. Skip the L2 clamp and use the parallelism-driven
+                        // calc_block directly. This gives large contiguous chunks with few
+                        // threads (good for streaming) and appropriately many tasks with
+                        // many threads (good for load balancing).
+                        n_task_block = calc_block;
+                    }
+                    else if (calc_block > max_n_block)
                     {
                         int num_splits = (n + max_n_block - 1) / max_n_block;
                         int even_block = (n + num_splits - 1) / num_splits;
@@ -1150,6 +1160,14 @@ namespace llaminar2
                     // This ensures we tile even for moderate block sizes when M is large
                     const long long L2_CACHE_SIZE = (long long)(l2_size * debugEnv().gemm.gemm_k_tile_threshold_pct);
                     bool needs_k_tiling = ((long long)n_task_block * k > L2_CACHE_SIZE);
+
+                    // K-tiling only helps when M > 1: with multiple rows we can reuse
+                    // the same B tile across rows, keeping it warm in L2. For M=1 (GEMV),
+                    // there is only one row so B is streamed once regardless — K-tiling
+                    // just changes traversal order without any reuse benefit, and the
+                    // strided comp/scales accesses it introduces can hurt DRAM throughput.
+                    if (m <= 1)
+                        needs_k_tiling = false;
 
                     // Check if we have enough parallelism to avoid collapsing M
                     int num_n_tasks = (n + n_task_block - 1) / n_task_block;
