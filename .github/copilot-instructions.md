@@ -487,6 +487,104 @@ sudo /usr/local/cuda/bin/ncu -i /tmp/variant_b_ncu.ncu-rep --page details
 
 ---
 
+## CPU perf Profiling (Linux perf)
+
+### Overview
+
+Use Linux `perf` for CPU-side profiling of hotspots, IPC, cache misses, and instruction-level bottleneck analysis. This is the primary tool for optimizing CPU kernels (GEMM, attention, quantization).
+
+### Prerequisites
+
+Enable hardware counters (requires root, resets on reboot):
+
+```bash
+sudo sh -c 'echo -1 > /proc/sys/kernel/perf_event_paranoid'
+```
+
+Without this, `perf stat -a` (system-wide mode) will fail with permission errors, and per-process mode won't track OpenMP worker threads.
+
+### CRITICAL: Use `--no-mpi-bootstrap` and System-Wide Mode
+
+Llaminar auto-bootstraps MPI via `mpirun` when launched directly. `perf` will attach to the **mpirun wrapper** instead of the actual compute process. Additionally, per-process mode (`perf stat ./binary`) only tracks the main thread — OpenMP worker threads are invisible.
+
+**Solution**: Use `--no-mpi-bootstrap` + system-wide mode (`-a --cpu <cores>`) + `taskset` to pin:
+
+```bash
+# Create a wrapper script with OMP environment
+cat > /tmp/run_bench.sh << 'SCRIPT'
+#!/bin/bash
+export OMP_NUM_THREADS=28
+export OMP_PLACES=cores
+export OMP_PROC_BIND=close
+exec ./build_v2_release/llaminar2 --no-mpi-bootstrap -d cpu:0 \
+  -m models/Qwen2.5-7B-Instruct-Q8_0.gguf \
+  --benchmark -p "Your prompt here" -n 1
+SCRIPT
+chmod +x /tmp/run_bench.sh
+```
+
+### perf stat: Hardware Counters
+
+```bash
+# System-wide counters on cores 0-27 (single socket)
+perf stat -a --cpu 0-27 -- taskset -c 0-27 bash /tmp/run_bench.sh
+
+# Dual-socket (0-55)
+perf stat -a --cpu 0-55 -- taskset -c 0-55 bash /tmp/run_bench.sh
+```
+
+**Key metrics to check**:
+
+| Metric | Healthy Range | Red Flag |
+|--------|---------------|----------|
+| IPC (insn per cycle) | >2.0 for VNNI kernels | <1.5 → memory-bound or stalls |
+| L1-dcache-load-misses | <20% of total loads | >40% → poor data locality |
+| LLC-load-misses | <30% of LLC loads | >50% → DRAM-bound |
+
+### perf record + report: Hotspot Analysis
+
+```bash
+# Record with frame-pointer call graphs (NOT dwarf — dwarf loses 60%+ samples)
+perf record -a --cpu 0-27 --call-graph fp -F 997 -- taskset -c 0-27 bash /tmp/run_bench.sh
+
+# Interactive hotspot report
+perf report --no-children --sort=dso,symbol
+
+# Top functions with percentages
+perf report --no-children --stdio --sort=symbol | head -40
+```
+
+**IMPORTANT**: Use `--call-graph fp` (frame pointer), NOT `--call-graph dwarf`. DWARF unwinding loses 60-70% of samples due to high overhead. Frame pointers work reliably with `-fno-omit-frame-pointer` (default in our builds).
+
+### perf annotate: Instruction-Level Analysis
+
+After `perf record`, drill into specific functions:
+
+```bash
+# Annotate a specific function
+perf annotate --symbol='gemm_native_vnni_preq' --stdio
+
+# Or interactively
+perf report  # then press 'a' on a function to annotate
+```
+
+This shows per-instruction sample percentages, revealing:
+- Register spills (`vmovdqa32 %zmm*, -offset(%rbp)`)
+- Register-to-register shuffles (`vmovdqa64 %zmm*, %zmm*`)
+- Cache miss hotspots (high sample count on load instructions)
+- VPDPBUSD compute vs overhead ratio
+
+### Common Diagnosis Patterns
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| High % on `vmovdqa64` between ZMM regs | Register pressure (>32 ZMMs needed) | Reduce live registers per microkernel |
+| High % on `pause` in libgomp | OpenMP barrier spin-wait | Reduce barrier count, use `nowait` |
+| Low IPC + high L1 miss rate | Poor data locality | Reorder loops for cache reuse |
+| High % on stack spill/reload | Register spill to stack | Simplify microkernel, process fewer columns |
+
+---
+
 ## Testing Guidelines
 
 ### Test Organization

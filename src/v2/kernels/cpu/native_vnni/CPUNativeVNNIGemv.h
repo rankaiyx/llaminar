@@ -911,41 +911,30 @@ namespace llaminar2::cpu::native_vnni
 
             for (int group = 0; group < 8; ++group)
             {
-                // Load B once — shared
-                __m512i b0 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 0));
-                __m512i b1 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 1));
-                __m512i b2 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 2));
-                __m512i b3 = _mm512_load_si512(packed.interleavedB(chunk, kb, group, 3));
+                // GPR-only A-prep: XOR with 0x80 converts signed→unsigned bytes,
+                // avoids xmm intermediaries that alias zmm accumulators.
+                // vpbroadcastd has a GPR source form on AVX-512 (no xmm needed).
+                int32_t raw0, raw1;
+                std::memcpy(&raw0, &a0.qs[group * 4], 4);
+                std::memcpy(&raw1, &a1.qs[group * 4], 4);
+                __m512i a0_bc = _mm512_set1_epi32(static_cast<int32_t>(
+                    static_cast<uint32_t>(raw0) ^ 0x80808080u));
+                __m512i a1_bc = _mm512_set1_epi32(static_cast<int32_t>(
+                    static_cast<uint32_t>(raw1) ^ 0x80808080u));
 
-                // Row 0
-                {
-                    uint8_t vals[4];
-                    vals[0] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 0]) + 128);
-                    vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 1]) + 128);
-                    vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 2]) + 128);
-                    vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a0.qs[group * 4 + 3]) + 128);
-                    int32_t v; std::memcpy(&v, vals, 4);
-                    __m512i ab = _mm512_set1_epi32(v);
-                    ia0_0 = _mm512_dpbusd_epi32(ia0_0, ab, b0);
-                    ia0_1 = _mm512_dpbusd_epi32(ia0_1, ab, b1);
-                    ia0_2 = _mm512_dpbusd_epi32(ia0_2, ab, b2);
-                    ia0_3 = _mm512_dpbusd_epi32(ia0_3, ab, b3);
+                // Load-use-discard: 1 B register live at a time (not 4).
+                // Peak: 8 INT32 + 8 FP32 + 2 A + 1 B + 1 const = 20 ZMMs.
+                #define INT8_SUBCHUNK(Z, IA0, IA1) \
+                { \
+                    __m512i b = _mm512_load_si512(packed.interleavedB(chunk, kb, group, Z)); \
+                    IA0 = _mm512_dpbusd_epi32(IA0, a0_bc, b); \
+                    IA1 = _mm512_dpbusd_epi32(IA1, a1_bc, b); \
                 }
-
-                // Row 1
-                {
-                    uint8_t vals[4];
-                    vals[0] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 0]) + 128);
-                    vals[1] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 1]) + 128);
-                    vals[2] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 2]) + 128);
-                    vals[3] = static_cast<uint8_t>(static_cast<int16_t>(a1.qs[group * 4 + 3]) + 128);
-                    int32_t v; std::memcpy(&v, vals, 4);
-                    __m512i ab = _mm512_set1_epi32(v);
-                    ia1_0 = _mm512_dpbusd_epi32(ia1_0, ab, b0);
-                    ia1_1 = _mm512_dpbusd_epi32(ia1_1, ab, b1);
-                    ia1_2 = _mm512_dpbusd_epi32(ia1_2, ab, b2);
-                    ia1_3 = _mm512_dpbusd_epi32(ia1_3, ab, b3);
-                }
+                INT8_SUBCHUNK(0, ia0_0, ia1_0)
+                INT8_SUBCHUNK(1, ia0_1, ia1_1)
+                INT8_SUBCHUNK(2, ia0_2, ia1_2)
+                INT8_SUBCHUNK(3, ia0_3, ia1_3)
+                #undef INT8_SUBCHUNK
             }
 
             // Bias correction (shared comp loads)
