@@ -736,6 +736,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Record a kernel whose timing was accumulated inside an OMP
+         *        parallel region (e.g. via `#pragma omp for reduction(+:ns)`).
+         *
+         * Thread-time sums are divided by the active thread count to produce
+         * a wall-clock estimate.  This prevents parallelised sub-kernels
+         * (like ATTENTION_QK / ATTENTION_V) from appearing to dominate
+         * execution time in the profiler output.
+         *
+         * @param type              Kernel type
+         * @param thread_time_ns    Accumulated nanoseconds across all threads
+         * @param num_threads       Number of OMP threads that contributed
+         */
+        static void recordParallel(KernelType type, uint64_t thread_time_ns, int num_threads)
+        {
+            if (!isEnabled() || num_threads <= 0)
+                return;
+            record(type, thread_time_ns / static_cast<uint64_t>(num_threads));
+        }
+
+        /**
          * @brief Get stats for a kernel type (global/combined)
          */
         static KernelStats &getStats(KernelType type)

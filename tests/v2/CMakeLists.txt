@@ -6248,6 +6248,22 @@ add_v2_test(V2_Perf_CPUNativeVNNI_Sweep
     MPI_PROCS 1
 )
 
+# Performance Test: CPU NativeVNNI Dispatch Parameter Sweep (tile heuristic tuning)
+add_executable(v2_perf_cpu_native_vnni_dispatch_sweep performance/kernels/cpu/native_vnni/Perf__CPUNativeVNNI_DispatchSweep.cpp)
+target_link_libraries(v2_perf_cpu_native_vnni_dispatch_sweep
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_perf_cpu_native_vnni_dispatch_sweep PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ includes (TestTensorFactory)
+)
+add_v2_test(V2_Perf_CPUNativeVNNI_DispatchSweep
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_dispatch_sweep>
+    LABELS "V2;Performance;GEMM;GEMV;NativeVNNI;CPU;Dispatch;Tuning;Qwen"
+    MPI_PROCS 1
+)
+
 # Performance Test: NativeVNNI vs oneDNN Reference (INT8 matmul baseline comparison)
 if(ONEDNN_LIB)
     add_executable(v2_perf_onednn_reference performance/kernels/cpu/native_vnni/Perf__OneDNN_Reference.cpp)

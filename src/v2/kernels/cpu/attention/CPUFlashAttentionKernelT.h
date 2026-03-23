@@ -772,6 +772,129 @@ namespace llaminar2
 #endif
         }
 
+#if defined(__AVX512F__)
+        /**
+         * @brief Fast vectorised exp() for 16 FP32 values using AVX-512.
+         *
+         * Uses range reduction (x = n*ln2 + f) and a 5th-order polynomial
+         * approximation of exp(f) on [-ln2/2, ln2/2].  Inputs below -88.7
+         * are clamped to produce 0 (avoids NaN from -inf).
+         * Accuracy: <1 ULP for |x| < 87.
+         */
+        static inline __m512 fast_exp_avx512(__m512 x)
+        {
+            // Clamp to avoid NaN from -inf inputs (exp(-88.7) ≈ 0)
+            x = _mm512_max_ps(x, _mm512_set1_ps(-88.722839f));
+
+            const __m512 log2e  = _mm512_set1_ps(1.4426950408889634f);
+            const __m512 ln2_hi = _mm512_set1_ps(0.693145751953125f);
+            const __m512 ln2_lo = _mm512_set1_ps(1.42860682030941723212e-06f);
+
+            // Range reduction: n = round(x / ln2), f = x - n*ln2
+            __m512 t = _mm512_mul_ps(x, log2e);
+            __m512 n = _mm512_roundscale_ps(t, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            __m512 f = _mm512_fnmadd_ps(n, ln2_hi, x);
+            f = _mm512_fnmadd_ps(n, ln2_lo, f);
+
+            // Horner evaluation of exp(f) ≈ 1 + f + f²/2 + f³/6 + f⁴/24 + f⁵/120
+            __m512 p = _mm512_set1_ps(8.36564774e-03f);              // ≈ 1/120
+            p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(4.16689515e-02f)); // ≈ 1/24
+            p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.66666716e-01f)); // ≈ 1/6
+            p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(4.99999851e-01f)); // ≈ 1/2
+            p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.00000000e+00f)); // 1
+            p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.00000000e+00f)); // 1
+
+            // Construct 2^n by setting the IEEE754 exponent field
+            // Clamp ni >= 0 so that extreme negative inputs (masked -inf
+            // positions clamped to -88.7) produce 0 rather than NaN.
+            __m512i ni = _mm512_cvtps_epi32(n);
+            ni = _mm512_add_epi32(ni, _mm512_set1_epi32(127));
+            ni = _mm512_max_epi32(ni, _mm512_setzero_si512());
+            ni = _mm512_slli_epi32(ni, 23);
+            return _mm512_mul_ps(p, _mm512_castsi512_ps(ni));
+        }
+
+        /**
+         * @brief Compute 4 dot products Q·K[0..3] simultaneously for ILP.
+         *
+         * By running 4 independent FMA accumulator chains, we keep both
+         * FMA ports busy on Cascade Lake (2 FMA/cycle, 4-cycle latency).
+         * Throughput: ~13 cycles per K-row vs ~32 for the single-accumulator
+         * dot_fp32_avx512 path (limited by FMA latency).
+         */
+        static void dot_fp32_avx512_4row(
+            const float *q,
+            const float *k0, const float *k1, const float *k2, const float *k3,
+            int head_dim,
+            float &s0, float &s1, float &s2, float &s3)
+        {
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+
+            int d = 0;
+            for (; d + 15 < head_dim; d += 16)
+            {
+                __m512 vq = _mm512_loadu_ps(q + d);
+                acc0 = _mm512_fmadd_ps(vq, _mm512_loadu_ps(k0 + d), acc0);
+                acc1 = _mm512_fmadd_ps(vq, _mm512_loadu_ps(k1 + d), acc1);
+                acc2 = _mm512_fmadd_ps(vq, _mm512_loadu_ps(k2 + d), acc2);
+                acc3 = _mm512_fmadd_ps(vq, _mm512_loadu_ps(k3 + d), acc3);
+            }
+
+            s0 = _mm512_reduce_add_ps(acc0);
+            s1 = _mm512_reduce_add_ps(acc1);
+            s2 = _mm512_reduce_add_ps(acc2);
+            s3 = _mm512_reduce_add_ps(acc3);
+
+            for (; d < head_dim; ++d)
+            {
+                float qd = q[d];
+                s0 += qd * k0[d];
+                s1 += qd * k1[d];
+                s2 += qd * k2[d];
+                s3 += qd * k3[d];
+            }
+        }
+#endif
+
+        /**
+         * @brief Compute optimal thread count for attention based on work size.
+         *
+         * Balances parallelism against OpenMP fork/join overhead (~30-50µs)
+         * by estimating total FLOPs and ensuring each thread has enough work
+         * to amortise the cost of entering a parallel region.
+         *
+         * At ~25 GFLOP/s effective FP32 throughput per core, 50µs = 1.25M FLOPs.
+         * We use 2M as the threshold to ensure clear amortisation.
+         */
+        static int computeOptimalAttentionThreads(
+            int n_heads, int seq_len, int kv_len, int head_dim, bool causal)
+        {
+            const int max_threads = omp_get_max_threads();
+
+            // Work per head: QK dots + V accumulation + exp overhead
+            // Causal masking halves the average KV positions per query.
+            const int64_t avg_kv = causal ? (static_cast<int64_t>(kv_len) + 1) / 2
+                                          : static_cast<int64_t>(kv_len);
+            const int64_t flops_per_head =
+                static_cast<int64_t>(seq_len) * avg_kv * static_cast<int64_t>(head_dim) * 4
+                + static_cast<int64_t>(seq_len) * avg_kv * 10; // exp + softmax overhead
+            const int64_t total_flops = flops_per_head * n_heads;
+
+            // Minimum FLOPs per thread to justify OMP overhead
+            constexpr int64_t MIN_FLOPS_PER_THREAD = 2000000; // ~80µs at 25 GFLOP/s
+
+            if (total_flops <= MIN_FLOPS_PER_THREAD)
+            {
+                return 1;
+            }
+
+            int desired = static_cast<int>(total_flops / MIN_FLOPS_PER_THREAD);
+            return std::max(1, std::min({desired, n_heads, max_threads}));
+        }
+
         // -----------------------------------------------------------------
         // Vector accumulation and scaling helpers
         // -----------------------------------------------------------------
@@ -1604,10 +1727,13 @@ namespace llaminar2
             // ---------------------------------------------------------------
             // Phase 2: Main flash-attention loop (parallel over heads)
             // ---------------------------------------------------------------
-            // Each head is completely independent, so we parallelise across
-            // heads with OpenMP.  Within each head, we iterate over all
-            // query positions and, for each query, stream through KV in
-            // tiles, maintaining the online softmax state.
+            // Compute optimal thread count.  For small problems (short
+            // sequences, decode), the per-head work may be too small to
+            // amortise OMP fork/join overhead (~30-50µs).  The heuristic
+            // estimates total FLOPs and scales threads accordingly.
+            const int attn_threads = computeOptimalAttentionThreads(
+                n_heads, seq_len, kv_len, head_dim, causal);
+
             auto work = [&]()
             {
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
@@ -1814,12 +1940,40 @@ namespace llaminar2
                                     continue;
                                 }
 
-                                // --- FP32 path: standard AVX-512 dot product ---
+                                // --- FP32 path: batched 4-row dot products for ILP ---
+#if defined(__AVX512F__)
+                                if (k + 3 < valid_end)
+                                {
+                                    const float *kbase = K + static_cast<size_t>(kv_h) * head_dim;
+                                    float s0, s1, s2, s3;
+                                    dot_fp32_avx512_4row(
+                                        q_ptr,
+                                        kbase + static_cast<size_t>(k + 0) * kv_stride,
+                                        kbase + static_cast<size_t>(k + 1) * kv_stride,
+                                        kbase + static_cast<size_t>(k + 2) * kv_stride,
+                                        kbase + static_cast<size_t>(k + 3) * kv_stride,
+                                        head_dim, s0, s1, s2, s3);
+                                    s0 *= scale; s1 *= scale; s2 *= scale; s3 *= scale;
+                                    if (mask_row)
+                                    {
+                                        s0 += mask_row[k + 0]; s1 += mask_row[k + 1];
+                                        s2 += mask_row[k + 2]; s3 += mask_row[k + 3];
+                                    }
+                                    block_scores[static_cast<size_t>(k - k0 + 0)] = s0;
+                                    block_scores[static_cast<size_t>(k - k0 + 1)] = s1;
+                                    block_scores[static_cast<size_t>(k - k0 + 2)] = s2;
+                                    block_scores[static_cast<size_t>(k - k0 + 3)] = s3;
+                                    block_max = std::max(block_max, std::max(std::max(s0, s1), std::max(s2, s3)));
+                                    k += 4;
+                                    continue;
+                                }
+#endif
+                                // Scalar / tail path
                                 float s = dot_fp32_avx512(
                                     q_ptr,
                                     K + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim,
                                     head_dim);
-                                s *= scale; // Apply attention scaling: score = (Q · K) / √d
+                                s *= scale;
 
                                 if (mask_row)
                                 {
@@ -1890,16 +2044,23 @@ namespace llaminar2
                 } // end head loop
             };
 
-            // Execute the work lambda inside an OMP workshare region.
-            // If we are already inside a parallel region (e.g. fused-layer
-            // execution), this avoids an expensive thread fork/join.
-            OMP_WORKSHARE_REGION(work);
+            // Execute with adaptive thread count.  For small problems
+            // (decode, short prefill), fewer threads avoids OMP overhead
+            // that otherwise dominates the tiny per-head compute.
+#pragma omp parallel num_threads(attn_threads)
+            {
+                work();
+            }
 
             // Report profiling breakdown (QK vs V phase) if enabled.
+            // qk_duration_ns and v_duration_ns are thread-time sums from
+            // the OMP reduction — divide by active thread count to get
+            // wall-clock estimates that are consistent with other kernel
+            // timings in the profiler output.
             if (profiling_enabled)
             {
-                KernelProfiler::record(KernelType::ATTENTION_QK, qk_duration_ns);
-                KernelProfiler::record(KernelType::ATTENTION_V, v_duration_ns);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, attn_threads);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, attn_threads);
             }
             return true;
         }

@@ -2655,12 +2655,55 @@ namespace llaminar2
     };
 
     /**
+     * @brief CPU NativeVNNI tile dispatch configuration
+     *
+     * Override the auto-tuned tile parameters for the CPU NativeVNNI GEMV/GEMM
+     * kernel (CPUNativeVNNIGemv.h / CPUNativeVNNITileConfig.h).
+     * All values default to 0 (= auto, use heuristic).
+     *
+     * Environment Variables:
+     *   LLAMINAR_CPU_VNNI_N_BLOCK_CHUNKS   - N-chunks per parallel task (0=auto)
+     *   LLAMINAR_CPU_VNNI_K_TILE_BLOCKS    - K-blocks per tile (0=auto/full K)
+     *   LLAMINAR_CPU_VNNI_M_UNROLL         - M-loop unroll factor (0=auto, 1 or 2)
+     *   LLAMINAR_CPU_VNNI_K_TILES          - K-parallel tile count for GEMV (0=auto)
+     *   LLAMINAR_CPU_VNNI_MIN_BPR_K_PARALLEL - Min blocks-per-row for K-parallel (0=auto, default 256)
+     */
+    struct CPUVNNIConfig
+    {
+        int n_block_chunks = 0;        ///< Override n_block_chunks (0=auto)
+        int k_tile_blocks = 0;         ///< Override k_tile_blocks (0=auto)
+        int m_unroll = 0;              ///< Override m_unroll (0=auto)
+        int k_tiles = 0;              ///< Override k_tiles (0=auto)
+        int min_bpr_k_parallel = 0;   ///< Override MIN_BPR_FOR_K_PARALLEL (0=auto → 256)
+
+        CPUVNNIConfig()
+        {
+            reload();
+        }
+
+        void reload()
+        {
+            auto readInt = [](const char *name) -> int
+            {
+                const char *v = std::getenv(name);
+                return v ? std::atoi(v) : 0;
+            };
+            n_block_chunks = readInt("LLAMINAR_CPU_VNNI_N_BLOCK_CHUNKS");
+            k_tile_blocks = readInt("LLAMINAR_CPU_VNNI_K_TILE_BLOCKS");
+            m_unroll = readInt("LLAMINAR_CPU_VNNI_M_UNROLL");
+            k_tiles = readInt("LLAMINAR_CPU_VNNI_K_TILES");
+            min_bpr_k_parallel = readInt("LLAMINAR_CPU_VNNI_MIN_BPR_K_PARALLEL");
+        }
+    };
+
+    /**
      * @brief Global debug environment snapshot
      */
     struct DebugEnv
     {
         DequantConfig dequant;
         GemmConfig gemm;
+        CPUVNNIConfig cpu_vnni; ///< CPU NativeVNNI tile dispatch overrides
         ProfileConfig profile;
         RMSNormConfig rmsnorm;
         AttentionConfig attention; ///< Q8_1 attention precision configuration

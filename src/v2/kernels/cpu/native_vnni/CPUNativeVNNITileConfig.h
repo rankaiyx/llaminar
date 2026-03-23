@@ -35,6 +35,7 @@
 #include <cstdint>
 
 #include "utils/CPUFeatures.h"
+#include "utils/DebugEnv.h"
 
 namespace llaminar2::cpu::native_vnni
 {
@@ -131,9 +132,12 @@ namespace llaminar2::cpu::native_vnni
 
             case ShapeCategory::FFN:
                 // Medium N (4864-18944): 76-296 chunks total
-                // Use cache-limited block size for streaming efficiency
-                cfg.n_block_chunks = std::min(chunks_per_task, max_chunks_l2);
-                cfg.n_block_chunks = std::max(cfg.n_block_chunks, 1);
+                // Sweep-validated: nbc=1 beats cache-limited nbc=2 by 11%
+                // across all FFN shapes (FFN_Gate, FFN_Up, FFN_Down).
+                // Finer granularity gives better load balance across threads
+                // and the L2 streaming argument doesn't hold — each chunk is
+                // processed independently with full-K streaming.
+                cfg.n_block_chunks = 1;
                 break;
 
             case ShapeCategory::LM_HEAD:
@@ -164,9 +168,12 @@ namespace llaminar2::cpu::native_vnni
             //  2. Each K-tile must have >= 4 K-blocks of work so per-task
             //     overhead doesn't dominate.
             // ---------------------------------------------------------------
-            constexpr int MIN_BPR_FOR_K_PARALLEL = 256;
+            constexpr int DEFAULT_MIN_BPR = 256;
+            const int min_bpr = debugEnv().cpu_vnni.min_bpr_k_parallel > 0
+                                    ? debugEnv().cpu_vnni.min_bpr_k_parallel
+                                    : DEFAULT_MIN_BPR;
             int total_n_tasks = (N_chunks + cfg.n_block_chunks - 1) / cfg.n_block_chunks;
-            if (total_n_tasks < num_threads && blocks_per_row >= MIN_BPR_FOR_K_PARALLEL)
+            if (total_n_tasks < num_threads && blocks_per_row >= min_bpr)
             {
                 // Compute k_tiles so that total 2D tasks ≈ num_threads
                 int desired_k_tiles = (num_threads + total_n_tasks - 1) / total_n_tasks;
@@ -186,6 +193,16 @@ namespace llaminar2::cpu::native_vnni
 
             // Minimum tasks threshold: below this, overhead > benefit
             cfg.omp_min_tasks = std::max(2, num_threads / 2);
+
+            // Apply LLAMINAR_CPU_VNNI_* overrides (for parameter sweep testing)
+            const auto &vnni_gemv = debugEnv().cpu_vnni;
+            if (vnni_gemv.n_block_chunks > 0)
+                cfg.n_block_chunks = vnni_gemv.n_block_chunks;
+            if (vnni_gemv.k_tile_blocks > 0)
+                cfg.k_tile_blocks = vnni_gemv.k_tile_blocks;
+            if (vnni_gemv.k_tiles > 0)
+                cfg.k_tiles = vnni_gemv.k_tiles;
+
             return cfg;
         }
 
@@ -214,16 +231,30 @@ namespace llaminar2::cpu::native_vnni
         else
         {
             cfg.k_tile_blocks = 0; // Full K
-            // Choose n_block_chunks: balance parallelism vs cache
-            int target_tasks = num_threads * 2;
-            int m_tasks = (M + cfg.m_unroll - 1) / cfg.m_unroll;
-            int needed_n_tasks = std::max(1, target_tasks / m_tasks);
-            int calc_chunks = std::max(1, N_chunks / needed_n_tasks);
-            cfg.n_block_chunks = std::min(calc_chunks, max_chunks_for_b);
-            cfg.n_block_chunks = std::max(cfg.n_block_chunks, 1);
+            // Sweep-validated: nbc=1 consistently wins for GEMM prefill
+            // across all shapes and batch sizes (M=64 to M=1788).
+            // FFN_Gate 1788: +10.7%, Wo_proj 1024: +10.8%.
+            // With M>1, there's already massive 2D parallelism
+            // (M-tasks × N-tasks), so finer N-granularity gives better
+            // load balance without cache penalty.
+            cfg.n_block_chunks = 1;
         }
 
         cfg.omp_min_tasks = std::max(2, num_threads / 2);
+
+        // -------------------------------------------------------------------
+        // Apply LLAMINAR_CPU_VNNI_* overrides (for parameter sweep testing)
+        // -------------------------------------------------------------------
+        const auto &vnni = debugEnv().cpu_vnni;
+        if (vnni.n_block_chunks > 0)
+            cfg.n_block_chunks = vnni.n_block_chunks;
+        if (vnni.k_tile_blocks > 0)
+            cfg.k_tile_blocks = vnni.k_tile_blocks;
+        if (vnni.m_unroll > 0)
+            cfg.m_unroll = vnni.m_unroll;
+        if (vnni.k_tiles > 0)
+            cfg.k_tiles = vnni.k_tiles;
+
         return cfg;
     }
 
