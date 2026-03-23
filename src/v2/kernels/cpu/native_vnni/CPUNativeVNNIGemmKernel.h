@@ -28,6 +28,7 @@
 
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNIGemv.h"
+#include "Q8_0NativeGemv.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/TensorClasses.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
@@ -59,11 +60,28 @@ namespace llaminar2::cpu::native_vnni
                 return;
             }
             valid_ = true;
+
+            // For Q8_0 (codebook 19): store native block pointer for M=1 GEMV bypass.
+            // This avoids the 3-array packed format (weight+scales+comps) which creates
+            // too many memory streams for the hardware prefetcher during decode.
+            if (packed_.codebook_id == 19)
+            {
+                auto *q8 = dynamic_cast<const Q8_0Tensor *>(weights);
+                if (q8)
+                {
+                    int actual_start = (row_start >= 0) ? row_start : 0;
+                    native_q8_0_blocks_ = q8->typed_data() +
+                                          static_cast<size_t>(actual_start) * packed_.blocks_per_row;
+                    native_q8_0_bpr_ = packed_.blocks_per_row;
+                }
+            }
+
             LOG_DEBUG("[CPUNativeVNNIGemmKernel] Packed "
                       << packed_.N << "×" << packed_.K
                       << " weights (codebook=" << (int)packed_.codebook_id
                       << ", payload=" << packed_.payload_bytes << " B/block"
-                      << ", asymmetric=" << packed_.is_asymmetric << ")");
+                      << ", asymmetric=" << packed_.is_asymmetric
+                      << ", native_q8_0=" << (native_q8_0_blocks_ != nullptr) << ")");
         }
 
         /**
@@ -135,13 +153,25 @@ namespace llaminar2::cpu::native_vnni
                 // Optimized GEMV path
                 if (beta == 0.0f && alpha == 1.0f)
                 {
-                    gemv_native_vnni(packed_, A_data, C_data);
+#if defined(__AVX512F__)
+                    if (native_q8_0_blocks_)
+                        q8_0_native_gemv(native_q8_0_blocks_, A_data, C_data,
+                                         n, k, native_q8_0_bpr_);
+                    else
+#endif
+                        gemv_native_vnni(packed_, A_data, C_data);
                 }
                 else
                 {
                     // General case: C = alpha * A@B + beta * C
                     std::vector<float> temp(n);
-                    gemv_native_vnni(packed_, A_data, temp.data());
+#if defined(__AVX512F__)
+                    if (native_q8_0_blocks_)
+                        q8_0_native_gemv(native_q8_0_blocks_, A_data, temp.data(),
+                                           n, k, native_q8_0_bpr_);
+                    else
+#endif
+                        gemv_native_vnni(packed_, A_data, temp.data());
                     for (int j = 0; j < n; ++j)
                         C_data[j] += alpha * temp[j];
                 }
@@ -247,34 +277,75 @@ namespace llaminar2::cpu::native_vnni
 
             const float *input_data = input->data();
 
-            // Pre-quantize input once (shared across all projections)
-            const int K_blocks = (k + 31) / 32;
-            std::vector<Q8_1Block> shared_q8(static_cast<size_t>(m) * K_blocks);
-
+            // Check if all projections support native Q8_0 GEMV (M=1 only).
+            [[maybe_unused]] bool all_native_q8_0 = false;
+#if defined(__AVX512F__)
             if (m == 1)
             {
-                const bool k_aligned = (k % 32 == 0);
-                int kb = 0;
-#if defined(__AVX512F__)
-                if (k_aligned)
+                all_native_q8_0 = true;
+                for (const auto &proj : projections)
                 {
-                    for (; kb + 1 < K_blocks; kb += 2)
-                        simd::quantize_two_blocks_avx512(input_data + kb * 32, shared_q8[kb], shared_q8[kb + 1]);
+                    auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                    if (!vnni || !vnni->native_q8_0_blocks_)
+                    {
+                        all_native_q8_0 = false;
+                        break;
+                    }
                 }
-#endif
-                for (; kb < K_blocks; ++kb)
+
+                // Fused FP32-dequant path: process all projections in a
+                // single OMP region, eliminating fork/join overhead.
+                if (all_native_q8_0)
                 {
-                    int block_start = kb * 32;
-                    int block_len = std::min(32, k - block_start);
-                    simd::quantize_single_block(input_data + block_start, shared_q8[kb], block_len);
+                    const int num_proj = static_cast<int>(projections.size());
+                    FusedProjectionDesc descs[8]; // max 8 projections (QKV=3, GateUp=2)
+                    for (int p = 0; p < num_proj; ++p)
+                    {
+                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(projections[p].kernel);
+                        descs[p].weights = vnni->native_q8_0_blocks_;
+                        descs[p].output = projections[p].output->mutable_data();
+                        descs[p].bias = projections[p].bias ? projections[p].bias->data() : nullptr;
+                        descs[p].N = projections[p].n;
+                        descs[p].bpr = vnni->native_q8_0_bpr_;
+                    }
+
+                    q8_0_native_gemv_fused(input_data, descs, num_proj);
+                    return true;
                 }
             }
-            else
+#endif
+
+            // Non-Q8_0 fallback: pre-quantize input to Q8_1
+            const int K_blocks = (k + 31) / 32;
+            std::vector<Q8_1Block> shared_q8;
+            if (!all_native_q8_0)
             {
-                quantize_activations_to_q8_1(input_data, shared_q8.data(), m, k, K_blocks);
+                shared_q8.resize(static_cast<size_t>(m) * K_blocks);
+                if (m == 1)
+                {
+                    const bool k_aligned = (k % 32 == 0);
+                    int kb = 0;
+#if defined(__AVX512F__)
+                    if (k_aligned)
+                    {
+                        for (; kb + 1 < K_blocks; kb += 2)
+                            simd::quantize_two_blocks_avx512(input_data + kb * 32, shared_q8[kb], shared_q8[kb + 1]);
+                    }
+#endif
+                    for (; kb < K_blocks; ++kb)
+                    {
+                        int block_start = kb * 32;
+                        int block_len = std::min(32, k - block_start);
+                        simd::quantize_single_block(input_data + block_start, shared_q8[kb], block_len);
+                    }
+                }
+                else
+                {
+                    quantize_activations_to_q8_1(input_data, shared_q8.data(), m, k, K_blocks);
+                }
             }
 
-            // Run each projection using the shared Q8_1 buffer + apply epilogues
+            // Run each projection + apply epilogues
             for (const auto &proj : projections)
             {
                 if (!proj.kernel || !proj.output)
@@ -298,7 +369,6 @@ namespace llaminar2::cpu::native_vnni
                         true, 1.0f, 0.0f, proj.bias, mpi_ctx, -1, workspace);
                     if (!success)
                         return false;
-                    // multiply_tensor already handled bias for fallback
                     continue;
                 }
 
@@ -315,6 +385,11 @@ namespace llaminar2::cpu::native_vnni
     private:
         CPUNativeVNNIPackedWeights packed_;
         bool valid_ = false;
+
+        // Q8_0 native GEMV bypass: pointer into original tensor's contiguous blocks.
+        // Set for codebook_id==19 (Q8_0) to enable single-stream GEMV at M=1.
+        const Q8_0Block *native_q8_0_blocks_ = nullptr;
+        int native_q8_0_bpr_ = 0;
     };
 
 } // namespace llaminar2::cpu::native_vnni
