@@ -64,16 +64,13 @@ fi
 echo -e "${GREEN}✓ Unit tests passed${NC}"
 echo ""
 
-# Step 3: Run Qwen2 SingleDevice Prefill Parity Tests (~75s)
+# Step 3: Run Qwen2 SingleDevice Parity Tests (prefill + decode, ~2 min)
 # Validates inference accuracy across CPU/CUDA/ROCm with multiple KV cache configs.
 # Catches accuracy regressions in attention, GEMM, and graph wiring.
-# NOTE: DecodeParity excluded — pre-existing CUDA decode segfault (null ITensor in
-#       layer0_attention coherence). Re-enable when that bug is fixed.
-echo -e "${YELLOW}[3/4] Running Qwen2 SingleDevice prefill parity tests...${NC}"
+echo -e "${YELLOW}[3/4] Running Qwen2 SingleDevice parity tests (prefill + decode)...${NC}"
 echo ""
 
 set +e
-GTEST_FILTER="*PrefillParity*" \
 ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice$" --output-on-failure --timeout 300
 PARITY_EXIT_CODE=$?
 set -e
