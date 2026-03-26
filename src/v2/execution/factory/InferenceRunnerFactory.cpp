@@ -26,6 +26,7 @@
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../utils/WeightLoadingProfiler.h"
+#include "../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include <atomic>
 #include <future>
 #include <thread>
@@ -633,6 +634,22 @@ namespace llaminar2
                   << kvCachePrecisionToString(config.kv_cache_precision));
 
         // =====================================================================
+        // TurboQuant Context (TQ4/TQ3 KV Cache)
+        // =====================================================================
+        // If TQ4 or TQ3 KV cache precision is requested, create the shared
+        // rotation matrix that all layers use for quantize/dequantize.
+        std::shared_ptr<TurboQuantContext> turboquant_ctx;
+        if (config.kv_cache_precision == KVCachePrecision::TQ4 ||
+            config.kv_cache_precision == KVCachePrecision::TQ3)
+        {
+            turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
+            graph_config.turboquant_ctx = turboquant_ctx.get();
+            LOG_INFO("[InferenceRunner] TurboQuant context created for "
+                     << kvCachePrecisionToString(config.kv_cache_precision)
+                     << " KV cache (head_dim=" << graph_config.head_dim << ")");
+        }
+
+        // =====================================================================
         // Phase 3+: Tensor-Parallel Configuration
         // =====================================================================
         // Three modes are supported (in order of precedence):
@@ -691,6 +708,12 @@ namespace llaminar2
             ScopedWeightLoadDetailTimer timer("graph.build.create_orchestrator");
             orchestrator = std::make_unique<DeviceGraphOrchestrator>(
                 graph_config, mpi_ctx, cache_config);
+        }
+
+        // Transfer TurboQuant context ownership to orchestrator
+        if (turboquant_ctx)
+        {
+            orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
         }
 
         // Initialize graph cache
@@ -1515,6 +1538,15 @@ namespace llaminar2
         graph_config.kv_cache_scale = config.kv_cache_scale;
         graph_config.kv_cache_precision = config.kv_cache_precision;
 
+        // TurboQuant context for TQ4/TQ3 KV cache
+        std::shared_ptr<TurboQuantContext> turboquant_ctx;
+        if (config.kv_cache_precision == KVCachePrecision::TQ4 ||
+            config.kv_cache_precision == KVCachePrecision::TQ3)
+        {
+            turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
+            graph_config.turboquant_ctx = turboquant_ctx.get();
+        }
+
         // PP layer offset for KV cache indexing:
         // When building graphs for PP stage [first_layer, last_layer), this offset
         // is subtracted from global layer index to get local KV cache index.
@@ -1550,6 +1582,9 @@ namespace llaminar2
 
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             graph_config, nullptr /* no mpi_ctx */, cache_config);
+
+        if (turboquant_ctx)
+            orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
 
         // =====================================================================
         // Set PP stage configuration - CRITICAL for correct graph building
@@ -1655,6 +1690,15 @@ namespace llaminar2
         graph_config.kv_cache_scale = config.kv_cache_scale;
         graph_config.kv_cache_precision = config.kv_cache_precision;
 
+        // TurboQuant context for TQ4/TQ3 KV cache
+        std::shared_ptr<TurboQuantContext> turboquant_ctx;
+        if (config.kv_cache_precision == KVCachePrecision::TQ4 ||
+            config.kv_cache_precision == KVCachePrecision::TQ3)
+        {
+            turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
+            graph_config.turboquant_ctx = turboquant_ctx.get();
+        }
+
         // PP layer offset for nested TP-in-PP (partial graph with layer offset)
         if (config.pp_stage_config.has_value())
         {
@@ -1698,6 +1742,9 @@ namespace llaminar2
 
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(deps), graph_config, cache_config);
+
+        if (turboquant_ctx)
+            orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
 
         // Initialize graph cache
         orchestrator->initializeGraphCache(graph_config.n_layers);

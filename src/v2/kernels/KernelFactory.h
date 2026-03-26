@@ -124,6 +124,7 @@ namespace llaminar2
     class FP32Tensor;
     class FP16Tensor;
     class BF16Tensor;
+    class TurboQuantContext;
 
     enum class TensorType; // Forward declare from Tensors.h
 
@@ -261,6 +262,9 @@ namespace llaminar
 
                 // MPI context (required for CPU cache)
                 const ::llaminar2::MPIContext *mpi_ctx = nullptr;
+
+                /// TurboQuant context (for TQ4/TQ3 KV cache). Not owned.
+                const ::llaminar2::TurboQuantContext *turboquant_ctx = nullptr;
 
                 /**
                  * @brief Check if this config requests sharded (tensor-parallel) cache

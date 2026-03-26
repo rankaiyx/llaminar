@@ -12,6 +12,10 @@
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../tensors/TQ4Tensor.h"
+#include "../../../tensors/TQ3Tensor.h"
+#include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
+#include "../../../kernels/cpu/turboquant/TurboQuantDequantize.h"
 #include <limits>
 
 namespace llaminar2
@@ -209,6 +213,152 @@ namespace llaminar2
             // When fp16_native_available && K/V are FP16: pass FP16 tensors
             // directly to the kernel. compute_tensor() will detect FP16 K/V
             // and use compute_decode_fp16kv() for zero-copy FP16 attention.
+        }
+
+        // =====================================================================
+        // CPU DECODE: TQ4/TQ3 KV dequantization
+        //
+        // TurboQuant KV cache stores quantized blocks. The FP32 attention kernel
+        // cannot consume them directly — we maintain persistent FP32 buffers and
+        // incrementally dequantize newly appended rows each decode step.
+        // =====================================================================
+        if (is_decode_mode && gpuStream() == nullptr)
+        {
+            auto *K_tq4 = dynamic_cast<TQ4Tensor *>(effective_K);
+            auto *V_tq4 = dynamic_cast<TQ4Tensor *>(effective_V);
+            auto *K_tq3 = dynamic_cast<TQ3Tensor *>(effective_K);
+            auto *V_tq3 = dynamic_cast<TQ3Tensor *>(effective_V);
+
+            if ((K_tq4 && V_tq4) || (K_tq3 && V_tq3))
+            {
+                if (!params_.turboquant_ctx)
+                {
+                    LOG_ERROR("[AttentionComputeStage] TQ4/TQ3 KV cache requires turboquant_ctx in params");
+                    return false;
+                }
+                const auto *turboquant_ctx = params_.turboquant_ctx;
+
+                // Set the shared TurboQuant context on cache tensors so dequant is possible
+                if (K_tq4)
+                {
+                    K_tq4->set_turboquant_context(turboquant_ctx);
+                    V_tq4->set_turboquant_context(turboquant_ctx);
+                }
+                else
+                {
+                    K_tq3->set_turboquant_context(turboquant_ctx);
+                    V_tq3->set_turboquant_context(turboquant_ctx);
+                }
+
+                const int kv_dim = params_.n_kv_heads * params_.head_dim;
+                const int max_len = params_.kv_cache
+                                        ? params_.kv_cache->max_seq_len()
+                                        : effective_kv_len;
+
+                if (!tq_decode_k_fp32_)
+                {
+                    tq_decode_k_fp32_ = std::make_unique<FP32Tensor>(
+                        std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
+                    tq_decode_v_fp32_ = std::make_unique<FP32Tensor>(
+                        std::vector<size_t>{static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim)});
+                    tq_decode_fp32_rows_ = 0;
+                }
+
+                if (effective_kv_len < tq_decode_fp32_rows_)
+                {
+                    tq_decode_fp32_rows_ = 0;
+                }
+
+                if (tq_decode_fp32_rows_ < effective_kv_len)
+                {
+                    const size_t from = static_cast<size_t>(tq_decode_fp32_rows_);
+                    const size_t n_new = static_cast<size_t>(effective_kv_len) - from;
+
+                    if (K_tq4)
+                    {
+                        const TurboQuantContext *tq_ctx = K_tq4->turboquant_context();
+                        if (!tq_ctx)
+                        {
+                            LOG_ERROR("[AttentionComputeStage] TQ4 K tensor has no TurboQuant context set");
+                            return false;
+                        }
+                        // Dequantize only newly appended rows
+                        const size_t row_bytes = K_tq4->blocks_per_row() * K_tq4->block_bytes();
+
+                        for (size_t r = from; r < static_cast<size_t>(effective_kv_len); ++r)
+                        {
+                            // Create temporary single-row view for dequant
+                            const uint8_t *row_data = K_tq4->typed_data() + r * row_bytes;
+                            float *k_dst = tq_decode_k_fp32_->mutable_data() + r * kv_dim;
+                            float *v_dst = tq_decode_v_fp32_->mutable_data() + r * kv_dim;
+
+                            const uint8_t *v_row_data = V_tq4->typed_data() + r * row_bytes;
+                            alignas(64) float scratch[128];
+
+                            // Dequantize per-head blocks
+                            for (size_t h = 0; h < K_tq4->blocks_per_row(); ++h)
+                            {
+                                if (params_.head_dim == 128)
+                                {
+                                    const auto *kb = reinterpret_cast<const TQ4Block_128 *>(row_data + h * K_tq4->block_bytes());
+                                    turboquant_dequantize_tq4(*kb, *tq_ctx, k_dst + h * params_.head_dim, scratch);
+                                    const auto *vb = reinterpret_cast<const TQ4Block_128 *>(v_row_data + h * V_tq4->block_bytes());
+                                    turboquant_dequantize_tq4(*vb, *tq_ctx, v_dst + h * params_.head_dim, scratch);
+                                }
+                                else
+                                {
+                                    const auto *kb = reinterpret_cast<const TQ4Block_64 *>(row_data + h * K_tq4->block_bytes());
+                                    turboquant_dequantize_tq4(*kb, *tq_ctx, k_dst + h * params_.head_dim, scratch);
+                                    const auto *vb = reinterpret_cast<const TQ4Block_64 *>(v_row_data + h * V_tq4->block_bytes());
+                                    turboquant_dequantize_tq4(*vb, *tq_ctx, v_dst + h * params_.head_dim, scratch);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        const TurboQuantContext *tq_ctx = K_tq3->turboquant_context();
+                        if (!tq_ctx)
+                        {
+                            LOG_ERROR("[AttentionComputeStage] TQ3 K tensor has no TurboQuant context set");
+                            return false;
+                        }
+                        const size_t row_bytes = K_tq3->blocks_per_row() * K_tq3->block_bytes();
+                        for (size_t r = from; r < static_cast<size_t>(effective_kv_len); ++r)
+                        {
+                            const uint8_t *row_data = K_tq3->typed_data() + r * row_bytes;
+                            float *k_dst = tq_decode_k_fp32_->mutable_data() + r * kv_dim;
+                            float *v_dst = tq_decode_v_fp32_->mutable_data() + r * kv_dim;
+
+                            const uint8_t *v_row_data = V_tq3->typed_data() + r * row_bytes;
+                            alignas(64) float scratch[128];
+
+                            for (size_t h = 0; h < K_tq3->blocks_per_row(); ++h)
+                            {
+                                if (params_.head_dim == 128)
+                                {
+                                    const auto *kb = reinterpret_cast<const TQ3Block_128 *>(row_data + h * K_tq3->block_bytes());
+                                    turboquant_dequantize_tq3(*kb, *tq_ctx, k_dst + h * params_.head_dim, scratch);
+                                    const auto *vb = reinterpret_cast<const TQ3Block_128 *>(v_row_data + h * V_tq3->block_bytes());
+                                    turboquant_dequantize_tq3(*vb, *tq_ctx, v_dst + h * params_.head_dim, scratch);
+                                }
+                                else
+                                {
+                                    const auto *kb = reinterpret_cast<const TQ3Block_64 *>(row_data + h * K_tq3->block_bytes());
+                                    turboquant_dequantize_tq3(*kb, *tq_ctx, k_dst + h * params_.head_dim, scratch);
+                                    const auto *vb = reinterpret_cast<const TQ3Block_64 *>(v_row_data + h * V_tq3->block_bytes());
+                                    turboquant_dequantize_tq3(*vb, *tq_ctx, v_dst + h * params_.head_dim, scratch);
+                                }
+                            }
+                        }
+                    }
+
+                    tq_decode_fp32_rows_ = effective_kv_len;
+                }
+
+                effective_K = tq_decode_k_fp32_.get();
+                effective_V = tq_decode_v_fp32_.get();
+            }
         }
 
         LOG_DEBUG("[AttentionComputeStage] Execute: batch=" << params_.batch_size

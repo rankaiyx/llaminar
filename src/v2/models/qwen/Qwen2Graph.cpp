@@ -1789,6 +1789,7 @@ namespace llaminar2
                 // Phase 5.4: VNNI-safe Q16 KV cache quantization parameters
                 kv_append_params.kv_cache_scale = config_.kv_cache_scale;
                 kv_append_params.head_dim = config_.head_dim;
+                kv_append_params.turboquant_ctx = config_.turboquant_ctx;
 
                 graph.addNode(prefix + "kv_append",
                               ComputeStageFactory::createKVCacheAppend(kv_append_params),
@@ -1918,6 +1919,7 @@ namespace llaminar2
                 attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
                 attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
                 attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
+                attn_params.turboquant_ctx = config_.turboquant_ctx;
 
                 graph.addNode(prefix + "attention",
                               ComputeStageFactory::createAttentionCompute(attn_params),

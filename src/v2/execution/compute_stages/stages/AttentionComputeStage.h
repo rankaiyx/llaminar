@@ -19,6 +19,7 @@ namespace llaminar2
     // Forward declarations
     class ITensorAttention;
     class FP32Tensor;
+    class TurboQuantContext;
 
     /**
      * @brief Pure attention compute stage (no KV cache management)
@@ -86,6 +87,9 @@ namespace llaminar2
             std::optional<BufferId> output_buffer_id;
             std::optional<BufferId> workspace_scores_buffer_id;
             std::optional<BufferId> workspace_context_buffer_id;
+
+            /// TurboQuant context for TQ4/TQ3 KV cache dequantization
+            const TurboQuantContext *turboquant_ctx = nullptr;
         };
 
         explicit AttentionComputeStage(Params params);
@@ -152,6 +156,11 @@ namespace llaminar2
         std::unique_ptr<FP32Tensor> decode_k_fp32_;
         std::unique_ptr<FP32Tensor> decode_v_fp32_;
         int decode_kv_fp32_rows_ = 0;
+
+        /// Persistent FP32 decode buffers for incremental TQ4/TQ3→FP32 dequantization.
+        std::unique_ptr<FP32Tensor> tq_decode_k_fp32_;
+        std::unique_ptr<FP32Tensor> tq_decode_v_fp32_;
+        int tq_decode_fp32_rows_ = 0;
 
         /**
          * @brief Get or create the attention kernel

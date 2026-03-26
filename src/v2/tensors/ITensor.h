@@ -485,6 +485,8 @@ namespace llaminar2
         constexpr int IQ3_S = 24;
         constexpr int IQ1_S = 25;
         constexpr int IQ1_M = 26;
+        constexpr int TQ4 = 27;
+        constexpr int TQ3 = 28;
     }
 
 } // namespace llaminar2

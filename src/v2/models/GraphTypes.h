@@ -40,6 +40,7 @@ namespace llaminar2
     class TensorBase;
     class ILocalTPContext;
     class ILocalPPContext;
+    class TurboQuantContext;
     struct PipelineConfig;
 
     // =========================================================================
@@ -117,6 +118,10 @@ namespace llaminar2
 
         /// Explicit KV cache precision mode (AUTO preserves legacy behavior).
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
+
+        /// TurboQuant context for TQ4/TQ3 KV cache quantization.
+        /// Holds rotation matrix. Not owned by GraphConfig.
+        const TurboQuantContext *turboquant_ctx = nullptr;
 
         // Execution settings
         DeviceId default_device = DeviceId::cpu(); ///< Default device for execution

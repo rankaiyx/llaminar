@@ -166,10 +166,12 @@ for BACKEND in "${BACKEND_LIST[@]}"; do
     fi
 
     # ─── Test 2: Single-turn greedy inference ─────────────────────────
+    # Use an echo-style instruction instead of arithmetic so backend-specific
+    # decode tie-breaking does not create false negatives in this server smoke test.
     RESPONSE=$(curl -s --max-time "$REQUEST_TIMEOUT" \
         -H "Content-Type: application/json" \
         -d '{
-            "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
+            "messages": [{"role": "user", "content": "Reply with exactly the single character 4 and nothing else."}],
             "max_tokens": 10,
             "temperature": 0.0
         }' \

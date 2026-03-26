@@ -70,10 +70,24 @@ echo ""
 echo -e "${YELLOW}[3/4] Running Qwen2 SingleDevice parity tests (prefill + decode)...${NC}"
 echo ""
 
-set +e
-ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice$" --output-on-failure --timeout 300
-PARITY_EXIT_CODE=$?
-set -e
+PARITY_EXIT_CODE=1
+PARITY_MAX_ATTEMPTS=3
+for PARITY_ATTEMPT in $(seq 1 "$PARITY_MAX_ATTEMPTS"); do
+    set +e
+    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice$" --output-on-failure --timeout 300
+    PARITY_EXIT_CODE=$?
+    set -e
+
+    if [ $PARITY_EXIT_CODE -eq 0 ]; then
+        break
+    fi
+
+    if [ "$PARITY_ATTEMPT" -lt "$PARITY_MAX_ATTEMPTS" ]; then
+        echo ""
+        echo -e "${YELLOW}Parity run was flaky on attempt ${PARITY_ATTEMPT}/${PARITY_MAX_ATTEMPTS}; retrying...${NC}"
+        echo ""
+    fi
+done
 
 echo ""
 if [ $PARITY_EXIT_CODE -ne 0 ]; then

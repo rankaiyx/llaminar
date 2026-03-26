@@ -1311,6 +1311,9 @@ add_library(llaminar2_core STATIC
     tensors/IQ3_STensor.cpp
     tensors/IQ1_STensor.cpp
     tensors/IQ1_MTensor.cpp
+    # TurboQuant KV cache tensors
+    tensors/TQ4Tensor.cpp
+    tensors/TQ3Tensor.cpp
     # KV Cache implementation (moved from tensors/)
     kernels/cpu/CPURingKVCache.cpp
     # Vectorized primitives (ported from V1)

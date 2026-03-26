@@ -68,6 +68,7 @@ namespace llaminar2
     class WeightManager;
     class WeightPlacementMap;
     class TensorParallelConfig;
+    class TurboQuantContext;
 
     /**
      * @brief Configuration for graph caching behavior
@@ -612,6 +613,20 @@ namespace llaminar2
          * @return true if CollectiveContext is set and ready
          */
         bool isGpuCollectivesEnabled() const { return injected_collective_ctx_ != nullptr; }
+
+        /**
+         * @brief Set TurboQuant context for TQ4/TQ3 KV cache quantization.
+         *
+         * The context holds the rotation matrix used during KV cache quantization
+         * and dequantization. Ownership is shared — the orchestrator keeps the
+         * context alive for the entire inference session.
+         *
+         * @param ctx Shared pointer to TurboQuantContext
+         */
+        void setTurboQuantContext(std::shared_ptr<TurboQuantContext> ctx)
+        {
+            turboquant_ctx_ = std::move(ctx);
+        }
 
         // =========================================================================
         // Weight Manager and Phase-Aware Weight Access (Gap 3)
@@ -2302,6 +2317,9 @@ namespace llaminar2
 
         /// Injected collective context (nullptr if using default)
         std::shared_ptr<ICollectiveContext> injected_collective_ctx_;
+
+        /// TurboQuant context for TQ4/TQ3 KV cache (owns rotation matrix lifetime)
+        std::shared_ptr<TurboQuantContext> turboquant_ctx_;
 
         // =========================================================================
         // Pipeline Parallelism Configuration (Legacy - Single Stage)

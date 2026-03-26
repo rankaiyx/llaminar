@@ -3424,6 +3424,59 @@ add_v2_test(V2_Unit_RequantizeRowToInt8
     LABELS "V2;Unit;TensorOperations;Quantization;SIMD;AVX2;AVX512;Q8_0;Q8_1;Q8_K;Int8Conversion;ROCm"
 )
 
+# =============================================================================
+# TurboQuant KV Cache Quantization Tests (Phase 1: Foundation)
+# =============================================================================
+
+# Test: TurboQuant Codebook
+# Validates Lloyd-Max codebook centroids for 4-bit and 3-bit quantization.
+# Tests centroid accuracy vs re-derived values, symmetry, sorted order,
+# threshold midpoints, nearest-centroid lookup, TQ3 bit packing, and
+# theoretical MSE bounds.
+add_executable(v2_test_turboquant_codebook unit/Test__TurboQuantCodebook.cpp)
+target_link_libraries(v2_test_turboquant_codebook
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TurboQuantCodebook
+    COMMAND $<TARGET_FILE:v2_test_turboquant_codebook>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Quantization;TurboQuant;Codebook;LloydMax"
+)
+
+# Test: TurboQuant Roundtrip
+# Validates full quantize→dequantize roundtrip for TQ4 and TQ3 at
+# head_dim=64 and 128. Tests rotation orthogonality, norm preservation,
+# determinism, zero vectors, MSE within paper bounds, batch consistency,
+# and TQ4 < TQ3 quality ordering.
+add_executable(v2_test_turboquant_roundtrip unit/Test__TurboQuantRoundtrip.cpp)
+target_link_libraries(v2_test_turboquant_roundtrip
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TurboQuantRoundtrip
+    COMMAND $<TARGET_FILE:v2_test_turboquant_roundtrip>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Quantization;TurboQuant;Roundtrip;MSE;Rotation"
+)
+
+# TurboQuant KV Cache Integration (Phase 2: KV Cache round-trip)
+# Tests TQ4/TQ3 quantized data flowing through the CPURingKVCache:
+# append, gather, ring wrap, incremental decode, multi-layer, clear.
+add_executable(v2_test_turboquant_kvcache unit/kernels/cpu/Test__CPURingKVCache_TurboQuant.cpp)
+target_link_libraries(v2_test_turboquant_kvcache
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TurboQuant_KVCache
+    COMMAND $<TARGET_FILE:v2_test_turboquant_kvcache>
+    MPI_PROCS 1
+    LABELS "V2;Unit;KVCache;TurboQuant;TQ4;TQ3;Ring;CPU;Quantization"
+)
+
 # Test: ModelContextConfig
 # Tests configuration struct for ModelContext creation (PP/TP/combined scenarios)
 add_executable(v2_unit_modelcontextconfig unit/loaders/Test__ModelContextConfig.cpp)

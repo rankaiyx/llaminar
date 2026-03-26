@@ -178,39 +178,14 @@ namespace llaminar2
     /**
      * @brief Allocate a typed tensor using compile-time dispatch.
      *
-     * Uses `if constexpr` to select the correct TensorFactory creation method
-     * based on the Precision template parameter. This is resolved entirely at
-     * compile time — no runtime branching.
+     * Delegates to CPUKVCacheTensor<Precision>::allocate() which encapsulates
+     * the type-specific creation logic for each precision.
      */
     template <ActivationPrecision Precision>
     std::shared_ptr<typename CPURingKVCache<Precision>::TensorT> CPURingKVCache<Precision>::allocate_tensor(
         size_t rows, size_t cols, DeviceId device)
     {
-        if constexpr (Precision == ActivationPrecision::FP32)
-        {
-            return tensor_factory_->createFP32({rows, cols}, device);
-        }
-        else if constexpr (Precision == ActivationPrecision::BF16)
-        {
-            return tensor_factory_->createBF16({rows, cols});
-        }
-        else if constexpr (Precision == ActivationPrecision::FP16)
-        {
-            return tensor_factory_->createFP16({rows, cols});
-        }
-        else if constexpr (Precision == ActivationPrecision::Q8_1)
-        {
-            return tensor_factory_->createQ8_1({rows, cols}, device);
-        }
-        else
-        {
-            // Q16_1 precision with head-dim-aligned block size.
-            // Uses BLOCK_128 for head_dim=128 (Llama-3, Qwen3), BLOCK_64 for
-            // head_dim=64 (Qwen2.5-0.5B), giving 1 block per head with a
-            // single scale factor — optimal for VNNI decode attention.
-            return tensor_factory_->createQ16_1(
-                {rows, cols}, optimal_q16_block_size(head_dim_), device);
-        }
+        return detail::CPUKVCacheTensor<Precision>::allocate(*tensor_factory_, rows, cols, head_dim_, device);
     }
 
     /**
@@ -519,95 +494,26 @@ namespace llaminar2
         //
         // POSITION_MAJOR stores each token as a single contiguous row of
         // `kv_dim` elements (all heads concatenated). So copying a token
-        // is a single memcpy of `kv_dim * sizeof(element)` bytes.
-        //
-        // For quantized formats (Q8_1, Q16_1), the copy size is
-        // `blocks_per_row * sizeof(Block)` instead.
+        // is a single memcpy of row_bytes (computed via the CPUKVCacheTensor
+        // trait, which handles element, block, and turbo-quant strides).
         // -----------------------------------------------------------------
+        using Trait = detail::CPUKVCacheTensor<Precision>;
+        const size_t rb = Trait::row_bytes(dst_k, kv_dim_, head_dim_);
+
         auto copy_position_major_token = [&](int src_row, int dst_row)
         {
-            if constexpr (Precision == ActivationPrecision::FP32)
+            const auto *sk = reinterpret_cast<const uint8_t *>(new_k->raw_data());
+            const auto *sv = reinterpret_cast<const uint8_t *>(new_v->raw_data());
+            auto *dk = reinterpret_cast<uint8_t *>(dst_k->raw_mutable_data());
+            auto *dv = reinterpret_cast<uint8_t *>(dst_v->raw_mutable_data());
+            if (!sk || !sv || !dk || !dv)
             {
-                const float *src_k = new_k->typed_data();
-                const float *src_v = new_v->typed_data();
-                float *dst_k_data = dst_k->mutable_typed_data();
-                float *dst_v_data = dst_v->mutable_typed_data();
-                if (!src_k || !src_v || !dst_k_data || !dst_v_data)
-                {
-                    return false;
-                }
-
-                const float *src_k_row = src_k + static_cast<size_t>(src_row) * kv_dim_;
-                const float *src_v_row = src_v + static_cast<size_t>(src_row) * kv_dim_;
-                float *dst_k_row = dst_k_data + static_cast<size_t>(dst_row) * kv_dim_;
-                float *dst_v_row = dst_v_data + static_cast<size_t>(dst_row) * kv_dim_;
-                std::memcpy(dst_k_row, src_k_row, static_cast<size_t>(kv_dim_) * sizeof(float));
-                std::memcpy(dst_v_row, src_v_row, static_cast<size_t>(kv_dim_) * sizeof(float));
-                return true;
+                return false;
             }
-            else if constexpr (Precision == ActivationPrecision::BF16 || Precision == ActivationPrecision::FP16)
-            {
-                const uint16_t *src_k = new_k->typed_data();
-                const uint16_t *src_v = new_v->typed_data();
-                uint16_t *dst_k_data = dst_k->mutable_typed_data();
-                uint16_t *dst_v_data = dst_v->mutable_typed_data();
-                if (!src_k || !src_v || !dst_k_data || !dst_v_data)
-                {
-                    return false;
-                }
 
-                const uint16_t *src_k_row = src_k + static_cast<size_t>(src_row) * kv_dim_;
-                const uint16_t *src_v_row = src_v + static_cast<size_t>(src_row) * kv_dim_;
-                uint16_t *dst_k_row = dst_k_data + static_cast<size_t>(dst_row) * kv_dim_;
-                uint16_t *dst_v_row = dst_v_data + static_cast<size_t>(dst_row) * kv_dim_;
-                std::memcpy(dst_k_row, src_k_row, static_cast<size_t>(kv_dim_) * sizeof(uint16_t));
-                std::memcpy(dst_v_row, src_v_row, static_cast<size_t>(kv_dim_) * sizeof(uint16_t));
-                return true;
-            }
-            else if constexpr (Precision == ActivationPrecision::Q8_1)
-            {
-                const Q8_1Block *src_k = new_k->typed_data();
-                const Q8_1Block *src_v = new_v->typed_data();
-                Q8_1Block *dst_k_data = dst_k->mutable_typed_data();
-                Q8_1Block *dst_v_data = dst_v->mutable_typed_data();
-                if (!src_k || !src_v || !dst_k_data || !dst_v_data)
-                {
-                    return false;
-                }
-
-                const size_t blocks_per_row = (static_cast<size_t>(kv_dim_) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                const Q8_1Block *src_k_row = src_k + static_cast<size_t>(src_row) * blocks_per_row;
-                const Q8_1Block *src_v_row = src_v + static_cast<size_t>(src_row) * blocks_per_row;
-                Q8_1Block *dst_k_row = dst_k_data + static_cast<size_t>(dst_row) * blocks_per_row;
-                Q8_1Block *dst_v_row = dst_v_data + static_cast<size_t>(dst_row) * blocks_per_row;
-                std::memcpy(dst_k_row, src_k_row, blocks_per_row * sizeof(Q8_1Block));
-                std::memcpy(dst_v_row, src_v_row, blocks_per_row * sizeof(Q8_1Block));
-                return true;
-            }
-            else
-            {
-                const Q16BlockSize bs = dst_k->q16_block_size();
-                const size_t block_bytes = q16_block_size_bytes(bs);
-                const size_t block_elements = q16_block_size_elements(bs);
-                const size_t blocks_per_row = (static_cast<size_t>(kv_dim_) + block_elements - 1) / block_elements;
-
-                const uint8_t *src_k_bytes = reinterpret_cast<const uint8_t *>(new_k->raw_data());
-                const uint8_t *src_v_bytes = reinterpret_cast<const uint8_t *>(new_v->raw_data());
-                uint8_t *dst_k_bytes = reinterpret_cast<uint8_t *>(dst_k->raw_mutable_data());
-                uint8_t *dst_v_bytes = reinterpret_cast<uint8_t *>(dst_v->raw_mutable_data());
-                if (!src_k_bytes || !src_v_bytes || !dst_k_bytes || !dst_v_bytes)
-                {
-                    return false;
-                }
-
-                const uint8_t *src_k_row = src_k_bytes + static_cast<size_t>(src_row) * blocks_per_row * block_bytes;
-                const uint8_t *src_v_row = src_v_bytes + static_cast<size_t>(src_row) * blocks_per_row * block_bytes;
-                uint8_t *dst_k_row = dst_k_bytes + static_cast<size_t>(dst_row) * blocks_per_row * block_bytes;
-                uint8_t *dst_v_row = dst_v_bytes + static_cast<size_t>(dst_row) * blocks_per_row * block_bytes;
-                std::memcpy(dst_k_row, src_k_row, blocks_per_row * block_bytes);
-                std::memcpy(dst_v_row, src_v_row, blocks_per_row * block_bytes);
-                return true;
-            }
+            std::memcpy(dk + static_cast<size_t>(dst_row) * rb, sk + static_cast<size_t>(src_row) * rb, rb);
+            std::memcpy(dv + static_cast<size_t>(dst_row) * rb, sv + static_cast<size_t>(src_row) * rb, rb);
+            return true;
         };
 
         // -----------------------------------------------------------------
@@ -618,13 +524,11 @@ namespace llaminar2
         // [position][n_heads * head_dim]. So for each source token, we need
         // to scatter the per-head slices into their respective head blocks.
         //
-        // Source addressing:  src + src_row * kv_dim + h * head_dim
-        // Dest addressing:    dst + (h * max_seq_len + dst_pos) * head_dim
-        //
-        // This is more expensive than POSITION_MAJOR append (n_heads memcpys
-        // per token instead of 1) but pays off during attention where each
-        // head's data is contiguous.
+        // Source addressing (bytes):  src + src_row * rb + h * hb
+        // Dest addressing (bytes):    dst + (h * max_seq_len + dst_pos) * hb
         // -----------------------------------------------------------------
+        const size_t hb = Trait::head_bytes(dst_k, kv_dim_, head_dim_);
+
         auto copy_head_major_token = [&](int src_row, int dst_pos)
         {
             if (local_n_kv_heads_ <= 0 || head_dim_ <= 0)
@@ -632,109 +536,27 @@ namespace llaminar2
                 return false;
             }
 
-            if constexpr (Precision == ActivationPrecision::FP32)
+            const auto *sk = reinterpret_cast<const uint8_t *>(new_k->raw_data());
+            const auto *sv = reinterpret_cast<const uint8_t *>(new_v->raw_data());
+            auto *dk = reinterpret_cast<uint8_t *>(dst_k->raw_mutable_data());
+            auto *dv = reinterpret_cast<uint8_t *>(dst_v->raw_mutable_data());
+            if (!sk || !sv || !dk || !dv)
             {
-                const float *src_k_all = new_k->typed_data();
-                const float *src_v_all = new_v->typed_data();
-                float *dst_k_ptr = dst_k->mutable_typed_data();
-                float *dst_v_ptr = dst_v->mutable_typed_data();
-                if (!src_k_all || !src_v_all || !dst_k_ptr || !dst_v_ptr)
-                {
-                    return false;
-                }
-                const float *src_k = src_k_all + static_cast<size_t>(src_row) * kv_dim_;
-                const float *src_v = src_v_all + static_cast<size_t>(src_row) * kv_dim_;
-                for (int h = 0; h < local_n_kv_heads_; ++h)
-                {
-                    const float *src_k_head = src_k + static_cast<size_t>(h) * head_dim_;
-                    const float *src_v_head = src_v + static_cast<size_t>(h) * head_dim_;
-                    float *dst_k_head = dst_k_ptr + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * head_dim_;
-                    float *dst_v_head = dst_v_ptr + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * head_dim_;
-                    std::memcpy(dst_k_head, src_k_head, static_cast<size_t>(head_dim_) * sizeof(float));
-                    std::memcpy(dst_v_head, src_v_head, static_cast<size_t>(head_dim_) * sizeof(float));
-                }
-                return true;
+                return false;
             }
-            else if constexpr (Precision == ActivationPrecision::BF16 || Precision == ActivationPrecision::FP16)
-            {
-                const uint16_t *src_k_all = new_k->typed_data();
-                const uint16_t *src_v_all = new_v->typed_data();
-                uint16_t *dst_k_ptr = dst_k->mutable_typed_data();
-                uint16_t *dst_v_ptr = dst_v->mutable_typed_data();
-                if (!src_k_all || !src_v_all || !dst_k_ptr || !dst_v_ptr)
-                {
-                    return false;
-                }
-                const uint16_t *src_k = src_k_all + static_cast<size_t>(src_row) * kv_dim_;
-                const uint16_t *src_v = src_v_all + static_cast<size_t>(src_row) * kv_dim_;
-                for (int h = 0; h < local_n_kv_heads_; ++h)
-                {
-                    const uint16_t *src_k_head = src_k + static_cast<size_t>(h) * head_dim_;
-                    const uint16_t *src_v_head = src_v + static_cast<size_t>(h) * head_dim_;
-                    uint16_t *dst_k_head = dst_k_ptr + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * head_dim_;
-                    uint16_t *dst_v_head = dst_v_ptr + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * head_dim_;
-                    std::memcpy(dst_k_head, src_k_head, static_cast<size_t>(head_dim_) * sizeof(uint16_t));
-                    std::memcpy(dst_v_head, src_v_head, static_cast<size_t>(head_dim_) * sizeof(uint16_t));
-                }
-                return true;
-            }
-            else if constexpr (Precision == ActivationPrecision::Q8_1)
-            {
-                const auto *src_k_all = new_k->typed_data();
-                const auto *src_v_all = new_v->typed_data();
-                auto *dst_k_blocks = dst_k->mutable_typed_data();
-                auto *dst_v_blocks = dst_v->mutable_typed_data();
-                if (!src_k_all || !src_v_all || !dst_k_blocks || !dst_v_blocks)
-                {
-                    return false;
-                }
 
-                const size_t blocks_per_head = (static_cast<size_t>(head_dim_) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                const size_t src_blocks_per_row = (static_cast<size_t>(kv_dim_) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                const Q8_1Block *src_k_blocks = src_k_all + static_cast<size_t>(src_row) * src_blocks_per_row;
-                const Q8_1Block *src_v_blocks = src_v_all + static_cast<size_t>(src_row) * src_blocks_per_row;
-
-                for (int h = 0; h < local_n_kv_heads_; ++h)
-                {
-                    const Q8_1Block *src_k_head = src_k_blocks + static_cast<size_t>(h) * blocks_per_head;
-                    const Q8_1Block *src_v_head = src_v_blocks + static_cast<size_t>(h) * blocks_per_head;
-                    (void)src_blocks_per_row;
-                    Q8_1Block *dst_k_head = dst_k_blocks + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * blocks_per_head;
-                    Q8_1Block *dst_v_head = dst_v_blocks + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * blocks_per_head;
-                    std::memcpy(dst_k_head, src_k_head, blocks_per_head * sizeof(Q8_1Block));
-                    std::memcpy(dst_v_head, src_v_head, blocks_per_head * sizeof(Q8_1Block));
-                }
-                return true;
-            }
-            else
+            const auto *src_k_row = sk + static_cast<size_t>(src_row) * rb;
+            const auto *src_v_row = sv + static_cast<size_t>(src_row) * rb;
+            for (int h = 0; h < local_n_kv_heads_; ++h)
             {
-                const Q16BlockSize bs = dst_k->q16_block_size();
-                const size_t block_bytes = q16_block_size_bytes(bs);
-                const size_t block_elements = q16_block_size_elements(bs);
-                const uint8_t *src_k_bytes = reinterpret_cast<const uint8_t *>(new_k->raw_data());
-                const uint8_t *src_v_bytes = reinterpret_cast<const uint8_t *>(new_v->raw_data());
-                uint8_t *dst_k_bytes = reinterpret_cast<uint8_t *>(dst_k->raw_mutable_data());
-                uint8_t *dst_v_bytes = reinterpret_cast<uint8_t *>(dst_v->raw_mutable_data());
-                if (!src_k_bytes || !src_v_bytes || !dst_k_bytes || !dst_v_bytes)
-                {
-                    return false;
-                }
-
-                const size_t blocks_per_head = (static_cast<size_t>(head_dim_) + block_elements - 1) / block_elements;
-                const size_t src_blocks_per_row = (static_cast<size_t>(kv_dim_) + block_elements - 1) / block_elements;
-                const uint8_t *src_k_row = src_k_bytes + static_cast<size_t>(src_row) * src_blocks_per_row * block_bytes;
-                const uint8_t *src_v_row = src_v_bytes + static_cast<size_t>(src_row) * src_blocks_per_row * block_bytes;
-                for (int h = 0; h < local_n_kv_heads_; ++h)
-                {
-                    const uint8_t *src_k_head = src_k_row + static_cast<size_t>(h) * blocks_per_head * block_bytes;
-                    const uint8_t *src_v_head = src_v_row + static_cast<size_t>(h) * blocks_per_head * block_bytes;
-                    uint8_t *dst_k_head = dst_k_bytes + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * blocks_per_head * block_bytes;
-                    uint8_t *dst_v_head = dst_v_bytes + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * blocks_per_head * block_bytes;
-                    std::memcpy(dst_k_head, src_k_head, blocks_per_head * block_bytes);
-                    std::memcpy(dst_v_head, src_v_head, blocks_per_head * block_bytes);
-                }
-                return true;
+                const auto *src_k_head = src_k_row + static_cast<size_t>(h) * hb;
+                const auto *src_v_head = src_v_row + static_cast<size_t>(h) * hb;
+                auto *dst_k_head = dk + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * hb;
+                auto *dst_v_head = dv + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(dst_pos)) * hb;
+                std::memcpy(dst_k_head, src_k_head, hb);
+                std::memcpy(dst_v_head, src_v_head, hb);
             }
+            return true;
         };
 
         // -----------------------------------------------------------------
@@ -930,7 +752,12 @@ namespace llaminar2
         // Handles both POSITION_MAJOR and HEAD_MAJOR source layouts.
         // In HEAD_MAJOR mode, the gather also transposes the data back
         // to POSITION_MAJOR in the output.
+        //
+        // Uses the CPUKVCacheTensor trait's row_bytes/head_bytes to
+        // compute strides, eliminating per-precision if-constexpr chains.
         // -----------------------------------------------------------------
+        using GatherTrait = detail::CPUKVCacheTensor<Precision>;
+
         auto gather_tensor = [&](const TensorT *src_tensor, TensorT *dst_tensor, const EntryT &entry, int seq_idx, int kv_len) -> bool
         {
             if (!src_tensor || !dst_tensor || kv_len <= 0)
@@ -938,209 +765,53 @@ namespace llaminar2
                 return true; // Empty sequence — nothing to gather.
             }
 
-            const int head = entry.head; // Oldest valid position in the ring.
+            const int head = entry.head;
+            const size_t g_rb = GatherTrait::row_bytes(src_tensor, kv_dim_, head_dim_);
+            const size_t g_hb = GatherTrait::head_bytes(src_tensor, kv_dim_, head_dim_);
+
+            const auto *src = reinterpret_cast<const uint8_t *>(src_tensor->raw_data());
+            auto *dst = reinterpret_cast<uint8_t *>(dst_tensor->raw_mutable_data());
+            if (!src || !dst)
+            {
+                return false;
+            }
 
             if (layout_mode_ == KVCacheLayoutMode::POSITION_MAJOR)
             {
-                if constexpr (Precision == ActivationPrecision::FP32)
+                // POSITION_MAJOR: each ring slot is one contiguous row of g_rb bytes.
+                for (int logical = 0; logical < kv_len; ++logical)
                 {
-                    const float *src = src_tensor->typed_data();
-                    float *dst = dst_tensor->mutable_typed_data();
-                    if (!src || !dst)
-                    {
-                        return false;
-                    }
-
-                    for (int logical = 0; logical < kv_len; ++logical)
-                    {
-                        const int phys = (head + logical) % max_seq_len_;
-                        const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
-                        const float *src_row = src + static_cast<size_t>(phys) * kv_dim_;
-                        float *dst_row_ptr = dst + dst_row * kv_dim_;
-                        std::memcpy(dst_row_ptr, src_row, static_cast<size_t>(kv_dim_) * sizeof(float));
-                    }
-                    return true;
+                    const int phys = (head + logical) % max_seq_len_;
+                    const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
+                    std::memcpy(dst + dst_row * g_rb, src + static_cast<size_t>(phys) * g_rb, g_rb);
                 }
-                else if constexpr (Precision == ActivationPrecision::BF16 || Precision == ActivationPrecision::FP16)
-                {
-                    const uint16_t *src = src_tensor->typed_data();
-                    uint16_t *dst = dst_tensor->mutable_typed_data();
-                    if (!src || !dst)
-                    {
-                        return false;
-                    }
-
-                    for (int logical = 0; logical < kv_len; ++logical)
-                    {
-                        const int phys = (head + logical) % max_seq_len_;
-                        const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
-                        const uint16_t *src_row = src + static_cast<size_t>(phys) * kv_dim_;
-                        uint16_t *dst_row_ptr = dst + dst_row * kv_dim_;
-                        std::memcpy(dst_row_ptr, src_row, static_cast<size_t>(kv_dim_) * sizeof(uint16_t));
-                    }
-                    return true;
-                }
-                else if constexpr (Precision == ActivationPrecision::Q8_1)
-                {
-                    const Q8_1Block *src = src_tensor->typed_data();
-                    Q8_1Block *dst = dst_tensor->mutable_typed_data();
-                    if (!src || !dst)
-                    {
-                        return false;
-                    }
-
-                    const size_t blocks_per_row = (static_cast<size_t>(kv_dim_) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                    for (int logical = 0; logical < kv_len; ++logical)
-                    {
-                        const int phys = (head + logical) % max_seq_len_;
-                        const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
-                        const Q8_1Block *src_row = src + static_cast<size_t>(phys) * blocks_per_row;
-                        Q8_1Block *dst_row_ptr = dst + dst_row * blocks_per_row;
-                        std::memcpy(dst_row_ptr, src_row, blocks_per_row * sizeof(Q8_1Block));
-                    }
-                    return true;
-                }
-                else
-                {
-                    const Q16BlockSize bs = src_tensor->q16_block_size();
-                    const size_t block_bytes = q16_block_size_bytes(bs);
-                    const size_t block_elements = q16_block_size_elements(bs);
-                    const size_t blocks_per_row = (static_cast<size_t>(kv_dim_) + block_elements - 1) / block_elements;
-
-                    const uint8_t *src_bytes = reinterpret_cast<const uint8_t *>(src_tensor->raw_data());
-                    uint8_t *dst_bytes = reinterpret_cast<uint8_t *>(dst_tensor->raw_mutable_data());
-                    if (!src_bytes || !dst_bytes)
-                    {
-                        return false;
-                    }
-
-                    for (int logical = 0; logical < kv_len; ++logical)
-                    {
-                        const int phys = (head + logical) % max_seq_len_;
-                        const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
-                        const uint8_t *src_row = src_bytes + static_cast<size_t>(phys) * blocks_per_row * block_bytes;
-                        uint8_t *dst_row_ptr = dst_bytes + dst_row * blocks_per_row * block_bytes;
-                        std::memcpy(dst_row_ptr, src_row, blocks_per_row * block_bytes);
-                    }
-                    return true;
-                }
+                return true;
             }
 
             // =============================================================
             // HEAD_MAJOR gather: transpose [head][pos][head_dim] →
             //   [pos][n_heads * head_dim] in the output.
             //
-            // For each logical token position, iterate over all heads and
-            // copy each head's slice into the correct column offset in the
-            // output row.
+            // Source (HEAD_MAJOR):   src + (h * max_seq_len + phys) * g_hb
+            // Dest   (POSITION_MAJOR): dst + dst_row * g_rb + h * g_hb
             // =============================================================
-
-            if constexpr (Precision == ActivationPrecision::FP32)
+            if (g_rb < static_cast<size_t>(local_n_kv_heads_) * g_hb)
             {
-                const float *src = reinterpret_cast<const float *>(src_tensor->raw_data());
-                float *dst = reinterpret_cast<float *>(dst_tensor->raw_mutable_data());
-                if (!src || !dst)
-                {
-                    return false;
-                }
-                for (int logical = 0; logical < kv_len; ++logical)
-                {
-                    const int phys = (head + logical) % max_seq_len_;
-                    const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
-                    float *dst_row_ptr = dst + dst_row * static_cast<size_t>(kv_dim_);
-                    for (int h = 0; h < local_n_kv_heads_; ++h)
-                    {
-                        const float *src_head = src + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(phys)) * head_dim_;
-                        std::memcpy(dst_row_ptr + static_cast<size_t>(h) * head_dim_, src_head, static_cast<size_t>(head_dim_) * sizeof(float));
-                    }
-                }
-                return true;
+                return false; // Sanity: row must fit all heads.
             }
-            else if constexpr (Precision == ActivationPrecision::BF16 || Precision == ActivationPrecision::FP16)
-            {
-                const uint16_t *src = reinterpret_cast<const uint16_t *>(src_tensor->raw_data());
-                uint16_t *dst = reinterpret_cast<uint16_t *>(dst_tensor->raw_mutable_data());
-                if (!src || !dst)
-                {
-                    return false;
-                }
-                for (int logical = 0; logical < kv_len; ++logical)
-                {
-                    const int phys = (head + logical) % max_seq_len_;
-                    const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
-                    uint16_t *dst_row_ptr = dst + dst_row * static_cast<size_t>(kv_dim_);
-                    for (int h = 0; h < local_n_kv_heads_; ++h)
-                    {
-                        const uint16_t *src_head = src + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(phys)) * head_dim_;
-                        std::memcpy(dst_row_ptr + static_cast<size_t>(h) * head_dim_, src_head, static_cast<size_t>(head_dim_) * sizeof(uint16_t));
-                    }
-                }
-                return true;
-            }
-            else if constexpr (Precision == ActivationPrecision::Q8_1)
-            {
-                const Q8_1Block *src = reinterpret_cast<const Q8_1Block *>(src_tensor->raw_data());
-                Q8_1Block *dst = reinterpret_cast<Q8_1Block *>(dst_tensor->raw_mutable_data());
-                if (!src || !dst)
-                {
-                    return false;
-                }
-                const size_t blocks_per_head = (static_cast<size_t>(head_dim_) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                const size_t dst_blocks_per_row = (static_cast<size_t>(kv_dim_) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
-                if (dst_blocks_per_row < static_cast<size_t>(local_n_kv_heads_) * blocks_per_head)
-                {
-                    return false;
-                }
 
-                for (int logical = 0; logical < kv_len; ++logical)
-                {
-                    const int phys = (head + logical) % max_seq_len_;
-                    const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
-                    Q8_1Block *dst_row_ptr = dst + dst_row * dst_blocks_per_row;
-                    for (int h = 0; h < local_n_kv_heads_; ++h)
-                    {
-                        const Q8_1Block *src_head = src + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(phys)) * blocks_per_head;
-                        std::memcpy(dst_row_ptr + static_cast<size_t>(h) * blocks_per_head,
-                                    src_head,
-                                    blocks_per_head * sizeof(Q8_1Block));
-                    }
-                }
-                return true;
-            }
-            else
+            for (int logical = 0; logical < kv_len; ++logical)
             {
-                const Q16BlockSize bs = src_tensor->q16_block_size();
-                const size_t block_bytes = q16_block_size_bytes(bs);
-                const size_t block_elements = q16_block_size_elements(bs);
-                const uint8_t *src = reinterpret_cast<const uint8_t *>(src_tensor->raw_data());
-                uint8_t *dst = reinterpret_cast<uint8_t *>(dst_tensor->raw_mutable_data());
-                if (!src || !dst)
+                const int phys = (head + logical) % max_seq_len_;
+                const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
+                auto *dst_row_ptr = dst + dst_row * g_rb;
+                for (int h = 0; h < local_n_kv_heads_; ++h)
                 {
-                    return false;
+                    const auto *src_head = src + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(phys)) * g_hb;
+                    std::memcpy(dst_row_ptr + static_cast<size_t>(h) * g_hb, src_head, g_hb);
                 }
-
-                const size_t blocks_per_head = (static_cast<size_t>(head_dim_) + block_elements - 1) / block_elements;
-                const size_t dst_blocks_per_row = (static_cast<size_t>(kv_dim_) + block_elements - 1) / block_elements;
-                if (dst_blocks_per_row < static_cast<size_t>(local_n_kv_heads_) * blocks_per_head)
-                {
-                    return false;
-                }
-
-                for (int logical = 0; logical < kv_len; ++logical)
-                {
-                    const int phys = (head + logical) % max_seq_len_;
-                    const size_t dst_row = static_cast<size_t>(seq_idx) * static_cast<size_t>(max_kv_len) + static_cast<size_t>(logical);
-                    uint8_t *dst_row_ptr = dst + dst_row * dst_blocks_per_row * block_bytes;
-                    for (int h = 0; h < local_n_kv_heads_; ++h)
-                    {
-                        const uint8_t *src_head = src + (static_cast<size_t>(h) * max_seq_len_ + static_cast<size_t>(phys)) * blocks_per_head * block_bytes;
-                        std::memcpy(dst_row_ptr + static_cast<size_t>(h) * blocks_per_head * block_bytes,
-                                    src_head,
-                                    blocks_per_head * block_bytes);
-                    }
-                }
-                return true;
             }
+            return true;
         };
 
         // Gather K and V for each sequence in the batch.
@@ -1289,6 +960,10 @@ namespace llaminar2
             return std::make_unique<CPURingKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
         case ActivationPrecision::Q16_1:
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+        case ActivationPrecision::TQ4:
+            return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
+        case ActivationPrecision::TQ3:
+            return std::make_unique<CPURingKVCacheTQ3>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
         default:
             LOG_ERROR("createCPURingKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1318,6 +993,10 @@ namespace llaminar2
             return std::make_unique<CPURingKVCacheQ8_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::Q16_1:
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+        case ActivationPrecision::TQ4:
+            return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
+        case ActivationPrecision::TQ3:
+            return std::make_unique<CPURingKVCacheTQ3>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         default:
             LOG_ERROR("createCPURingKVCache(attention_devices): unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1352,6 +1031,12 @@ namespace llaminar2
         case ActivationPrecision::Q16_1:
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                          n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+        case ActivationPrecision::TQ4:
+            return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
+        case ActivationPrecision::TQ3:
+            return std::make_unique<CPURingKVCacheTQ3>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
         default:
             LOG_ERROR("createShardedCPURingKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1387,6 +1072,12 @@ namespace llaminar2
         case ActivationPrecision::Q16_1:
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                          n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+        case ActivationPrecision::TQ4:
+            return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
+        case ActivationPrecision::TQ3:
+            return std::make_unique<CPURingKVCacheTQ3>(mpi_ctx, n_layers, batch_size, max_seq_len,
+                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         default:
             LOG_ERROR("createShardedCPURingKVCache(attention_devices): unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1407,5 +1098,7 @@ namespace llaminar2
     template class CPURingKVCache<ActivationPrecision::FP16>;
     template class CPURingKVCache<ActivationPrecision::Q8_1>;
     template class CPURingKVCache<ActivationPrecision::Q16_1>;
+    template class CPURingKVCache<ActivationPrecision::TQ4>;
+    template class CPURingKVCache<ActivationPrecision::TQ3>;
 
 } // namespace llaminar2

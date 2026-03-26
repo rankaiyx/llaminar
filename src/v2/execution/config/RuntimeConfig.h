@@ -152,7 +152,9 @@ namespace llaminar2
         Q8_1,     ///< Block-quantized int8 (36 bytes per 32 elements, 3.5x compression)
         Q16_1,    ///< Block-quantized int16 (72 bytes per 32 elements, 266× better than Q8_1)
         Hybrid,   ///< Mixed precision: FP32 residual, BF16 KV cache, Q8_1 QKV activations
-        HybridQ16 ///< Mixed precision: Q16_1 residual, Q8_1 activations (62% memory savings)
+        HybridQ16, ///< Mixed precision: Q16_1 residual, Q8_1 activations (62% memory savings)
+        TQ4,      ///< TurboQuant 4-bit KV cache (7.5× compression vs FP32)
+        TQ3       ///< TurboQuant 3-bit KV cache (9.8× compression vs FP32)
     };
 
     /**
@@ -176,6 +178,10 @@ namespace llaminar2
             return "Hybrid";
         case ActivationPrecision::HybridQ16:
             return "HybridQ16";
+        case ActivationPrecision::TQ4:
+            return "TQ4";
+        case ActivationPrecision::TQ3:
+            return "TQ3";
         default:
             return "Unknown";
         }
@@ -193,7 +199,9 @@ namespace llaminar2
         FP32,
         FP16,
         Q8_1,
-        Q16_1
+        Q16_1,
+        TQ4,
+        TQ3
     };
 
     inline const char *kvCachePrecisionToString(KVCachePrecision precision)
@@ -210,6 +218,10 @@ namespace llaminar2
             return "Q8_1";
         case KVCachePrecision::Q16_1:
             return "Q16_1";
+        case KVCachePrecision::TQ4:
+            return "TQ4";
+        case KVCachePrecision::TQ3:
+            return "TQ3";
         default:
             return "UNKNOWN";
         }
@@ -230,6 +242,10 @@ namespace llaminar2
             return KVCachePrecision::Q8_1;
         if (lower == "q16_1" || lower == "q16" || lower == "q161" || lower == "i16" || lower == "int16")
             return KVCachePrecision::Q16_1;
+        if (lower == "tq4")
+            return KVCachePrecision::TQ4;
+        if (lower == "tq3")
+            return KVCachePrecision::TQ3;
         return KVCachePrecision::AUTO;
     }
 
@@ -246,6 +262,10 @@ namespace llaminar2
             return ActivationPrecision::Q8_1;
         case KVCachePrecision::Q16_1:
             return ActivationPrecision::Q16_1;
+        case KVCachePrecision::TQ4:
+            return ActivationPrecision::TQ4;
+        case KVCachePrecision::TQ3:
+            return ActivationPrecision::TQ3;
         case KVCachePrecision::AUTO:
         default:
             // CPU: Q16_1 uses VNNI int16 attention — ~1.4x decode speedup, 50% KV memory
@@ -282,6 +302,10 @@ namespace llaminar2
             return 36.0f / 32.0f; // 1.125 bytes/element
         case ActivationPrecision::Q16_1:
             return 72.0f / 32.0f; // 2.25 bytes/element
+        case ActivationPrecision::TQ4:
+            return 68.0f / 128.0f; // ~0.53 bytes/element (head_dim=128)
+        case ActivationPrecision::TQ3:
+            return 52.0f / 128.0f; // ~0.41 bytes/element (head_dim=128)
         case ActivationPrecision::Hybrid:
         case ActivationPrecision::HybridQ16:
         default:

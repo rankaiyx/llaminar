@@ -24,6 +24,7 @@ namespace llaminar2
         CONVERT_TO_FP16,
         CONVERT_TO_Q8_1,
         CONVERT_TO_Q16_1,
+        CONVERT_TO_TQ,
         GATHER,
         GPU_ALLOC,
         COUNT
@@ -43,6 +44,8 @@ namespace llaminar2
             return "KV_CONV_Q8_1";
         case KVCacheOpType::CONVERT_TO_Q16_1:
             return "KV_CONV_Q16_1";
+        case KVCacheOpType::CONVERT_TO_TQ:
+            return "KV_CONV_TQ";
         case KVCacheOpType::GATHER:
             return "KV_GATHER";
         case KVCacheOpType::GPU_ALLOC:

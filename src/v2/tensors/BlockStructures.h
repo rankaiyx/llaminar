@@ -589,4 +589,154 @@ namespace llaminar2
     } __attribute__((packed));
     static_assert(sizeof(IQ1_MBlock) == 56, "IQ1_MBlock must be 56 bytes");
 
+    // ========================================================================
+    // TurboQuant 4-bit Inner-product Block (TQ4)
+    // ========================================================================
+
+    /**
+     * @brief TQ4 variable-size block implementing the paper's 4-bit prod path.
+     *
+     * Total logical bit budget per coordinate is 4 bits:
+     *   - 3-bit MSE TurboQuant codebook index
+     *   - 1-bit QJL residual sign
+     *
+     * Two FP32 scalars are stored per head block:
+     *   - norm:          original vector norm for non-unit inputs
+     *   - residual_norm: ||x_unit - x_mse|| used to scale the QJL residual
+     *
+     * Template parameter D = number of elements (head_dim).
+     *
+     * Memory layout:
+     *   [float norm][float residual_norm][uint8_t mse_indices[D*3/8]][uint8_t qjl_signs[D/8]]
+     *
+     * Memory per block:
+     *   D=64:  4 + 4 + 24 + 8  = 40 bytes
+     *   D=128: 4 + 4 + 48 + 16 = 72 bytes
+     */
+    template <int D>
+    struct TQ4Block
+    {
+        static_assert(D > 0 && D % 8 == 0, "TQ4Block dimension must be positive and divisible by 8");
+
+        float norm;
+        float residual_norm;
+        uint8_t mse_indices[D * 3 / 8];
+        uint8_t qjl_signs[D / 8];
+
+        static constexpr int BLOCK_DIM = D;
+        static constexpr int BITS = 4;
+        static constexpr int MSE_BITS = 3;
+        static constexpr int NUM_CENTROIDS = 8;
+        static constexpr size_t MSE_BYTES = D * 3 / 8;
+        static constexpr size_t QJL_BYTES = D / 8;
+        static constexpr size_t TOTAL_BYTES = 2 * sizeof(float) + MSE_BYTES + QJL_BYTES;
+    };
+
+    // Common instantiations
+    using TQ4Block_64 = TQ4Block<64>;
+    using TQ4Block_128 = TQ4Block<128>;
+
+    static_assert(sizeof(TQ4Block_64) == 40, "TQ4Block_64 must be 40 bytes");
+    static_assert(sizeof(TQ4Block_128) == 72, "TQ4Block_128 must be 72 bytes");
+
+    // ========================================================================
+    // TurboQuant 3-bit Inner-product Block (TQ3)
+    // ========================================================================
+
+    /**
+    * @brief TQ3 variable-size block implementing the paper's 3-bit prod path.
+    *
+    * Total logical bit budget per coordinate is 3 bits:
+    *   - 2-bit MSE TurboQuant codebook index
+    *   - 1-bit QJL residual sign
+    *
+    * Two FP32 scalars are stored per head block: the original vector norm and
+    * the residual norm used to scale the QJL reconstruction.
+    *
+    * Packing scheme (4 elements → 1 byte):
+    *   byte0 = idx[0] | (idx[1] << 2) | (idx[2] << 4) | (idx[3] << 6)
+     *
+     * Template parameter D = number of elements (head_dim).
+     * D must be divisible by 8 for clean packing.
+     *
+     * Memory layout:
+     *   [float norm][float residual_norm][uint8_t mse_indices[D/4]][uint8_t qjl_signs[D/8]]
+     *
+     * Memory per block:
+     *   D=64:  4 + 4 + 16 + 8  = 32 bytes
+     *   D=128: 4 + 4 + 32 + 16 = 56 bytes
+     */
+    template <int D>
+    struct TQ3Block
+    {
+        static_assert(D > 0 && D % 8 == 0, "TQ3Block dimension must be positive and divisible by 8");
+
+        float norm;
+        float residual_norm;
+        uint8_t mse_indices[D / 4];
+        uint8_t qjl_signs[D / 8];
+
+        static constexpr int BLOCK_DIM = D;
+        static constexpr int BITS = 3;
+        static constexpr int MSE_BITS = 2;
+        static constexpr int NUM_CENTROIDS = 4;
+        static constexpr size_t MSE_BYTES = D / 4;
+        static constexpr size_t QJL_BYTES = D / 8;
+        static constexpr size_t TOTAL_BYTES = 2 * sizeof(float) + MSE_BYTES + QJL_BYTES;
+    };
+
+    // Common instantiations
+    using TQ3Block_64 = TQ3Block<64>;
+    using TQ3Block_128 = TQ3Block<128>;
+
+    static_assert(sizeof(TQ3Block_64) == 32, "TQ3Block_64 must be 32 bytes");
+    static_assert(sizeof(TQ3Block_128) == 56, "TQ3Block_128 must be 56 bytes");
+
+    inline void tq2_pack_4(const uint8_t *idx, uint8_t *out)
+    {
+        *out = static_cast<uint8_t>(idx[0] | (idx[1] << 2) | (idx[2] << 4) | (idx[3] << 6));
+    }
+
+    inline void tq2_unpack_4(const uint8_t *packed, uint8_t *out)
+    {
+        const uint8_t bits = *packed;
+        out[0] = bits & 0x03;
+        out[1] = (bits >> 2) & 0x03;
+        out[2] = (bits >> 4) & 0x03;
+        out[3] = (bits >> 6) & 0x03;
+    }
+
+    // ========================================================================
+    // TQ3 Bit-packing Helpers
+    // ========================================================================
+
+    /**
+     * @brief Pack 8 3-bit indices into 3 bytes
+     * @param idx Pointer to 8 indices (each 0-7)
+     * @param out Pointer to 3 output bytes
+     */
+    inline void tq3_pack_8(const uint8_t *idx, uint8_t *out)
+    {
+        out[0] = static_cast<uint8_t>(idx[0] | (idx[1] << 3) | (idx[2] << 6));
+        out[1] = static_cast<uint8_t>((idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7));
+        out[2] = static_cast<uint8_t>((idx[5] >> 1) | (idx[6] << 2) | (idx[7] << 5));
+    }
+
+    /**
+     * @brief Unpack 3 bytes into 8 3-bit indices
+     * @param packed Pointer to 3 packed bytes
+     * @param out Pointer to 8 output indices (each 0-7)
+     */
+    inline void tq3_unpack_8(const uint8_t *packed, uint8_t *out)
+    {
+        out[0] = packed[0] & 0x07;
+        out[1] = (packed[0] >> 3) & 0x07;
+        out[2] = ((packed[0] >> 6) | (packed[1] << 2)) & 0x07;
+        out[3] = (packed[1] >> 1) & 0x07;
+        out[4] = (packed[1] >> 4) & 0x07;
+        out[5] = ((packed[1] >> 7) | (packed[2] << 1)) & 0x07;
+        out[6] = (packed[2] >> 2) & 0x07;
+        out[7] = (packed[2] >> 5) & 0x07;
+    }
+
 } // namespace llaminar2

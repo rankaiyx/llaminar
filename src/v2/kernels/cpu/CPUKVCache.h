@@ -7,6 +7,8 @@
 
 #include "../IKVCache.h" // Unified KVCache interface
 #include "../../tensors/Tensors.h"
+#include "../../tensors/TQ4Tensor.h"
+#include "../../tensors/TQ3Tensor.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/TensorLayout.h"
 #include "../../backends/DeviceId.h"
@@ -249,7 +251,20 @@ namespace llaminar2
     namespace detail
     {
         /**
-         * @brief Map ActivationPrecision to tensor type for KV cache
+         * @brief Map ActivationPrecision to tensor type for KV cache, with allocation.
+         *
+         * Each specialization provides:
+         *   - Type: the concrete tensor class
+         *   - allocate(): creates a shared_ptr<Type> for the given shape/device
+         *   - row_bytes(): bytes per complete row (all heads, position-major stride)
+         *   - head_bytes(): bytes per single head slice (head-major copy unit)
+         *
+         * row_bytes() and head_bytes() enable precision-agnostic byte-level copy
+         * operations in the ring buffer, eliminating per-precision if-constexpr chains.
+         *
+         * The allocate() signature is uniform across all precisions. Parameters
+         * that a given precision does not need (e.g. head_dim for FP32) are
+         * simply ignored, keeping the call site a single line.
          */
         template <ActivationPrecision P>
         struct CPUKVCacheTensor;
@@ -258,30 +273,109 @@ namespace llaminar2
         struct CPUKVCacheTensor<ActivationPrecision::FP32>
         {
             using Type = FP32Tensor;
+            static std::shared_ptr<Type> allocate(TensorFactory &factory, size_t rows, size_t cols, int /*head_dim*/, DeviceId device)
+            {
+                return factory.createFP32({rows, cols}, device);
+            }
+            static size_t row_bytes(const Type *, int kv_dim, int) { return static_cast<size_t>(kv_dim) * sizeof(float); }
+            static size_t head_bytes(const Type *, int, int head_dim) { return static_cast<size_t>(head_dim) * sizeof(float); }
         };
 
         template <>
         struct CPUKVCacheTensor<ActivationPrecision::BF16>
         {
             using Type = BF16Tensor;
+            static std::shared_ptr<Type> allocate(TensorFactory &factory, size_t rows, size_t cols, int /*head_dim*/, DeviceId /*device*/)
+            {
+                return factory.createBF16({rows, cols});
+            }
+            static size_t row_bytes(const Type *, int kv_dim, int) { return static_cast<size_t>(kv_dim) * sizeof(uint16_t); }
+            static size_t head_bytes(const Type *, int, int head_dim) { return static_cast<size_t>(head_dim) * sizeof(uint16_t); }
         };
 
         template <>
         struct CPUKVCacheTensor<ActivationPrecision::FP16>
         {
             using Type = FP16Tensor;
+            static std::shared_ptr<Type> allocate(TensorFactory &factory, size_t rows, size_t cols, int /*head_dim*/, DeviceId /*device*/)
+            {
+                return factory.createFP16({rows, cols});
+            }
+            static size_t row_bytes(const Type *, int kv_dim, int) { return static_cast<size_t>(kv_dim) * sizeof(uint16_t); }
+            static size_t head_bytes(const Type *, int, int head_dim) { return static_cast<size_t>(head_dim) * sizeof(uint16_t); }
         };
 
         template <>
         struct CPUKVCacheTensor<ActivationPrecision::Q8_1>
         {
             using Type = Q8_1Tensor;
+            static std::shared_ptr<Type> allocate(TensorFactory &factory, size_t rows, size_t cols, int /*head_dim*/, DeviceId device)
+            {
+                return factory.createQ8_1({rows, cols}, device);
+            }
+            static size_t row_bytes(const Type *, int kv_dim, int)
+            {
+                return ((static_cast<size_t>(kv_dim) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE) * sizeof(Q8_1Block);
+            }
+            static size_t head_bytes(const Type *, int, int head_dim)
+            {
+                return ((static_cast<size_t>(head_dim) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE) * sizeof(Q8_1Block);
+            }
         };
 
         template <>
         struct CPUKVCacheTensor<ActivationPrecision::Q16_1>
         {
             using Type = Q16_1Tensor;
+            static std::shared_ptr<Type> allocate(TensorFactory &factory, size_t rows, size_t cols, int head_dim, DeviceId device)
+            {
+                return factory.createQ16_1({rows, cols}, optimal_q16_block_size(head_dim), device);
+            }
+            static size_t row_bytes(const Type *t, int kv_dim, int)
+            {
+                const size_t be = q16_block_size_elements(t->q16_block_size());
+                const size_t bb = q16_block_size_bytes(t->q16_block_size());
+                return ((static_cast<size_t>(kv_dim) + be - 1) / be) * bb;
+            }
+            static size_t head_bytes(const Type *t, int, int head_dim)
+            {
+                const size_t be = q16_block_size_elements(t->q16_block_size());
+                const size_t bb = q16_block_size_bytes(t->q16_block_size());
+                return ((static_cast<size_t>(head_dim) + be - 1) / be) * bb;
+            }
+        };
+
+        template <>
+        struct CPUKVCacheTensor<ActivationPrecision::TQ4>
+        {
+            using Type = TQ4Tensor;
+            static std::shared_ptr<Type> allocate(TensorFactory & /*factory*/, size_t rows, size_t cols, int head_dim, DeviceId device)
+            {
+                return std::make_shared<TQ4Tensor>(std::vector<size_t>{rows, cols}, head_dim, device);
+            }
+            static size_t row_bytes(const Type *t, int kv_dim, int head_dim)
+            {
+                // Use kv_dim parameter (not tensor's blocks_per_row) so the stride is always
+                // kv_dim-wide.  HEAD_MAJOR internal tensors have cols=head_dim, but the
+                // row stride for source/dest copies must span all heads.
+                return static_cast<size_t>(kv_dim / head_dim) * t->block_bytes();
+            }
+            static size_t head_bytes(const Type *t, int, int) { return t->block_bytes(); } // 1 block per head
+        };
+
+        template <>
+        struct CPUKVCacheTensor<ActivationPrecision::TQ3>
+        {
+            using Type = TQ3Tensor;
+            static std::shared_ptr<Type> allocate(TensorFactory & /*factory*/, size_t rows, size_t cols, int head_dim, DeviceId device)
+            {
+                return std::make_shared<TQ3Tensor>(std::vector<size_t>{rows, cols}, head_dim, device);
+            }
+            static size_t row_bytes(const Type *t, int kv_dim, int head_dim)
+            {
+                return static_cast<size_t>(kv_dim / head_dim) * t->block_bytes();
+            }
+            static size_t head_bytes(const Type *t, int, int) { return t->block_bytes(); } // 1 block per head
         };
     } // namespace detail
 
