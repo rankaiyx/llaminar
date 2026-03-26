@@ -19,7 +19,6 @@ namespace llaminar2
     class FP16Tensor;
     class Q8_1Tensor;
     class TQ4Tensor;
-    class TQ3Tensor;
     class TurboQuantContext;
 
     /**
@@ -73,8 +72,8 @@ namespace llaminar2
             /// Required for proper MAX_SAFE_INT16 selection. Common values: 64, 96, 128, 192.
             int head_dim = 128;
 
-            /// TurboQuant context (rotation matrix) for TQ4/TQ3 KV cache quantization.
-            /// Required when cache precision is TQ4 or TQ3. Not owned by this struct.
+            /// TurboQuant context (rotation matrix) for TQ4 KV cache quantization.
+            /// Required when cache precision is TQ4. Not owned by this struct.
             const TurboQuantContext *turboquant_ctx = nullptr;
 
             // Optional BufferIds for contract-based coherence
@@ -137,8 +136,6 @@ namespace llaminar2
         std::unique_ptr<Q8_1Tensor> q8_v_scratch_;
         std::shared_ptr<TQ4Tensor> tq4_k_scratch_;
         std::shared_ptr<TQ4Tensor> tq4_v_scratch_;
-        std::shared_ptr<TQ3Tensor> tq3_k_scratch_;
-        std::shared_ptr<TQ3Tensor> tq3_v_scratch_;
     };
 
 } // namespace llaminar2

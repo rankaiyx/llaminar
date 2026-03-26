@@ -1,12 +1,12 @@
 /**
  * @file TurboQuantQuantize.h
- * @brief FP32 → TQ4/TQ3 quantization for TurboQuant KV cache
+ * @brief FP32 → TQ4 scalar-full quantization for TurboQuant KV cache
  * @author David Sanftenberg
  *
- * Quantizes FP32 vectors to the paper's inner-product-corrected TurboQuant
- * blocks.
+ * Quantizes FP32 vectors to 4-bit TQ4 blocks using scalar-full MSE centroids.
+ * All 4 bits encode MSE centroid indices directly.
  *
- * Provides both single-vector and batch (multi-head) entry points.
+ * Provides single-vector entry point.
  */
 
 #pragma once
@@ -14,12 +14,15 @@
 #include "tensors/BlockStructures.h"
 #include "kernels/cpu/turboquant/TurboQuantCodebook.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
-#include "kernels/cpu/turboquant/TurboQuantQJL.h"
 
 #include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <vector>
+
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#endif
 
 namespace llaminar2
 {
@@ -36,19 +39,13 @@ namespace llaminar2
     }
 
     // ========================================================================
-    // Single-vector quantize: FP32 → TQ4
+    // Single-vector quantize: scalar full-index helpers
+    //
+    // Used for value vectors, where direct reconstruction fidelity matters more
+    // than unbiased inner-product estimation. residual_norm < 0 signals this
+    // storage mode at dequantization time.
     // ========================================================================
 
-    /**
-     * @brief Quantize one FP32 vector to a TQ4 block.
-     *
-     * @tparam D Dimension of the vector (head_dim)
-     * @param input FP32 vector of length D
-     * @param ctx Pre-generated TurboQuant context (rotation + QJL projection)
-     * @param out Output TQ4 block
-     * @param scratch0 Scratch buffer of at least D floats
-     * @param scratch1 Scratch buffer of at least D floats
-     */
     template <int D>
     inline void turboquant_quantize_tq4(
         const float *input,
@@ -57,31 +54,119 @@ namespace llaminar2
         float *scratch0,
         float *scratch1)
     {
-        float norm_sq = 0.0f;
-        for (int i = 0; i < D; ++i)
-            norm_sq += input[i] * input[i];
-        float norm = std::sqrt(norm_sq);
-        out.norm = norm;
-        out.residual_norm = 0.0f;
+        (void)scratch1;
 
-        if (norm < 1e-30f) {
+#if defined(__AVX512F__)
+        // --- Norm computation (AVX-512 FMA + reduce) ---
+        __m512 vacc = _mm512_setzero_ps();
+        for (int i = 0; i < D; i += 16)
+        {
+            __m512 v = _mm512_loadu_ps(input + i);
+            vacc = _mm512_fmadd_ps(v, v, vacc);
+        }
+        const float norm_sq = _mm512_reduce_add_ps(vacc);
+        const float norm = std::sqrt(norm_sq);
+        out.norm = norm;
+        out.residual_norm = -1.0f;
+
+        if (norm < 1e-30f)
+        {
             std::memset(out.mse_indices, 0, TQ4Block<D>::MSE_BYTES);
-            std::memset(out.qjl_signs, 0, TQ4Block<D>::QJL_BYTES);
+            std::memset(out.high_bits, 0, TQ4Block<D>::HIGH_BIT_BYTES);
             return;
         }
 
-        float inv_norm = 1.0f / norm;
+        // --- Unit vector (AVX-512 mul) ---
+        const float inv_norm = 1.0f / norm;
+        alignas(64) float unit_vec[D];
+        {
+            const __m512 vinv = _mm512_set1_ps(inv_norm);
+            for (int i = 0; i < D; i += 16)
+            {
+                __m512 v = _mm512_loadu_ps(input + i);
+                _mm512_store_ps(unit_vec + i, _mm512_mul_ps(v, vinv));
+            }
+        }
+
+        // --- Rotation (already AVX-512 internally) ---
+        apply_rotation(ctx.rotation(), unit_vec, scratch0);
+
+        // --- Scale by sqrt(D) (AVX-512 mul) ---
+        const float scale = std::sqrt(static_cast<float>(D));
+        {
+            const __m512 vscale = _mm512_set1_ps(scale);
+            for (int i = 0; i < D; i += 16)
+            {
+                __m512 v = _mm512_loadu_ps(scratch0 + i);
+                _mm512_storeu_ps(scratch0 + i, _mm512_mul_ps(v, vscale));
+            }
+        }
+
+        // --- Nearest centroid (AVX-512 threshold-popcount, 16 elements at a time) ---
+        // For each of 16 values, count how many of the 15 thresholds it exceeds.
+        // This replaces the scalar binary search with fully parallel comparisons.
+        for (int i = 0; i < D; i += 16)
+        {
+            __m512 vals = _mm512_loadu_ps(scratch0 + i);
+            __m512i vidx = _mm512_setzero_si512();
+            const __m512i one = _mm512_set1_epi32(1);
+
+            for (int t = 0; t < 15; ++t)
+            {
+                const __m512 thresh = _mm512_set1_ps(TQ4_THRESHOLDS[t]);
+                const __mmask16 gt = _mm512_cmp_ps_mask(vals, thresh, _CMP_GT_OQ);
+                vidx = _mm512_mask_add_epi32(vidx, gt, vidx, one);
+            }
+
+            // Extract indices and split into 3-bit low + 1-bit high, then pack
+            alignas(64) int32_t idx_arr[16];
+            _mm512_store_epi32(idx_arr, vidx);
+
+            for (int half = 0; half < 2; ++half)
+            {
+                const int base = half * 8;
+                const int g = (i + base) / 8;
+                uint8_t idx8[8];
+                uint8_t high_bits[8];
+                for (int j = 0; j < 8; ++j)
+                {
+                    const int idx4 = idx_arr[base + j];
+                    high_bits[j] = static_cast<uint8_t>((idx4 >> 3) & 0x1u);
+                    idx8[j] = static_cast<uint8_t>(idx4 & 0x7u);
+                }
+                tq3_pack_8(idx8, out.mse_indices + g * 3);
+                pack_bitplane_8(high_bits, out.high_bits + g);
+            }
+        }
+
+#else
+        float norm_sq = 0.0f;
+        for (int i = 0; i < D; ++i)
+            norm_sq += input[i] * input[i];
+        const float norm = std::sqrt(norm_sq);
+        out.norm = norm;
+        out.residual_norm = -1.0f;
+
+        if (norm < 1e-30f)
+        {
+            std::memset(out.mse_indices, 0, TQ4Block<D>::MSE_BYTES);
+            std::memset(out.high_bits, 0, TQ4Block<D>::HIGH_BIT_BYTES);
+            return;
+        }
+
+        const float inv_norm = 1.0f / norm;
         float unit_vec[D];
         for (int i = 0; i < D; ++i)
             unit_vec[i] = input[i] * inv_norm;
 
         apply_rotation(ctx.rotation(), unit_vec, scratch0);
 
-        float scale = std::sqrt(static_cast<float>(D));
+        const float scale = std::sqrt(static_cast<float>(D));
         for (int i = 0; i < D; ++i)
             scratch0[i] *= scale;
 
-        for (int i = 0; i < D; i += 8) {
+        for (int i = 0; i < D; i += 8)
+        {
             uint8_t idx8[8];
             uint8_t high_bits[8];
             for (int j = 0; j < 8; ++j)
@@ -91,136 +176,9 @@ namespace llaminar2
                 idx8[j] &= 0x7u;
             }
             tq3_pack_8(idx8, out.mse_indices + (i / 8) * 3);
-            pack_bitplane_8(high_bits, out.qjl_signs + (i / 8));
+            pack_bitplane_8(high_bits, out.high_bits + (i / 8));
         }
-    }
-
-    // ========================================================================
-    // Single-vector quantize: FP32 → TQ3
-    // ========================================================================
-
-    /**
-     * @brief Quantize one FP32 vector to a TQ3 block.
-     *
-     * @tparam D Dimension of the vector (head_dim)
-     * @param input FP32 vector of length D
-     * @param ctx Pre-generated TurboQuant context (rotation + QJL projection)
-     * @param out Output TQ3 block
-     * @param scratch0 Scratch buffer of at least D floats
-     * @param scratch1 Scratch buffer of at least D floats
-     */
-    template <int D>
-    inline void turboquant_quantize_tq3(
-        const float *input,
-        const TurboQuantContext &ctx,
-        TQ3Block<D> &out,
-        float *scratch0,
-        float *scratch1)
-    {
-        float norm_sq = 0.0f;
-        for (int i = 0; i < D; ++i)
-            norm_sq += input[i] * input[i];
-        float norm = std::sqrt(norm_sq);
-        out.norm = norm;
-        out.residual_norm = 0.0f;
-
-        if (norm < 1e-30f) {
-            std::memset(out.mse_indices, 0, TQ3Block<D>::MSE_BYTES);
-            std::memset(out.qjl_signs, 0, TQ3Block<D>::QJL_BYTES);
-            return;
-        }
-
-        float inv_norm = 1.0f / norm;
-        float unit_vec[D];
-        for (int i = 0; i < D; ++i)
-            unit_vec[i] = input[i] * inv_norm;
-
-        apply_rotation(ctx.rotation(), unit_vec, scratch0);
-
-        float scale = std::sqrt(static_cast<float>(D));
-        for (int i = 0; i < D; ++i)
-            scratch0[i] *= scale;
-
-        for (int i = 0; i < D; i += 8) {
-            uint8_t high_bits[8];
-            for (int j = 0; j < 8; j += 4)
-            {
-                uint8_t idx4[4];
-                for (int k = 0; k < 4; ++k)
-                {
-                    idx4[k] = tq3_nearest_centroid(scratch0[i + j + k]);
-                    high_bits[j + k] = static_cast<uint8_t>((idx4[k] >> 2) & 0x1u);
-                    idx4[k] &= 0x3u;
-                }
-                tq2_pack_4(idx4, out.mse_indices + ((i + j) / 4));
-            }
-            pack_bitplane_8(high_bits, out.qjl_signs + (i / 8));
-        }
-    }
-
-    // ========================================================================
-    // Batch quantize: multiple vectors (e.g., all KV heads in a layer)
-    // ========================================================================
-
-    /**
-     * @brief Quantize a batch of FP32 vectors to TQ4 blocks.
-     *
-    * Each vector is independently quantized using the same TurboQuant context.
-     * Suitable for quantizing K or V vectors across all heads in a layer.
-     *
-     * @tparam D Dimension of each vector (head_dim)
-     * @param input Pointer to num_vectors × D contiguous FP32 data (row-major)
-     * @param ctx Pre-generated TurboQuant context
-     * @param out Pointer to num_vectors TQ4 blocks
-     * @param num_vectors Number of vectors to quantize
-     */
-    template <int D>
-    inline void turboquant_quantize_tq4_batch(
-        const float *input,
-        const TurboQuantContext &ctx,
-        TQ4Block<D> *out,
-        int num_vectors)
-    {
-        float scratch0[D];
-        float scratch1[D];
-
-        for (int v = 0; v < num_vectors; ++v) {
-            turboquant_quantize_tq4<D>(
-                input + v * D,
-                ctx,
-                out[v],
-                scratch0,
-                scratch1);
-        }
-    }
-
-    /**
-     * @brief Quantize a batch of FP32 vectors to TQ3 blocks.
-     *
-     * @tparam D Dimension of each vector (head_dim)
-     * @param input Pointer to num_vectors × D contiguous FP32 data (row-major)
-     * @param ctx Pre-generated TurboQuant context
-     * @param out Pointer to num_vectors TQ3 blocks
-     * @param num_vectors Number of vectors to quantize
-     */
-    template <int D>
-    inline void turboquant_quantize_tq3_batch(
-        const float *input,
-        const TurboQuantContext &ctx,
-        TQ3Block<D> *out,
-        int num_vectors)
-    {
-        float scratch0[D];
-        float scratch1[D];
-
-        for (int v = 0; v < num_vectors; ++v) {
-            turboquant_quantize_tq3<D>(
-                input + v * D,
-                ctx,
-                out[v],
-                scratch0,
-                scratch1);
-        }
+#endif
     }
 
 } // namespace llaminar2

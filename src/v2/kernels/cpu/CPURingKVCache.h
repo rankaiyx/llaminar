@@ -551,7 +551,6 @@ namespace llaminar2
     using CPURingKVCacheQ8_1 = CPURingKVCache<ActivationPrecision::Q8_1>;   ///< 8-bit quantized KV cache.
     using CPURingKVCacheQ16_1 = CPURingKVCache<ActivationPrecision::Q16_1>; ///< 16-bit quantized KV cache.
     using CPURingKVCacheTQ4 = CPURingKVCache<ActivationPrecision::TQ4>;     ///< TurboQuant 4-bit KV cache.
-    using CPURingKVCacheTQ3 = CPURingKVCache<ActivationPrecision::TQ3>;     ///< TurboQuant 3-bit KV cache.
 
     // =========================================================================
     // Factory Functions

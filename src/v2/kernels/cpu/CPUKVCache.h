@@ -8,7 +8,6 @@
 #include "../IKVCache.h" // Unified KVCache interface
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TQ4Tensor.h"
-#include "../../tensors/TQ3Tensor.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../tensors/TensorLayout.h"
 #include "../../backends/DeviceId.h"
@@ -363,20 +362,6 @@ namespace llaminar2
             static size_t head_bytes(const Type *t, int, int) { return t->block_bytes(); } // 1 block per head
         };
 
-        template <>
-        struct CPUKVCacheTensor<ActivationPrecision::TQ3>
-        {
-            using Type = TQ3Tensor;
-            static std::shared_ptr<Type> allocate(TensorFactory & /*factory*/, size_t rows, size_t cols, int head_dim, DeviceId device)
-            {
-                return std::make_shared<TQ3Tensor>(std::vector<size_t>{rows, cols}, head_dim, device);
-            }
-            static size_t row_bytes(const Type *t, int kv_dim, int head_dim)
-            {
-                return static_cast<size_t>(kv_dim / head_dim) * t->block_bytes();
-            }
-            static size_t head_bytes(const Type *t, int, int) { return t->block_bytes(); } // 1 block per head
-        };
     } // namespace detail
 
 } // namespace llaminar2

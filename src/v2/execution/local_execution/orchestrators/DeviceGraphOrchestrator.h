@@ -615,7 +615,7 @@ namespace llaminar2
         bool isGpuCollectivesEnabled() const { return injected_collective_ctx_ != nullptr; }
 
         /**
-         * @brief Set TurboQuant context for TQ4/TQ3 KV cache quantization.
+         * @brief Set TurboQuant context for TQ4 KV cache quantization.
          *
          * The context holds the rotation matrix used during KV cache quantization
          * and dequantization. Ownership is shared — the orchestrator keeps the
@@ -2318,7 +2318,7 @@ namespace llaminar2
         /// Injected collective context (nullptr if using default)
         std::shared_ptr<ICollectiveContext> injected_collective_ctx_;
 
-        /// TurboQuant context for TQ4/TQ3 KV cache (owns rotation matrix lifetime)
+        /// TurboQuant context for TQ4 KV cache (owns rotation matrix lifetime)
         std::shared_ptr<TurboQuantContext> turboquant_ctx_;
 
         // =========================================================================

@@ -54,6 +54,7 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/TQ4Tensor.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
@@ -255,6 +256,14 @@ namespace llaminar2
          * - Prefill: target 37% of cache, tiles in [4, 32].
          */
         using DefaultFlashKVTilePolicy = CacheAwareFlashKVTilePolicy<50, 37, 8, 32, 4, 32>;
+
+        /// Maximum KV tile size across all flash attention policies.
+        /// Used to size stack-allocated score buffers instead of heap vectors.
+        static constexpr int kMaxKVTile = 32;
+
+        /// Maximum I16 row stride for quantized Q buffers.
+        /// Covers head_dim up to 256 with 32-element alignment: ((256+31)/32)*32 = 256.
+        static constexpr int kMaxI16RowStride = 256;
 
         /**
          * @brief Compile-time map from ActivationPrecision → concrete tensor type.
@@ -2352,17 +2361,13 @@ namespace llaminar2
                         // Optional additive mask row for this query position.
                         const float *mask_row = mask ? (mask + static_cast<size_t>(q_pos) * kv_len) : nullptr;
 
-                        // Thread-local I16 quantised Q buffer, reused across q_pos iterations.
-                        thread_local std::vector<int16_t> q_i16;
+                        // Stack-allocated I16 quantised Q buffer.
+                        alignas(64) int16_t q_i16[detail::kMaxI16RowStride];
                         float q_scale_i16 = 0.0f;
                         if (use_i16_i12_prefill)
                         {
-                            if (static_cast<int>(q_i16.size()) < i16_row_stride)
-                            {
-                                q_i16.resize(static_cast<size_t>(i16_row_stride));
-                            }
                             // Quantise the Q row once; it will be dotted against every K pair.
-                            q_scale_i16 = quantize_row_i16_i12_padded(q_ptr, q_i16.data(), head_dim, i16_row_stride, qmax);
+                            q_scale_i16 = quantize_row_i16_i12_padded(q_ptr, q_i16, head_dim, i16_row_stride, qmax);
                         }
 
                         // ===================================================
@@ -2378,13 +2383,9 @@ namespace llaminar2
                             const int k1 = std::min(k0 + kv_tile, kv_len); // End of this tile
                             float block_max = -std::numeric_limits<float>::infinity();
 
-                            // Thread-local score buffer, reused across tiles.
-                            thread_local std::vector<float> block_scores;
+                            // Stack-allocated score buffer (max tile size bounded by policy).
+                            float block_scores[detail::kMaxKVTile];
                             const int blk = k1 - k0; // Number of KV positions in this tile
-                            if (static_cast<int>(block_scores.size()) < blk)
-                            {
-                                block_scores.resize(blk);
-                            }
 
                             const auto qk_start = profiling_enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
@@ -2439,7 +2440,7 @@ namespace llaminar2
                                         const float k_scale3 = k_head_pair_scales[static_cast<size_t>(pair_idx1) * 2ULL + 1ULL];
 
                                         int32_t dot0 = 0, dot1 = 0, dot2 = 0, dot3 = 0;
-                                        dot_i16_i16_i32_vnni_4row_packedpair(q_i16.data(), k_pair0, k_pair1, i16_row_stride, dot0, dot1, dot2, dot3);
+                                        dot_i16_i16_i32_vnni_4row_packedpair(q_i16, k_pair0, k_pair1, i16_row_stride, dot0, dot1, dot2, dot3);
 
                                         float s0 = static_cast<float>(dot0) * (q_scale_i16 * k_scale0) * scale;
                                         float s1 = static_cast<float>(dot1) * (q_scale_i16 * k_scale1) * scale;
@@ -2476,7 +2477,7 @@ namespace llaminar2
                                         const float k_scale1 = k_head_pair_scales[static_cast<size_t>(pair_idx) * 2ULL + 1ULL];
                                         int32_t dot_i32_0 = 0;
                                         int32_t dot_i32_1 = 0;
-                                        dot_i16_i16_i32_vnni_2row_packedpair(q_i16.data(), k_pair, i16_row_stride, dot_i32_0, dot_i32_1);
+                                        dot_i16_i16_i32_vnni_2row_packedpair(q_i16, k_pair, i16_row_stride, dot_i32_0, dot_i32_1);
 
                                         float s0 = static_cast<float>(dot_i32_0) * (q_scale_i16 * k_scale0);
                                         float s1 = static_cast<float>(dot_i32_1) * (q_scale_i16 * k_scale1);
@@ -2502,7 +2503,7 @@ namespace llaminar2
                                     const int row_sel = (k & 1); // 0 = first row in pair, 1 = second
                                     const int16_t *k_pair = k_head_pairs_i16 + static_cast<size_t>(pair_idx) * static_cast<size_t>(k_pair_stride);
                                     const float k_scale = k_head_pair_scales[static_cast<size_t>(pair_idx) * 2ULL + static_cast<size_t>(row_sel)];
-                                    const int32_t dot_i32 = dot_i16_i16_i32_vnni_single_from_packedpair(q_i16.data(), k_pair, i16_row_stride, row_sel);
+                                    const int32_t dot_i32 = dot_i16_i16_i32_vnni_single_from_packedpair(q_i16, k_pair, i16_row_stride, row_sel);
                                     // Recover approximate FP32 dot: int_dot × q_scale × k_scale
                                     float s = static_cast<float>(dot_i32) * (q_scale_i16 * k_scale);
                                     s *= scale;
@@ -2773,9 +2774,7 @@ namespace llaminar2
 
             auto work = [&]()
             {
-                thread_local std::vector<int16_t> q_i16_buf;
-                if (static_cast<int>(q_i16_buf.size()) < head_dim)
-                    q_i16_buf.resize(static_cast<size_t>(head_dim));
+                alignas(64) int16_t q_i16_buf[detail::kMaxI16RowStride];
 
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
                 for (int h = 0; h < n_heads; ++h)
@@ -2788,7 +2787,7 @@ namespace llaminar2
                     const size_t row_stride_bytes = blocks_per_kv_row * block_bytes;
                     const size_t blk_off_bytes = head_block_start * block_bytes;
 
-                    thread_local std::vector<float> block_scores;
+                    float block_scores[detail::kMaxKVTile];
 
                     for (int q_pos = 0; q_pos < seq_len; ++q_pos)
                     {
@@ -2803,7 +2802,7 @@ namespace llaminar2
 
                         // Quantize Q to int16 once per (head, q_pos)
                         const float q_scale = quantize_row_i16_i12(
-                            q_ptr, q_i16_buf.data(), head_dim, QMAX);
+                            q_ptr, q_i16_buf, head_dim, QMAX);
                         const float qk_combined_scale = q_scale * scale;
 
                         // KV tile loop
@@ -2813,8 +2812,6 @@ namespace llaminar2
                             float block_max = -std::numeric_limits<float>::infinity();
 
                             const int blk = k1 - k0;
-                            if (static_cast<int>(block_scores.size()) < blk)
-                                block_scores.resize(static_cast<size_t>(blk));
 
                             // Valid window for causal/sliding-window masking
                             int valid_start = k0;
@@ -2878,7 +2875,7 @@ namespace llaminar2
 
                                         int32_t dot0, dot1, dot2, dot3;
                                         dot_i16_i16_i32_vnni_4row(
-                                            q_i16_buf.data(), k_qs0, k_qs1, k_qs2, k_qs3,
+                                            q_i16_buf, k_qs0, k_qs1, k_qs2, k_qs3,
                                             head_dim, dot0, dot1, dot2, dot3);
 
                                         float s0 = static_cast<float>(dot0) * qk_combined_scale * kd0;
@@ -2900,7 +2897,7 @@ namespace llaminar2
                                     float kd;
                                     std::memcpy(&kd, blk_s, sizeof(float));
                                     const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
-                                    int32_t dot = dot_i16_i16_i32_vnni(q_i16_buf.data(), k_qs, head_dim);
+                                    int32_t dot = dot_i16_i16_i32_vnni(q_i16_buf, k_qs, head_dim);
                                     float s = static_cast<float>(dot) * qk_combined_scale * kd;
                                     block_scores[static_cast<size_t>(k - k0)] = s;
                                     block_max = std::max(block_max, s);
@@ -2920,7 +2917,7 @@ namespace llaminar2
                                         const int elem_count = static_cast<int>(
                                             std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
                                         int32_t dot = dot_i16_i16_i32_vnni(
-                                            q_i16_buf.data() + bi * block_elems, k_qs, elem_count);
+                                            q_i16_buf + bi * block_elems, k_qs, elem_count);
                                         s += static_cast<float>(dot) * q_scale * kd;
                                     }
                                     s *= scale;
@@ -3162,9 +3159,7 @@ namespace llaminar2
             auto work = [&]()
             {
                 // Per-thread Q quantisation buffer
-                thread_local std::vector<int16_t> q_i16_buf;
-                if (static_cast<int>(q_i16_buf.size()) < head_dim)
-                    q_i16_buf.resize(static_cast<size_t>(head_dim));
+                alignas(64) int16_t q_i16_buf[detail::kMaxI16RowStride];
 
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
                 for (int h = 0; h < n_heads; ++h)
@@ -3181,7 +3176,7 @@ namespace llaminar2
 
                     // Quantize Q to int16 once per head
                     const float q_scale = quantize_row_i16_i12(
-                        q_ptr, q_i16_buf.data(), head_dim, QMAX);
+                        q_ptr, q_i16_buf, head_dim, QMAX);
 
                     // Precompute combined scale: q_scale * (1/√d)
                     // This saves one multiply per QK score reconstruction.
@@ -3199,7 +3194,7 @@ namespace llaminar2
                                                         ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head)
                                                         : (static_cast<size_t>(kv_h) * blocks_per_head);
 
-                    thread_local std::vector<float> block_scores;
+                    float block_scores[detail::kMaxKVTile];
 
                     for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
                     {
@@ -3207,8 +3202,6 @@ namespace llaminar2
                         float block_max = -std::numeric_limits<float>::infinity();
 
                         const int blk = k1 - k0;
-                        if (static_cast<int>(block_scores.size()) < blk)
-                            block_scores.resize(static_cast<size_t>(blk));
 
                         // Valid window for causal masking
                         int valid_end = causal ? std::min(k1, q_abs + 1) : k1;
@@ -3268,7 +3261,7 @@ namespace llaminar2
 
                                     int32_t dot0, dot1, dot2, dot3;
                                     dot_i16_i16_i32_vnni_4row(
-                                        q_i16_buf.data(), k_qs0, k_qs1, k_qs2, k_qs3,
+                                        q_i16_buf, k_qs0, k_qs1, k_qs2, k_qs3,
                                         head_dim, dot0, dot1, dot2, dot3);
 
                                     // Score: int_dot * (q_scale / √d) * k_scale
@@ -3291,7 +3284,7 @@ namespace llaminar2
                                 float kd;
                                 std::memcpy(&kd, blk_s, sizeof(float));
                                 const int16_t *k_qs = reinterpret_cast<const int16_t *>(blk_s + QS_OFFSET);
-                                int32_t dot = dot_i16_i16_i32_vnni(q_i16_buf.data(), k_qs, head_dim);
+                                int32_t dot = dot_i16_i16_i32_vnni(q_i16_buf, k_qs, head_dim);
                                 float s = static_cast<float>(dot) * qk_combined_scale * kd;
                                 block_scores[static_cast<size_t>(k - k0)] = s;
                                 block_max = std::max(block_max, s);
@@ -3311,7 +3304,7 @@ namespace llaminar2
                                     const int elem_count = static_cast<int>(
                                         std::min(block_elems, static_cast<size_t>(head_dim) - bi * block_elems));
                                     int32_t dot = dot_i16_i16_i32_vnni(
-                                        q_i16_buf.data() + bi * block_elems, k_qs, elem_count);
+                                        q_i16_buf + bi * block_elems, k_qs, elem_count);
                                     s += static_cast<float>(dot) * q_scale * kd;
                                 }
                                 s *= scale;
@@ -3563,7 +3556,7 @@ namespace llaminar2
                     const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;
                     const int q_abs = position_offset;
 
-                    thread_local std::vector<float> block_scores;
+                    float block_scores[detail::kMaxKVTile];
 
                     for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
                     {
@@ -3571,8 +3564,6 @@ namespace llaminar2
                         float block_max = -std::numeric_limits<float>::infinity();
 
                         const int blk = k1 - k0;
-                        if (static_cast<int>(block_scores.size()) < blk)
-                            block_scores.resize(blk);
 
                         // Valid window for causal masking
                         int valid_end = causal ? std::min(k1, q_abs + 1) : k1;

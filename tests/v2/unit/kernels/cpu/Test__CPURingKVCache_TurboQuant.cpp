@@ -1,9 +1,9 @@
 /**
  * @file Test__CPURingKVCache_TurboQuant.cpp
- * @brief Tests for TQ4 and TQ3 KV cache precision modes in CPURingKVCache.
+ * @brief Tests for TQ4 KV cache precision mode in CPURingKVCache.
  *
- * Validates the full round-trip: FP32 → TQ4/TQ3 quantize → ring buffer append →
- * ring buffer gather → TQ4/TQ3 dequantize → FP32. Ensures the ring buffer mechanics
+ * Validates the full round-trip: FP32 → TQ4 quantize → ring buffer append →
+ * ring buffer gather → TQ4 dequantize → FP32. Ensures the ring buffer mechanics
  * (wrap-around, eviction, multi-layer) work correctly with block-quantized data.
  */
 
@@ -16,7 +16,6 @@
 #include "kernels/cpu/CPURingKVCache.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "tensors/TQ4Tensor.h"
-#include "tensors/TQ3Tensor.h"
 #include "tensors/Tensors.h"
 #include "utils/MPIContext.h"
 
@@ -28,7 +27,7 @@ using namespace llaminar2;
 
 class Test__CPURingKVCache_TurboQuant : public ::testing::Test
 {
-  protected:
+protected:
     static constexpr int HEAD_DIM = 64;
     static constexpr int N_KV_HEADS = 2;
     static constexpr int KV_DIM = N_KV_HEADS * HEAD_DIM; // 128
@@ -62,23 +61,8 @@ class Test__CPURingKVCache_TurboQuant : public ::testing::Test
             src.data(), src.shape(), HEAD_DIM, *turboquant_ctx_);
     }
 
-    /// Quantize FP32 tensor to TQ3.
-    std::shared_ptr<TQ3Tensor> quantizeTQ3(const FP32Tensor &src)
-    {
-        return TQ3Tensor::quantize_from_fp32(
-            src.data(), src.shape(), HEAD_DIM, *turboquant_ctx_);
-    }
-
     /// Dequantize TQ4 tensor to a new FP32 buffer.
     std::vector<float> dequantizeTQ4(const TQ4Tensor &t)
-    {
-        std::vector<float> buf(t.rows() * KV_DIM);
-        t.dequantize_to_fp32(buf.data(), *turboquant_ctx_);
-        return buf;
-    }
-
-    /// Dequantize TQ3 tensor to a new FP32 buffer.
-    std::vector<float> dequantizeTQ3(const TQ3Tensor &t)
     {
         std::vector<float> buf(t.rows() * KV_DIM);
         t.dequantize_to_fp32(buf.data(), *turboquant_ctx_);
@@ -95,6 +79,27 @@ class Test__CPURingKVCache_TurboQuant : public ::testing::Test
             acc += d * d;
         }
         return acc / static_cast<double>(n);
+    }
+
+    template <typename TensorT>
+    static bool compareRawRows(const TensorT &expected, const TensorT &actual, size_t rows)
+    {
+        const auto *expected_bytes = static_cast<const uint8_t *>(expected.raw_data());
+        const auto *actual_bytes = static_cast<const uint8_t *>(actual.raw_data());
+        if (!expected_bytes || !actual_bytes)
+            return false;
+
+        const size_t row_bytes = expected.blocks_per_row() * expected.block_bytes();
+        for (size_t row = 0; row < rows; ++row)
+        {
+            if (std::memcmp(expected_bytes + row * row_bytes,
+                            actual_bytes + row * row_bytes,
+                            row_bytes) != 0)
+            {
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -133,31 +138,10 @@ TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_PositionMajor_AppendAndGather_RoundT
     ASSERT_EQ(kv_lens.size(), 1u);
     EXPECT_EQ(kv_lens[0], N_TOKENS);
 
-    // Dequantize both original and gathered, compare
-    auto orig_k_fp32 = dequantizeTQ4(*tq4_k);
-    auto orig_v_fp32 = dequantizeTQ4(*tq4_v);
-
-    // Set rotation on gathered tensors so dequantize works
-    out_k->set_turboquant_context(turboquant_ctx_.get());
-    out_v->set_turboquant_context(turboquant_ctx_.get());
-
-    // Dequantize gathered data — only first N_TOKENS rows are valid
-    std::vector<float> gathered_k_fp32(N_TOKENS * KV_DIM);
-    std::vector<float> gathered_v_fp32(N_TOKENS * KV_DIM);
-
-    // Use to_fp32_row for per-row dequantization of the gathered output
-    for (int r = 0; r < N_TOKENS; ++r)
-    {
-        out_k->to_fp32_row(r, gathered_k_fp32.data() + r * KV_DIM);
-        out_v->to_fp32_row(r, gathered_v_fp32.data() + r * KV_DIM);
-    }
-
-    // Round-trip through the ring cache should be bit-exact at the quantized level
-    double mse_k = computeMSE(orig_k_fp32.data(), gathered_k_fp32.data(), N_TOKENS * KV_DIM);
-    double mse_v = computeMSE(orig_v_fp32.data(), gathered_v_fp32.data(), N_TOKENS * KV_DIM);
-
-    EXPECT_EQ(mse_k, 0.0) << "TQ4 K data changed after cache round-trip";
-    EXPECT_EQ(mse_v, 0.0) << "TQ4 V data changed after cache round-trip";
+    EXPECT_TRUE(compareRawRows(*tq4_k, *out_k, N_TOKENS))
+        << "TQ4 K raw blocks changed after cache round-trip";
+    EXPECT_TRUE(compareRawRows(*tq4_v, *out_v, N_TOKENS))
+        << "TQ4 V raw blocks changed after cache round-trip";
 }
 
 TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_HeadMajor_AppendAndGather_RoundTrip)
@@ -186,24 +170,10 @@ TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_HeadMajor_AppendAndGather_RoundTrip)
     int max_kv = cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
     ASSERT_EQ(max_kv, N_TOKENS);
 
-    auto orig_k_fp32 = dequantizeTQ4(*tq4_k);
-    auto orig_v_fp32 = dequantizeTQ4(*tq4_v);
-
-    out_k->set_turboquant_context(turboquant_ctx_.get());
-    out_v->set_turboquant_context(turboquant_ctx_.get());
-
-    std::vector<float> gathered_k(N_TOKENS * KV_DIM);
-    std::vector<float> gathered_v(N_TOKENS * KV_DIM);
-    for (int r = 0; r < N_TOKENS; ++r)
-    {
-        out_k->to_fp32_row(r, gathered_k.data() + r * KV_DIM);
-        out_v->to_fp32_row(r, gathered_v.data() + r * KV_DIM);
-    }
-
-    EXPECT_EQ(computeMSE(orig_k_fp32.data(), gathered_k.data(), N_TOKENS * KV_DIM), 0.0)
-        << "HEAD_MAJOR TQ4 K data changed after cache round-trip";
-    EXPECT_EQ(computeMSE(orig_v_fp32.data(), gathered_v.data(), N_TOKENS * KV_DIM), 0.0)
-        << "HEAD_MAJOR TQ4 V data changed after cache round-trip";
+    EXPECT_TRUE(compareRawRows(*tq4_k, *out_k, N_TOKENS))
+        << "HEAD_MAJOR TQ4 K raw blocks changed after cache round-trip";
+    EXPECT_TRUE(compareRawRows(*tq4_v, *out_v, N_TOKENS))
+        << "HEAD_MAJOR TQ4 V raw blocks changed after cache round-trip";
 }
 
 TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_RingWrap_PreservesNewestTokens)
@@ -239,22 +209,10 @@ TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_RingWrap_PreservesNewestTokens)
     std::memcpy(ref_v_slice->mutable_data(), fp32_v->data() + 2 * KV_DIM, 4 * KV_DIM * sizeof(float));
     auto ref_tq4_k = quantizeTQ4(*ref_k_slice);
     auto ref_tq4_v = quantizeTQ4(*ref_v_slice);
-    auto ref_k_fp32 = dequantizeTQ4(*ref_tq4_k);
-    auto ref_v_fp32 = dequantizeTQ4(*ref_tq4_v);
-
-    out_k->set_turboquant_context(turboquant_ctx_.get());
-    out_v->set_turboquant_context(turboquant_ctx_.get());
-    std::vector<float> gathered_k(MAX_SEQ * KV_DIM), gathered_v(MAX_SEQ * KV_DIM);
-    for (int r = 0; r < MAX_SEQ; ++r)
-    {
-        out_k->to_fp32_row(r, gathered_k.data() + r * KV_DIM);
-        out_v->to_fp32_row(r, gathered_v.data() + r * KV_DIM);
-    }
-
-    EXPECT_EQ(computeMSE(ref_k_fp32.data(), gathered_k.data(), MAX_SEQ * KV_DIM), 0.0)
-        << "After ring wrap, gathered TQ4 K data doesn't match expected newest tokens";
-    EXPECT_EQ(computeMSE(ref_v_fp32.data(), gathered_v.data(), MAX_SEQ * KV_DIM), 0.0)
-        << "After ring wrap, gathered TQ4 V data doesn't match expected newest tokens";
+    EXPECT_TRUE(compareRawRows(*ref_tq4_k, *out_k, MAX_SEQ))
+        << "After ring wrap, gathered TQ4 K raw blocks don't match expected newest tokens";
+    EXPECT_TRUE(compareRawRows(*ref_tq4_v, *out_v, MAX_SEQ))
+        << "After ring wrap, gathered TQ4 V raw blocks don't match expected newest tokens";
 }
 
 TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_IncrementalAppend_DecodeLike)
@@ -370,214 +328,8 @@ TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_Clear_ResetsAllLayers)
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// TQ3 tests
+// Quantization error bounds
 // ─────────────────────────────────────────────────────────────────────
-
-TEST_F(Test__CPURingKVCache_TurboQuant, TQ3_PositionMajor_AppendAndGather_RoundTrip)
-{
-    constexpr int MAX_SEQ = 8;
-    constexpr int N_TOKENS = 3;
-
-    CPURingKVCacheTQ3 cache(mpi_ctx_, 1, 1, MAX_SEQ,
-                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu(),
-                            KVCacheLayoutMode::POSITION_MAJOR);
-
-    auto fp32_k = makeRandomFP32(N_TOKENS, 2100);
-    auto fp32_v = makeRandomFP32(N_TOKENS, 2200);
-    auto tq3_k = quantizeTQ3(*fp32_k);
-    auto tq3_v = quantizeTQ3(*fp32_v);
-
-    ASSERT_TRUE(cache.append_kv(0, 0, tq3_k.get(), tq3_v.get(), N_TOKENS));
-    EXPECT_EQ(cache.ring_size(0, 0), N_TOKENS);
-
-    auto out_k = std::make_shared<TQ3Tensor>(
-        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
-    auto out_v = std::make_shared<TQ3Tensor>(
-        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
-    std::vector<int> kv_lens;
-
-    int max_kv = cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
-    ASSERT_EQ(max_kv, N_TOKENS);
-
-    auto orig_k_fp32 = dequantizeTQ3(*tq3_k);
-    auto orig_v_fp32 = dequantizeTQ3(*tq3_v);
-
-    out_k->set_turboquant_context(turboquant_ctx_.get());
-    out_v->set_turboquant_context(turboquant_ctx_.get());
-    std::vector<float> gathered_k(N_TOKENS * KV_DIM), gathered_v(N_TOKENS * KV_DIM);
-    for (int r = 0; r < N_TOKENS; ++r)
-    {
-        out_k->to_fp32_row(r, gathered_k.data() + r * KV_DIM);
-        out_v->to_fp32_row(r, gathered_v.data() + r * KV_DIM);
-    }
-
-    EXPECT_EQ(computeMSE(orig_k_fp32.data(), gathered_k.data(), N_TOKENS * KV_DIM), 0.0)
-        << "TQ3 K data changed after cache round-trip";
-    EXPECT_EQ(computeMSE(orig_v_fp32.data(), gathered_v.data(), N_TOKENS * KV_DIM), 0.0)
-        << "TQ3 V data changed after cache round-trip";
-}
-
-TEST_F(Test__CPURingKVCache_TurboQuant, TQ3_HeadMajor_AppendAndGather_RoundTrip)
-{
-    constexpr int MAX_SEQ = 8;
-    constexpr int N_TOKENS = 4;
-
-    CPURingKVCacheTQ3 cache(mpi_ctx_, 1, 1, MAX_SEQ,
-                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu(),
-                            KVCacheLayoutMode::HEAD_MAJOR);
-
-    auto fp32_k = makeRandomFP32(N_TOKENS, 2300);
-    auto fp32_v = makeRandomFP32(N_TOKENS, 2400);
-    auto tq3_k = quantizeTQ3(*fp32_k);
-    auto tq3_v = quantizeTQ3(*fp32_v);
-
-    ASSERT_TRUE(cache.append_kv(0, 0, tq3_k.get(), tq3_v.get(), N_TOKENS));
-    EXPECT_EQ(cache.ring_size(0, 0), N_TOKENS);
-
-    auto out_k = std::make_shared<TQ3Tensor>(
-        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
-    auto out_v = std::make_shared<TQ3Tensor>(
-        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
-    std::vector<int> kv_lens;
-
-    int max_kv = cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
-    ASSERT_EQ(max_kv, N_TOKENS);
-
-    auto orig_k_fp32 = dequantizeTQ3(*tq3_k);
-    auto orig_v_fp32 = dequantizeTQ3(*tq3_v);
-
-    out_k->set_turboquant_context(turboquant_ctx_.get());
-    out_v->set_turboquant_context(turboquant_ctx_.get());
-    std::vector<float> gathered_k(N_TOKENS * KV_DIM), gathered_v(N_TOKENS * KV_DIM);
-    for (int r = 0; r < N_TOKENS; ++r)
-    {
-        out_k->to_fp32_row(r, gathered_k.data() + r * KV_DIM);
-        out_v->to_fp32_row(r, gathered_v.data() + r * KV_DIM);
-    }
-
-    EXPECT_EQ(computeMSE(orig_k_fp32.data(), gathered_k.data(), N_TOKENS * KV_DIM), 0.0)
-        << "HEAD_MAJOR TQ3 K data changed after cache round-trip";
-    EXPECT_EQ(computeMSE(orig_v_fp32.data(), gathered_v.data(), N_TOKENS * KV_DIM), 0.0)
-        << "HEAD_MAJOR TQ3 V data changed after cache round-trip";
-}
-
-TEST_F(Test__CPURingKVCache_TurboQuant, TQ3_RingWrap_PreservesNewestTokens)
-{
-    constexpr int MAX_SEQ = 4;
-
-    CPURingKVCacheTQ3 cache(mpi_ctx_, 1, 1, MAX_SEQ,
-                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
-
-    auto fp32_k = makeRandomFP32(6, 2500);
-    auto fp32_v = makeRandomFP32(6, 2600);
-    auto tq3_k = quantizeTQ3(*fp32_k);
-    auto tq3_v = quantizeTQ3(*fp32_v);
-
-    ASSERT_TRUE(cache.append_kv(0, 0, tq3_k.get(), tq3_v.get(), 6));
-    EXPECT_EQ(cache.ring_size(0, 0), MAX_SEQ);
-
-    auto out_k = std::make_shared<TQ3Tensor>(
-        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
-    auto out_v = std::make_shared<TQ3Tensor>(
-        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
-    std::vector<int> kv_lens;
-    cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
-
-    // Reference: quantize only the last 4 tokens
-    auto ref_k_slice = std::make_shared<FP32Tensor>(std::vector<size_t>{4, KV_DIM});
-    auto ref_v_slice = std::make_shared<FP32Tensor>(std::vector<size_t>{4, KV_DIM});
-    std::memcpy(ref_k_slice->mutable_data(), fp32_k->data() + 2 * KV_DIM, 4 * KV_DIM * sizeof(float));
-    std::memcpy(ref_v_slice->mutable_data(), fp32_v->data() + 2 * KV_DIM, 4 * KV_DIM * sizeof(float));
-    auto ref_tq3_k = quantizeTQ3(*ref_k_slice);
-    auto ref_tq3_v = quantizeTQ3(*ref_v_slice);
-    auto ref_k_fp32 = dequantizeTQ3(*ref_tq3_k);
-    auto ref_v_fp32 = dequantizeTQ3(*ref_tq3_v);
-
-    out_k->set_turboquant_context(turboquant_ctx_.get());
-    out_v->set_turboquant_context(turboquant_ctx_.get());
-    std::vector<float> gathered_k(MAX_SEQ * KV_DIM), gathered_v(MAX_SEQ * KV_DIM);
-    for (int r = 0; r < MAX_SEQ; ++r)
-    {
-        out_k->to_fp32_row(r, gathered_k.data() + r * KV_DIM);
-        out_v->to_fp32_row(r, gathered_v.data() + r * KV_DIM);
-    }
-
-    EXPECT_EQ(computeMSE(ref_k_fp32.data(), gathered_k.data(), MAX_SEQ * KV_DIM), 0.0);
-    EXPECT_EQ(computeMSE(ref_v_fp32.data(), gathered_v.data(), MAX_SEQ * KV_DIM), 0.0);
-}
-
-TEST_F(Test__CPURingKVCache_TurboQuant, TQ3_IncrementalAppend_DecodeLike)
-{
-    constexpr int MAX_SEQ = 16;
-
-    CPURingKVCacheTQ3 cache(mpi_ctx_, 1, 1, MAX_SEQ,
-                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
-
-    // Prefill + decode
-    auto prefill_k = makeRandomFP32(5, 2700);
-    auto prefill_v = makeRandomFP32(5, 2800);
-    ASSERT_TRUE(cache.append_kv(0, 0, quantizeTQ3(*prefill_k).get(),
-                                quantizeTQ3(*prefill_v).get(), 5));
-
-    for (int step = 0; step < 3; ++step)
-    {
-        auto dk = makeRandomFP32(1, 2900 + step);
-        auto dv = makeRandomFP32(1, 3000 + step);
-        ASSERT_TRUE(cache.append_kv(0, 0, quantizeTQ3(*dk).get(),
-                                    quantizeTQ3(*dv).get(), 1));
-    }
-    EXPECT_EQ(cache.ring_size(0, 0), 8);
-
-    // Gather and verify no NaN/Inf
-    auto out_k = std::make_shared<TQ3Tensor>(
-        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
-    auto out_v = std::make_shared<TQ3Tensor>(
-        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
-    std::vector<int> kv_lens;
-    cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
-
-    out_k->set_turboquant_context(turboquant_ctx_.get());
-    out_v->set_turboquant_context(turboquant_ctx_.get());
-    std::vector<float> fp32_k(8 * KV_DIM), fp32_v(8 * KV_DIM);
-    for (int r = 0; r < 8; ++r)
-    {
-        out_k->to_fp32_row(r, fp32_k.data() + r * KV_DIM);
-        out_v->to_fp32_row(r, fp32_v.data() + r * KV_DIM);
-    }
-
-    for (size_t i = 0; i < fp32_k.size(); ++i)
-    {
-        ASSERT_FALSE(std::isnan(fp32_k[i])) << "NaN in gathered TQ3 K at " << i;
-        ASSERT_FALSE(std::isinf(fp32_k[i])) << "Inf in gathered TQ3 K at " << i;
-        ASSERT_FALSE(std::isnan(fp32_v[i])) << "NaN in gathered TQ3 V at " << i;
-        ASSERT_FALSE(std::isinf(fp32_v[i])) << "Inf in gathered TQ3 V at " << i;
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────
-// Cross-precision comparison
-// ─────────────────────────────────────────────────────────────────────
-
-TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_vs_TQ3_QualityOrdering)
-{
-    // TQ4 (4-bit) should have lower quantization error than TQ3 (3-bit)
-    constexpr int N_TOKENS = 8;
-
-    auto fp32_k = makeRandomFP32(N_TOKENS, 3100);
-
-    auto tq4_k = quantizeTQ4(*fp32_k);
-    auto tq3_k = quantizeTQ3(*fp32_k);
-
-    auto tq4_fp32 = dequantizeTQ4(*tq4_k);
-    auto tq3_fp32 = dequantizeTQ3(*tq3_k);
-
-    double mse_tq4 = computeMSE(fp32_k->data(), tq4_fp32.data(), N_TOKENS * KV_DIM);
-    double mse_tq3 = computeMSE(fp32_k->data(), tq3_fp32.data(), N_TOKENS * KV_DIM);
-
-    EXPECT_LT(mse_tq4, mse_tq3)
-        << "TQ4 (4-bit) should have lower MSE than TQ3 (3-bit). "
-        << "TQ4 MSE=" << mse_tq4 << ", TQ3 MSE=" << mse_tq3;
-}
 
 TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_QuantizationError_WithinBounds)
 {
@@ -591,14 +343,166 @@ TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_QuantizationError_WithinBounds)
     EXPECT_LT(mse, 0.06) << "TQ4 prod MSE " << mse << " exceeds expected quality floor";
 }
 
-TEST_F(Test__CPURingKVCache_TurboQuant, TQ3_QuantizationError_WithinBounds)
-{
-    // TurboQuant prod prioritizes inner-product quality over pure reconstruction MSE.
-    constexpr int N_TOKENS = 32;
-    auto fp32 = makeRandomFP32(N_TOKENS, 3300);
-    auto tq3 = quantizeTQ3(*fp32);
-    auto roundtrip = dequantizeTQ3(*tq3);
+// ─────────────────────────────────────────────────────────────────────
+// Ring cache accuracy: full pipeline cosine similarity
+// ─────────────────────────────────────────────────────────────────────
 
-    double mse = computeMSE(fp32->data(), roundtrip.data(), N_TOKENS * KV_DIM);
-    EXPECT_LT(mse, 0.20) << "TQ3 prod MSE " << mse << " exceeds expected quality floor";
+TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_CacheRoundTrip_CosineSimilarity)
+{
+    constexpr int MAX_SEQ = 32;
+    constexpr int N_TOKENS = 16;
+
+    CPURingKVCacheTQ4 cache(mpi_ctx_, 1, 1, MAX_SEQ,
+                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
+
+    auto fp32_k = makeRandomFP32(N_TOKENS, 4100);
+    auto fp32_v = makeRandomFP32(N_TOKENS, 4200);
+    auto tq4_k = quantizeTQ4(*fp32_k);
+    auto tq4_v = quantizeTQ4(*fp32_v);
+
+    ASSERT_TRUE(cache.append_kv(0, 0, tq4_k.get(), tq4_v.get(), N_TOKENS));
+
+    // Gather from cache
+    auto out_k = std::make_shared<TQ4Tensor>(
+        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
+    auto out_v = std::make_shared<TQ4Tensor>(
+        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
+    std::vector<int> kv_lens;
+    int max_kv = cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
+    ASSERT_EQ(max_kv, N_TOKENS);
+
+    // Dequantize gathered tensors
+    out_k->set_turboquant_context(turboquant_ctx_.get());
+    out_v->set_turboquant_context(turboquant_ctx_.get());
+    std::vector<float> gathered_k(N_TOKENS * KV_DIM);
+    std::vector<float> gathered_v(N_TOKENS * KV_DIM);
+    for (int r = 0; r < N_TOKENS; ++r)
+    {
+        out_k->to_fp32_row(r, gathered_k.data() + r * KV_DIM);
+        out_v->to_fp32_row(r, gathered_v.data() + r * KV_DIM);
+    }
+
+    // Compute per-row cosine similarity against original FP32
+    double min_cosine_k = 1.0, avg_cosine_k = 0.0;
+    double min_cosine_v = 1.0, avg_cosine_v = 0.0;
+
+    for (int r = 0; r < N_TOKENS; ++r)
+    {
+        const float *orig_k = fp32_k->data() + r * KV_DIM;
+        const float *orig_v = fp32_v->data() + r * KV_DIM;
+        const float *reco_k = gathered_k.data() + r * KV_DIM;
+        const float *reco_v = gathered_v.data() + r * KV_DIM;
+
+        // Compute cosine per-row
+        double dot_k = 0, na_k = 0, nb_k = 0;
+        double dot_v = 0, na_v = 0, nb_v = 0;
+        for (int i = 0; i < KV_DIM; ++i)
+        {
+            dot_k += orig_k[i] * reco_k[i];
+            na_k += orig_k[i] * orig_k[i];
+            nb_k += reco_k[i] * reco_k[i];
+            dot_v += orig_v[i] * reco_v[i];
+            na_v += orig_v[i] * orig_v[i];
+            nb_v += reco_v[i] * reco_v[i];
+        }
+        double cos_k = (na_k > 1e-30 && nb_k > 1e-30)
+                           ? dot_k / std::sqrt(na_k * nb_k)
+                           : 0.0;
+        double cos_v = (na_v > 1e-30 && nb_v > 1e-30)
+                           ? dot_v / std::sqrt(na_v * nb_v)
+                           : 0.0;
+        min_cosine_k = std::min(min_cosine_k, cos_k);
+        min_cosine_v = std::min(min_cosine_v, cos_v);
+        avg_cosine_k += cos_k;
+        avg_cosine_v += cos_v;
+    }
+    avg_cosine_k /= N_TOKENS;
+    avg_cosine_v /= N_TOKENS;
+
+    std::cout << "Cache round-trip K: avg_cosine=" << avg_cosine_k
+              << " min_cosine=" << min_cosine_k << std::endl;
+    std::cout << "Cache round-trip V: avg_cosine=" << avg_cosine_v
+              << " min_cosine=" << min_cosine_v << std::endl;
+
+    EXPECT_GT(avg_cosine_k, 0.90) << "Average K cosine through cache too low";
+    EXPECT_GT(avg_cosine_v, 0.90) << "Average V cosine through cache too low";
+    EXPECT_GT(min_cosine_k, 0.80) << "Worst-case K cosine through cache too low";
+    EXPECT_GT(min_cosine_v, 0.80) << "Worst-case V cosine through cache too low";
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// One-hot vectors through the ring cache
+// ─────────────────────────────────────────────────────────────────────
+
+TEST_F(Test__CPURingKVCache_TurboQuant, TQ4_OneHot_ThroughCache)
+{
+    constexpr int MAX_SEQ = 8;
+
+    CPURingKVCacheTQ4 cache(mpi_ctx_, 1, 1, MAX_SEQ,
+                            N_KV_HEADS, HEAD_DIM, DeviceId::cpu());
+
+    // Create one-hot K and V vectors (2 tokens, each head has one-hot at different pos)
+    constexpr int N_TOKENS = 2;
+    auto fp32_k = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{N_TOKENS, static_cast<size_t>(KV_DIM)});
+    auto fp32_v = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{N_TOKENS, static_cast<size_t>(KV_DIM)});
+    float *kd = fp32_k->mutable_data();
+    float *vd = fp32_v->mutable_data();
+    std::fill(kd, kd + N_TOKENS * KV_DIM, 0.0f);
+    std::fill(vd, vd + N_TOKENS * KV_DIM, 0.0f);
+
+    // Token 0: one-hot at position 0 in each head
+    for (int h = 0; h < N_KV_HEADS; ++h)
+    {
+        kd[h * HEAD_DIM] = 1.0f;
+        vd[h * HEAD_DIM] = 1.0f;
+    }
+    // Token 1: one-hot at position HEAD_DIM/2 in each head
+    for (int h = 0; h < N_KV_HEADS; ++h)
+    {
+        kd[KV_DIM + h * HEAD_DIM + HEAD_DIM / 2] = 1.0f;
+        vd[KV_DIM + h * HEAD_DIM + HEAD_DIM / 2] = 1.0f;
+    }
+
+    auto tq4_k = quantizeTQ4(*fp32_k);
+    auto tq4_v = quantizeTQ4(*fp32_v);
+    ASSERT_TRUE(cache.append_kv(0, 0, tq4_k.get(), tq4_v.get(), N_TOKENS));
+
+    // Gather and dequantize
+    auto out_k = std::make_shared<TQ4Tensor>(
+        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
+    auto out_v = std::make_shared<TQ4Tensor>(
+        std::vector<size_t>{static_cast<size_t>(MAX_SEQ), KV_DIM}, HEAD_DIM);
+    std::vector<int> kv_lens;
+    cache.gather_kv_batched(0, 1, out_k.get(), out_v.get(), kv_lens);
+
+    out_k->set_turboquant_context(turboquant_ctx_.get());
+    std::vector<float> reco_k(N_TOKENS * KV_DIM);
+    for (int r = 0; r < N_TOKENS; ++r)
+        out_k->to_fp32_row(r, reco_k.data() + r * KV_DIM);
+
+    // Verify: no NaN/Inf, and cosine > 0.7 for one-hot input
+    for (size_t i = 0; i < reco_k.size(); ++i)
+    {
+        ASSERT_FALSE(std::isnan(reco_k[i])) << "NaN at index " << i;
+        ASSERT_FALSE(std::isinf(reco_k[i])) << "Inf at index " << i;
+    }
+
+    // Per-row cosine with original
+    for (int r = 0; r < N_TOKENS; ++r)
+    {
+        const float *orig = fp32_k->data() + r * KV_DIM;
+        const float *reco = reco_k.data() + r * KV_DIM;
+        double dot = 0, na = 0, nb = 0;
+        for (int i = 0; i < KV_DIM; ++i)
+        {
+            dot += orig[i] * reco[i];
+            na += orig[i] * orig[i];
+            nb += reco[i] * reco[i];
+        }
+        double cosine = (na > 1e-30 && nb > 1e-30) ? dot / std::sqrt(na * nb) : 0.0;
+        EXPECT_GT(cosine, 0.70)
+            << "One-hot through cache: cosine too low at row " << r;
+    }
 }

@@ -962,8 +962,6 @@ namespace llaminar2
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
         case ActivationPrecision::TQ4:
             return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
-        case ActivationPrecision::TQ3:
-            return std::make_unique<CPURingKVCacheTQ3>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device, layout_mode);
         default:
             LOG_ERROR("createCPURingKVCache: unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -995,8 +993,6 @@ namespace llaminar2
             return std::make_unique<CPURingKVCacheQ16_1>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         case ActivationPrecision::TQ4:
             return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
-        case ActivationPrecision::TQ3:
-            return std::make_unique<CPURingKVCacheTQ3>(mpi_ctx, n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, attention_devices, layout_mode);
         default:
             LOG_ERROR("createCPURingKVCache(attention_devices): unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1033,9 +1029,6 @@ namespace llaminar2
                                                          n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
         case ActivationPrecision::TQ4:
             return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
-        case ActivationPrecision::TQ3:
-            return std::make_unique<CPURingKVCacheTQ3>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, device, layout_mode);
         default:
             LOG_ERROR("createShardedCPURingKVCache: unsupported precision " << static_cast<int>(precision));
@@ -1075,9 +1068,6 @@ namespace llaminar2
         case ActivationPrecision::TQ4:
             return std::make_unique<CPURingKVCacheTQ4>(mpi_ctx, n_layers, batch_size, max_seq_len,
                                                        n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
-        case ActivationPrecision::TQ3:
-            return std::make_unique<CPURingKVCacheTQ3>(mpi_ctx, n_layers, batch_size, max_seq_len,
-                                                       n_kv_heads, local_n_kv_heads, kv_head_start, head_dim, attention_devices, layout_mode);
         default:
             LOG_ERROR("createShardedCPURingKVCache(attention_devices): unsupported precision " << static_cast<int>(precision));
             return nullptr;
@@ -1099,6 +1089,5 @@ namespace llaminar2
     template class CPURingKVCache<ActivationPrecision::Q8_1>;
     template class CPURingKVCache<ActivationPrecision::Q16_1>;
     template class CPURingKVCache<ActivationPrecision::TQ4>;
-    template class CPURingKVCache<ActivationPrecision::TQ3>;
 
 } // namespace llaminar2

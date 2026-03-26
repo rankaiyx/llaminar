@@ -13,10 +13,11 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../tensors/TQ4Tensor.h"
-#include "../../../tensors/TQ3Tensor.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantDequantize.h"
 #include <limits>
+#include <fstream>
+#include <filesystem>
 
 namespace llaminar2
 {
@@ -28,6 +29,25 @@ namespace llaminar2
     AttentionComputeStage::AttentionComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        // Pre-allocate TQ4 dequant buffers at construction time (model load)
+        // to avoid heap allocations during the decode hot path.
+        if (params_.turboquant_ctx && params_.kv_cache)
+        {
+            const int kv_dim = params_.n_kv_heads * params_.head_dim;
+            const int max_len = params_.kv_cache->max_seq_len();
+            const size_t buf_size = static_cast<size_t>(max_len) * static_cast<size_t>(kv_dim);
+
+            // V always needs FP32 dequant buffer
+            tq_decode_v_fp32_ = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{buf_size});
+
+            if (params_.head_dim != 128)
+            {
+                // K and V both need FP32 dequant
+                tq_decode_k_fp32_ = std::make_unique<FP32Tensor>(
+                    std::vector<size_t>{buf_size});
+            }
+        }
     }
 
     // =============================================================================
@@ -216,45 +236,36 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // CPU DECODE: TQ4/TQ3 KV dequantization
+        // CPU DECODE: TQ4 KV dequantization
         //
-        // TurboQuant KV cache stores quantized blocks. The FP32 attention kernel
-        // cannot consume them directly — we maintain persistent FP32 buffers and
-        // incrementally dequantize newly appended rows each decode step.
+        // TurboQuant KV cache: both K and V are dequantized to FP32.
+        // Scalar-full mode uses 4-bit MSE centroids for reconstruction.
         // =====================================================================
         if (is_decode_mode && gpuStream() == nullptr)
         {
             auto *K_tq4 = dynamic_cast<TQ4Tensor *>(effective_K);
             auto *V_tq4 = dynamic_cast<TQ4Tensor *>(effective_V);
-            auto *K_tq3 = dynamic_cast<TQ3Tensor *>(effective_K);
-            auto *V_tq3 = dynamic_cast<TQ3Tensor *>(effective_V);
 
-            if ((K_tq4 && V_tq4) || (K_tq3 && V_tq3))
+            if (K_tq4 && V_tq4)
             {
                 if (!params_.turboquant_ctx)
                 {
-                    LOG_ERROR("[AttentionComputeStage] TQ4/TQ3 KV cache requires turboquant_ctx in params");
+                    LOG_ERROR("[AttentionComputeStage] TQ4 KV cache requires turboquant_ctx in params");
                     return false;
                 }
-                const auto *turboquant_ctx = params_.turboquant_ctx;
+                const auto &layer_turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
+                const auto *turboquant_ctx = &layer_turboquant_ctx;
 
                 // Set the shared TurboQuant context on cache tensors so dequant is possible
-                if (K_tq4)
-                {
-                    K_tq4->set_turboquant_context(turboquant_ctx);
-                    V_tq4->set_turboquant_context(turboquant_ctx);
-                }
-                else
-                {
-                    K_tq3->set_turboquant_context(turboquant_ctx);
-                    V_tq3->set_turboquant_context(turboquant_ctx);
-                }
+                K_tq4->set_turboquant_context(turboquant_ctx);
+                V_tq4->set_turboquant_context(turboquant_ctx);
 
                 const int kv_dim = params_.n_kv_heads * params_.head_dim;
                 const int max_len = params_.kv_cache
                                         ? params_.kv_cache->max_seq_len()
                                         : effective_kv_len;
 
+                // K+V dequant buffers (pre-allocated in constructor, fallback here for safety)
                 if (!tq_decode_k_fp32_)
                 {
                     tq_decode_k_fp32_ = std::make_unique<FP32Tensor>(
@@ -265,94 +276,20 @@ namespace llaminar2
                 }
 
                 if (effective_kv_len < tq_decode_fp32_rows_)
-                {
                     tq_decode_fp32_rows_ = 0;
-                }
 
                 if (tq_decode_fp32_rows_ < effective_kv_len)
                 {
-                    const size_t from = static_cast<size_t>(tq_decode_fp32_rows_);
-                    const size_t n_new = static_cast<size_t>(effective_kv_len) - from;
-
-                    if (K_tq4)
-                    {
-                        const TurboQuantContext *tq_ctx = K_tq4->turboquant_context();
-                        if (!tq_ctx)
-                        {
-                            LOG_ERROR("[AttentionComputeStage] TQ4 K tensor has no TurboQuant context set");
-                            return false;
-                        }
-                        // Dequantize only newly appended rows
-                        const size_t row_bytes = K_tq4->blocks_per_row() * K_tq4->block_bytes();
-
-                        for (size_t r = from; r < static_cast<size_t>(effective_kv_len); ++r)
-                        {
-                            // Create temporary single-row view for dequant
-                            const uint8_t *row_data = K_tq4->typed_data() + r * row_bytes;
-                            float *k_dst = tq_decode_k_fp32_->mutable_data() + r * kv_dim;
-                            float *v_dst = tq_decode_v_fp32_->mutable_data() + r * kv_dim;
-
-                            const uint8_t *v_row_data = V_tq4->typed_data() + r * row_bytes;
-                            alignas(64) float scratch[128];
-
-                            // Dequantize per-head blocks
-                            for (size_t h = 0; h < K_tq4->blocks_per_row(); ++h)
-                            {
-                                if (params_.head_dim == 128)
-                                {
-                                    const auto *kb = reinterpret_cast<const TQ4Block_128 *>(row_data + h * K_tq4->block_bytes());
-                                    turboquant_dequantize_tq4(*kb, *tq_ctx, k_dst + h * params_.head_dim, scratch);
-                                    const auto *vb = reinterpret_cast<const TQ4Block_128 *>(v_row_data + h * V_tq4->block_bytes());
-                                    turboquant_dequantize_tq4(*vb, *tq_ctx, v_dst + h * params_.head_dim, scratch);
-                                }
-                                else
-                                {
-                                    const auto *kb = reinterpret_cast<const TQ4Block_64 *>(row_data + h * K_tq4->block_bytes());
-                                    turboquant_dequantize_tq4(*kb, *tq_ctx, k_dst + h * params_.head_dim, scratch);
-                                    const auto *vb = reinterpret_cast<const TQ4Block_64 *>(v_row_data + h * V_tq4->block_bytes());
-                                    turboquant_dequantize_tq4(*vb, *tq_ctx, v_dst + h * params_.head_dim, scratch);
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        const TurboQuantContext *tq_ctx = K_tq3->turboquant_context();
-                        if (!tq_ctx)
-                        {
-                            LOG_ERROR("[AttentionComputeStage] TQ3 K tensor has no TurboQuant context set");
-                            return false;
-                        }
-                        const size_t row_bytes = K_tq3->blocks_per_row() * K_tq3->block_bytes();
-                        for (size_t r = from; r < static_cast<size_t>(effective_kv_len); ++r)
-                        {
-                            const uint8_t *row_data = K_tq3->typed_data() + r * row_bytes;
-                            float *k_dst = tq_decode_k_fp32_->mutable_data() + r * kv_dim;
-                            float *v_dst = tq_decode_v_fp32_->mutable_data() + r * kv_dim;
-
-                            const uint8_t *v_row_data = V_tq3->typed_data() + r * row_bytes;
-                            alignas(64) float scratch[128];
-
-                            for (size_t h = 0; h < K_tq3->blocks_per_row(); ++h)
-                            {
-                                if (params_.head_dim == 128)
-                                {
-                                    const auto *kb = reinterpret_cast<const TQ3Block_128 *>(row_data + h * K_tq3->block_bytes());
-                                    turboquant_dequantize_tq3(*kb, *tq_ctx, k_dst + h * params_.head_dim, scratch);
-                                    const auto *vb = reinterpret_cast<const TQ3Block_128 *>(v_row_data + h * V_tq3->block_bytes());
-                                    turboquant_dequantize_tq3(*vb, *tq_ctx, v_dst + h * params_.head_dim, scratch);
-                                }
-                                else
-                                {
-                                    const auto *kb = reinterpret_cast<const TQ3Block_64 *>(row_data + h * K_tq3->block_bytes());
-                                    turboquant_dequantize_tq3(*kb, *tq_ctx, k_dst + h * params_.head_dim, scratch);
-                                    const auto *vb = reinterpret_cast<const TQ3Block_64 *>(v_row_data + h * V_tq3->block_bytes());
-                                    turboquant_dequantize_tq3(*vb, *tq_ctx, v_dst + h * params_.head_dim, scratch);
-                                }
-                            }
-                        }
-                    }
-
+                    turboquant_dequantize_kv_rows(
+                        K_tq4->typed_data(), V_tq4->typed_data(),
+                        *turboquant_ctx,
+                        tq_decode_k_fp32_->mutable_data(),
+                        tq_decode_v_fp32_->mutable_data(),
+                        tq_decode_fp32_rows_, effective_kv_len,
+                        params_.head_dim, params_.n_kv_heads,
+                        K_tq4->blocks_per_row() * K_tq4->block_bytes(),
+                        V_tq4->blocks_per_row() * V_tq4->block_bytes(),
+                        K_tq4->block_bytes(), V_tq4->block_bytes());
                     tq_decode_fp32_rows_ = effective_kv_len;
                 }
 
@@ -480,6 +417,101 @@ namespace llaminar2
         LOG_DEBUG("[AttentionComputeStage] Executing kernel: Q_type=" << params_.Q->dtype_name()
                                                                       << " device=" << params_.device_id.to_string()
                                                                       << " device_idx=" << device_idx);
+
+        // =====================================================================
+        // DEBUG: Dump effective K/V to binary files for Python analysis
+        // Enable with LLAMINAR_DUMP_EFFECTIVE_KV=1
+        // Dumps layer 0 data (or all layers with LLAMINAR_DUMP_EFFECTIVE_KV_ALL=1)
+        // =====================================================================
+        {
+            static const bool dump_enabled = (std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV") &&
+                                              std::atoi(std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV")) != 0);
+            static const bool dump_all = (std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV_ALL") &&
+                                          std::atoi(std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV_ALL")) != 0);
+
+            if (dump_enabled && (dump_all || params_.layer_idx == 0) && is_decode_mode)
+            {
+                static int dump_iteration = 0;
+                const std::string dump_dir = "/tmp/effective_kv_dump/layer" +
+                                             std::to_string(params_.layer_idx) +
+                                             "_iter" + std::to_string(dump_iteration);
+                std::filesystem::create_directories(dump_dir);
+
+                // Write metadata
+                {
+                    std::ofstream meta(dump_dir + "/meta.txt");
+                    meta << "layer=" << params_.layer_idx << "\n"
+                         << "iteration=" << dump_iteration << "\n"
+                         << "seq_len=" << params_.seq_len << "\n"
+                         << "kv_len=" << effective_kv_len << "\n"
+                         << "n_heads=" << params_.n_heads << "\n"
+                         << "n_kv_heads=" << params_.n_kv_heads << "\n"
+                         << "head_dim=" << params_.head_dim << "\n"
+                         << "batch_size=" << params_.batch_size << "\n"
+                         << "mode=" << attention_mode_name(mode) << "\n"
+                         << "Q_type=" << (params_.Q ? params_.Q->dtype_name() : "null") << "\n"
+                         << "K_type=" << (effective_K ? effective_K->dtype_name() : "null") << "\n"
+                         << "V_type=" << (effective_V ? effective_V->dtype_name() : "null") << "\n"
+                         << "K_is_dequanted=" << (effective_K == tq_decode_k_fp32_.get() ? 1 : 0) << "\n"
+                         << "V_is_dequanted=" << (effective_V == tq_decode_v_fp32_.get() ? 1 : 0) << "\n"
+                         << "K_ptr=" << (void *)effective_K << "\n"
+                         << "V_ptr=" << (void *)effective_V << "\n";
+                }
+
+                // Dump Q (FP32)
+                if (auto *q_fp32 = dynamic_cast<FP32Tensor *>(params_.Q))
+                {
+                    const size_t q_elems = static_cast<size_t>(params_.seq_len) *
+                                           params_.n_heads * params_.head_dim;
+                    std::ofstream f(dump_dir + "/Q.bin", std::ios::binary);
+                    f.write(reinterpret_cast<const char *>(q_fp32->data()),
+                            q_elems * sizeof(float));
+                }
+
+                // Dump effective K (should be FP32 after dequant)
+                if (auto *k_fp32 = dynamic_cast<FP32Tensor *>(effective_K))
+                {
+                    const size_t k_elems = static_cast<size_t>(effective_kv_len) *
+                                           params_.n_kv_heads * params_.head_dim;
+                    std::ofstream f(dump_dir + "/K_effective.bin", std::ios::binary);
+                    f.write(reinterpret_cast<const char *>(k_fp32->data()),
+                            k_elems * sizeof(float));
+                }
+
+                // Dump effective V (should be FP32 after dequant)
+                if (auto *v_fp32 = dynamic_cast<FP32Tensor *>(effective_V))
+                {
+                    const size_t v_elems = static_cast<size_t>(effective_kv_len) *
+                                           params_.n_kv_heads * params_.head_dim;
+                    std::ofstream f(dump_dir + "/V_effective.bin", std::ios::binary);
+                    f.write(reinterpret_cast<const char *>(v_fp32->data()),
+                            v_elems * sizeof(float));
+                }
+
+                // Dump raw TQ4 K cache if available
+                if (params_.kv_cache && params_.layer_idx >= 0)
+                {
+                    ITensor *cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+                    if (auto *k_tq4 = dynamic_cast<TQ4Tensor *>(cache_k))
+                    {
+                        const size_t raw_bytes = static_cast<size_t>(effective_kv_len) *
+                                                 k_tq4->blocks_per_row() * k_tq4->block_bytes();
+                        std::ofstream f(dump_dir + "/K_cache_tq4.bin", std::ios::binary);
+                        f.write(reinterpret_cast<const char *>(k_tq4->typed_data()),
+                                raw_bytes);
+                        std::ofstream m(dump_dir + "/K_cache_meta.txt");
+                        m << "blocks_per_row=" << k_tq4->blocks_per_row() << "\n"
+                          << "block_bytes=" << k_tq4->block_bytes() << "\n"
+                          << "head_dim=" << k_tq4->head_dim() << "\n"
+                          << "rows=" << effective_kv_len << "\n";
+                    }
+                }
+
+                LOG_INFO("[AttentionComputeStage] Dumped effective K/V to " << dump_dir);
+                if (params_.layer_idx == 0)
+                    dump_iteration++;
+            }
+        }
 
         bool success = kernel->compute_tensor(
             params_.Q, effective_K, effective_V, params_.output,

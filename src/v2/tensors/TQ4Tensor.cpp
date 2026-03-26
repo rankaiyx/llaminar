@@ -39,8 +39,8 @@ namespace llaminar2
         }
 
         block_bytes_ = (head_dim == 128)
-                   ? sizeof(TQ4Block_128)
-                   : sizeof(TQ4Block_64);
+                           ? sizeof(TQ4Block_128)
+                           : sizeof(TQ4Block_64);
         blocks_per_row_ = kv_dim / static_cast<size_t>(head_dim);
 
         // Calculate total rows
@@ -153,13 +153,15 @@ namespace llaminar2
 
             if (head_dim_ == 128)
             {
+                const auto &head_ctx = turboquant_ctx_->for_layer(static_cast<int>(h));
                 const TQ4Block_128 *block = reinterpret_cast<const TQ4Block_128 *>(block_src);
-                turboquant_dequantize_tq4<128>(*block, *turboquant_ctx_, head_dst, scratch);
+                turboquant_dequantize_tq4<128>(*block, head_ctx, head_dst, scratch);
             }
             else if (head_dim_ == 64)
             {
+                const auto &head_ctx = turboquant_ctx_->for_layer(static_cast<int>(h));
                 const TQ4Block_64 *block = reinterpret_cast<const TQ4Block_64 *>(block_src);
-                turboquant_dequantize_tq4<64>(*block, *turboquant_ctx_, head_dst, scratch);
+                turboquant_dequantize_tq4<64>(*block, head_ctx, head_dst, scratch);
             }
         }
     }
@@ -205,8 +207,6 @@ namespace llaminar2
         const size_t bpr = tensor->blocks_per_row();
         const size_t bb = tensor->block_bytes();
 
-        // Quantize each head vector independently
-        // Each row has blocks_per_row heads, each head is head_dim elements
 #pragma omp parallel for if (num_rows * bpr >= 32)
         for (size_t r = 0; r < num_rows; ++r)
         {
@@ -220,16 +220,17 @@ namespace llaminar2
                 const float *head_src = row_src + h * static_cast<size_t>(head_dim);
                 uint8_t *block_dst = row_dst + h * bb;
 
-                // Dispatch based on head_dim
                 if (head_dim == 128)
                 {
                     TQ4Block_128 *block = reinterpret_cast<TQ4Block_128 *>(block_dst);
-                    turboquant_quantize_tq4<128>(head_src, turboquant_ctx, *block, scratch0, scratch1);
+                    const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
+                    turboquant_quantize_tq4<128>(head_src, head_ctx, *block, scratch0, scratch1);
                 }
                 else if (head_dim == 64)
                 {
                     TQ4Block_64 *block = reinterpret_cast<TQ4Block_64 *>(block_dst);
-                    turboquant_quantize_tq4<64>(head_src, turboquant_ctx, *block, scratch0, scratch1);
+                    const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
+                    turboquant_quantize_tq4<64>(head_src, head_ctx, *block, scratch0, scratch1);
                 }
             }
         }
@@ -262,12 +263,14 @@ namespace llaminar2
                 if (head_dim_ == 128)
                 {
                     TQ4Block_128 *block = reinterpret_cast<TQ4Block_128 *>(block_dst);
-                    turboquant_quantize_tq4<128>(head_src, turboquant_ctx, *block, scratch0, scratch1);
+                    const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
+                    turboquant_quantize_tq4<128>(head_src, head_ctx, *block, scratch0, scratch1);
                 }
                 else if (head_dim_ == 64)
                 {
                     TQ4Block_64 *block = reinterpret_cast<TQ4Block_64 *>(block_dst);
-                    turboquant_quantize_tq4<64>(head_src, turboquant_ctx, *block, scratch0, scratch1);
+                    const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
+                    turboquant_quantize_tq4<64>(head_src, head_ctx, *block, scratch0, scratch1);
                 }
             }
         }
@@ -299,12 +302,14 @@ namespace llaminar2
                 if (head_dim_ == 128)
                 {
                     const TQ4Block_128 *block = reinterpret_cast<const TQ4Block_128 *>(block_src);
-                    turboquant_dequantize_tq4<128>(*block, turboquant_ctx, head_dst, scratch);
+                    const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
+                    turboquant_dequantize_tq4<128>(*block, head_ctx, head_dst, scratch);
                 }
                 else if (head_dim_ == 64)
                 {
                     const TQ4Block_64 *block = reinterpret_cast<const TQ4Block_64 *>(block_src);
-                    turboquant_dequantize_tq4<64>(*block, turboquant_ctx, head_dst, scratch);
+                    const auto &head_ctx = turboquant_ctx.for_layer(static_cast<int>(h));
+                    turboquant_dequantize_tq4<64>(*block, head_ctx, head_dst, scratch);
                 }
             }
         }

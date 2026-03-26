@@ -167,10 +167,9 @@ static const std::vector<TestConfig> kSingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::Q8_1,
     },
     // =========================================================================
-    // TurboQuant KV cache configs — exercises the TQ4/TQ3 quantization path
-    // (rotation + Lloyd-Max codebook quantization of K/V vectors).
-    // TQ4 = 4-bit indices, TQ3 = 3-bit indices.
-    // Thresholds match FP16 — TQ should be near-lossless on this model.
+    // TurboQuant KV cache configs — exercises the TQ4 quantization path.
+    // These stay under the same end-to-end parity harness as the other KV
+    // precisions because the acceptance criterion is real inference quality.
     // =========================================================================
     {
         .name = "CPU_KV_TQ4",
@@ -188,23 +187,6 @@ static const std::vector<TestConfig> kSingleDeviceConfigs = {
         },
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::TQ4,
-    },
-    {
-        .name = "CPU_KV_TQ3",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,
-            .decode_cosine_threshold = 0.88f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.005f,
-            .min_top1_accuracy = 90.0f,
-            .min_top5_accuracy = 95.0f,
-        },
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::TQ3,
     },
     // =========================================================================
     // Q8_0 model configs — exercises the native-VNNI code path (codebook 18)

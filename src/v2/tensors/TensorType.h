@@ -42,8 +42,7 @@ namespace llaminar2
         IQ3_S,   // 3-bit small IQ
         IQ1_S,   // 1-bit small IQ
         IQ1_M,   // 1-bit medium IQ
-        TQ4,     // TurboQuant 4-bit (KV cache)
-        TQ3      // TurboQuant 3-bit (KV cache)
+        TQ4      // TurboQuant 4-bit (KV cache)
     };
 
     /**
@@ -111,8 +110,6 @@ namespace llaminar2
             return "IQ1_M";
         case TensorType::TQ4:
             return "TQ4";
-        case TensorType::TQ3:
-            return "TQ3";
         default:
             return "UNKNOWN";
         }

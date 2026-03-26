@@ -263,7 +263,7 @@ namespace llaminar
                 // MPI context (required for CPU cache)
                 const ::llaminar2::MPIContext *mpi_ctx = nullptr;
 
-                /// TurboQuant context (for TQ4/TQ3 KV cache). Not owned.
+                /// TurboQuant context (for TQ4 KV cache). Not owned.
                 const ::llaminar2::TurboQuantContext *turboquant_ctx = nullptr;
 
                 /**

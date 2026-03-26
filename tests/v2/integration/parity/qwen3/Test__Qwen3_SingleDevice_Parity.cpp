@@ -81,6 +81,26 @@ static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::Q16_1,
     },
     {
+        .name = "Qwen3_CPU_KV_TQ4",
+        .devices = {ParityDeviceType::CPU},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.94f,
+            .decode_cosine_threshold = 0.80f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.01f,
+            .min_top1_accuracy = 60.0f, // TQ4 on 28-layer Qwen3 diverges at later decode steps
+            .min_top5_accuracy = 80.0f,
+            .pytorch_top1_in_topk = 0, // Disable strict topK gate for TQ4 (cumulative quantization error)
+        },
+        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen3_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::TQ4,
+    },
+    {
         .name = "Qwen3_CUDA_KV_FP16",
         .devices = {ParityDeviceType::CUDA},
         .parallelism = Parallelism::None,

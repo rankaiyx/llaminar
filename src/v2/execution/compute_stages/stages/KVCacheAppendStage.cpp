@@ -12,7 +12,6 @@
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../tensors/TQ4Tensor.h"
-#include "../../../tensors/TQ3Tensor.h"
 #include "../../../utils/OpenMPUtils.h"
 
 #include "../../../utils/KVCacheProfiler.h"
@@ -327,40 +326,25 @@ namespace llaminar2
 
                     success = append_to_cache(seq_idx, k_q8.get(), v_q8.get(), seq_len);
                 }
-                else if (cache_precision == ActivationPrecision::TQ4 ||
-                         cache_precision == ActivationPrecision::TQ3)
+                else if (cache_precision == ActivationPrecision::TQ4)
                 {
                     if (!params_.turboquant_ctx)
                     {
                         LOG_ERROR("[KVCacheAppendStage] TurboQuant cache requires turboquant_ctx in params");
                         return false;
                     }
-                    const auto &turboquant_ctx = *params_.turboquant_ctx;
+                    const auto &turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
                     const std::vector<size_t> tq_shape{static_cast<size_t>(seq_len), kv_dim};
 
-                    if (cache_precision == ActivationPrecision::TQ4)
+                    auto k_tq4 = TQ4Tensor::quantize_from_fp32(k_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
+                    auto v_tq4 = TQ4Tensor::quantize_from_fp32(v_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
+                    if (!k_tq4 || !v_tq4)
                     {
-                        auto k_tq4 = TQ4Tensor::quantize_from_fp32(k_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
-                        auto v_tq4 = TQ4Tensor::quantize_from_fp32(v_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
-                        if (!k_tq4 || !v_tq4)
-                        {
-                            LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to TQ4");
-                            return false;
-                        }
+                        LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to TQ4");
+                        return false;
+                    }
 
-                        success = append_to_cache(seq_idx, k_tq4.get(), v_tq4.get(), seq_len);
-                    }
-                    else
-                    {
-                        auto k_tq3 = TQ3Tensor::quantize_from_fp32(k_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
-                        auto v_tq3 = TQ3Tensor::quantize_from_fp32(v_slice->data(), tq_shape, params_.head_dim, turboquant_ctx);
-                        if (!k_tq3 || !v_tq3)
-                        {
-                            LOG_ERROR("[KVCacheAppendStage] Failed to quantize batched K/V slices to TQ3");
-                            return false;
-                        }
-                        success = append_to_cache(seq_idx, k_tq3.get(), v_tq3.get(), seq_len);
-                    }
+                    success = append_to_cache(seq_idx, k_tq4.get(), v_tq4.get(), seq_len);
                 }
                 else
                 {
@@ -931,12 +915,12 @@ namespace llaminar2
         }
 
         // =================================================================
-        // TQ4/TQ3 cache path with TurboQuant rotation-based quantization
+        // TQ4 cache path with TurboQuant rotation-based quantization
         // =================================================================
+        // TQ4 cache path with TurboQuant rotation-based quantization
         bool cache_is_tq4 = (params_.kv_cache->precision() == ActivationPrecision::TQ4);
-        bool cache_is_tq3 = (params_.kv_cache->precision() == ActivationPrecision::TQ3);
 
-        if (cache_is_tq4 || cache_is_tq3)
+        if (cache_is_tq4)
         {
             if (!params_.turboquant_ctx)
             {
@@ -947,7 +931,11 @@ namespace llaminar2
             const auto conv_start = std::chrono::high_resolution_clock::now();
             const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
             const int head_dim = params_.head_dim;
-            const auto &turboquant_ctx = *params_.turboquant_ctx;
+            const auto &turboquant_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
+
+            // Scalar-full quantization for both K and V:
+            // All 4 bits used for MSE centroids, giving ~0.995 per-vector
+            // reconstruction cosine similarity.
 
             const float *k_fp32 = params_.K->fp32_data();
             const float *v_fp32 = params_.V->fp32_data();
@@ -959,51 +947,25 @@ namespace llaminar2
 
             const std::vector<size_t> tq_shape{static_cast<size_t>(total_tokens), kv_dim};
 
-            if (cache_is_tq4)
+            tq4_k_scratch_ = TQ4Tensor::quantize_from_fp32(k_fp32, tq_shape, head_dim, turboquant_ctx);
+            tq4_v_scratch_ = TQ4Tensor::quantize_from_fp32(v_fp32, tq_shape, head_dim, turboquant_ctx);
+
+            if (!tq4_k_scratch_ || !tq4_v_scratch_)
             {
-                tq4_k_scratch_ = TQ4Tensor::quantize_from_fp32(k_fp32, tq_shape, head_dim, turboquant_ctx);
-                tq4_v_scratch_ = TQ4Tensor::quantize_from_fp32(v_fp32, tq_shape, head_dim, turboquant_ctx);
-
-                if (!tq4_k_scratch_ || !tq4_v_scratch_)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to quantize K/V to TQ4");
-                    return false;
-                }
-
-                const auto conv_end = std::chrono::high_resolution_clock::now();
-                const uint64_t conv_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
-                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_TQ, conv_ns, static_cast<uint64_t>(total_tokens), 0);
-
-                bool success = append_to_cache(params_.seq_idx, tq4_k_scratch_.get(), tq4_v_scratch_.get(), total_tokens);
-                if (!success)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] append failed (TQ4 cache)");
-                    return false;
-                }
+                LOG_ERROR("[KVCacheAppendStage] Failed to quantize K/V to TQ4");
+                return false;
             }
-            else
+
+            const auto conv_end = std::chrono::high_resolution_clock::now();
+            const uint64_t conv_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+            KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_TQ, conv_ns, static_cast<uint64_t>(total_tokens), 0);
+
+            bool success = append_to_cache(params_.seq_idx, tq4_k_scratch_.get(), tq4_v_scratch_.get(), total_tokens);
+            if (!success)
             {
-                tq3_k_scratch_ = TQ3Tensor::quantize_from_fp32(k_fp32, tq_shape, head_dim, turboquant_ctx);
-                tq3_v_scratch_ = TQ3Tensor::quantize_from_fp32(v_fp32, tq_shape, head_dim, turboquant_ctx);
-
-                if (!tq3_k_scratch_ || !tq3_v_scratch_)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] Failed to quantize K/V to TQ3");
-                    return false;
-                }
-
-                const auto conv_end = std::chrono::high_resolution_clock::now();
-                const uint64_t conv_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
-                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_TQ, conv_ns, static_cast<uint64_t>(total_tokens), 0);
-
-                bool success = append_to_cache(params_.seq_idx, tq3_k_scratch_.get(), tq3_v_scratch_.get(), total_tokens);
-                if (!success)
-                {
-                    LOG_ERROR("[KVCacheAppendStage] append failed (TQ3 cache)");
-                    return false;
-                }
+                LOG_ERROR("[KVCacheAppendStage] append failed (TQ4 cache)");
+                return false;
             }
 
             return true;

@@ -3477,6 +3477,21 @@ add_v2_test(V2_Unit_TurboQuant_KVCache
     LABELS "V2;Unit;KVCache;TurboQuant;TQ4;TQ3;Ring;CPU;Quantization"
 )
 
+# TQ4 Attention with head_dim=128 (Qwen3-like)
+# Tests TQ4 round-trip, cache round-trip, dequant correctness, and full attention pipeline
+# with head_dim=128 — the code path that differs from Qwen2's head_dim=64.
+add_executable(v2_test_tq4_attention_headdim128 unit/kernels/cpu/Test__TQ4_Attention_HeadDim128.cpp)
+target_link_libraries(v2_test_tq4_attention_headdim128
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TQ4_Attention_HeadDim128
+    COMMAND $<TARGET_FILE:v2_test_tq4_attention_headdim128>
+    MPI_PROCS 1
+    LABELS "V2;Unit;KVCache;TurboQuant;TQ4;Attention;CPU;Quantization"
+)
+
 # Test: ModelContextConfig
 # Tests configuration struct for ModelContext creation (PP/TP/combined scenarios)
 add_executable(v2_unit_modelcontextconfig unit/loaders/Test__ModelContextConfig.cpp)
@@ -4238,6 +4253,24 @@ if(ZLIB_FOUND)
     add_v2_test(V2_Integration_Parity_Qwen3_SingleDevice
         COMMAND $<TARGET_FILE:v2_integration_parity_qwen3_single_device>
         LABELS "V2;Integration;Parity;Qwen3;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
+        MPI_PROCS 1
+    )
+
+    # ---- TQ4 Decode Step 4 Divergence Analysis ----
+    add_executable(v2_integration_parity_qwen3_tq4_analysis
+        integration/parity/qwen3/Test__Qwen3_TQ4_DecodeAnalysis.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen3_tq4_analysis
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen3_tq4_analysis PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_v2_test(V2_Integration_Parity_Qwen3_TQ4_Analysis
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen3_tq4_analysis>
+        LABELS "V2;Integration;Parity;Qwen3;CPU;TQ4;Analysis;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
     )
 
@@ -8500,5 +8533,24 @@ set_tests_properties(V2_E2E_Server_MultiTurn PROPERTIES
     ENVIRONMENT "LLAMINAR_LOG_LEVEL=ERROR"
 )
 message(STATUS "V2 Tests: Added E2E Server multi-turn integration tests")
+
+# =============================================================================
+# Performance: TurboQuant TQ4 (quantize / dequantize / native dot)
+# =============================================================================
+
+add_executable(v2_perf_turboquant performance/kernels/cpu/turboquant/Perf__TurboQuant.cpp)
+target_link_libraries(v2_perf_turboquant
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_perf_turboquant PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Perf_TurboQuant
+    COMMAND $<TARGET_FILE:v2_perf_turboquant>
+    LABELS "V2;Performance;TurboQuant;TQ4;Quantize;Dequantize;NativeDot;KVCache;SIMD;AVX512"
+    MPI_PROCS 1
+)
 
 endif()

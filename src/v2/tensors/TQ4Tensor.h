@@ -4,7 +4,7 @@
  *
  * Stores KV cache vectors quantized using the paper's inner-product-corrected
  * TurboQuant path:
- *   FP32 → unit-norm → 3-bit MSE TurboQuant → 1-bit QJL residual sketch
+ *   FP32 → unit-norm → 4-bit MSE TurboQuant codes
  *
  * Each logical "row" of kv_dim elements is stored as n_kv_heads TQ4Blocks,
  * one block per attention head (each block = head_dim elements).
@@ -94,7 +94,6 @@ namespace llaminar2
         const void *raw_host_data_ptr() const override { return raw_blocks_.data(); }
 
     public:
-
         bool copyFrom(const TensorBase *src) override;
 
         void release_raw_data() override;
@@ -136,19 +135,19 @@ namespace llaminar2
         const TurboQuantContext *turboquant_context() const { return turboquant_ctx_; }
 
         /**
-         * @brief Quantize FP32 data into a new TQ4Tensor.
+         * @brief Quantize FP32 data into a new TQ4Tensor (scalar-full mode).
          *
          * @param src       Source FP32 data [num_positions, kv_dim]
          * @param shape     Shape: [num_positions, kv_dim]
          * @param head_dim  Head dimension (64 or 128)
-            * @param turboquant_ctx  Pre-computed TurboQuant context
+         * @param turboquant_ctx  Pre-computed TurboQuant context
          * @return New TQ4Tensor with quantized data
          */
         static std::shared_ptr<TQ4Tensor> quantize_from_fp32(
             const float *src,
             const std::vector<size_t> &shape,
             int head_dim,
-                const TurboQuantContext &turboquant_ctx);
+            const TurboQuantContext &turboquant_ctx);
 
         /**
          * @brief Quantize first num_rows rows of FP32 data into existing storage.
@@ -169,10 +168,10 @@ namespace llaminar2
         void dequantize_to_fp32(float *dst, const TurboQuantContext &turboquant_ctx) const;
 
     private:
-        std::vector<size_t> shape_;       ///< [num_positions, kv_dim]
-        int head_dim_;                    ///< Head dimension (64 or 128)
+        std::vector<size_t> shape_; ///< [num_positions, kv_dim]
+        int head_dim_;              ///< Head dimension (64 or 128)
         size_t block_bytes_;
-        size_t blocks_per_row_;           ///< kv_dim / head_dim
+        size_t blocks_per_row_; ///< kv_dim / head_dim
         DeviceId device_;
         std::vector<uint8_t> raw_blocks_; ///< Raw block data
         bool raw_data_released_ = false;

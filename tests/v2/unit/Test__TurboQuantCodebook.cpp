@@ -8,7 +8,7 @@
  * - Thresholds are midpoints of adjacent centroids
  * - Symmetry: centroid[k] = -centroid[K-1-k]
  * - Nearest centroid returns correct indices
- * - TQ3 bit packing/unpacking round-trips correctly
+ * - 3-bit packing/unpacking round-trips correctly (used by TQ4)
  *
  * @author David Sanftenberg
  */
@@ -37,7 +37,8 @@ TEST(Test__TurboQuantCodebook, TQ4_CentroidsAreFixedPoint)
 
 TEST(Test__TurboQuantCodebook, TQ4_CentroidsAreSorted)
 {
-    for (int i = 0; i < 15; ++i) {
+    for (int i = 0; i < 15; ++i)
+    {
         EXPECT_LT(TQ4_CENTROIDS[i], TQ4_CENTROIDS[i + 1])
             << "TQ4 centroids not sorted at index " << i;
     }
@@ -45,7 +46,8 @@ TEST(Test__TurboQuantCodebook, TQ4_CentroidsAreSorted)
 
 TEST(Test__TurboQuantCodebook, TQ4_CentroidsAreSymmetric)
 {
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 8; ++i)
+    {
         EXPECT_NEAR(TQ4_CENTROIDS[i], -TQ4_CENTROIDS[15 - i], 1e-5f)
             << "TQ4 symmetry violated at index " << i;
     }
@@ -53,7 +55,8 @@ TEST(Test__TurboQuantCodebook, TQ4_CentroidsAreSymmetric)
 
 TEST(Test__TurboQuantCodebook, TQ4_ThresholdsAreMidpoints)
 {
-    for (int i = 0; i < 15; ++i) {
+    for (int i = 0; i < 15; ++i)
+    {
         float expected = 0.5f * (TQ4_CENTROIDS[i] + TQ4_CENTROIDS[i + 1]);
         EXPECT_NEAR(TQ4_THRESHOLDS[i], expected, 1e-4f)
             << "TQ4 threshold[" << i << "] is not midpoint of centroids";
@@ -62,7 +65,8 @@ TEST(Test__TurboQuantCodebook, TQ4_ThresholdsAreMidpoints)
 
 TEST(Test__TurboQuantCodebook, TQ4_ThresholdsAreSorted)
 {
-    for (int i = 0; i < 14; ++i) {
+    for (int i = 0; i < 14; ++i)
+    {
         EXPECT_LT(TQ4_THRESHOLDS[i], TQ4_THRESHOLDS[i + 1])
             << "TQ4 thresholds not sorted at index " << i;
     }
@@ -81,7 +85,8 @@ TEST(Test__TurboQuantCodebook, TQ3_CentroidsAreFixedPoint)
 
 TEST(Test__TurboQuantCodebook, TQ3_CentroidsAreSorted)
 {
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 7; ++i)
+    {
         EXPECT_LT(TQ3_CENTROIDS[i], TQ3_CENTROIDS[i + 1])
             << "TQ3 centroids not sorted at index " << i;
     }
@@ -89,7 +94,8 @@ TEST(Test__TurboQuantCodebook, TQ3_CentroidsAreSorted)
 
 TEST(Test__TurboQuantCodebook, TQ3_CentroidsAreSymmetric)
 {
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4; ++i)
+    {
         EXPECT_NEAR(TQ3_CENTROIDS[i], -TQ3_CENTROIDS[7 - i], 1e-5f)
             << "TQ3 symmetry violated at index " << i;
     }
@@ -97,7 +103,8 @@ TEST(Test__TurboQuantCodebook, TQ3_CentroidsAreSymmetric)
 
 TEST(Test__TurboQuantCodebook, TQ3_ThresholdsAreMidpoints)
 {
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 7; ++i)
+    {
         float expected = 0.5f * (TQ3_CENTROIDS[i] + TQ3_CENTROIDS[i + 1]);
         EXPECT_NEAR(TQ3_THRESHOLDS[i], expected, 1e-4f)
             << "TQ3 threshold[" << i << "] is not midpoint of centroids";
@@ -111,7 +118,8 @@ TEST(Test__TurboQuantCodebook, TQ3_ThresholdsAreMidpoints)
 TEST(Test__TurboQuantCodebook, TQ4_NearestCentroid_ExactValues)
 {
     // Each centroid should map to itself
-    for (int k = 0; k < 16; ++k) {
+    for (int k = 0; k < 16; ++k)
+    {
         uint8_t idx = tq4_nearest_centroid(TQ4_CENTROIDS[k]);
         EXPECT_EQ(idx, k)
             << "TQ4 centroid[" << k << "] = " << TQ4_CENTROIDS[k]
@@ -133,7 +141,8 @@ TEST(Test__TurboQuantCodebook, TQ4_NearestCentroid_Extremes)
 
 TEST(Test__TurboQuantCodebook, TQ3_NearestCentroid_ExactValues)
 {
-    for (int k = 0; k < 8; ++k) {
+    for (int k = 0; k < 8; ++k)
+    {
         uint8_t idx = tq3_nearest_centroid(TQ3_CENTROIDS[k]);
         EXPECT_EQ(idx, k)
             << "TQ3 centroid[" << k << "] = " << TQ3_CENTROIDS[k]
@@ -158,7 +167,8 @@ TEST(Test__TurboQuantCodebook, TQ3_PackUnpack_AllValues)
 {
     // Test all 8^8 possible 8-element groups? No — test representative patterns.
     // Test all-same values
-    for (uint8_t val = 0; val < 8; ++val) {
+    for (uint8_t val = 0; val < 8; ++val)
+    {
         uint8_t input[8] = {val, val, val, val, val, val, val, val};
         uint8_t packed[3];
         uint8_t unpacked[8];
@@ -185,7 +195,8 @@ TEST(Test__TurboQuantCodebook, TQ3_PackUnpack_Random)
     std::mt19937 rng(12345);
     std::uniform_int_distribution<int> dist(0, 7);
 
-    for (int trial = 0; trial < 1000; ++trial) {
+    for (int trial = 0; trial < 1000; ++trial)
+    {
         uint8_t input[8], packed[3], unpacked[8];
         for (int i = 0; i < 8; ++i)
             input[i] = static_cast<uint8_t>(dist(rng));
@@ -212,22 +223,4 @@ TEST(Test__TurboQuantCodebook, TQ4_TheoreticalMSE)
     // Literature value is ~0.009497 for N(0,1) 16-level Lloyd-Max
     EXPECT_NEAR(mse, 0.009497, 0.002)
         << "4-bit MSE deviates from literature value";
-}
-
-TEST(Test__TurboQuantCodebook, TQ3_TheoreticalMSE)
-{
-    // For N(0,1) with 8 levels, Lloyd-Max MSE ≈ 0.03454
-    double mse = lloyd_max_mse(8, 1.0);
-    EXPECT_GT(mse, 0.0);
-    EXPECT_LT(mse, 0.050);
-    EXPECT_NEAR(mse, 0.03454, 0.005)
-        << "3-bit MSE deviates from literature value";
-}
-
-TEST(Test__TurboQuantCodebook, TQ4_BetterThanTQ3)
-{
-    double mse_tq4 = lloyd_max_mse(16, 1.0);
-    double mse_tq3 = lloyd_max_mse(8, 1.0);
-    EXPECT_LT(mse_tq4, mse_tq3)
-        << "4-bit should have lower MSE than 3-bit";
 }
