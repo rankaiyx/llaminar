@@ -1391,6 +1391,201 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_BatchDecoding)
               << ", n_kv_heads=" << n_kv_heads << " - PASSED" << std::endl;
 }
 
+// ============================================================================
+// Fused Q8_1 Decode Parity Test
+// Tests the new fused Q8_1 CUDA kernel (flash_decoding_q8kv_kernel) that reads
+// Q8_1 blocks directly in the attention inner loop, eliminating the separate
+// dequant-to-FP32-workspace step.
+// ============================================================================
+
+TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_Parity)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int kv_len = 256;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+
+    const size_t q_size = static_cast<size_t>(n_heads) * head_dim;
+    const size_t kv_size = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+    const size_t out_size = static_cast<size_t>(n_heads) * head_dim;
+
+    auto Q_data = randomFP32(q_size);
+    auto K_data_fp32 = randomFP32(kv_size);
+    auto V_data_fp32 = randomFP32(kv_size);
+
+    // CPU FP32 reference output
+    std::vector<float> cpu_fp32_output(out_size, 0.0f);
+    cpuDecodeAttentionReference(
+        Q_data.data(), K_data_fp32.data(), V_data_fp32.data(),
+        cpu_fp32_output.data(),
+        kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+
+    // Quantize K/V to Q8_1
+    auto k_q81 = Q8_1Tensor::quantize_from_fp32(
+        K_data_fp32.data(), {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    auto v_q81 = Q8_1Tensor::quantize_from_fp32(
+        V_data_fp32.data(), {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    ASSERT_NE(k_q81, nullptr);
+    ASSERT_NE(v_q81, nullptr);
+
+    // CPU Q8_1 dequant reference (Q8_1→FP32 then FP32 attention)
+    const float *K_deq = k_q81->fp32_data();
+    const float *V_deq = v_q81->fp32_data();
+    std::vector<float> cpu_q81_deq_output(out_size, 0.0f);
+    cpuDecodeAttentionReference(
+        Q_data.data(), K_deq, V_deq,
+        cpu_q81_deq_output.data(),
+        kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+
+    // Create FP32 Q tensor and output tensor for GPU
+    auto Q_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(n_heads), static_cast<size_t>(head_dim)});
+    memcpy(Q_tensor->mutable_data(), Q_data.data(), q_size * sizeof(float));
+
+    auto output_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(n_heads), static_cast<size_t>(head_dim)});
+    memset(output_tensor->mutable_data(), 0, out_size * sizeof(float));
+
+    // Upload all tensors to GPU
+    DeviceId gpu_dev = DeviceId::cuda(0);
+    ASSERT_TRUE(Q_tensor->ensureOnDevice(gpu_dev));
+    ASSERT_TRUE(k_q81->ensureOnDevice(gpu_dev));
+    ASSERT_TRUE(v_q81->ensureOnDevice(gpu_dev));
+    ASSERT_TRUE(output_tensor->ensureOnDevice(gpu_dev));
+
+    // Call compute_tensor with Q8_1 K/V — should trigger fused kernel
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    bool success = cuda_kernel.compute_tensor(
+        Q_tensor.get(), k_q81.get(), v_q81.get(), output_tensor.get(),
+        1, // batch_size
+        1, // seq_len (decode)
+        kv_len,
+        n_heads, n_kv_heads, head_dim,
+        true,  // causal
+        0,     // window_size
+        nullptr, nullptr, nullptr, // workspace, mask, mpi
+        0);    // device_idx
+    ASSERT_TRUE(success) << "Fused Q8_1 CUDA decode kernel failed";
+
+    // Sync GPU→host
+    output_tensor->mark_device_dirty();
+    const float *cuda_output = output_tensor->data();
+    ASSERT_NE(cuda_output, nullptr);
+
+    // Verify no NaN/Inf
+    ASSERT_FALSE(hasNaNOrInf(cuda_output, out_size)) << "CUDA fused Q8_1 output has NaN/Inf";
+
+    // Compare CUDA fused Q8_1 vs CPU dequant Q8_1 (should be very close)
+    const double fused_vs_deq_cos = cosineSimilarity(cuda_output, cpu_q81_deq_output.data(), out_size);
+    const double fused_vs_deq_l2 = relativeL2Error(cuda_output, cpu_q81_deq_output.data(), out_size);
+
+    // Compare CUDA fused Q8_1 vs CPU FP32 baseline
+    const double fused_vs_fp32_cos = cosineSimilarity(cuda_output, cpu_fp32_output.data(), out_size);
+    const double fused_vs_fp32_l2 = relativeL2Error(cuda_output, cpu_fp32_output.data(), out_size);
+
+    printComparisonStats("FlashDecode Fused Q8_1 CUDA vs CPU dequant Q8_1",
+                         fused_vs_deq_cos, fused_vs_deq_l2,
+                         maxAbsError(cuda_output, cpu_q81_deq_output.data(), out_size), out_size);
+    printComparisonStats("FlashDecode Fused Q8_1 CUDA vs FP32 baseline",
+                         fused_vs_fp32_cos, fused_vs_fp32_l2,
+                         maxAbsError(cuda_output, cpu_fp32_output.data(), out_size), out_size);
+
+    // Fused kernel vs dequant should be very close (both operate on same Q8_1 data,
+    // just different dequant paths — inline vs separate kernel)
+    EXPECT_GE(fused_vs_deq_cos, 0.99) << "CUDA fused Q8_1 vs CPU dequant parity too low";
+    EXPECT_LE(fused_vs_deq_l2, 0.05) << "CUDA fused Q8_1 vs CPU dequant L2 too high";
+
+    // Q8_1 quantization error vs FP32 baseline (wider tolerance)
+    EXPECT_GE(fused_vs_fp32_cos, 0.95) << "CUDA fused Q8_1 vs FP32 baseline drift too high";
+    EXPECT_LE(fused_vs_fp32_l2, 0.15) << "CUDA fused Q8_1 vs FP32 baseline L2 too high";
+
+    std::cout << "  FlashDecode Fused Q8_1: kv_len=" << kv_len
+              << ", n_heads=" << n_heads << ", n_kv_heads=" << n_kv_heads
+              << ", head_dim=" << head_dim << " - PASSED" << std::endl;
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_HeadDim128_Parity)
+{
+    SKIP_IF_NO_CUDA();
+
+    // Test with head_dim=128 (Llama-3 style) and longer KV
+    constexpr int kv_len = 512;
+    constexpr int n_heads = 8;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 128;
+
+    const size_t q_size = static_cast<size_t>(n_heads) * head_dim;
+    const size_t kv_size = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+    const size_t out_size = static_cast<size_t>(n_heads) * head_dim;
+
+    auto Q_data = randomFP32(q_size);
+    auto K_data_fp32 = randomFP32(kv_size);
+    auto V_data_fp32 = randomFP32(kv_size);
+
+    // CPU FP32 reference
+    std::vector<float> cpu_fp32_output(out_size, 0.0f);
+    cpuDecodeAttentionReference(
+        Q_data.data(), K_data_fp32.data(), V_data_fp32.data(),
+        cpu_fp32_output.data(),
+        kv_len, n_heads, n_kv_heads, head_dim,
+        true, 0);
+
+    // Quantize to Q8_1
+    auto k_q81 = Q8_1Tensor::quantize_from_fp32(
+        K_data_fp32.data(), {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    auto v_q81 = Q8_1Tensor::quantize_from_fp32(
+        V_data_fp32.data(), {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    ASSERT_NE(k_q81, nullptr);
+    ASSERT_NE(v_q81, nullptr);
+
+    // Create Q and output tensors
+    auto Q_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(n_heads), static_cast<size_t>(head_dim)});
+    memcpy(Q_tensor->mutable_data(), Q_data.data(), q_size * sizeof(float));
+
+    auto output_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(n_heads), static_cast<size_t>(head_dim)});
+    memset(output_tensor->mutable_data(), 0, out_size * sizeof(float));
+
+    // Upload to GPU
+    DeviceId gpu_dev = DeviceId::cuda(0);
+    ASSERT_TRUE(Q_tensor->ensureOnDevice(gpu_dev));
+    ASSERT_TRUE(k_q81->ensureOnDevice(gpu_dev));
+    ASSERT_TRUE(v_q81->ensureOnDevice(gpu_dev));
+    ASSERT_TRUE(output_tensor->ensureOnDevice(gpu_dev));
+
+    // Fused Q8_1 decode
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    bool success = cuda_kernel.compute_tensor(
+        Q_tensor.get(), k_q81.get(), v_q81.get(), output_tensor.get(),
+        1, 1, kv_len,
+        n_heads, n_kv_heads, head_dim,
+        true, 0,
+        nullptr, nullptr, nullptr, 0);
+    ASSERT_TRUE(success) << "Fused Q8_1 CUDA decode (hd=128) failed";
+
+    output_tensor->mark_device_dirty();
+    const float *cuda_output = output_tensor->data();
+    ASSERT_FALSE(hasNaNOrInf(cuda_output, out_size));
+
+    const double cos = cosineSimilarity(cuda_output, cpu_fp32_output.data(), out_size);
+    const double l2 = relativeL2Error(cuda_output, cpu_fp32_output.data(), out_size);
+
+    printComparisonStats("FlashDecode Fused Q8_1 HD128 CUDA vs FP32",
+                         cos, l2,
+                         maxAbsError(cuda_output, cpu_fp32_output.data(), out_size), out_size);
+
+    EXPECT_GE(cos, 0.95) << "CUDA fused Q8_1 (hd=128) vs FP32 parity too low";
+    EXPECT_LE(l2, 0.15) << "CUDA fused Q8_1 (hd=128) L2 too high";
+
+    std::cout << "  FlashDecode Fused Q8_1 HD128: kv_len=" << kv_len
+              << ", n_heads=" << n_heads << " - PASSED" << std::endl;
+}
+
 #else // !HAVE_CUDA
 
 TEST_F(Test__CUDAFlashAttentionParity, SkipWithoutCUDA)

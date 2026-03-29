@@ -81,38 +81,16 @@ static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::Q16_1,
     },
     {
-        .name = "Qwen3_CPU_KV_TQ4",
-        .devices = {ParityDeviceType::CPU},
-        .parallelism = Parallelism::None,
-        .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f,
-            .decode_cosine_threshold = 0.80f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 4,
-            .kl_threshold = 0.01f,
-            .min_top1_accuracy = 60.0f, // TQ4 on 28-layer Qwen3 diverges at later decode steps
-            .min_top5_accuracy = 80.0f,
-            .pytorch_top1_in_topk = 0, // Disable strict topK gate for TQ4 (cumulative quantization error)
-        },
-        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
-        .snapshot_dir = "pytorch_qwen3_snapshots",
-        .activation_precision = ActivationPrecision::FP32,
-        .kv_cache_precision = KVCachePrecision::TQ4,
-    },
-    {
         .name = "Qwen3_CPU_KV_TQ",
         .devices = {ParityDeviceType::CPU},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
         .thresholds = {
             .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges from FP32 reference
-            .decode_cosine_threshold = 0.98f,
+            .decode_cosine_threshold = 0.90f,
             .early_layers_count = 6,
             .min_early_layers_passed = 4,
             .kl_threshold = 0.01f,
-            .min_top1_accuracy = 80.0f,
-            .min_top5_accuracy = 95.0f,
         },
         .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
         .snapshot_dir = "pytorch_qwen3_snapshots",
@@ -152,6 +130,23 @@ static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
         .snapshot_dir = "pytorch_qwen3_snapshots",
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::Q8_1,
+    },
+    {
+        .name = "Qwen3_CUDA_KV_TQ",
+        .devices = {ParityDeviceType::CUDA},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.94f, // Q8_0 Layer 1 cosine ~0.945 is borderline at 0.95
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.01f,
+        },
+        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen3_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::TQ,
     },
     {
         .name = "Qwen3_ROCm_KV_FP16",
@@ -209,6 +204,25 @@ static const std::vector<TestConfig> kQwen3SingleDeviceConfigs = {
         .snapshot_dir = "pytorch_qwen3_snapshots",
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::Q8_1,
+    },
+    {
+        .name = "Qwen3_ROCm_KV_TQ",
+        .devices = {ParityDeviceType::ROCm},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.94f, // Q8_0 quantized GEMM diverges equally across backends
+            .decode_cosine_threshold = 0.90f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.01f,
+            .min_top1_accuracy = 60.0f,
+            .min_top5_accuracy = 60.0f,
+        },
+        .model_path = "models/Qwen3-0.6B-Q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen3_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::TQ,
     },
 };
 

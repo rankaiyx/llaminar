@@ -2356,6 +2356,7 @@ namespace llaminar2
                 kv_config.head_dim = head_dim;
                 kv_config.layout_mode = kv_layout_mode;
                 kv_config.mpi_ctx = local_mpi_ctx.get();
+                kv_config.turboquant_ctx = config.turboquant_ctx;
 
                 if (use_sharded_cache && (is_global_tp || is_local_tp))
                 {
@@ -2403,6 +2404,7 @@ namespace llaminar2
             kv_config.head_dim = head_dim;
             kv_config.layout_mode = kv_layout_mode;
             kv_config.mpi_ctx = local_mpi_ctx.get();
+            kv_config.turboquant_ctx = config.turboquant_ctx;
 
             if (use_sharded_cache && (is_global_tp || is_local_tp))
             {

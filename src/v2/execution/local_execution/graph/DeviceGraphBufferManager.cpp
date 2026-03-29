@@ -831,11 +831,18 @@ namespace llaminar2
     size_t DeviceGraphBufferManager::computeModelAwareBudgetFloor(const WorkspaceSizingHints &hints) const
     {
         const int max_seq_len = std::max(1, hints.max_seq_len);
+        const int batch_size = std::max(1, hints.batch_size);
         const int vocab_size = std::max(1, hints.vocab_size);
         const int d_model = std::max(1, hints.d_model);
 
-        const size_t mn_buffer_size = static_cast<size_t>(max_seq_len) * static_cast<size_t>(vocab_size) * sizeof(float);
-        const size_t lm_head_workspace = 3 * mn_buffer_size;
+        // LM head always computes M=1 (last token only, even during prefill),
+        // so its workspace is proportional to batch_size, not max_seq_len.
+        // Using max_seq_len here was allocating ~2.3 GB per M×N buffer when
+        // only ~593 KB was needed (for Qwen2.5-14B, vocab=152064).
+        const size_t lm_mn_buffer_size = static_cast<size_t>(batch_size) * static_cast<size_t>(vocab_size) * sizeof(float);
+        const size_t lm_head_workspace = 3 * lm_mn_buffer_size;
+
+        // Per-layer GEMM workspace uses full max_seq_len (prefill processes all tokens)
         const size_t mk_overhead = static_cast<size_t>(max_seq_len) * static_cast<size_t>(d_model) * sizeof(float) * 2;
         const size_t padded_n_buffer = 8ULL * static_cast<size_t>(vocab_size) * sizeof(float);
         const size_t embed_table_temp = static_cast<size_t>(vocab_size) * static_cast<size_t>(d_model) * sizeof(float);
@@ -890,6 +897,7 @@ namespace llaminar2
 
             const bool is_embedding = (lowered_name == "embedding") || (lowered_name.find("embed") != std::string::npos);
             const bool is_attention = (lowered_name.find("attention") != std::string::npos);
+            const bool is_lm_head = (lowered_name == "lm_head") || (lowered_name.find("lm_head") != std::string::npos);
 
             ConsumerBinding binding;
             binding.consumer = consumer;
@@ -899,6 +907,15 @@ namespace llaminar2
                 binding.m = std::max(1, hints.batch_size);
                 binding.n = std::max(0, hints.n_heads);
                 binding.k = std::max(0, hints.head_dim);
+            }
+            else if (is_lm_head)
+            {
+                // LM head always computes M=1 (last token only, even during
+                // prefill). Using max_seq_len here over-allocates M×N workspace
+                // buffers by max_seq_len× (e.g., 4096× for Qwen2.5-14B).
+                binding.m = std::max(1, hints.batch_size);
+                binding.n = 0;
+                binding.k = 0;
             }
             else if (is_embedding)
             {

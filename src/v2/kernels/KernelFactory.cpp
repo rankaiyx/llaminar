@@ -23,6 +23,7 @@
 #include "cpu/CPURingKVCache.h"
 #ifdef HAVE_CUDA
 #include "cuda/kvcache/CUDARingKVCache.h"
+#include "cuda/kvcache/CUDARingKVCacheTQ.h"
 #endif
 
 #include "../tensors/Tensors.h"
@@ -52,6 +53,7 @@ extern "C" void cudaNativeVNNIGemvTuned_clearStaticState();
 #include "rocm/gemm/ROCmFloatingPointGemmKernel.h"    // FP32/FP16/BF16 via hipBLAS
 #include "rocm/gemm/ROCmQuantisedGemmKernel.h"        // Quantized tensors via CK INT8/FP16
 #include "rocm/kvcache/ROCmRingKVCacheFactory.h"      // ROCm Ring Buffer KV Cache factory
+#include "rocm/kvcache/ROCmRingKVCacheTQFactory.h"    // ROCm TurboQuant KV Cache factory
 #include "rocm/ops/ROCmEmbeddingKernelT.h"            // Embedding FP32/BF16/FP16/Q8_1
 #include "rocm/ops/ROCmRMSNormKernelT.h"              // RMSNorm FP32/BF16/FP16
 #include "rocm/ops/ROCmRoPEKernelT.h"                 // RoPE FP32
@@ -4106,6 +4108,16 @@ namespace llaminar
                 else if (config.device.is_cuda())
                 {
 #ifdef HAVE_CUDA
+                    // TQ precision uses a separate non-template class
+                    if (config.precision == llaminar2::ActivationPrecision::TQ4 ||
+                        config.precision == llaminar2::ActivationPrecision::TQ8)
+                    {
+                        const int cuda_device = config.device.cuda_ordinal();
+                        return std::make_unique<llaminar2::CUDARingKVCacheTQ>(
+                            config.num_layers, config.batch_size, config.max_seq_len,
+                            config.n_kv_heads, config.head_dim,
+                            config.turboquant_ctx, cuda_device);
+                    }
                     return createCUDAKVCache(config);
 #else
                     LOG_ERROR("[KernelFactory] CUDA KVCache requested but HAVE_CUDA not defined");
@@ -4115,6 +4127,16 @@ namespace llaminar
                 else if (config.device.is_rocm())
                 {
 #ifdef HAVE_ROCM
+                    // TQ precision uses a separate non-template class
+                    if (config.precision == llaminar2::ActivationPrecision::TQ4 ||
+                        config.precision == llaminar2::ActivationPrecision::TQ8)
+                    {
+                        const int rocm_device = config.device.rocm_ordinal();
+                        return llaminar2::createROCmRingKVCacheTQ(
+                            config.num_layers, config.batch_size, config.max_seq_len,
+                            config.n_kv_heads, config.head_dim,
+                            config.turboquant_ctx, rocm_device);
+                    }
                     return createROCmKVCache(config);
 #else
                     LOG_ERROR("[KernelFactory] ROCm KVCache requested but HAVE_ROCM not defined");

@@ -1924,7 +1924,9 @@ namespace llaminar2
                 attn_params.kv_cache = kv_cache;
                 attn_params.layer_idx = layer_idx - config_.pp_layer_offset;
                 attn_params.read_kv_from_cache = device.is_gpu() &&
-                                                 (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1);
+                                                 (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
+                                                 (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
+                                                                kv_cache->precision() != ActivationPrecision::TQ4));
                 attn_params.position_offset = position_ids ? position_ids[0] : 0;
                 attn_params.mpi_ctx = mpi_ctx_.get();
                 attn_params.device_id = device;

@@ -482,13 +482,12 @@ namespace llaminar2
     ROCmRingKVCache<Precision>::ROCmRingKVCache(
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, int device_id)
-        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
-          n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
-          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim),
+        : IROCmRingKVCache(n_layers, batch_size, max_seq_len,
+                           n_kv_heads, head_dim, n_kv_heads * head_dim, device_id),
+          local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
           kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
                               ? ((n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
                               : (n_kv_heads * head_dim)),
-          device_id_(device_id),
           is_sharded_(false), device_ctx_(nullptr)
     {
         LOG_DEBUG("[ROCmRingKVCache] Creating cache: "
@@ -505,13 +504,12 @@ namespace llaminar2
     ROCmRingKVCache<Precision>::ROCmRingKVCache(
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim, IWorkerGPUContext *ctx)
-        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
-          n_kv_heads_(n_kv_heads), local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
-          head_dim_(head_dim), kv_dim_(n_kv_heads * head_dim),
+        : IROCmRingKVCache(n_layers, batch_size, max_seq_len,
+                           n_kv_heads, head_dim, n_kv_heads * head_dim, 0),
+          local_n_kv_heads_(n_kv_heads), kv_head_start_(0),
           kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
                               ? ((n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
                               : (n_kv_heads * head_dim)),
-          device_id_(0),
           is_sharded_(false), device_ctx_(nullptr)
     {
         if (!ctx)
@@ -542,13 +540,12 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, int device_id)
-        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
-          n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
-          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim),
+        : IROCmRingKVCache(n_layers, batch_size, max_seq_len,
+                           n_kv_heads, head_dim, local_n_kv_heads * head_dim, device_id),
+          local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
           kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
                               ? ((local_n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
                               : (local_n_kv_heads * head_dim)),
-          device_id_(device_id),
           is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
         LOG_DEBUG("[ROCmRingKVCache] Creating sharded cache: "
@@ -568,13 +565,12 @@ namespace llaminar2
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, IWorkerGPUContext *ctx)
-        : n_layers_(n_layers), batch_size_(batch_size), max_seq_len_(max_seq_len),
-          n_kv_heads_(n_kv_heads), local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
-          head_dim_(head_dim), kv_dim_(local_n_kv_heads * head_dim),
+        : IROCmRingKVCache(n_layers, batch_size, max_seq_len,
+                           n_kv_heads, head_dim, local_n_kv_heads * head_dim, 0),
+          local_n_kv_heads_(local_n_kv_heads), kv_head_start_(kv_head_start),
           kv_storage_dim_((Precision == ActivationPrecision::Q8_1)
                               ? ((local_n_kv_heads * head_dim + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE)
                               : (local_n_kv_heads * head_dim)),
-          device_id_(0),
           is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
         if (!ctx)
@@ -612,8 +608,6 @@ namespace llaminar2
             // Runtime is shutting down, skip cleanup
             return;
         }
-
-        free_device_params();
 
         if (pool_base_)
         {
@@ -747,7 +741,7 @@ namespace llaminar2
                   << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                   << " MB total (including scratch)");
 
-        allocate_device_params();
+        allocateDeviceParams();  // Base class method (ROCmRingKVCacheBase)
     }
 
     template <ActivationPrecision Precision>
@@ -811,35 +805,8 @@ namespace llaminar2
         entry.d_V_scratch = nullptr;
     }
 
-    template <ActivationPrecision Precision>
-    int ROCmRingKVCache<Precision>::get_cached_tokens(int layer, int seq_idx) const
-    {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-        {
-            return 0;
-        }
-        return entries_[layer][seq_idx].count;
-    }
-
-    template <ActivationPrecision Precision>
-    int ROCmRingKVCache<Precision>::get_head_position(int layer, int seq_idx) const
-    {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-        {
-            return 0;
-        }
-        return entries_[layer][seq_idx].head;
-    }
-
-    template <ActivationPrecision Precision>
-    bool ROCmRingKVCache<Precision>::is_wrapped(int layer, int seq_idx) const
-    {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-        {
-            return false;
-        }
-        return entries_[layer][seq_idx].is_wrapped(max_seq_len_);
-    }
+    // get_cached_tokens(), get_head_position(), is_wrapped() are now
+    // provided by ROCmRingKVCacheBase via entry accessor overrides.
 
     template <ActivationPrecision Precision>
     bool ROCmRingKVCache<Precision>::append(
@@ -979,103 +946,8 @@ namespace llaminar2
         }
     }
 
-    // =========================================================================
-    // Graph Capture Support: Device-side head parameters
-    // =========================================================================
-
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::allocate_device_params()
-    {
-        int num_entries = n_layers_ * batch_size_;
-        hipError_t err;
-
-        err = hipMalloc(&d_head_params_, num_entries * sizeof(int));
-        if (err != hipSuccess)
-        {
-            LOG_WARN("[ROCmRingKVCache] Failed to allocate device head params: "
-                     << hipGetErrorString(err) << " - graph capture for KV append disabled");
-            d_head_params_ = nullptr;
-            h_head_params_ = nullptr;
-            return;
-        }
-
-        err = hipHostMalloc(&h_head_params_, num_entries * sizeof(int));
-        if (err != hipSuccess)
-        {
-            LOG_WARN("[ROCmRingKVCache] Failed to allocate pinned head params: "
-                     << hipGetErrorString(err) << " - graph capture for KV append disabled");
-            hipFree(d_head_params_);
-            d_head_params_ = nullptr;
-            h_head_params_ = nullptr;
-            return;
-        }
-
-        // Initialize to zeros
-        hipMemset(d_head_params_, 0, num_entries * sizeof(int));
-        std::memset(h_head_params_, 0, num_entries * sizeof(int));
-
-        LOG_DEBUG("[ROCmRingKVCache] Allocated device params for graph capture: "
-                  << num_entries << " entries (" << num_entries * sizeof(int) << " bytes)");
-    }
-
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::free_device_params()
-    {
-        if (d_head_params_)
-        {
-            hipError_t err = hipFree(d_head_params_);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_head_params_) failed: %s\n", hipGetErrorString(err));
-            }
-            d_head_params_ = nullptr;
-        }
-        if (h_head_params_)
-        {
-            hipError_t err = hipHostFree(h_head_params_);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipHostFree(h_head_params_) failed: %s\n", hipGetErrorString(err));
-            }
-            h_head_params_ = nullptr;
-        }
-    }
-
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::setDynamicHead(int layer, int seq_idx, void * /*gpu_stream*/)
-    {
-        if (!d_head_params_ || !h_head_params_)
-            return;
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-            return;
-
-        int idx = layer * batch_size_ + seq_idx;
-        h_head_params_[idx] = entries_[layer][seq_idx].head;
-        // No explicit H2D needed — the graph's captured hipMemcpyAsync reads
-        // from this same pinned host buffer on replay. For stream-only/non-graph
-        // mode, append_typed() issues its own H2D during execute().
-    }
-
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::advanceHead(int layer, int seq_idx, int num_tokens)
-    {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-            return;
-
-        EntryT &entry = entries_[layer][seq_idx];
-
-        // Handle auto-eviction (same logic as append_typed)
-        if (entry.count + num_tokens > max_seq_len_)
-        {
-            int to_evict = entry.count + num_tokens - max_seq_len_;
-            entry.count -= to_evict;
-            total_evicted_ += to_evict;
-        }
-
-        entry.head = (entry.head + num_tokens) % max_seq_len_;
-        entry.count += num_tokens;
-        entry.scratch_valid = false;
-    }
+    // allocate_device_params(), free_device_params(), setDynamicHead(), advanceHead()
+    // are now provided by ROCmRingKVCacheBase.
 
     template <ActivationPrecision Precision>
     void ROCmRingKVCache<Precision>::launch_append_kernel_dynamic(
@@ -1414,42 +1286,8 @@ namespace llaminar2
         // Workspace buffers are caller-owned, no cleanup needed
     }
 
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::clear()
-    {
-        for (int layer = 0; layer < n_layers_; ++layer)
-        {
-            clear_layer(layer);
-        }
-    }
-
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::clear_sequence(int layer, int seq_idx)
-    {
-        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
-        {
-            return;
-        }
-
-        EntryT &entry = entries_[layer][seq_idx];
-        entry.head = 0;
-        entry.count = 0;
-        entry.scratch_valid = false;
-    }
-
-    template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::clear_layer(int layer)
-    {
-        if (layer < 0 || layer >= n_layers_)
-        {
-            return;
-        }
-
-        for (int seq = 0; seq < batch_size_; ++seq)
-        {
-            clear_sequence(layer, seq);
-        }
-    }
+    // clear(), clear_sequence(), clear_layer() are now provided by
+    // ROCmRingKVCacheBase via entry accessor overrides (resetEntry, onClearSequence).
 
     // =========================================================================
     // get_k() / get_v() implementations

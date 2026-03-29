@@ -410,6 +410,30 @@ namespace llaminar2
              */
             bool hasDeviceContext() const { return device_ctx_ != nullptr; }
 
+            /**
+             * @brief Fused TQ KV decode attention (TQ8 K + TQ4 V with rotation trick)
+             *
+             * Called directly by AttentionComputeStage when TQ GPU decode is detected.
+             * Bypasses normal compute_tensor() dispatch since TQ requires ring buffer
+             * metadata, rotation matrices, and codebook access.
+             */
+            bool compute_tensor_tq_decode(
+                const ITensor *Q,
+                ITensor *output,
+                const void *K_cache,
+                const void *V_cache,
+                const float *rotation,
+                const float *rotation_t,
+                int batch_size,
+                int kv_count,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                int max_seq_len,
+                int tail,
+                int k_block_size,
+                int v_block_size);
+
         private:
             int device_idx_;
             void *stream_ = nullptr;

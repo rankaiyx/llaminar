@@ -3531,6 +3531,35 @@ add_v2_test(V2_Unit_SplitTQ_Attention_HeadDim128
     LABELS "V2;Unit;KVCache;TurboQuant;TQ8;TQ4;SplitTQ;Attention;CPU;Quantization"
 )
 
+# Fused TQ attention decode path: validates the rotation-orthogonality trick where
+# Q is pre-rotated once and QK/V ops use centroids directly (zero shadow buffers).
+add_executable(v2_test_tq_fused_attention unit/kernels/cpu/attention/Test__TQFusedAttention.cpp)
+target_link_libraries(v2_test_tq_fused_attention
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_TQFusedAttention
+    COMMAND $<TARGET_FILE:v2_test_tq_fused_attention>
+    MPI_PROCS 1
+    LABELS "V2;Unit;TurboQuant;TQ8;TQ4;Attention;CPU;Kernels;FlashAttention"
+)
+
+# Q8_1 / Q16_1 Fused Attention Tests
+# Validates that fused attention paths (bypassing FP32 shadow buffers) for Q8_1
+# and Q16_1 KV cache formats match the dequant-first reference path.
+add_executable(v2_test_q8q16_fused_attention unit/kernels/cpu/attention/Test__Q8Q16FusedAttention.cpp)
+target_link_libraries(v2_test_q8q16_fused_attention
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Q8Q16FusedAttention
+    COMMAND $<TARGET_FILE:v2_test_q8q16_fused_attention>
+    MPI_PROCS 1
+    LABELS "V2;Unit;Q8_1;Q16_1;Attention;CPU;Kernels;FlashAttention"
+)
+
 # Split TQ Regression Tests
 # Targeted regression tests for 4 specific bugs found during split TQ8/TQ4 integration:
 # 1. Per-head context derivation in turboquant_dequantize_row_tq8
@@ -4003,6 +4032,39 @@ add_v2_test(V2_Integration_CUDARingKVCache_Sharding
     MPI_PROCS 1  # Tests GPU KV cache sharding locally, no MPI needed
 )
 message(STATUS "V2 Tests: Added CUDA Ring KV Cache sharding integration tests")
+
+# Test: CUDA Ring Buffer KV Cache with TurboQuant (TQ8-K / TQ4-V)
+# Tests TurboQuant quantize/dequant roundtrip, ring wrap, RoPE-on-read, shadow invalidation
+add_executable(v2_integration_cuda_ring_kv_cache_tq integration/kernels/cuda/Test__CUDARingKVCacheTQ.cpp)
+target_link_libraries(v2_integration_cuda_ring_kv_cache_tq llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDARingKVCacheTQ
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_tq>
+    LABELS "V2;Integration;CUDA;KVCache;TurboQuant;TQ8;TQ4;RoPE;Quantization"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added CUDA TurboQuant KV Cache integration tests")
+
+# Test: CUDA Ring Buffer KV Cache RoPE-on-read (FP16, Q8_1, FP32 caches)
+# Tests get_kv_converted() with fused RoPE for existing cache precisions
+add_executable(v2_integration_cuda_ring_kv_cache_rope integration/kernels/cuda/Test__CUDARingKVCache_RoPEOnRead.cpp)
+target_link_libraries(v2_integration_cuda_ring_kv_cache_rope llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDARingKVCache_RoPEOnRead
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_rope>
+    LABELS "V2;Integration;CUDA;KVCache;RoPE;FP16;Q8_1;FP32"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added CUDA KV Cache RoPE-on-read integration tests")
+
+# Comprehensive edge-case tests for CUDA Ring KV Cache
+# Covers metadata accessors, eviction edge cases, single-token ops, multi-sequence, wrapping stress
+add_executable(v2_integration_cuda_ring_kv_cache_comprehensive integration/kernels/cuda/Test__CUDARingKVCache_Comprehensive.cpp)
+target_link_libraries(v2_integration_cuda_ring_kv_cache_comprehensive llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDARingKVCache_Comprehensive
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_comprehensive>
+    LABELS "V2;Integration;CUDA;KVCache;RingBuffer;Eviction;Metadata;EdgeCases;FP32;FP16;BF16"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added CUDA Ring KV Cache comprehensive edge-case tests")
 
 # Test: NCCL Backend Integration
 # Tests NCCL-based collective operations for multi-GPU communication
@@ -7623,6 +7685,40 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Ring KV Cache sharding integration tests")
+
+    # Integration Test: ROCm Ring Buffer KV Cache Comprehensive
+    # Comprehensive edge-case tests: metadata, eviction, single-token, multi-seq, wrapping stress
+    add_executable(v2_integration_rocm_ring_kv_cache_comprehensive 
+        integration/kernels/rocm/Test__ROCmRingKVCache_Comprehensive.cpp
+    )
+    target_link_libraries(v2_integration_rocm_ring_kv_cache_comprehensive 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmRingKVCache_Comprehensive
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache_comprehensive>
+        LABELS "V2;Integration;ROCm;KVCache;RingBuffer;Eviction;Metadata;EdgeCases;FP32;FP16;BF16;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Ring KV Cache comprehensive edge-case tests")
+
+    # Integration Test: ROCm TurboQuant KV Cache
+    # Tests ROCmRingKVCacheTQ: TQ8 K / TQ4 V quantized storage, RoPE-on-read, eviction, shadows
+    add_executable(v2_integration_rocm_ring_kv_cache_tq 
+        integration/kernels/rocm/Test__ROCmRingKVCacheTQ.cpp
+    )
+    target_link_libraries(v2_integration_rocm_ring_kv_cache_tq 
+        llaminar2_core 
+        GTest::gtest 
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmRingKVCacheTQ
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache_tq>
+        LABELS "V2;Integration;ROCm;KVCache;TurboQuant;TQ8;TQ4;RoPE;Quantization;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm TurboQuant KV Cache integration tests")
 
     # =============================================================================
     # ROCm SwiGLU Parity Tests

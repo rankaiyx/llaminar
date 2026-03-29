@@ -57,6 +57,21 @@ namespace llaminar2
         GpuTensorView(GpuTensorView &&) = default;
         GpuTensorView &operator=(GpuTensorView &&) = default;
 
+        /**
+         * @brief Update the view's GPU pointer and row count in-place.
+         *
+         * This keeps the same object identity (stable address) while updating
+         * the GPU pointer and dimensions. Essential for KV cache views where
+         * the graph stores raw ITensor* pointers and the underlying data may
+         * change between iterations (e.g., after KV cache append).
+         */
+        void update_view(void *new_gpu_ptr, size_t new_rows)
+        {
+            gpu_ptr_ = new_gpu_ptr;
+            rows_ = new_rows;
+            shape_[0] = new_rows;
+        }
+
         // =========================================================================
         // ITensor interface implementation
         // =========================================================================

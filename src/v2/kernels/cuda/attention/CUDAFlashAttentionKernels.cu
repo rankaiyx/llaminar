@@ -1266,6 +1266,540 @@ namespace
         }
     }
 
+    // =========================================================================
+    // Flash Decoding kernel — Q8_1 KV cache variant (fused inline dequant)
+    //
+    // Reads K/V directly from Q8_1 block format, performing int8→float
+    // dequantization inline in the attention inner loop. This eliminates
+    // the separate dequant kernel + FP32 workspace buffer.
+    //
+    // Q8_1Block layout: { uint16_t d (FP16 scale), int16_t sum_qs, int8_t qs[32] }
+    // Total: 36 bytes per block, each block covers 32 elements.
+    // =========================================================================
+
+    /**
+     * @brief Q8_1 block structure for inline dequantization in attention kernel.
+     * Must match host-side Q8_1Block in BlockStructures.h.
+     */
+    struct GpuQ8_1BlockInline
+    {
+        uint16_t d;     // FP16 scale factor
+        int16_t sum_qs; // pre-computed sum (unused in attention)
+        int8_t qs[32];  // 32 quantized int8 values
+    };
+    static_assert(sizeof(GpuQ8_1BlockInline) == 36, "GpuQ8_1BlockInline must be 36 bytes");
+
+    __global__ __launch_bounds__(256, 4) void flash_decoding_q8kv_kernel(
+        const float *__restrict__ Q,
+        const void *__restrict__ K_cache,
+        const void *__restrict__ V_cache,
+        float *__restrict__ O_partial,
+        float *__restrict__ m_partial,
+        float *__restrict__ l_partial,
+        int kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int num_splits,
+        float softmax_scale,
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+    {
+        // Q8_1 block addressing constants
+        constexpr int Q8_BS = 32;
+
+        int kv_stride = kv_len;
+        int kv_len_runtime = kv_len;
+        if (device_params)
+        {
+            kv_len_runtime = device_params->kv_len;
+        }
+
+        const int head_idx = blockIdx.x;
+        const int split_idx = blockIdx.y;
+        const int batch_idx = blockIdx.z;
+
+        const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx : (head_idx / (n_heads / n_kv_heads));
+
+        const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
+        const int kv_start = split_idx * split_size;
+        const int kv_end = min(kv_start + split_size, kv_len_runtime);
+
+        const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
+
+        if (kv_start >= kv_len_runtime)
+        {
+            if (threadIdx.x == 0)
+            {
+                m_partial[partial_idx] = -FLT_MAX;
+                l_partial[partial_idx] = 0.0f;
+            }
+            float *O_out = O_partial + partial_idx * head_dim;
+            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+            {
+                O_out[d] = 0.0f;
+            }
+            return;
+        }
+
+        const int tid = threadIdx.x;
+        const int num_threads = blockDim.x;
+        const int warp_id = tid / WARP_SIZE;
+        const int lane_id = tid % WARP_SIZE;
+        const int num_warps = num_threads / WARP_SIZE;
+
+        extern __shared__ char smem[];
+        float *Q_shared = reinterpret_cast<float *>(smem);
+
+        const float *Q_ptr = Q + (batch_idx * n_heads + head_idx) * head_dim;
+        for (int d = tid; d < head_dim; d += num_threads)
+        {
+            Q_shared[d] = Q_ptr[d];
+        }
+        __syncthreads();
+
+        constexpr int MAX_DIMS_PER_LANE = 8;
+        float O_lane[MAX_DIMS_PER_LANE] = {0};
+        float m_local = -FLT_MAX;
+        float l_local = 0.0f;
+
+        // Q8_1 block addressing: KV cache is stored as Q8_1Block arrays
+        // Layout: [batch, kv_pos, n_kv_heads * blocks_per_head] (row-major blocks)
+        const int bph = head_dim / Q8_BS; // blocks per head
+        const int bpr = n_kv_heads * bph; // blocks per KV row
+        const int row_byte_stride = bpr * static_cast<int>(sizeof(GpuQ8_1BlockInline));
+
+        const char *K_base = static_cast<const char *>(K_cache) + batch_idx * kv_stride * row_byte_stride + kv_head_idx * bph * static_cast<int>(sizeof(GpuQ8_1BlockInline));
+        const char *V_base = static_cast<const char *>(V_cache) + batch_idx * kv_stride * row_byte_stride + kv_head_idx * bph * static_cast<int>(sizeof(GpuQ8_1BlockInline));
+
+        for (int kv_pos = kv_start + warp_id; kv_pos < kv_end; kv_pos += num_warps)
+        {
+            // K dot product: inline Q8_1 dequant
+            const GpuQ8_1BlockInline *Kq = reinterpret_cast<const GpuQ8_1BlockInline *>(
+                K_base + kv_pos * row_byte_stride);
+
+            float partial_dot = 0.0f;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE)
+            {
+                const int bi = d / Q8_BS;
+                const int bo = d % Q8_BS;
+                __half h_scale;
+                memcpy(&h_scale, &Kq[bi].d, sizeof(__half));
+                float ks = __half2float(h_scale);
+                partial_dot += Q_shared[d] * (static_cast<float>(Kq[bi].qs[bo]) * ks);
+            }
+
+            float score = warpReduceSum(partial_dot) * softmax_scale;
+
+            float m_new = fmaxf(m_local, score);
+            float scale_old = __expf(m_local - m_new);
+            float p = __expf(score - m_new);
+
+            l_local = l_local * scale_old + p;
+
+            // V accumulation: inline Q8_1 dequant
+            const GpuQ8_1BlockInline *Vq = reinterpret_cast<const GpuQ8_1BlockInline *>(
+                V_base + kv_pos * row_byte_stride);
+
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
+            {
+                const int bi = d / Q8_BS;
+                const int bo = d % Q8_BS;
+                __half h_scale;
+                memcpy(&h_scale, &Vq[bi].d, sizeof(__half));
+                float vs = __half2float(h_scale);
+                O_lane[o_idx] = O_lane[o_idx] * scale_old + p * (static_cast<float>(Vq[bi].qs[bo]) * vs);
+            }
+
+            m_local = m_new;
+        }
+
+        // Inter-warp reduction (identical to FP32/FP16 variants)
+        __shared__ float block_m[8];
+        __shared__ float block_l[8];
+        __shared__ float block_O[8 * 128];
+
+        if (lane_id == 0)
+        {
+            block_m[warp_id] = m_local;
+            block_l[warp_id] = l_local;
+        }
+        {
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
+            {
+                block_O[warp_id * head_dim + d] = O_lane[o_idx];
+            }
+        }
+        __syncthreads();
+
+        __shared__ float warp_scales[8];
+        if (tid == 0)
+        {
+            float final_m = block_m[0];
+            float final_l = block_l[0];
+            warp_scales[0] = 1.0f;
+
+            for (int w = 1; w < num_warps; w++)
+            {
+                float other_m = block_m[w];
+                float other_l = block_l[w];
+
+                float m_new = fmaxf(final_m, other_m);
+                float scale_self = __expf(final_m - m_new);
+                float scale_other = __expf(other_m - m_new);
+
+                for (int prev = 0; prev < w; prev++)
+                    warp_scales[prev] *= scale_self;
+                warp_scales[w] = scale_other;
+
+                final_l = scale_self * final_l + scale_other * other_l;
+                final_m = m_new;
+            }
+
+            m_partial[partial_idx] = final_m;
+            l_partial[partial_idx] = final_l;
+        }
+        __syncthreads();
+
+        float *O_out = O_partial + partial_idx * head_dim;
+        for (int d = tid; d < head_dim; d += num_threads)
+        {
+            float sum = 0.0f;
+            for (int w = 0; w < num_warps; w++)
+            {
+                sum += warp_scales[w] * block_O[w * head_dim + d];
+            }
+            O_out[d] = sum;
+        }
+    }
+
+} // anonymous namespace
+
+// =============================================================================
+// Fused TQ KV Decode Attention Kernel (TQ8 K + TQ4 V)
+//
+// Reads TQ8/TQ4 blocks directly from the ring buffer, performing centroid
+// lookup and rotation inline. Uses the "rotation trick":
+//   dot(Q, dequant(K)) = K.norm/√D · dot(R·Q, centroids[K.indices])
+// which reduces per-position cost from O(D²) to O(D).
+//
+// V accumulation happens in rotated centroid space, with a final Rᵀ multiply.
+// =============================================================================
+
+namespace
+{
+    // TQ codebooks (compile-time Lloyd-Max centroids for N(0,1))
+    __constant__ float d_tq8_attn_cents[256];
+    __constant__ float d_tq4_attn_cents[16];
+    static bool s_tq_attn_codebooks_uploaded = false;
+
+    void upload_tq_attn_codebooks()
+    {
+        if (s_tq_attn_codebooks_uploaded)
+            return;
+        // TQ4: 16-level Lloyd-Max centroids for N(0,1)
+        static constexpr float TQ4_C[16] = {
+            -2.732897f, -2.069364f, -1.618400f, -1.256565f,
+            -0.942629f, -0.656982f, -0.388189f, -0.128443f,
+            0.128443f, 0.388189f, 0.656982f, 0.942629f,
+            1.256565f, 1.618400f, 2.069364f, 2.732897f};
+        // TQ8: 256-level Lloyd-Max centroids for N(0,1)
+        static constexpr float TQ8_C[256] = {
+            -3.78920960f, -3.30915570f, -3.01834941f, -2.80658674f, -2.63340139f, -2.48449373f, -2.35561466f, -2.24269128f,
+            -2.14211559f, -2.05341673f, -1.97122753f, -1.89669085f, -1.82880616f, -1.76743543f, -1.71260118f, -1.66326785f,
+            -1.61619723f, -1.57234073f, -1.53127813f, -1.49353135f, -1.45867503f, -1.42624652f, -1.39503074f, -1.36621320f,
+            -1.33910429f, -1.31285179f, -1.28799033f, -1.26373041f, -1.24022365f, -1.21824205f, -1.19704747f, -1.17650998f,
+            -1.15636790f, -1.13686514f, -1.11771226f, -1.09937215f, -1.08145535f, -1.06413019f, -1.04700780f, -1.02985537f,
+            -1.01289260f, -0.99635839f, -0.97985989f, -0.96346331f, -0.94718844f, -0.93142581f, -0.91591436f, -0.90098518f,
+            -0.88661534f, -0.87208009f, -0.85743922f, -0.84298599f, -0.82868934f, -0.81421226f, -0.79995292f, -0.78608519f,
+            -0.77253389f, -0.75930405f, -0.74655443f, -0.73399001f, -0.72171885f, -0.70948768f, -0.69729090f, -0.68519193f,
+            -0.67294139f, -0.66097361f, -0.64903301f, -0.63699722f, -0.62520957f, -0.61343849f, -0.60164148f, -0.58989501f,
+            -0.57817614f, -0.56638294f, -0.55476522f, -0.54346019f, -0.53228927f, -0.52154797f, -0.51064700f, -0.49990472f,
+            -0.48919857f, -0.47810543f, -0.46704516f, -0.45603955f, -0.44486380f, -0.43340886f, -0.42221144f, -0.41127491f,
+            -0.40069824f, -0.39020312f, -0.37980038f, -0.36931747f, -0.35883522f, -0.34820479f, -0.33763838f, -0.32712156f,
+            -0.31680506f, -0.30650702f, -0.29633904f, -0.28598318f, -0.27587256f, -0.26576686f, -0.25534680f, -0.24487814f,
+            -0.23456042f, -0.22439688f, -0.21428297f, -0.20450732f, -0.19472016f, -0.18452135f, -0.17464319f, -0.16479470f,
+            -0.15506494f, -0.14514914f, -0.13510469f, -0.12490919f, -0.11475672f, -0.10477102f, -0.09481984f, -0.08470155f,
+            -0.07488193f, -0.06495188f, -0.05493221f, -0.04509697f, -0.03520501f, -0.02532661f, -0.01568576f, -0.00597589f,
+            0.00372220f, 0.01344266f, 0.02319991f, 0.03286659f, 0.04291259f, 0.05293084f, 0.06276978f, 0.07249805f,
+            0.08250652f, 0.09261067f, 0.10255274f, 0.11248623f, 0.12212010f, 0.13166577f, 0.14129025f, 0.15095016f,
+            0.16084716f, 0.17080866f, 0.18087213f, 0.19098914f, 0.20085125f, 0.21076398f, 0.22071999f, 0.23092821f,
+            0.24115537f, 0.25143579f, 0.26179457f, 0.27212587f, 0.28246218f, 0.29251403f, 0.30247530f, 0.31238413f,
+            0.32260880f, 0.33276638f, 0.34315947f, 0.35366595f, 0.36426541f, 0.37491897f, 0.38535890f, 0.39584789f,
+            0.40643987f, 0.41705394f, 0.42789838f, 0.43888989f, 0.44957283f, 0.46015123f, 0.47093272f, 0.48179030f,
+            0.49290875f, 0.50388461f, 0.51482475f, 0.52595741f, 0.53740937f, 0.54880124f, 0.56035239f, 0.57217956f,
+            0.58371091f, 0.59516978f, 0.60679603f, 0.61841190f, 0.63014859f, 0.64220595f, 0.65432996f, 0.66648364f,
+            0.67858601f, 0.69097805f, 0.70347679f, 0.71617913f, 0.72882068f, 0.74160296f, 0.75484610f, 0.76858562f,
+            0.78214169f, 0.79558426f, 0.80941713f, 0.82344604f, 0.83751440f, 0.85179305f, 0.86665273f, 0.88163447f,
+            0.89666569f, 0.91165745f, 0.92661709f, 0.94195455f, 0.95747328f, 0.97319126f, 0.98969555f, 1.00626135f,
+            1.02299738f, 1.03975272f, 1.05691993f, 1.07431412f, 1.09259737f, 1.11127019f, 1.13069904f, 1.15059435f,
+            1.17105842f, 1.19241130f, 1.21456146f, 1.23746312f, 1.26111495f, 1.28548789f, 1.31057048f, 1.33675921f,
+            1.36415398f, 1.39277720f, 1.42348731f, 1.45656335f, 1.49078155f, 1.52804673f, 1.56803429f, 1.61146212f,
+            1.65781057f, 1.70859325f, 1.76440656f, 1.82453620f, 1.89094412f, 1.96517146f, 2.04702711f, 2.13570380f,
+            2.23243070f, 2.34583116f, 2.47412658f, 2.62253070f, 2.79892921f, 3.01957417f, 3.30903292f, 3.74206471f};
+        cudaMemcpyToSymbol(d_tq8_attn_cents, TQ8_C, sizeof(TQ8_C));
+        cudaMemcpyToSymbol(d_tq4_attn_cents, TQ4_C, sizeof(TQ4_C));
+        s_tq_attn_codebooks_uploaded = true;
+    }
+} // anonymous namespace
+
+namespace
+{
+    /**
+     * @brief Fused TQ8/TQ4 flash decoding kernel.
+     *
+     * Uses rotation trick: dot(Q, dequant(K)) = norm/√D · dot(R·Q, centroids[indices])
+     * V accumulated in rotated centroid space, post-rotated at end.
+     *
+     * Grid: (n_heads, num_splits, batch_size)
+     * Block: 256 threads (8 warps)
+     * Shared memory: Q[D] + Q_rot[D] + block_m[8] + block_l[8] + block_O[8*D] + warp_scales[8]
+     */
+    __global__ __launch_bounds__(256, 2) void flash_decoding_tqkv_kernel(
+        const float *__restrict__ Q,
+        const void *__restrict__ K_cache,     // TQ8Block<D> ring buffer
+        const void *__restrict__ V_cache,     // TQ4Block<D> ring buffer
+        const float *__restrict__ rotation,   // R[kv_head][D][D]
+        const float *__restrict__ rotation_t, // Rᵀ[kv_head][D][D]
+        float *__restrict__ O_partial,
+        float *__restrict__ m_partial,
+        float *__restrict__ l_partial,
+        int kv_count, // actual cached tokens
+        int n_heads,
+        int n_kv_heads,
+        int head_dim,
+        int num_splits,
+        float softmax_scale,
+        int max_seq_len,  // ring buffer capacity (stride)
+        int tail,         // ring buffer tail position
+        int k_block_size, // sizeof(TQ8Block<D>)
+        int v_block_size, // sizeof(TQ4Block<D>)
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+    {
+        const int head_idx = blockIdx.x;
+        const int split_idx = blockIdx.y;
+        const int batch_idx = blockIdx.z;
+
+        const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx
+                                                        : (head_idx / (n_heads / n_kv_heads));
+
+        int kv_count_rt = kv_count;
+        if (device_params)
+            kv_count_rt = device_params->kv_len;
+
+        const int split_size = (kv_count_rt + num_splits - 1) / num_splits;
+        const int kv_start = split_idx * split_size;
+        const int kv_end = min(kv_start + split_size, kv_count_rt);
+
+        const int partial_idx = (batch_idx * n_heads + head_idx) * num_splits + split_idx;
+
+        if (kv_start >= kv_count_rt)
+        {
+            if (threadIdx.x == 0)
+            {
+                m_partial[partial_idx] = -FLT_MAX;
+                l_partial[partial_idx] = 0.0f;
+            }
+            float *O_out = O_partial + partial_idx * head_dim;
+            for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+                O_out[d] = 0.0f;
+            return;
+        }
+
+        const int tid = threadIdx.x;
+        const int num_threads = blockDim.x;
+        const int warp_id = tid / WARP_SIZE;
+        const int lane_id = tid % WARP_SIZE;
+        const int num_warps = num_threads / WARP_SIZE;
+
+        // Shared memory: Q[D] + Q_rot[D]
+        extern __shared__ char smem[];
+        float *Q_shared = reinterpret_cast<float *>(smem);
+        float *Q_rot = Q_shared + head_dim;
+
+        // Load Q into shared memory
+        const float *Q_ptr = Q + (batch_idx * n_heads + head_idx) * head_dim;
+        for (int d = tid; d < head_dim; d += num_threads)
+            Q_shared[d] = Q_ptr[d];
+        __syncthreads();
+
+        // Compute Q_rot = R * Q (rotation matrix multiply, once per head)
+        // R layout: [n_kv_heads, D, D]
+        const float *R = rotation + static_cast<size_t>(kv_head_idx) * head_dim * head_dim;
+        if (tid < head_dim)
+        {
+            const float *R_row = R + tid * head_dim;
+            float sum = 0.0f;
+            for (int j = 0; j < head_dim; j++)
+                sum += R_row[j] * Q_shared[j];
+            Q_rot[tid] = sum;
+        }
+        __syncthreads();
+
+        // Online softmax + KV loop
+        constexpr int MAX_DIMS_PER_LANE = 8; // head_dim/WARP_SIZE = 128/32 = 4, pad for safety
+        float O_lane[MAX_DIMS_PER_LANE] = {0};
+        float m_local = -FLT_MAX;
+        float l_local = 0.0f;
+
+        const float inv_sqrt_d = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+        // Ring buffer addressing
+        const int k_row_stride = n_kv_heads * k_block_size;
+        const int v_row_stride = n_kv_heads * v_block_size;
+        const uint8_t *K_base = static_cast<const uint8_t *>(K_cache) + kv_head_idx * k_block_size;
+        const uint8_t *V_base = static_cast<const uint8_t *>(V_cache) + kv_head_idx * v_block_size;
+
+        for (int logical_pos = kv_start + warp_id; logical_pos < kv_end; logical_pos += num_warps)
+        {
+            const int phys_pos = (tail + logical_pos) % max_seq_len;
+
+            // ---- TQ8 K dot product ----
+            const uint8_t *k_block = K_base + phys_pos * k_row_stride;
+            float k_norm = *reinterpret_cast<const float *>(k_block);
+            const uint8_t *k_indices = k_block + 2 * sizeof(float); // skip norm + residual_norm
+
+            float partial_dot = 0.0f;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE)
+                partial_dot += Q_rot[d] * d_tq8_attn_cents[k_indices[d]];
+
+            float score = warpReduceSum(partial_dot) * k_norm * inv_sqrt_d * softmax_scale;
+
+            // Online softmax update
+            float m_new = fmaxf(m_local, score);
+            float scale_old = __expf(m_local - m_new);
+            float p = __expf(score - m_new);
+            l_local = l_local * scale_old + p;
+
+            // ---- TQ4 V accumulation (in rotated centroid space) ----
+            const uint8_t *v_block = V_base + phys_pos * v_row_stride;
+            float v_norm = *reinterpret_cast<const float *>(v_block);
+            const uint8_t *v_mse = v_block + 2 * sizeof(float);
+            const uint8_t *v_high = v_mse + head_dim * 3 / 8;
+            float weight = p * v_norm * inv_sqrt_d;
+
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
+            {
+                // Unpack TQ4 3+1 bit index
+                int group8 = d / 8;
+                int within = d % 8;
+                int byte_off = group8 * 3;
+                uint8_t b0 = v_mse[byte_off];
+                uint8_t b1 = v_mse[byte_off + 1];
+                uint8_t b2 = v_mse[byte_off + 2];
+
+                uint8_t low3;
+                switch (within)
+                {
+                case 0:
+                    low3 = b0 & 0x07;
+                    break;
+                case 1:
+                    low3 = (b0 >> 3) & 0x07;
+                    break;
+                case 2:
+                    low3 = ((b0 >> 6) | (b1 << 2)) & 0x07;
+                    break;
+                case 3:
+                    low3 = (b1 >> 1) & 0x07;
+                    break;
+                case 4:
+                    low3 = (b1 >> 4) & 0x07;
+                    break;
+                case 5:
+                    low3 = ((b1 >> 7) | (b2 << 1)) & 0x07;
+                    break;
+                case 6:
+                    low3 = (b2 >> 2) & 0x07;
+                    break;
+                default:
+                    low3 = (b2 >> 5) & 0x07;
+                    break;
+                }
+                uint8_t high1 = (v_high[group8] >> within) & 0x01;
+                uint8_t full_idx = low3 | (high1 << 3);
+
+                O_lane[o_idx] = O_lane[o_idx] * scale_old + weight * d_tq4_attn_cents[full_idx];
+            }
+
+            m_local = m_new;
+        }
+
+        // ---- Inter-warp reduction ----
+        // Reuse smem after Q_rot no longer needed
+        float *block_m = reinterpret_cast<float *>(smem);
+        float *block_l = block_m + 8;
+        float *block_O = block_l + 8;
+
+        __syncthreads(); // ensure all warps done before reusing smem
+
+        if (lane_id == 0)
+        {
+            block_m[warp_id] = m_local;
+            block_l[warp_id] = l_local;
+        }
+        {
+            int o_idx = 0;
+            for (int d = lane_id; d < head_dim; d += WARP_SIZE, o_idx++)
+                block_O[warp_id * head_dim + d] = O_lane[o_idx];
+        }
+        __syncthreads();
+
+        float *warp_scales = block_O + 8 * head_dim;
+
+        if (tid == 0)
+        {
+            float final_m = block_m[0];
+            float final_l = block_l[0];
+            warp_scales[0] = 1.0f;
+
+            for (int w = 1; w < num_warps; w++)
+            {
+                float other_m = block_m[w];
+                float other_l = block_l[w];
+                float m_new = fmaxf(final_m, other_m);
+                float s_self = __expf(final_m - m_new);
+                float s_other = __expf(other_m - m_new);
+                for (int prev = 0; prev < w; prev++)
+                    warp_scales[prev] *= s_self;
+                warp_scales[w] = s_other;
+                final_l = s_self * final_l + s_other * other_l;
+                final_m = m_new;
+            }
+
+            m_partial[partial_idx] = final_m;
+            l_partial[partial_idx] = final_l;
+        }
+        __syncthreads();
+
+        // ---- Post-rotation: output = Rᵀ * V_accum ----
+        // Sum warps into first head_dim of block_O (overwrite warp 0)
+        for (int d = tid; d < head_dim; d += num_threads)
+        {
+            float sum = 0.0f;
+            for (int w = 0; w < num_warps; w++)
+                sum += warp_scales[w] * block_O[w * head_dim + d];
+            block_O[d] = sum; // rotated-space output
+        }
+        __syncthreads();
+
+        // Post-rotate: O_out[d] = Σⱼ Rᵀ[d][j] * block_O[j]
+        const float *Rt = rotation_t + static_cast<size_t>(kv_head_idx) * head_dim * head_dim;
+        float *O_out = O_partial + partial_idx * head_dim;
+
+        // All 256 threads cooperate: each thread handles one or two output dims
+        for (int d = tid; d < head_dim; d += num_threads)
+        {
+            const float *Rt_row = Rt + d * head_dim;
+            float sum = 0.0f;
+            for (int j = 0; j < head_dim; j++)
+                sum += Rt_row[j] * block_O[j];
+            O_out[d] = sum;
+        }
+    }
+
 } // anonymous namespace
 
 // =============================================================================
@@ -1646,6 +2180,116 @@ extern "C"
         }
 
         // Phase 2: Reduce partials (same as FP32 — operates on FP32 partials)
+        {
+            dim3 grid(n_heads, batch_size);
+            int block_size = min(head_dim, 256);
+
+            flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
+                O_partial, m_partial, l_partial, O,
+                n_heads, head_dim, num_splits);
+        }
+
+        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    }
+
+    /**
+     * @brief Launch Flash Decoding kernel with Q8_1 KV cache (fused inline dequant)
+     *
+     * Same workspace layout as FP32/FP16 variants. K/V are read directly as
+     * Q8_1 blocks and dequantized inline in the attention inner loop,
+     * eliminating the separate dequant kernel and FP32 workspace buffers.
+     */
+    int cudaFlashAttn_decode_q8_1(
+        const float *Q, const void *K_cache_q8, const void *V_cache_q8, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx)
+    {
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+        // Phase 1: Compute partial attention per split (Q8_1 KV, fused dequant)
+        {
+            dim3 grid(n_heads, num_splits, batch_size);
+            int block_size = 256;
+            size_t smem_size = head_dim * sizeof(float);
+
+            flash_decoding_q8kv_kernel<<<grid, block_size, smem_size, cuda_stream>>>(
+                Q, K_cache_q8, V_cache_q8,
+                O_partial, m_partial, l_partial,
+                kv_len, n_heads, n_kv_heads, head_dim,
+                num_splits, softmax_scale, device_params);
+        }
+
+        // Phase 2: Reduce partials (same as FP32 — operates on FP32 partials)
+        {
+            dim3 grid(n_heads, batch_size);
+            int block_size = min(head_dim, 256);
+
+            flash_decoding_reduce_fp32_kernel<<<grid, block_size, 0, cuda_stream>>>(
+                O_partial, m_partial, l_partial, O,
+                n_heads, head_dim, num_splits);
+        }
+
+        return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    }
+
+    /**
+     * @brief Flash Decoding with TQ8 K / TQ4 V — fused rotation + centroid attention
+     *
+     * Uses rotation trick to avoid O(D²) per-position dequantization.
+     * Pre-rotates Q once per head, then does O(D) centroid lookup per K/V position.
+     */
+    int cudaFlashAttn_decode_tqkv(
+        const float *Q, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        const void *K_cache, const void *V_cache,
+        const float *rotation, const float *rotation_t,
+        int batch_size, int kv_count,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        int max_seq_len, int tail,
+        int k_block_size, int v_block_size,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx)
+    {
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        // Ensure TQ codebooks are in constant memory
+        upload_tq_attn_codebooks();
+
+        float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+        // Phase 1: Fused TQ attention with rotation trick
+        {
+            dim3 grid(n_heads, num_splits, batch_size);
+            int block_size = 256;
+            // Shared memory: Q[D] + Q_rot[D] (used during Q rotation),
+            // then reused for block_m[8] + block_l[8] + block_O[8*D] + warp_scales[8]
+            size_t smem_size = static_cast<size_t>(head_dim) * 2 * sizeof(float); // Q + Q_rot
+            size_t reduce_smem = (8 + 8) * sizeof(float) + 8 * head_dim * sizeof(float) + 8 * sizeof(float);
+            smem_size = max(smem_size, reduce_smem);
+
+            flash_decoding_tqkv_kernel<<<grid, block_size, smem_size, cuda_stream>>>(
+                Q, K_cache, V_cache,
+                rotation, rotation_t,
+                O_partial, m_partial, l_partial,
+                kv_count, n_heads, n_kv_heads, head_dim,
+                num_splits, softmax_scale,
+                max_seq_len, tail,
+                k_block_size, v_block_size,
+                device_params);
+        }
+
+        // Phase 2: Reduce partials (same reduce kernel as FP32/Q8_1)
         {
             dim3 grid(n_heads, batch_size);
             int block_size = min(head_dim, 256);

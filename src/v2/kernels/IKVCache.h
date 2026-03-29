@@ -293,6 +293,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Update device-side dequant params for graph-capturable read.
+         *
+         * TQ caches override this to write incremental dequant parameters
+         * (ring_pos, out_offset, rope_position) to a pinned host buffer.
+         * The captured H2D memcpy in the graph re-reads from pinned host
+         * on replay, so the kernel receives updated values.
+         *
+         * Called from AttentionComputeStage::updateDynamicParams() before
+         * graph replay. Not needed for non-TQ caches.
+         */
+        virtual void setDynamicDequantParams(int layer, int seq_idx,
+                                              float rope_theta, int position_start,
+                                              void *gpu_stream)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)rope_theta;
+            (void)position_start;
+            (void)gpu_stream;
+        }
+
+        /**
          * @brief Advance ring buffer head position (host-side bookkeeping)
          *
          * During graph replay, execute() is not called on the KVCacheAppendStage.

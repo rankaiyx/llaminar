@@ -237,6 +237,8 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
+        kernels/cuda/kvcache/CUDATurboQuantKernels.cu  # TurboQuant quantize/dequant/RoPE GPU kernels
+        kernels/cuda/kvcache/CUDARingKVCacheTQ.cu     # TurboQuant KV cache (TQ8-K/TQ4-V split)
         # Profiling utilities
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
@@ -270,6 +272,7 @@ if(HAVE_CUDA)
         collective/backends/HostBackendCUDA.cu
         collective/coordinators/NCCLCoordinator.cu
         kernels/cuda/kvcache/CUDARingKVCacheTensorAdapter.cpp
+        kernels/cuda/kvcache/CUDARingKVCacheBase.cpp
         ${CUDA_KERNEL_SOURCES}
     )
     # Resolve CUDA device symbols at library build time so downstream executables
@@ -512,6 +515,8 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMM kernels for M>1 prefill (gfx906)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
+        kernels/rocm/kvcache/ROCmTurboQuantKernels.hip        # TurboQuant quantize/dequant/RoPE GPU kernels
+        kernels/rocm/kvcache/ROCmRingKVCacheTQ.hip            # TurboQuant KV cache (TQ8-K/TQ4-V split)
         kernels/rocm/ops/ROCmSwiGLUKernels.hip               # SwiGLU kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmRoPEKernels.hip                 # RoPE kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmRMSNormKernels.hip              # RMSNorm kernels (FP32, BF16, FP16)
@@ -1532,6 +1537,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/HipBLASGemmKernel.cpp        # hipBLAS GEMM for FP32/FP16 (compiled with g++, linked with hipBLAS)
         kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
         kernels/rocm/kvcache/ROCmRingKVCache.cpp              # Ring buffer KV cache implementation
+        kernels/rocm/kvcache/ROCmRingKVCacheBase.cpp          # Shared base class for ring buffer KV caches
         kernels/rocm/kvcache/ROCmRingKVCacheFactory.cpp       # Factory for creating ROCm KV cache instances
         kernels/rocm/ops/ROCmSwiGLUKernelT.cpp                # SwiGLU ITensor implementation
         kernels/rocm/ops/ROCmRoPEKernelT.cpp                  # RoPE ITensor implementation

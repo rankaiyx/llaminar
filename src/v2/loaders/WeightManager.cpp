@@ -2234,14 +2234,21 @@ namespace llaminar2
                 return;
             }
 
-            // Only release host data for tensors that have valid GPU data.
-            // CPU-only tensors (originals without GPU upload) must keep their host data
-            // because graph stages may still reference them via raw pointers and need
-            // to lazy-upload via ensureOnDevice() during the first forward pass.
+            // Release host data for tensors that have valid GPU data OR
+            // kernel-managed device data (GEMM packed weights). GEMM kernels
+            // upload pre-packed representations to their own device buffers and
+            // never read the raw TensorBase data, so the host copy can be freed.
             if (!ptr->isDeviceValid())
             {
-                skipped_count++;
-                return;
+                // Check if kernel has its own device copy (CUDA/ROCm packed weights)
+                bool has_kernel_device_data =
+                    ptr->hasCachedDeviceData(DeviceType::CUDA) ||
+                    ptr->hasCachedDeviceData(DeviceType::ROCm);
+                if (!has_kernel_device_data)
+                {
+                    skipped_count++;
+                    return;
+                }
             }
 
             try

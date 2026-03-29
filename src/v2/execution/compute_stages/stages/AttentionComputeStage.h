@@ -105,7 +105,20 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
-        bool isGraphCapturable() const override { return true; } // Device-side params buffer handles dynamic kv_len/position
+        bool isGraphCapturable() const override
+        {
+            // TQ KV cache dequant runs inside execute() via get_kv_converted() with
+            // iteration-varying arguments (ring_pos, out_offset grow each step).
+            // With device-side dynamic params, the captured H2D + kernel can be
+            // replayed with updated values from pinned host memory.
+            if (params_.kv_cache)
+            {
+                const auto kp = params_.kv_cache->k_precision();
+                if (kp == ActivationPrecision::TQ4 || kp == ActivationPrecision::TQ8)
+                    return params_.kv_cache->isGraphCaptureReady();
+            }
+            return true; // Device-side params buffer handles dynamic kv_len/position
+        }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
@@ -131,6 +144,18 @@ namespace llaminar2
                 int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
                 kv_len += seq_len; // This step will append seq_len tokens
                 cached_kernel_->setDynamicAttnParams(kv_len, pos_offset);
+
+                // TQ dequant: update pinned host params for captured H2D.
+                // setDynamicDequantParams computes ring_pos, out_offset, rope_position
+                // from the pre-append entry state. On graph replay, the captured
+                // H2D re-reads from pinned host, giving the kernel updated values.
+                // position_start=0 matches execute() which always passes 0 — cache
+                // rows are stored in position order, so position = entry.count.
+                const float dequant_rope_theta =
+                    params_.apply_rope_to_k ? params_.rope_theta : 0.0f;
+                params_.kv_cache->setDynamicDequantParams(
+                    params_.layer_idx, 0, dequant_rope_theta,
+                    0, gpuStream());
             }
         }
 

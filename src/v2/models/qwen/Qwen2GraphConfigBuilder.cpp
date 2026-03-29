@@ -117,11 +117,12 @@ namespace llaminar2
         // Device settings
         config.default_device = plan.primary_device.toLocalDeviceId();
 
-        // Enable rope_on_read for CPU: fuses RoPE into KV cache read path
+        // Enable rope_on_read: fuses RoPE into KV cache read path
         // (get_kv_converted applies RoPE during incremental dequant)
-        if (config.default_device.type == DeviceType::CPU)
+        // Supported on CPU (all precisions) and GPU (via get_kv_converted override)
         {
-            config.rope_on_read = true;
+            const char* ror_env = std::getenv("LLAMINAR_ROPE_ON_READ");
+            config.rope_on_read = ror_env ? (std::atoi(ror_env) != 0) : true;
         }
 
         // Configure TP for attention
@@ -380,6 +381,14 @@ namespace llaminar2
             config.rope_theta = loader->ropeTheta();
             config.rms_norm_eps = loader->rmsNormEps();
         }
+
+        // Enable rope_on_read: fuses RoPE into KV cache read path.
+        // K is stored pre-RoPE in the cache; get_kv_converted() applies RoPE
+        // during read (fused with dequantization for quantized caches).
+        // Required for TQ caches (raw TQ blocks can't be read by attention),
+        // and saves a kernel launch for all cache types during decode.
+        // TODO: Re-enable once the TQ pipeline parity is acceptable
+        // config.rope_on_read = true;
 
         return true;
     }

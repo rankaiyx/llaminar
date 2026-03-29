@@ -339,23 +339,9 @@ namespace llaminar2
         }                                                                                                       \
     } while (0)
 
-// In Release/E2ERelease builds (NDEBUG without LLAMINAR_ENABLE_ASSERTIONS),
-// LOG_DEBUG and LOG_TRACE are compiled out entirely — zero overhead, no runtime
-// shouldLog() check, and no way to accidentally enable verbose output via env vars.
-// In Debug and Integration builds they remain runtime-gated as usual.
-#if defined(NDEBUG) && !defined(LLAMINAR_ENABLE_ASSERTIONS)
-
-#define LOG_DEBUG(msg) \
-    do                 \
-    {                  \
-    } while (0)
-#define LOG_TRACE(msg) \
-    do                 \
-    {                  \
-    } while (0)
-
-#else
-
+// LOG_DEBUG: Always runtime-gated in all build types. The shouldLog() check
+// is branch-predicted away when log level < DEBUG, so the overhead is negligible.
+// This allows LLAMINAR_LOG_LEVEL=DEBUG to work even in Release builds.
 #define LOG_DEBUG(msg)                                                                                                     \
     do                                                                                                                     \
     {                                                                                                                      \
@@ -366,6 +352,18 @@ namespace llaminar2
             ::llaminar2::Logger::getInstance().log(::llaminar2::LogLevel::VERBOSITY_DEBUG, oss.str(), __FILE__, __LINE__); \
         }                                                                                                                  \
     } while (0)
+
+// LOG_TRACE: Compiled out in Release/E2ERelease/Integration (NDEBUG) builds.
+// Only active in Debug builds. TRACE generates extremely verbose output that
+// can materially slow down even the shouldLog() branch prediction.
+#if defined(NDEBUG)
+
+#define LOG_TRACE(msg) \
+    do                 \
+    {                  \
+    } while (0)
+
+#else
 
 #define LOG_TRACE(msg)                                                                                           \
     do                                                                                                           \
@@ -378,7 +376,7 @@ namespace llaminar2
         }                                                                                                        \
     } while (0)
 
-#endif // NDEBUG && !LLAMINAR_ENABLE_ASSERTIONS
+#endif // NDEBUG
 
 // Simple logging without location info
 #define LOG(level, msg)                                               \

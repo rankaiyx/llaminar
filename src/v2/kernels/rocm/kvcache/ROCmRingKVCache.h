@@ -33,7 +33,7 @@
 #pragma once
 
 // Minimal includes - avoid MPI headers for hipcc compatibility
-#include "../../IKVCache.h"                          // Unified KVCache interface (src/v2/kernels/IKVCache.h)
+#include "ROCmRingKVCacheBase.h"                     // Common base for ROCm ring KV caches
 #include "../../kvcache/KVCacheDeviceParams.h"       // Device-side params for graph capture
 #include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
 #include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
@@ -85,7 +85,7 @@ namespace llaminar2
      * NOTE: ROCm KV cache uses device pointers internally, so the ITensor-based
      * get_kv() returns ROCmTensor wrappers around the device buffers.
      */
-    class IROCmRingKVCache : public IKVCache
+    class IROCmRingKVCache : public ROCmRingKVCacheBase
     {
     public:
         virtual ~IROCmRingKVCache();
@@ -95,16 +95,6 @@ namespace llaminar2
         // =====================================================================
 
         virtual ActivationPrecision k_precision() const = 0;
-        int n_layers() const override { return num_layers(); }
-        int max_seq_len() const override = 0;
-
-        // Per-sequence token tracking (IKVCache)
-        int get_cached_tokens(int layer, int seq_idx = 0) const override = 0;
-
-        // Cache management (IKVCache)
-        virtual void clear() = 0;
-        virtual void clear_sequence(int layer, int seq_idx) = 0;
-        virtual void clear_layer(int layer) = 0;
 
         // =====================================================================
         // ITensor Access (IKVCache interface via get_k/get_v)
@@ -164,16 +154,9 @@ namespace llaminar2
         // These are exposed for ROCm attention kernels and testing.
         // =====================================================================
 
-        virtual int num_layers() const = 0;
-        virtual int batch_size() const = 0;
-        virtual int n_kv_heads() const = 0;
-        virtual int head_dim() const = 0;
-        virtual int kv_dim() const = 0; ///< n_kv_heads * head_dim
-        virtual int device_id() const = 0;
-
-        // Ring buffer state
-        virtual int get_head_position(int layer, int seq_idx = 0) const = 0;
-        virtual bool is_wrapped(int layer, int seq_idx = 0) const = 0;
+        // Core accessors inherited from ROCmRingKVCacheBase:
+        //   num_layers(), batch_size(), n_kv_heads(), head_dim(), kv_dim(),
+        //   device_id(), get_head_position(), is_wrapped()
 
         /**
          * @brief Append K/V tokens to cache (device pointer version)
@@ -268,13 +251,18 @@ namespace llaminar2
         virtual int get_linearization_count() const = 0;
         virtual void reset_linearization_counter() = 0;
 
-        // =====================================================================
-        // Graph Capture Support (IKVCache interface)
-        // =====================================================================
-
-        // Overrides are provided by the concrete ROCmRingKVCache<P> class
+        // Graph capture overrides inherited from ROCmRingKVCacheBase:
+        //   isGraphCaptureReady(), setDynamicHead(), advanceHead()
 
     protected:
+        // Constructor forwards to ROCmRingKVCacheBase
+        IROCmRingKVCache(int n_layers, int batch_size, int max_seq_len,
+                         int n_kv_heads, int head_dim, int kv_dim, int device_id)
+            : ROCmRingKVCacheBase(n_layers, batch_size, max_seq_len,
+                                  n_kv_heads, head_dim, kv_dim, device_id)
+        {
+        }
+
         // =====================================================================
         // Pre-allocated conversion scratch buffers
         // =====================================================================
@@ -486,13 +474,6 @@ namespace llaminar2
         // =====================================================================
 
         ActivationPrecision k_precision() const override { return Precision; }
-        int max_seq_len() const override { return max_seq_len_; }
-
-        int get_cached_tokens(int layer, int seq_idx = 0) const override;
-
-        void clear() override;
-        void clear_sequence(int layer, int seq_idx) override;
-        void clear_layer(int layer) override;
 
         // ITensor Access (IKVCache interface via get_k/get_v)
         ITensor *get_k(int layer, int seq_idx = 0) override;
@@ -506,17 +487,6 @@ namespace llaminar2
         using IROCmRingKVCache::gather_kv_batched;
 
         // =====================================================================
-        // ROCm-Specific Methods (implementation)
-        // =====================================================================
-
-        int num_layers() const override { return n_layers_; }
-        int batch_size() const override { return batch_size_; }
-        int n_kv_heads() const override { return n_kv_heads_; }
-        int head_dim() const override { return head_dim_; }
-        int kv_dim() const override { return kv_dim_; }
-        int device_id() const override { return device_id_; }
-
-        // =====================================================================
         // Sharding (Tensor Parallelism) Accessors (IKVCache interface)
         // =====================================================================
 
@@ -524,9 +494,6 @@ namespace llaminar2
         int local_n_kv_heads() const override { return local_n_kv_heads_; }
         int kv_head_start() const override { return kv_head_start_; }
         int local_kv_dim() const override { return kv_dim_; }
-
-        int get_head_position(int layer, int seq_idx = 0) const override;
-        bool is_wrapped(int layer, int seq_idx = 0) const override;
 
         bool append(int layer, int seq_idx,
                     const void *d_k, const void *d_v,
@@ -634,27 +601,47 @@ namespace llaminar2
          */
         IWorkerGPUContext *deviceContext() const { return device_ctx_; }
 
+    protected:
         // =====================================================================
-        // Graph Capture Support (IKVCache overrides)
+        // ROCmRingKVCacheBase entry accessor overrides
         // =====================================================================
 
-        bool isGraphCaptureReady() const override { return d_head_params_ != nullptr; }
+        int entryHead(int layer, int seq_idx) const override
+        {
+            return entries_[layer][seq_idx].head;
+        }
+        int entryCount(int layer, int seq_idx) const override
+        {
+            return entries_[layer][seq_idx].count;
+        }
+        void setEntryHead(int layer, int seq_idx, int value) override
+        {
+            entries_[layer][seq_idx].head = value;
+        }
+        void setEntryCount(int layer, int seq_idx, int value) override
+        {
+            entries_[layer][seq_idx].count = value;
+        }
+        void resetEntry(int layer, int seq_idx) override
+        {
+            entries_[layer][seq_idx].head = 0;
+            entries_[layer][seq_idx].count = 0;
+            entries_[layer][seq_idx].scratch_valid = false;
+        }
 
-        void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override;
-
-        void advanceHead(int layer, int seq_idx, int num_tokens) override;
+        void onEviction(int layer, int seq_idx, int num_evicted) override
+        {
+            total_evicted_ += num_evicted;
+        }
+        void onAdvanceComplete(int layer, int seq_idx) override
+        {
+            entries_[layer][seq_idx].scratch_valid = false;
+        }
 
     private:
-        int n_layers_;
-        int batch_size_;
-        int max_seq_len_;
-        int n_kv_heads_;       // Total KV heads (across all ranks)
         int local_n_kv_heads_; // Local KV heads (this rank), == n_kv_heads_ if not sharded
         int kv_head_start_;    // Starting KV head index (0 if not sharded)
-        int head_dim_;
-        int kv_dim_;         // local_n_kv_heads * head_dim (storage dimension)
         int kv_storage_dim_; // per-token storage units (elements for fp/bf16, blocks for Q8_1)
-        int device_id_;
         bool is_sharded_; // True if using local KV heads (TP enabled)
 
         // Device context for kernel launches (optional)
@@ -684,17 +671,6 @@ namespace llaminar2
         mutable int total_evicted_ = 0;
         mutable int linearization_count_ = 0;
 
-        // =====================================================================
-        // Graph Capture Device Params
-        // =====================================================================
-
-        // Device-side head position buffer for graph-capturable append.
-        // Layout: [n_layers_ * batch_size_] ints on device memory.
-        int *d_head_params_ = nullptr;
-
-        // Pinned host-side head position buffer (for H2D copy).
-        int *h_head_params_ = nullptr;
-
         // Helper methods
         void allocate_pool(); // Single hipMalloc for all entries
         void free_pool();     // Single hipFree for all entries
@@ -702,8 +678,6 @@ namespace llaminar2
         void allocate_entry(EntryT &entry); // Legacy: individual hipMalloc per entry
         void free_entry(EntryT &entry);     // Nulls pointers (no hipFree if pooled)
         void allocate_all_entries();        // Pool + assign entries + tensor_views + device_params
-        void allocate_device_params();
-        void free_device_params();
         void linearize_entry(EntryT &entry, hipStream_t stream);
 
         /**

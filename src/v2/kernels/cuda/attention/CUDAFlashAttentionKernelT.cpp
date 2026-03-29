@@ -76,6 +76,32 @@ extern "C"
         void *stream,
         int device_idx);
 
+    // Flash Decoding with Q8_1 KV cache — fused inline dequant, no workspace
+    int cudaFlashAttn_decode_q8_1(
+        const float *Q, const void *K_cache_q8, const void *V_cache_q8, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        int batch_size, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx);
+
+    // Flash Decoding with TQ8 K / TQ4 V — fused rotation + centroid attention
+    int cudaFlashAttn_decode_tqkv(
+        const float *Q, float *O,
+        float *O_partial, float *m_partial, float *l_partial,
+        const void *K_cache, const void *V_cache,
+        const float *rotation, const float *rotation_t,
+        int batch_size, int kv_count,
+        int n_heads, int n_kv_heads, int head_dim,
+        int num_splits,
+        int max_seq_len, int tail,
+        int k_block_size, int v_block_size,
+        const llaminar2::attention::AttentionDeviceParams *device_params,
+        void *stream,
+        int device_idx);
+
     int cudaFlashAttn_allocWorkspace(
         void **partial_output, void **partial_m, void **partial_l,
         int batch_size, int n_heads, int head_dim, int num_splits);
@@ -579,12 +605,17 @@ namespace llaminar2
                 }
             }
 
-            // === Mixed-precision KV handling (FP16→direct or Q8_1→FP32) ===
+            // === Mixed-precision KV handling (FP16→direct or Q8_1→fused/FP32) ===
             // For FP16 KV: both prefill (seq_len > 1) and decode (seq_len == 1)
             // use direct FP16 kernel variants, eliminating FP16→FP32 conversion.
+            // For Q8_1 KV decode: fused inline dequant kernel (no workspace),
+            // For Q8_1 KV prefill: dequant to FP32 workspace (no Q8_1 prefill kernel).
             bool use_fp16kv_direct = false;
+            bool use_q8kv_direct = false;
             const void *K_fp16_ptr = nullptr;
             const void *V_fp16_ptr = nullptr;
+            const void *K_q8_ptr = nullptr;
+            const void *V_q8_ptr = nullptr;
 
             if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32)
             {
@@ -604,9 +635,19 @@ namespace llaminar2
                     V_fp16_ptr = V->gpu_data_ptr();
                     LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] FP16 KV direct path (no conversion)");
                 }
+                else if (K->native_type() == TensorType::Q8_1 && seq_len == 1)
+                {
+                    // FAST PATH: Q8_1 KV decode → fused inline dequant kernel
+                    // Reads Q8_1 blocks directly in the attention inner loop,
+                    // eliminating dequant kernel + FP32 workspace buffer.
+                    use_q8kv_direct = true;
+                    K_q8_ptr = K->gpu_data_ptr();
+                    V_q8_ptr = V->gpu_data_ptr();
+                    LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Q8_1 KV fused decode path (no workspace)");
+                }
                 else
                 {
-                    // CONVERSION PATH: FP16 decode or Q8_1 → convert to FP32 workspace
+                    // CONVERSION PATH: Q8_1 prefill → convert to FP32 workspace
                     if (!workspace_)
                     {
                         LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Mixed-precision KV requires workspace-bound conversion buffers");
@@ -814,6 +855,46 @@ namespace llaminar2
                 return true;
             }
 
+            // Q8_1 KV fused decode: inline dequant in attention kernel, no workspace
+            if (use_q8kv_direct)
+            {
+                if (cudaFlashAttn_setDevice(dev) != 0)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to set device " << dev);
+                    return false;
+                }
+
+                // seq_len == 1 is guaranteed by the flag setup above
+                int num_splits = computeNumSplitsForDevice(kv_len, n_heads, dev);
+
+                allocateWorkspace(n_heads, head_dim, num_splits);
+
+                if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace allocation failed for Q8_1 fused decode");
+                    return false;
+                }
+
+                int result;
+                {
+                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                    result = cudaFlashAttn_decode_q8_1(
+                        Q_ptr, K_q8_ptr, V_q8_ptr, output_ptr,
+                        static_cast<float *>(partial_output_buf_),
+                        static_cast<float *>(partial_m_buf_),
+                        static_cast<float *>(partial_l_buf_),
+                        batch_size, kv_len,
+                        n_heads, n_kv_heads, head_dim,
+                        num_splits, d_attn_params, stream_, dev);
+                }
+                if (result != 0)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Flash Decoding Q8_1 fused failed");
+                    return false;
+                }
+                return true;
+            }
+
             // Standard path: K/V are FP32 (either native or converted)
             if (kv_len != seq_len)
             {
@@ -847,10 +928,10 @@ namespace llaminar2
             // Default parameters for Flash Decoding workspace sizing
             // Conservative estimates for maximum expected configuration
             const int batch_size = (m > 0) ? m : 1;
-            const int n_heads = (n > 0) ? n : 128;     // Max expected heads
-            const int head_dim = (k > 0) ? k : 128;    // Max expected head dim
-            const int num_splits = MAX_NUM_SPLITS; // Conservative: allocate for max possible splits
-            const int max_kv_len = 4096;               // decode workspace bound
+            const int n_heads = (n > 0) ? n : 128;  // Max expected heads
+            const int head_dim = (k > 0) ? k : 128; // Max expected head dim
+            const int num_splits = MAX_NUM_SPLITS;  // Conservative: allocate for max possible splits
+            const int max_kv_len = 4096;            // decode workspace bound
 
             // Conservative conversion buffer sizing for mixed-precision KV
             // Assume n_kv_heads <= n_heads and allocate with n_heads for safety.
@@ -947,6 +1028,102 @@ namespace llaminar2
                     }
                 }
             }
+        }
+
+        // =====================================================================
+        // Fused TQ KV Decode — rotation trick + centroid attention
+        // =====================================================================
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute_tensor_tq_decode(
+            const ITensor *Q,
+            ITensor *output,
+            const void *K_cache,
+            const void *V_cache,
+            const float *rotation,
+            const float *rotation_t,
+            int batch_size,
+            int kv_count,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            int max_seq_len,
+            int tail,
+            int k_block_size,
+            int v_block_size)
+        {
+            const int num_splits = std::max(1, std::min(kv_count / 64, 32));
+
+            // Ensure workspace is allocated
+            if (workspace_)
+            {
+                void *O_partial = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
+                void *m_partial = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_M);
+                void *l_partial = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_L);
+
+                if (!O_partial || !m_partial || !l_partial)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor_tq_decode] Workspace buffers not allocated");
+                    return false;
+                }
+
+                const attention::AttentionDeviceParams *d_params = nullptr;
+                if (h_attn_params_)
+                {
+                    void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+                    if (d_buf)
+                        d_params = static_cast<const attention::AttentionDeviceParams *>(d_buf);
+                }
+
+                int result = cudaFlashAttn_decode_tqkv(
+                    static_cast<const float *>(Q->gpu_data_ptr()),
+                    static_cast<float *>(output->gpu_data_ptr()),
+                    static_cast<float *>(O_partial),
+                    static_cast<float *>(m_partial),
+                    static_cast<float *>(l_partial),
+                    K_cache, V_cache,
+                    rotation, rotation_t,
+                    batch_size, kv_count,
+                    n_heads, n_kv_heads, head_dim,
+                    num_splits,
+                    max_seq_len, tail,
+                    k_block_size, v_block_size,
+                    d_params,
+                    stream_, device_idx_);
+
+                if (result != 0)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor_tq_decode] Fused TQ kernel failed");
+                    return false;
+                }
+                return true;
+            }
+
+            // Fallback without managed workspace
+            if (!partial_output_buf_)
+                allocateWorkspace(n_heads, head_dim, num_splits);
+
+            int result = cudaFlashAttn_decode_tqkv(
+                static_cast<const float *>(Q->gpu_data_ptr()),
+                static_cast<float *>(output->gpu_data_ptr()),
+                static_cast<float *>(partial_output_buf_),
+                static_cast<float *>(partial_m_buf_),
+                static_cast<float *>(partial_l_buf_),
+                K_cache, V_cache,
+                rotation, rotation_t,
+                batch_size, kv_count,
+                n_heads, n_kv_heads, head_dim,
+                num_splits,
+                max_seq_len, tail,
+                k_block_size, v_block_size,
+                nullptr,
+                stream_, device_idx_);
+
+            if (result != 0)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor_tq_decode] Fused TQ kernel failed (no workspace)");
+                return false;
+            }
+            return true;
         }
 
         // =====================================================================

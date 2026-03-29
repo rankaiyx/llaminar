@@ -31,7 +31,7 @@
 #pragma once
 
 // Minimal includes - avoid MPI headers for nvcc compatibility
-#include "../../IKVCache.h"                          // Unified KVCache interface
+#include "CUDARingKVCacheBase.h"                     // Common ring buffer base class
 #include "../../kvcache/KVCacheDeviceParams.h"       // Device-side params for graph capture
 #include "../../../execution/config/RuntimeConfig.h" // For ActivationPrecision
 #include "../../../interfaces/IWorkspaceConsumer.h"  // Workspace management
@@ -83,7 +83,7 @@ namespace llaminar2
      * NOTE: CUDA KV cache uses device pointers internally, so the ITensor-based
      * get_kv() returns CUDATensor wrappers around the device buffers.
      */
-    class ICUDARingKVCache : public IKVCache
+    class ICUDARingKVCache : public CUDARingKVCacheBase
     {
     public:
         virtual ~ICUDARingKVCache();
@@ -93,16 +93,6 @@ namespace llaminar2
         // =====================================================================
 
         virtual ActivationPrecision k_precision() const = 0;
-        int n_layers() const override { return num_layers(); }
-        int max_seq_len() const override = 0;
-
-        // Per-sequence token tracking (IKVCache)
-        int get_cached_tokens(int layer, int seq_idx = 0) const override = 0;
-
-        // Cache management (IKVCache)
-        virtual void clear() = 0;
-        virtual void clear_sequence(int layer, int seq_idx) = 0;
-        virtual void clear_layer(int layer) = 0;
 
         // =====================================================================
         // ITensor Access (IKVCache interface via get_k/get_v)
@@ -160,18 +150,10 @@ namespace llaminar2
         // =====================================================================
         // CUDA-Specific Methods (device pointer APIs)
         // These are exposed for CUDA attention kernels and testing.
+        // Common accessors (num_layers, batch_size, n_kv_heads, head_dim,
+        // kv_dim, device_id, get_head_position, is_wrapped) are inherited
+        // from CUDARingKVCacheBase.
         // =====================================================================
-
-        virtual int num_layers() const = 0;
-        virtual int batch_size() const = 0;
-        virtual int n_kv_heads() const = 0;
-        virtual int head_dim() const = 0;
-        virtual int kv_dim() const = 0; ///< n_kv_heads * head_dim
-        virtual int device_id() const = 0;
-
-        // Ring buffer state
-        virtual int get_head_position(int layer, int seq_idx = 0) const = 0;
-        virtual bool is_wrapped(int layer, int seq_idx = 0) const = 0;
 
         /**
          * @brief Append K/V tokens to cache (device pointer version)
@@ -243,13 +225,16 @@ namespace llaminar2
         virtual int get_linearization_count() const = 0;
         virtual void reset_linearization_counter() = 0;
 
-        // =====================================================================
-        // Graph Capture Support (IKVCache interface)
-        // =====================================================================
-
-        // Overrides are provided by the concrete CUDARingKVCache<P> class
-
     protected:
+        // =====================================================================
+        // Constructor (forwards to CUDARingKVCacheBase)
+        // =====================================================================
+
+        ICUDARingKVCache(int n_layers, int batch_size, int max_seq_len,
+                         int n_kv_heads, int head_dim, int kv_dim, int device_id)
+            : CUDARingKVCacheBase(n_layers, batch_size, max_seq_len,
+                                  n_kv_heads, head_dim, kv_dim, device_id) {}
+
         // =====================================================================
         // Pre-allocated conversion scratch buffers
         // =====================================================================
@@ -454,13 +439,6 @@ namespace llaminar2
         // =====================================================================
 
         ActivationPrecision k_precision() const override { return Precision; }
-        int max_seq_len() const override { return max_seq_len_; }
-
-        int get_cached_tokens(int layer, int seq_idx = 0) const override;
-
-        void clear() override;
-        void clear_sequence(int layer, int seq_idx) override;
-        void clear_layer(int layer) override;
 
         // ITensor Access (IKVCache interface via get_k/get_v)
         ITensor *get_k(int layer, int seq_idx = 0) override;
@@ -474,17 +452,6 @@ namespace llaminar2
         using ICUDARingKVCache::gather_kv_batched;
 
         // =====================================================================
-        // CUDA-Specific Methods (implementation)
-        // =====================================================================
-
-        int num_layers() const override { return n_layers_; }
-        int batch_size() const override { return batch_size_; }
-        int n_kv_heads() const override { return n_kv_heads_; }
-        int head_dim() const override { return head_dim_; }
-        int kv_dim() const override { return kv_dim_; }
-        int device_id() const override { return device_id_; }
-
-        // =====================================================================
         // Sharding (Tensor Parallelism) Accessors (IKVCache interface)
         // =====================================================================
 
@@ -492,9 +459,6 @@ namespace llaminar2
         int local_n_kv_heads() const override { return local_n_kv_heads_; }
         int kv_head_start() const override { return kv_head_start_; }
         int local_kv_dim() const override { return kv_dim_; }
-
-        int get_head_position(int layer, int seq_idx = 0) const override;
-        bool is_wrapped(int layer, int seq_idx = 0) const override;
 
         bool append(int layer, int seq_idx,
                     const void *d_k, const void *d_v,
@@ -597,28 +561,12 @@ namespace llaminar2
          */
         IWorkerGPUContext *deviceContext() const { return device_ctx_; }
 
-        // =====================================================================
-        // Graph Capture Support (IKVCache overrides)
-        // =====================================================================
-
-        bool isGraphCaptureReady() const override { return d_head_params_ != nullptr; }
-
-        void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override;
-
-        void advanceHead(int layer, int seq_idx, int num_tokens) override;
-
     private:
-        int n_layers_;
-        int batch_size_;
-        int max_seq_len_;
-        int n_kv_heads_;       // Total KV heads (across all ranks)
+        // Template-specific members (core params are in CUDARingKVCacheBase)
         int local_n_kv_heads_; // Local KV heads (this rank), == n_kv_heads_ if not sharded
         int kv_head_start_;    // Starting KV head index (0 if not sharded)
-        int head_dim_;
-        int kv_dim_;         // logical: local_n_kv_heads * head_dim
-        int kv_storage_dim_; // per-token storage units (elements for FP/BF16, blocks for Q8_1)
-        int device_id_;
-        bool is_sharded_; // True if using local KV heads (TP enabled)
+        int kv_storage_dim_;   // per-token storage units (elements for FP/BF16, blocks for Q8_1)
+        bool is_sharded_;      // True if using local KV heads (TP enabled)
 
         // Device context for kernel launches (optional)
         // When set, provides default stream for methods that accept optional streams
@@ -636,30 +584,9 @@ namespace llaminar2
         // Mutable because views are lazily created in const methods
         mutable std::vector<std::vector<std::array<std::unique_ptr<ITensor>, 2>>> tensor_views_;
 
-        // Statistics
-        mutable int total_evicted_ = 0;
-        mutable int linearization_count_ = 0;
-
-        // =====================================================================
-        // Graph Capture Device Params
-        // =====================================================================
-
-        // Device-side head position buffer for graph-capturable append.
-        // Layout: [n_layers_ * batch_size_] ints on device memory.
-        // The ring_append_kernel_dynamic reads head from this buffer
-        // instead of a frozen scalar argument.
-        int *d_head_params_ = nullptr;
-
-        // Pinned host-side head position buffer (for H2D copy).
-        // Updated by setDynamicHead() before graph replay; the captured
-        // H2D memcpy re-reads from this at execution time.
-        int *h_head_params_ = nullptr;
-
         // Helper methods
         void allocate_entry(EntryT &entry);
         void free_entry(EntryT &entry);
-        void allocate_device_params();
-        void free_device_params();
         void linearize_entry(EntryT &entry, cudaStream_t stream);
 
         /**
@@ -688,6 +615,95 @@ namespace llaminar2
                                   DataT *d_k_out, DataT *d_v_out,
                                   int *kv_lens, int max_kv_len,
                                   int num_seqs, cudaStream_t stream);
+
+        // =====================================================================
+        // CUDARingKVCacheBase entry accessors and hooks
+        // =====================================================================
+
+        int entryHead(int layer, int seq_idx) const override { return entries_[layer][seq_idx].head; }
+        int entryCount(int layer, int seq_idx) const override { return entries_[layer][seq_idx].count; }
+        void setEntryHead(int layer, int seq_idx, int value) override { entries_[layer][seq_idx].head = value; }
+        void setEntryCount(int layer, int seq_idx, int value) override { entries_[layer][seq_idx].count = value; }
+
+        void resetEntry(int layer, int seq_idx) override
+        {
+            entries_[layer][seq_idx].head = 0;
+            entries_[layer][seq_idx].count = 0;
+            entries_[layer][seq_idx].scratch_valid = false;
+        }
+
+        void onClearSequence(int layer, int seq_idx) override
+        {
+            invalidateRoPEShadow(layer, seq_idx);
+        }
+
+        void onEviction(int layer, int seq_idx, int num_evicted) override
+        {
+            total_evicted_ += num_evicted;
+        }
+
+        void onAdvanceComplete(int layer, int seq_idx) override
+        {
+            entries_[layer][seq_idx].scratch_valid = false;
+        }
+
+        // Statistics
+        mutable int total_evicted_ = 0;
+        mutable int linearization_count_ = 0;
+
+    public:
+        // =====================================================================
+        // get_kv_converted with RoPE-on-read (IKVCache override)
+        // =====================================================================
+
+        /**
+         * @brief Get K/V converted to FP16 with optional fused RoPE.
+         *
+         * Enables RoPE-on-read for GPU: K is stored pre-RoPE in the cache,
+         * and RoPE is applied during read into a FP16 shadow buffer.
+         *
+         * For FP16 caches: linearize + RoPE → shadow buffer
+         * For Q8_1 caches: linearize + dequant → FP16 + RoPE → shadow buffer
+         * For FP32 caches: linearize + convert → FP16 + RoPE → shadow buffer
+         *
+         * Shadow buffers are allocated lazily and reused across calls.
+         * Only newly-appended tokens are processed (incremental update).
+         * Falls back to full rebuild on first call or after eviction/clear.
+         *
+         * FP32/Q8_1/BF16 paths use pre-allocated conv_scratch buffers
+         * (via ensureConvScratch) to avoid cudaMalloc/cudaFree in the hot path.
+         */
+        bool get_kv_converted(int layer, int seq_idx,
+                              ActivationPrecision target,
+                              ITensor **out_k, ITensor **out_v,
+                              int *out_kv_len = nullptr,
+                              const KVReadParams *rope = nullptr) override;
+
+    private:
+        // =====================================================================
+        // RoPE-on-read Shadow Buffers
+        // =====================================================================
+
+        struct RoPEShadow
+        {
+            __half *d_K = nullptr;     ///< [max_seq_len, kv_dim] FP16 K with RoPE
+            __half *d_V = nullptr;     ///< [max_seq_len, kv_dim] FP16 V
+            int converted_count = 0;   ///< Rows already converted
+            int last_head = -1;        ///< Head position at last conversion
+            bool rope_applied = false; ///< Whether RoPE was applied
+
+            std::unique_ptr<ITensor> k_view; ///< GpuTensorView for K
+            std::unique_ptr<ITensor> v_view; ///< GpuTensorView for V
+        };
+
+        // [n_layers][batch_size] — lazily initialized
+        mutable std::vector<std::vector<RoPEShadow>> rope_shadows_;
+
+        /// Allocate shadow buffers for a layer/seq if needed
+        void ensureRoPEShadow(int layer, int seq_idx) const;
+
+        /// Invalidate shadow after append/evict
+        void invalidateRoPEShadow(int layer, int seq_idx) const;
     };
 
     // =========================================================================

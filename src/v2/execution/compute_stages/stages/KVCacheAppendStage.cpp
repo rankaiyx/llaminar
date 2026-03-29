@@ -949,6 +949,24 @@ namespace llaminar2
                 return false;
             }
 
+            // GPU fast path: pass FP32 directly for GPU-side quantization
+            if (params_.device_id.is_gpu())
+            {
+                const auto conv_start = std::chrono::high_resolution_clock::now();
+                bool success = append_to_cache(params_.seq_idx, params_.K, params_.V, total_tokens);
+                const auto conv_end = std::chrono::high_resolution_clock::now();
+                const uint64_t conv_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_TQ, conv_ns, static_cast<uint64_t>(total_tokens), 0);
+                if (!success)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] append failed (TQ4 GPU quantize path)");
+                    return false;
+                }
+                return true;
+            }
+
+            // CPU path: quantize on CPU, then upload blocks to cache
             const auto conv_start = std::chrono::high_resolution_clock::now();
             const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
             const int head_dim = params_.head_dim;
@@ -1055,6 +1073,37 @@ namespace llaminar2
                 return false;
             }
 
+            // =============================================================
+            // GPU fast path: pass FP32 K/V directly to the TQ cache.
+            // The GPU cache (CUDARingKVCacheTQ / ROCmRingKVCacheTQ) has
+            // built-in GPU quantize kernels that avoid the catastrophic
+            // D2H → CPU quant → H2D round-trip.
+            // =============================================================
+            if (params_.device_id.is_gpu())
+            {
+                const auto conv_start = std::chrono::high_resolution_clock::now();
+
+                // K/V are already on GPU from upstream stages (QKV proj, RoPE).
+                // Pass them directly — appendWithStream() will detect FP32 and
+                // use GPU quantize kernels (tq8_quantize_kernel + tq4_quantize_kernel).
+                bool success = append_to_cache(params_.seq_idx, params_.K, params_.V, total_tokens);
+
+                const auto conv_end = std::chrono::high_resolution_clock::now();
+                const uint64_t conv_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(conv_end - conv_start).count());
+                KVCacheProfiler::record(KVCacheOpType::CONVERT_TO_TQ, conv_ns, static_cast<uint64_t>(total_tokens), 0);
+
+                if (!success)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] append failed (split TQ GPU quantize path)");
+                    return false;
+                }
+                return true;
+            }
+
+            // =============================================================
+            // CPU path: quantize on CPU, then upload blocks to cache
+            // =============================================================
             const auto conv_start = std::chrono::high_resolution_clock::now();
             const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
             const int head_dim = params_.head_dim;

@@ -8,12 +8,20 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../tensors/TQ8Tensor.h"
+#include "../../../tensors/TQ4Tensor.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
+#include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include <limits>
 #include <fstream>
 #include <filesystem>
+
+#if defined(HAVE_CUDA)
+#include "../../../kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
+#include "../../../kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
+#endif
 
 namespace llaminar2
 {
@@ -120,56 +128,209 @@ namespace llaminar2
                 const bool is_cpu_path = (gpuStream() == nullptr);
                 if (is_cpu_path && (effective_kv_len > params_.seq_len || params_.apply_rope_to_k))
                 {
-                    IKVCache::KVReadParams read_params;
-                    if (params_.apply_rope_to_k)
+                    // =====================================================================
+                    // Fused TQ attention path: pass raw TQ8/TQ4 tensors directly to the
+                    // attention kernel, eliminating FP32 shadow buffers entirely.
+                    //
+                    // Conditions for fused path:
+                    //   - Decode mode (effective_kv_len > seq_len)
+                    //   - TQ cache format (TQ8-K / TQ4-V)
+                    //   - NOT rope_on_read (RoPE already applied at write time)
+                    //   - TurboQuantContext available (for rotation matrices)
+                    //
+                    // When active, the kernel exploits rotation orthogonality:
+                    //   dot(Q, dequant(K)) = (norm/D) · dot(Π·Q, centroids(K))
+                    // reducing per-position cost from O(D²) to O(D).
+                    // =====================================================================
+                    const bool is_tq_decode = (effective_kv_len > params_.seq_len &&
+                                               !params_.apply_rope_to_k &&
+                                               params_.turboquant_ctx);
+                    if (is_tq_decode)
                     {
-                        read_params.rope_theta = params_.rope_theta;
-                        read_params.position_start = 0; // Cache rows are stored in position order
-                    }
-                    read_params.n_kv_heads = params_.n_kv_heads;
-                    read_params.head_dim = params_.head_dim;
-                    read_params.turboquant_ctx = params_.turboquant_ctx;
+                        ITensor *raw_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+                        ITensor *raw_v = params_.kv_cache->get_v(params_.layer_idx, 0);
 
-                    int kv_len_out = 0;
-                    if (params_.kv_cache->get_kv_converted(
-                            params_.layer_idx, 0,
-                            ActivationPrecision::FP32,
-                            &cache_k, &cache_v, &kv_len_out,
-                            &read_params))
+                        if (raw_k && raw_v &&
+                            raw_k->native_type() == TensorType::TQ8 &&
+                            raw_v->native_type() == TensorType::TQ4)
+                        {
+                            // Set per-layer TQ context on tensors (needed by kernel for rotation)
+                            const auto &layer_ctx = params_.turboquant_ctx->for_layer(params_.layer_idx);
+                            auto *k_tq8 = dynamic_cast<TQ8Tensor *>(raw_k);
+                            auto *v_tq4 = dynamic_cast<TQ4Tensor *>(raw_v);
+                            if (k_tq8 && v_tq4)
+                            {
+                                k_tq8->set_turboquant_context(&layer_ctx);
+                                v_tq4->set_turboquant_context(&layer_ctx);
+                                effective_K = raw_k;
+                                effective_V = raw_v;
+                                LOG_TRACE("[AttentionComputeStage] Fused TQ path: passing raw TQ8/TQ4 tensors for layer "
+                                          << params_.layer_idx << " kv_len=" << effective_kv_len);
+                            }
+                        }
+                    }
+
+                    // =====================================================================
+                    // Fused Q16_1/Q8_1 attention path: pass raw quantized tensors directly
+                    // to the attention kernel, eliminating FP32 shadow buffers.
+                    //
+                    // Q16_1: VNNI int16 QK dot product (VPDPWSSD) + int16 V accumulation
+                    // Q8_1: int8→float inline dequant in attention's inner loop
+                    //
+                    // Conditions: decode mode, NOT rope_on_read, matching cache format
+                    // =====================================================================
+                    if (effective_K == params_.K && // not overridden by fused TQ path
+                        effective_kv_len > params_.seq_len &&
+                        !params_.apply_rope_to_k)
                     {
-                        effective_K = cache_k;
-                        effective_V = cache_v;
-                        LOG_TRACE("[AttentionComputeStage] Using cache get_kv<FP32> ("
-                                  << cache_k->dtype_name() << ") for layer " << params_.layer_idx
-                                  << " kv_len=" << kv_len_out);
+                        const auto kp = params_.kv_cache->k_precision();
+                        const auto vp = params_.kv_cache->v_precision();
+                        if ((kp == ActivationPrecision::Q16_1 && vp == ActivationPrecision::Q16_1) ||
+                            (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1))
+                        {
+                            ITensor *raw_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+                            ITensor *raw_v = params_.kv_cache->get_v(params_.layer_idx, 0);
+                            if (raw_k && raw_v)
+                            {
+                                effective_K = raw_k;
+                                effective_V = raw_v;
+                                LOG_TRACE("[AttentionComputeStage] Fused " << activationPrecisionToString(kp)
+                                                                           << " path: passing raw tensors for layer "
+                                                                           << params_.layer_idx << " kv_len=" << effective_kv_len);
+                            }
+                        }
+                    }
+
+                    // Fallback: dequant via get_kv_converted for unsupported formats or rope_on_read
+                    if (effective_K == params_.K) // not overridden by any fused path above
+                    {
+                        IKVCache::KVReadParams read_params;
+                        if (params_.apply_rope_to_k)
+                        {
+                            read_params.rope_theta = params_.rope_theta;
+                            read_params.position_start = 0; // Cache rows are stored in position order
+                        }
+                        read_params.n_kv_heads = params_.n_kv_heads;
+                        read_params.head_dim = params_.head_dim;
+                        read_params.turboquant_ctx = params_.turboquant_ctx;
+
+                        int kv_len_out = 0;
+                        if (params_.kv_cache->get_kv_converted(
+                                params_.layer_idx, 0,
+                                ActivationPrecision::FP32,
+                                &cache_k, &cache_v, &kv_len_out,
+                                &read_params))
+                        {
+                            effective_K = cache_k;
+                            effective_V = cache_v;
+                            LOG_TRACE("[AttentionComputeStage] Using cache get_kv<FP32> ("
+                                      << cache_k->dtype_name() << ") for layer " << params_.layer_idx
+                                      << " kv_len=" << kv_len_out);
+                        }
+                        else
+                        {
+                            LOG_WARN("[AttentionComputeStage] get_kv_converted failed, falling back to raw cache");
+                            cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+                            cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
+                            if (cache_k && cache_v)
+                            {
+                                effective_K = cache_k;
+                                effective_V = cache_v;
+                            }
+                        }
+                    } // end fallback get_kv_converted
+                }
+                else
+                {
+                    // GPU path: use get_kv_converted() for TQ dequant + fused RoPE,
+                    // otherwise use raw cache tensors directly.
+
+                    // =====================================================================
+                    // Fused Q8_1 GPU attention path: pass raw Q8_1 tensors to the CUDA
+                    // kernel which does inline int8→float dequant in the attention loop.
+                    // This eliminates the Q8_1→FP16/FP32 workspace conversion entirely.
+                    //
+                    // Conditions: decode mode, NOT rope_on_read, Q8_1 cache format
+                    // =====================================================================
+                    const bool is_q8_gpu_decode = (effective_kv_len > params_.seq_len &&
+                                                   !params_.apply_rope_to_k &&
+                                                   params_.seq_len == 1);
+                    if (is_q8_gpu_decode)
+                    {
+                        const auto kp = params_.kv_cache->k_precision();
+                        const auto vp = params_.kv_cache->v_precision();
+                        if (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1)
+                        {
+                            ITensor *raw_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+                            ITensor *raw_v = params_.kv_cache->get_v(params_.layer_idx, 0);
+                            if (raw_k && raw_v)
+                            {
+                                effective_K = raw_k;
+                                effective_V = raw_v;
+                                LOG_TRACE("[AttentionComputeStage] GPU fused Q8_1 path: passing raw Q8_1 tensors for layer "
+                                          << params_.layer_idx << " kv_len=" << effective_kv_len);
+                            }
+                        }
+                    }
+
+                    if (effective_K == params_.K &&
+                        (params_.apply_rope_to_k || effective_kv_len > params_.seq_len))
+                    {
+                        LOG_DEBUG("[AttentionComputeStage] GPU KV CONVERTED PATH layer=" << params_.layer_idx
+                                                                                         << " apply_rope=" << params_.apply_rope_to_k
+                                                                                         << " rope_theta=" << params_.rope_theta
+                                                                                         << " eff_kv_len=" << effective_kv_len
+                                                                                         << " seq_len=" << params_.seq_len);
+                        IKVCache::KVReadParams read_params;
+                        if (params_.apply_rope_to_k)
+                        {
+                            read_params.rope_theta = params_.rope_theta;
+                            read_params.position_start = 0;
+                        }
+                        read_params.n_kv_heads = params_.n_kv_heads;
+                        read_params.head_dim = params_.head_dim;
+                        read_params.turboquant_ctx = params_.turboquant_ctx;
+
+                        int kv_len_out = 0;
+                        if (params_.kv_cache->get_kv_converted(
+                                params_.layer_idx, 0,
+                                ActivationPrecision::FP16,
+                                &cache_k, &cache_v, &kv_len_out,
+                                &read_params))
+                        {
+                            effective_K = cache_k;
+                            effective_V = cache_v;
+                            LOG_TRACE("[AttentionComputeStage] GPU: Using cache get_kv_converted<FP16> ("
+                                      << cache_k->dtype_name() << ") for layer " << params_.layer_idx
+                                      << " kv_len=" << kv_len_out);
+                        }
+                        else
+                        {
+                            LOG_WARN("[AttentionComputeStage] GPU: get_kv_converted failed, falling back to raw cache");
+                            cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
+                            cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
+                            if (cache_k && cache_v)
+                            {
+                                effective_K = cache_k;
+                                effective_V = cache_v;
+                            }
+                        }
                     }
                     else
                     {
-                        LOG_WARN("[AttentionComputeStage] get_kv_converted failed, falling back to raw cache");
                         cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
                         cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
                         if (cache_k && cache_v)
                         {
                             effective_K = cache_k;
                             effective_V = cache_v;
+                            LOG_TRACE("[AttentionComputeStage] Using cache K/V ("
+                                      << cache_k->dtype_name() << ") for layer " << params_.layer_idx);
                         }
-                    }
-                }
-                else
-                {
-                    // GPU path: use raw cache tensors
-                    cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
-                    cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
-                    if (cache_k && cache_v)
-                    {
-                        effective_K = cache_k;
-                        effective_V = cache_v;
-                        LOG_TRACE("[AttentionComputeStage] Using cache K/V ("
-                                  << cache_k->dtype_name() << ") for layer " << params_.layer_idx);
-                    }
-                    else
-                    {
-                        LOG_TRACE("[AttentionComputeStage] Cache K/V not available yet, using wired tensors");
+                        else
+                        {
+                            LOG_TRACE("[AttentionComputeStage] Cache K/V not available yet, using wired tensors");
+                        }
                     }
                 }
             }
@@ -399,6 +560,57 @@ namespace llaminar2
                     dump_iteration++;
             }
         }
+
+        // =====================================================================
+        // Fused TQ GPU decode: rotation trick + centroid attention
+        // Bypasses normal compute_tensor() since TQ requires ring buffer
+        // metadata, rotation matrices, and codebook access.
+        // NOTE: Currently slower than dequant+flash path. Enable with
+        // LLAMINAR_ENABLE_FUSED_TQ_ATTN=1 for testing.
+        // =====================================================================
+#if defined(HAVE_CUDA)
+        if (is_decode_mode && params_.device_id.is_gpu() && params_.kv_cache && std::getenv("LLAMINAR_ENABLE_FUSED_TQ_ATTN"))
+        {
+            const auto kp = params_.kv_cache->k_precision();
+            const auto vp = params_.kv_cache->v_precision();
+            if (kp == ActivationPrecision::TQ8 && vp == ActivationPrecision::TQ4)
+            {
+                auto *tq_cache = dynamic_cast<CUDARingKVCacheTQ *>(params_.kv_cache);
+                auto *cuda_kernel = dynamic_cast<cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> *>(kernel);
+                if (tq_cache && cuda_kernel)
+                {
+                    const auto &rots = tq_cache->rotations();
+                    const size_t layer_offset = static_cast<size_t>(params_.layer_idx) *
+                                                rots.n_kv_heads * rots.head_dim * rots.head_dim;
+                    const float *R = rots.d_rotations + layer_offset;
+                    const float *Rt = rots.d_rotations_t + layer_offset;
+
+                    bool tq_success = cuda_kernel->compute_tensor_tq_decode(
+                        params_.Q, params_.output,
+                        tq_cache->raw_k_cache(params_.layer_idx, 0),
+                        tq_cache->raw_v_cache(params_.layer_idx, 0),
+                        R, Rt,
+                        params_.batch_size,
+                        effective_kv_len,
+                        params_.n_heads,
+                        params_.n_kv_heads,
+                        params_.head_dim,
+                        tq_cache->max_seq_len(),
+                        tq_cache->ring_tail(params_.layer_idx, 0),
+                        static_cast<int>(tq_cache->k_block_size()),
+                        static_cast<int>(tq_cache->v_block_size()));
+
+                    if (!tq_success)
+                    {
+                        LOG_ERROR("[AttentionComputeStage] Fused TQ GPU decode kernel failed");
+                        return false;
+                    }
+                    LOG_TRACE("[AttentionComputeStage] Fused TQ GPU decode for layer " << params_.layer_idx);
+                    return true;
+                }
+            }
+        }
+#endif
 
         bool success = kernel->compute_tensor(
             params_.Q, effective_K, effective_V, params_.output,

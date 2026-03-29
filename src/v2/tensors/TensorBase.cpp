@@ -1407,6 +1407,19 @@ namespace llaminar2
             LOG_DEBUG("[TensorBase::ensureOnDevice] No device migration needed (conditions not met)");
         }
 
+        // Skip raw upload for tensors with kernel-managed device data.
+        // GEMM kernels upload pre-packed VNNI/INT8 representations to their own
+        // device buffers (packed_->d_int8_data_vnni). The raw TensorBase data is
+        // never read by the kernel, so uploading it wastes VRAM.
+        if (!gpu_data_ptr_ && !device_valid_ && target_device.is_gpu() &&
+            hasCachedDeviceData(target_device.type))
+        {
+            LOG_DEBUG("[TensorBase::ensureOnDevice] Skipping raw upload for tensor "
+                      << (debug_name_.empty() ? "(unnamed)" : debug_name_)
+                      << " — kernel manages its own device representation");
+            return true;
+        }
+
         // Allocate on target device if needed
         size_t bytes = byte_size();
         if (!gpu_data_ptr_)

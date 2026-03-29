@@ -54,12 +54,17 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
+#include "../../../tensors/TQ8Tensor.h"
+#include "../../../tensors/TQ4Tensor.h"
 #include "../../../utils/CPUFeatures.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../primitives/ActivationTraits.h"
+#include "../turboquant/TurboQuantRotation.h"
+#include "../turboquant/TurboQuantContext.h"
 #include "CPUAttentionKernelT.h"
+#include "TQFusedAttentionPrimitives.h"
 
 #include <algorithm>
 #include <chrono>
@@ -718,6 +723,69 @@ namespace llaminar2
                                 Q_ptr, K_q16, V_q16, O_ptr,
                                 seq_len, kv_len, n_heads, n_kv_heads, head_dim,
                                 causal, window_size, position_offset);
+                        }
+                    }
+                }
+            }
+#endif
+
+            // ---------------------------------------------------------------
+            // TurboQuant TQ8-K / TQ4-V fused decode path: zero shadow buffers.
+            // Pre-rotates Q once per head [O(D²)], then O(D) per KV position.
+            // V accumulated in rotated centroid space, one final Πᵀ at end.
+            // ---------------------------------------------------------------
+#if defined(__AVX512F__)
+            if (K->native_type() == TensorType::TQ8 &&
+                V->native_type() == TensorType::TQ4 &&
+                batch_size == 1 && kv_len != seq_len) // decode only
+            {
+                const auto *K_tq8 = dynamic_cast<const TQ8Tensor *>(K);
+                const auto *V_tq4 = dynamic_cast<const TQ4Tensor *>(V);
+                if (K_tq8 && V_tq4 && K_tq8->turboquant_context())
+                {
+                    const float *Q_ptr = Q_base->fp32_data();
+                    float *O_ptr = O_base->mutable_data();
+                    if (Q_ptr && O_ptr)
+                    {
+                        const int position_offset = (kv_len > seq_len)
+                                                        ? (kv_len - seq_len)
+                                                        : 0;
+                        return compute_decode_tqkv(
+                            Q_ptr, K_tq8, V_tq4, O_ptr,
+                            kv_len, n_heads, n_kv_heads, head_dim,
+                            causal, position_offset);
+                    }
+                }
+            }
+#endif
+
+            // ---------------------------------------------------------------
+            // Q8_1 KV decode fast-path: inline int8→float dequant in the
+            // attention inner loop. Eliminates FP32 shadow buffers (saves
+            // ~440 MB for 7B models) while keeping compute accurate.
+            // ---------------------------------------------------------------
+#if defined(__AVX512F__) && defined(__F16C__)
+            if (K->native_type() == TensorType::Q8_1 &&
+                V->native_type() == TensorType::Q8_1 &&
+                batch_size == 1)
+            {
+                const auto *K_q8 = dynamic_cast<const Q8_1Tensor *>(K);
+                const auto *V_q8 = dynamic_cast<const Q8_1Tensor *>(V);
+                if (K_q8 && V_q8)
+                {
+                    const float *Q_ptr = Q_base->fp32_data();
+                    float *O_ptr = O_base->mutable_data();
+                    if (Q_ptr && O_ptr)
+                    {
+                        const int position_offset = (kv_len > seq_len)
+                                                        ? (kv_len - seq_len)
+                                                        : 0;
+                        if (kv_len != seq_len)
+                        {
+                            return compute_decode_q8kv(
+                                Q_ptr, K_q8, V_q8, O_ptr,
+                                kv_len, n_heads, n_kv_heads, head_dim,
+                                causal, position_offset);
                         }
                     }
                 }
@@ -3494,6 +3562,322 @@ namespace llaminar2
         }
 #endif // __AVX512F__ && __AVX512VNNI__
 
+        // =================================================================
+        // Q8_1 inline-dequant helpers for fused attention
+        // =================================================================
+
+        /**
+         * @brief Inline Q8_1 dot product: dot(Q_fp32, dequant(K_q8_1_block))
+         *
+         * For each of the 32 int8 values in K_block: float_k = qs[i] * scale
+         * Then computes dot(Q_slice, float_k) using AVX-512.
+         *
+         * @param q_fp32  Pointer to 32 FP32 Q elements (aligned to current block offset)
+         * @param k_block Pointer to Q8_1Block
+         * @return FP32 partial dot product for this block
+         */
+        static inline float dot_q_fp32_k_q8_1_block(
+            const float *q_fp32, const Q8_1Block *k_block)
+        {
+#if defined(__AVX512F__) && defined(__F16C__)
+            // Scale: uint16_t d is FP16-encoded
+            const float k_scale = _cvtsh_ss(k_block->d);
+            const __m512 vscale = _mm512_set1_ps(k_scale);
+
+            // Load 32 int8 → 2×16 int32 → 2×16 FP32
+            const __m256i qs_raw = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(k_block->qs));
+            // Lower 16 bytes → 16×int32
+            const __m512i lo_i32 = _mm512_cvtepi8_epi32(_mm256_castsi256_si128(qs_raw));
+            // Upper 16 bytes → 16×int32
+            const __m512i hi_i32 = _mm512_cvtepi8_epi32(_mm256_extracti128_si256(qs_raw, 1));
+
+            const __m512 lo_f = _mm512_mul_ps(_mm512_cvtepi32_ps(lo_i32), vscale);
+            const __m512 hi_f = _mm512_mul_ps(_mm512_cvtepi32_ps(hi_i32), vscale);
+
+            // Dot product with Q
+            const __m512 q0 = _mm512_loadu_ps(q_fp32);
+            const __m512 q1 = _mm512_loadu_ps(q_fp32 + 16);
+            const __m512 prod0 = _mm512_mul_ps(q0, lo_f);
+            const __m512 prod1 = _mm512_fmadd_ps(q1, hi_f, prod0);
+
+            return _mm512_reduce_add_ps(prod1);
+#else
+            const float k_scale = _cvtsh_ss(k_block->d);
+            float dot = 0.0f;
+            for (int i = 0; i < 32; ++i)
+                dot += q_fp32[i] * (static_cast<float>(k_block->qs[i]) * k_scale);
+            return dot;
+#endif
+        }
+
+        /**
+         * @brief Accumulate weighted dequantized Q8_1 V block into output.
+         *
+         * out[d] += weight * (qs[d] * scale)  for d in [0, 32)
+         *
+         * @param out     Output accumulator (32 floats at current block offset)
+         * @param v_block Pointer to Q8_1Block for V
+         * @param weight  Softmax probability × block scale already combined? No — just prob
+         */
+        static inline void accum_weighted_v_q8_1_block(
+            float *out, const Q8_1Block *v_block, float weight)
+        {
+#if defined(__AVX512F__) && defined(__F16C__)
+            const float v_scale = _cvtsh_ss(v_block->d);
+            const float combined = weight * v_scale;
+            const __m512 vw = _mm512_set1_ps(combined);
+
+            const __m256i qs_raw = _mm256_loadu_si256(
+                reinterpret_cast<const __m256i *>(v_block->qs));
+            const __m512i lo_i32 = _mm512_cvtepi8_epi32(_mm256_castsi256_si128(qs_raw));
+            const __m512i hi_i32 = _mm512_cvtepi8_epi32(_mm256_extracti128_si256(qs_raw, 1));
+
+            const __m512 lo_f = _mm512_cvtepi32_ps(lo_i32);
+            const __m512 hi_f = _mm512_cvtepi32_ps(hi_i32);
+
+            __m512 o0 = _mm512_loadu_ps(out);
+            __m512 o1 = _mm512_loadu_ps(out + 16);
+            o0 = _mm512_fmadd_ps(lo_f, vw, o0);
+            o1 = _mm512_fmadd_ps(hi_f, vw, o1);
+            _mm512_storeu_ps(out, o0);
+            _mm512_storeu_ps(out + 16, o1);
+#else
+            const float v_scale = _cvtsh_ss(v_block->d);
+            const float combined = weight * v_scale;
+            for (int i = 0; i < 32; ++i)
+                out[i] += combined * static_cast<float>(v_block->qs[i]);
+#endif
+        }
+
+        /**
+         * @brief Decode-only flash attention with Q8_1 KV cache (no FP32 shadow buffers).
+         *
+         * Reads K and V directly as Q8_1 blocks, performing inline int8→float
+         * dequantization in the dot product and V accumulation inner loops.
+         * Eliminates FP32 shadow buffers (~440 MB for 7B models with 8K context).
+         *
+         * Layout support: POSITION_MAJOR [pos][n_kv_heads * blocks_per_head]
+         * and HEAD_MAJOR [head][pos][blocks_per_head].
+         */
+        static bool compute_decode_q8kv(
+            const float *Q,
+            const Q8_1Tensor *K_q8, const Q8_1Tensor *V_q8,
+            float *output,
+            int kv_len,
+            int n_heads, int n_kv_heads, int head_dim,
+            bool causal, int position_offset)
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
+
+            if (!Q || !K_q8 || !V_q8 || !output)
+                return false;
+            if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+                return false;
+            if (n_heads % n_kv_heads != 0)
+                return false;
+
+            const int heads_per_kv = n_heads / n_kv_heads;
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+            constexpr size_t BLOCK_SIZE = Q8_1Block::BLOCK_SIZE; // 32
+            const size_t blocks_per_head = (static_cast<size_t>(head_dim) + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            // Detect layout from K tensor shape
+            const Q8_1Block *k_blocks = K_q8->typed_data();
+            const Q8_1Block *v_blocks = V_q8->typed_data();
+            if (!k_blocks || !v_blocks)
+                return false;
+
+            // blocks_per_row for the K tensor: cols / BLOCK_SIZE
+            const size_t k_cols = K_q8->shape().size() > 1 ? K_q8->shape()[1] : K_q8->shape()[0];
+            const size_t blocks_per_kv_row = (k_cols + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+            // HEAD_MAJOR: blocks_per_row == blocks_per_head (one head per row)
+            // POSITION_MAJOR: blocks_per_row == n_kv_heads * blocks_per_head
+            const bool is_head_major = (blocks_per_kv_row == blocks_per_head && n_kv_heads > 1);
+            const size_t rows_per_head = is_head_major
+                                             ? (K_q8->shape()[0] / static_cast<size_t>(n_kv_heads))
+                                             : 0;
+
+            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
+                head_dim, n_kv_heads, kv_len, /*is_decode=*/true);
+
+            const bool profiling_enabled = KernelProfiler::isEnabled();
+            uint64_t qk_duration_ns = 0;
+            uint64_t v_duration_ns = 0;
+
+            const int attn_threads = computeOptimalAttentionThreads(
+                n_heads, 1, kv_len, head_dim, causal);
+
+            auto work = [&]()
+            {
+                float block_scores[detail::kMaxKVTile];
+
+#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const int kv_h = h / heads_per_kv;
+                    float *out = output + static_cast<size_t>(h) * head_dim;
+                    std::fill(out, out + head_dim, 0.0f);
+
+                    float running_m = -std::numeric_limits<float>::infinity();
+                    float running_l = 0.0f;
+
+                    const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;
+                    const int q_abs = position_offset;
+
+                    // Per-head block layout
+                    // HEAD_MAJOR:     head data at block offset [kv_h * rows_per_head * blocks_per_head + pos * blocks_per_head]
+                    // POSITION_MAJOR: head data at block offset [pos * blocks_per_kv_row + kv_h * blocks_per_head]
+                    const size_t head_base = is_head_major
+                                                 ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head)
+                                                 : (static_cast<size_t>(kv_h) * blocks_per_head);
+
+                    for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+                    {
+                        const int k1 = std::min(k0 + kv_tile, kv_len);
+                        float block_max = -std::numeric_limits<float>::infinity();
+
+                        int valid_end = causal ? std::min(k1, q_abs + 1) : k1;
+                        valid_end = std::max(k0, std::min(valid_end, k1));
+
+                        for (int k = valid_end; k < k1; ++k)
+                            block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
+
+                        const auto qk_start = profiling_enabled
+                                                  ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point();
+
+                        // --- QK Phase: inline int8→float dequant + FP32 dot ---
+                        for (int k = k0; k < valid_end; ++k)
+                        {
+                            float dot = 0.0f;
+                            for (size_t bi = 0; bi < blocks_per_head; ++bi)
+                            {
+                                const size_t blk_idx = is_head_major
+                                                           ? (head_base + static_cast<size_t>(k) * blocks_per_head + bi)
+                                                           : (static_cast<size_t>(k) * blocks_per_kv_row + head_base + bi);
+                                dot += dot_q_fp32_k_q8_1_block(
+                                    q_ptr + bi * BLOCK_SIZE,
+                                    &k_blocks[blk_idx]);
+                            }
+                            const float s = dot * scale;
+                            block_scores[static_cast<size_t>(k - k0)] = s;
+                            block_max = std::max(block_max, s);
+
+                            // Prefetch next K position
+                            if (k + 1 < valid_end)
+                            {
+                                const size_t next_idx = is_head_major
+                                                            ? (head_base + static_cast<size_t>(k + 1) * blocks_per_head)
+                                                            : (static_cast<size_t>(k + 1) * blocks_per_kv_row + head_base);
+                                _mm_prefetch(reinterpret_cast<const char *>(&k_blocks[next_idx]),
+                                             _MM_HINT_T0);
+                            }
+                        }
+
+                        if (profiling_enabled)
+                            qk_duration_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - qk_start)
+                                    .count());
+
+                        // --- Online softmax correction ---
+                        const float new_m = std::max(running_m, block_max);
+                        const float alpha = std::isfinite(running_m)
+                                                ? std::exp(running_m - new_m)
+                                                : 0.0f;
+                        {
+                            const __m512 va = _mm512_set1_ps(alpha);
+                            int sd = 0;
+                            for (; sd + 15 < head_dim; sd += 16)
+                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(va, _mm512_loadu_ps(out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                out[sd] *= alpha;
+                        }
+                        float new_l = running_l * alpha;
+
+                        // --- V Phase: inline int8→float dequant + weighted accumulation ---
+                        const auto v_start = profiling_enabled
+                                                 ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point();
+
+                        for (int k = k0; k < valid_end; ++k)
+                        {
+                            const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
+                            new_l += p;
+
+                            for (size_t bi = 0; bi < blocks_per_head; ++bi)
+                            {
+                                const size_t blk_idx = is_head_major
+                                                           ? (head_base + static_cast<size_t>(k) * blocks_per_head + bi)
+                                                           : (static_cast<size_t>(k) * blocks_per_kv_row + head_base + bi);
+                                accum_weighted_v_q8_1_block(
+                                    out + bi * BLOCK_SIZE,
+                                    &v_blocks[blk_idx],
+                                    p);
+                            }
+
+                            // Prefetch next V position
+                            if (k + 1 < valid_end)
+                            {
+                                const size_t next_idx = is_head_major
+                                                            ? (head_base + static_cast<size_t>(k + 1) * blocks_per_head)
+                                                            : (static_cast<size_t>(k + 1) * blocks_per_kv_row + head_base);
+                                _mm_prefetch(reinterpret_cast<const char *>(&v_blocks[next_idx]),
+                                             _MM_HINT_T0);
+                            }
+                        }
+
+                        if (profiling_enabled)
+                            v_duration_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - v_start)
+                                    .count());
+
+                        running_m = new_m;
+                        running_l = new_l;
+                    } // end KV tile loop
+
+                    // Final normalisation
+                    if (running_l > 0.0f)
+                    {
+                        const float inv_l = 1.0f / running_l;
+                        const __m512 vi = _mm512_set1_ps(inv_l);
+                        int sd = 0;
+                        for (; sd + 15 < head_dim; sd += 16)
+                            _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
+                        for (; sd < head_dim; ++sd)
+                            out[sd] *= inv_l;
+                    }
+                } // end head loop
+            };
+
+            const bool force_full_pool = kv_len > 100;
+            int actual_threads;
+            if (force_full_pool)
+            {
+                OMP_WORKSHARE_REGION(work);
+                actual_threads = omp_get_max_threads();
+            }
+            else
+            {
+#pragma omp parallel num_threads(attn_threads)
+                {
+                    work();
+                }
+                actual_threads = attn_threads;
+            }
+
+            if (profiling_enabled)
+            {
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads);
+            }
+            return true;
+        }
+
 #if defined(__AVX512F__) && defined(__F16C__)
         /**
          * @brief Decode-only flash attention with FP16 KV cache (no FP32 copy).
@@ -3718,6 +4102,273 @@ namespace llaminar2
             return true;
         }
 #endif // __AVX512F__ && __F16C__
+
+        // =================================================================
+        // TurboQuant TQ8-K / TQ4-V fused decode attention (zero shadow buffers)
+        //
+        // Exploits the orthogonality of the TQ rotation matrix:
+        //   dot(Q, dequant(K)) = (norm/√D) · dot(Π·Q, centroids(K))
+        // Pre-rotates Q once per head [O(D²)], then per KV position [O(D)].
+        //
+        // V accumulation in rotated centroid space, one final Πᵀ at end.
+        // Total: O(D² + kv_len·D) instead of O(kv_len·D²).
+        // =================================================================
+#if defined(__AVX512F__)
+        /**
+         * @brief Fused TQ8-K / TQ4-V decode attention with zero shadow buffers.
+         *
+         * @param Q          Query tensor data [n_heads × head_dim], FP32
+         * @param K_tq8      TQ8 K cache tensor (POSITION_MAJOR layout)
+         * @param V_tq4      TQ4 V cache tensor (POSITION_MAJOR layout)
+         * @param output     Output tensor [n_heads × head_dim], FP32
+         * @param kv_len     Number of cached KV positions
+         * @param n_heads    Number of query heads
+         * @param n_kv_heads Number of KV heads (GQA: n_heads / n_kv_heads is group size)
+         * @param head_dim   Head dimension (64 or 128)
+         * @param causal     Whether to apply causal masking
+         * @param position_offset Offset for causal masking (typically kv_len - 1 for decode)
+         * @return true on success
+         */
+        static bool compute_decode_tqkv(
+            const float *Q,
+            const TQ8Tensor *K_tq8,
+            const TQ4Tensor *V_tq4,
+            float *output,
+            int kv_len,
+            int n_heads, int n_kv_heads, int head_dim,
+            bool causal, int position_offset)
+        {
+            KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
+
+            if (!Q || !K_tq8 || !V_tq4 || !output)
+                return false;
+            if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
+                return false;
+            if (n_heads % n_kv_heads != 0)
+                return false;
+
+            // Get TQ context (per-layer, set by the stage).
+            // Each KV head uses a DIFFERENT derived rotation: ctx.for_layer(kv_h).
+            const TurboQuantContext *tq_ctx = K_tq8->turboquant_context();
+            if (!tq_ctx)
+                return false;
+
+            const int heads_per_kv = n_heads / n_kv_heads;
+            // Combined scale: (1/√D) from TQ dequant descale × (1/√D) from attention = 1/D
+            const float combined_scale = 1.0f / static_cast<float>(head_dim);
+
+            // Raw byte access for position-major TQ layout
+            const uint8_t *k_raw = K_tq8->typed_data();
+            const uint8_t *v_raw = V_tq4->typed_data();
+            if (!k_raw || !v_raw)
+                return false;
+
+            const size_t k_block_bytes = K_tq8->block_bytes();
+            const size_t v_block_bytes = V_tq4->block_bytes();
+            const size_t k_blocks_per_row = K_tq8->blocks_per_row();
+            const size_t v_blocks_per_row = V_tq4->blocks_per_row();
+            const size_t k_row_stride = k_blocks_per_row * k_block_bytes;
+            const size_t v_row_stride = v_blocks_per_row * v_block_bytes;
+
+            const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
+                head_dim, n_kv_heads, kv_len, /*is_decode=*/true);
+
+            const bool profiling_enabled = KernelProfiler::isEnabled();
+            uint64_t qk_duration_ns = 0;
+            uint64_t v_duration_ns = 0;
+
+            const int attn_threads = computeOptimalAttentionThreads(
+                n_heads, 1, kv_len, head_dim, causal);
+
+            // V accumulation in rotated space uses 1/√D scaling:
+            // rotated_accum accumulates weight × norm × centroids.
+            // The 1/√D from TQ descale is deferred to the final inverse rotation step.
+            const float inv_sqrt_d = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+            auto work = [&]()
+            {
+                // Per-thread scratch buffers (on-stack, L1-hot)
+                alignas(64) float q_rot[256];         // Pre-rotated Q: Π·Q
+                alignas(64) float rotated_accum[256]; // V accumulator in rotated space
+
+#pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    const int kv_h = h / heads_per_kv;
+                    float *out = output + static_cast<size_t>(h) * head_dim;
+
+                    const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;
+                    const int q_abs = position_offset;
+
+                    // Each KV head has its own derived rotation (same as dequant path):
+                    //   ctx.for_layer(kv_h) → per-head TurboQuantContext → rotation()
+                    const TurboQuantRotation &head_rotation =
+                        tq_ctx->for_layer(kv_h).rotation();
+
+                    // Pre-rotate Q: Q_rot = Π_kv_h · Q (once per head, O(D²))
+                    apply_rotation(head_rotation, q_ptr, q_rot);
+
+                    // Zero rotated V accumulator
+                    for (int d = 0; d < head_dim; d += 16)
+                        _mm512_storeu_ps(rotated_accum + d, _mm512_setzero_ps());
+
+                    float running_m = -std::numeric_limits<float>::infinity();
+                    float running_l = 0.0f;
+
+                    // Block offsets for this KV head in POSITION_MAJOR layout
+                    const size_t k_head_offset = static_cast<size_t>(kv_h) * k_block_bytes;
+                    const size_t v_head_offset = static_cast<size_t>(kv_h) * v_block_bytes;
+
+                    float block_scores[detail::kMaxKVTile];
+
+                    for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+                    {
+                        const int k1 = std::min(k0 + kv_tile, kv_len);
+                        float block_max = -std::numeric_limits<float>::infinity();
+
+                        // Valid window for causal masking
+                        int valid_end = causal ? std::min(k1, q_abs + 1) : k1;
+                        valid_end = std::max(k0, std::min(valid_end, k1));
+
+                        // Fill masked positions
+                        for (int k = valid_end; k < k1; ++k)
+                            block_scores[static_cast<size_t>(k - k0)] = -std::numeric_limits<float>::infinity();
+
+                        // --- QK Phase: TQ8 fused dot products ---
+                        const auto qk_start = profiling_enabled
+                                                  ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point();
+
+                        for (int k = k0; k < valid_end; ++k)
+                        {
+                            // Prefetch next K block (stride too large for HW prefetcher)
+                            if (k + 4 < valid_end)
+                            {
+                                _mm_prefetch(reinterpret_cast<const char *>(
+                                                 k_raw + static_cast<size_t>(k + 4) * k_row_stride + k_head_offset),
+                                             _MM_HINT_T0);
+                            }
+
+                            const uint8_t *k_blk = k_raw + static_cast<size_t>(k) * k_row_stride + k_head_offset;
+
+                            // tq8_dot_rotated_q returns dot(Q_rot, centroids) × norm
+                            // Multiply by combined_scale = 1/D to get attention score:
+                            //   score = (norm/√D) · dot(Q_rot, c) · (1/√D) = norm·dot(Q_rot,c)/D
+                            float s = tq8_dot_rotated_q(q_rot, k_blk, head_dim) * combined_scale;
+                            block_scores[static_cast<size_t>(k - k0)] = s;
+                            block_max = std::max(block_max, s);
+                        }
+
+                        if (profiling_enabled)
+                            qk_duration_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - qk_start)
+                                    .count());
+
+                        // --- Online softmax correction ---
+                        const float new_m = std::max(running_m, block_max);
+                        const float alpha = std::isfinite(running_m)
+                                                ? std::exp(running_m - new_m)
+                                                : 0.0f;
+
+                        // Scale rotated V accumulator by alpha (same as Q16 path scales output)
+                        {
+                            const __m512 va = _mm512_set1_ps(alpha);
+                            for (int d = 0; d < head_dim; d += 16)
+                            {
+                                __m512 v = _mm512_loadu_ps(rotated_accum + d);
+                                _mm512_storeu_ps(rotated_accum + d, _mm512_mul_ps(va, v));
+                            }
+                        }
+                        float new_l = running_l * alpha;
+
+                        // --- V Phase: TQ4 fused accumulation in rotated space ---
+                        const auto v_start = profiling_enabled
+                                                 ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point();
+
+                        for (int k = k0; k < valid_end; ++k)
+                        {
+                            // Prefetch next V block
+                            if (k + 4 < valid_end)
+                            {
+                                _mm_prefetch(reinterpret_cast<const char *>(
+                                                 v_raw + static_cast<size_t>(k + 4) * v_row_stride + v_head_offset),
+                                             _MM_HINT_T0);
+                            }
+
+                            const float p = std::exp(block_scores[static_cast<size_t>(k - k0)] - new_m);
+                            new_l += p;
+
+                            const uint8_t *v_blk = v_raw + static_cast<size_t>(k) * v_row_stride + v_head_offset;
+
+                            // Accumulate: rotated_accum += p × norm × centroids(V_block)
+                            tq4_accum_weighted(rotated_accum, v_blk, p, head_dim);
+                        }
+
+                        if (profiling_enabled)
+                            v_duration_ns += static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - v_start)
+                                    .count());
+
+                        running_m = new_m;
+                        running_l = new_l;
+                    } // end KV tile loop
+
+                    // --- Final: Inverse-rotate + normalize ---
+                    // rotated_accum = Σ_k (weight_k × norm_k × centroid_vec_k)
+                    // output = (1/√D) × Πᵀ × rotated_accum / running_l
+                    //
+                    // Apply 1/√D (deferred TQ descale) before inverse rotation:
+                    if (running_l > 0.0f)
+                    {
+                        const float final_scale = inv_sqrt_d / running_l;
+                        const __m512 vs = _mm512_set1_ps(final_scale);
+                        for (int d = 0; d < head_dim; d += 16)
+                        {
+                            __m512 v = _mm512_loadu_ps(rotated_accum + d);
+                            _mm512_storeu_ps(rotated_accum + d, _mm512_mul_ps(v, vs));
+                        }
+                    }
+                    else
+                    {
+                        for (int d = 0; d < head_dim; d += 16)
+                            _mm512_storeu_ps(rotated_accum + d, _mm512_setzero_ps());
+                    }
+
+                    // Inverse rotation: output = Πᵀ_kv_h × rotated_accum (O(D²), once per head)
+                    apply_rotation_transpose(head_rotation, rotated_accum, out);
+
+                } // end head loop
+            };
+
+            // Threading strategy: use full thread pool for long contexts
+            const bool force_full_pool_tq = kv_len > 100;
+
+            int actual_threads_tq;
+            if (force_full_pool_tq)
+            {
+                OMP_WORKSHARE_REGION(work);
+                actual_threads_tq = omp_get_max_threads();
+            }
+            else
+            {
+#pragma omp parallel num_threads(attn_threads)
+                {
+                    work();
+                }
+                actual_threads_tq = attn_threads;
+            }
+
+            if (profiling_enabled)
+            {
+                KernelProfiler::recordParallel(KernelType::ATTENTION_QK, qk_duration_ns, actual_threads_tq);
+                KernelProfiler::recordParallel(KernelType::ATTENTION_V, v_duration_ns, actual_threads_tq);
+            }
+            return true;
+        }
+#endif // __AVX512F__ (TQ fused)
     };
 
     extern template class CPUFlashAttentionKernelT<ActivationPrecision::FP32>;
