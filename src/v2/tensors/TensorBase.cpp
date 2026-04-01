@@ -1305,8 +1305,11 @@ namespace llaminar2
         // Check if already allocated on target device - reuse existing allocation
         if (gpu_data_ptr_ && gpu_device_.has_value() && *gpu_device_ == target_device)
         {
-            // Already allocated on correct device - mark as invalid (kernel will overwrite)
-            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
+            // Buffer already exists on target device — preserve current coherence state.
+            // The caller (prepareForWrite) just needs the buffer allocated; the actual
+            // state transition happens later via markWritten() after the kernel runs.
+            // Resetting to HOST_AUTHORITATIVE here would cause stale H2D uploads if
+            // a subsequent prepareForRead sees the reset state before markWritten runs.
             if (trace)
             {
                 LOG_INFO("[TensorBase::allocateOnDevice] Reusing existing allocation on " << target_device.toString());

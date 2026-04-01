@@ -462,6 +462,17 @@ namespace llaminar2
             if (segment_cache.ensureCaptureStream(gpu_ctx))
             {
                 void *warmup_stream = segment_cache.capture_stream;
+
+                // Synchronize prior work on the old stream before switching.
+                // Previous decode steps (e.g., KV cache writes) may still be
+                // in-flight on gpu_stream. Without this dependency, the warmup
+                // on capture_stream could read stale KV data, causing the model
+                // to repeat the previous token (token duplication bug).
+                if (gpu_stream && gpu_stream != warmup_stream)
+                {
+                    gpu_ctx->synchronize();
+                }
+
                 // Point all stages at the capture stream for warmup execution.
                 for (const auto &name : graph.getExecutionOrder())
                 {

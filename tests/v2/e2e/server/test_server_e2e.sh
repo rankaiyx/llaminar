@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
 BINARY="${LLAMINAR_BINARY:-${REPO_ROOT}/build_v2_integration/llaminar2}"
-MODEL="${LLAMINAR_MODEL:-${REPO_ROOT}/models/qwen2.5-0.5b-instruct-q4_0.gguf}"
+MODEL="${LLAMINAR_MODEL:-${REPO_ROOT}/models/qwen2.5-1.5b-instruct-q8_0.gguf}"
 BACKENDS="${LLAMINAR_BACKENDS:-cpu,cuda:0,rocm:0}"
 LOG_LEVEL="${LLAMINAR_LOG_LEVEL:-ERROR}"
 BASE_PORT=19080
@@ -138,11 +138,8 @@ for BACKEND in "${BACKEND_LIST[@]}"; do
 
     echo -e "${YELLOW}─── Backend: ${BACKEND} (port ${PORT}) ───${NC}"
 
-    # Build device flag
-    DEVICE_FLAG=""
-    if [ "$BACKEND" != "cpu" ]; then
-        DEVICE_FLAG="-d ${BACKEND}"
-    fi
+    # Build device flag — always explicit to prevent auto-detection
+    DEVICE_FLAG="-d ${BACKEND}"
 
     # Start server
     LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" --no-mpi-bootstrap --serve --port "$PORT" \
@@ -166,12 +163,11 @@ for BACKEND in "${BACKEND_LIST[@]}"; do
     fi
 
     # ─── Test 2: Single-turn greedy inference ─────────────────────────
-    # Use an echo-style instruction instead of arithmetic so backend-specific
-    # decode tie-breaking does not create false negatives in this server smoke test.
+    # Simple arithmetic that works reliably across model sizes and backends.
     RESPONSE=$(curl -s --max-time "$REQUEST_TIMEOUT" \
         -H "Content-Type: application/json" \
         -d '{
-            "messages": [{"role": "user", "content": "Reply with exactly the single character 4 and nothing else."}],
+            "messages": [{"role": "user", "content": "What is 2+2? Reply with just the number."}],
             "max_tokens": 10,
             "temperature": 0.0
         }' \
@@ -186,13 +182,15 @@ for BACKEND in "${BACKEND_LIST[@]}"; do
     fi
 
     # ─── Test 3: Multi-turn conversation ──────────────────────────────
+    # Tests multi-turn context with simple recall: model must remember
+    # the number from the previous turn and repeat it.
     RESPONSE=$(curl -s --max-time "$REQUEST_TIMEOUT" \
         -H "Content-Type: application/json" \
         -d '{
             "messages": [
-                {"role": "user", "content": "What is 2+2?"},
-                {"role": "assistant", "content": "4"},
-                {"role": "user", "content": "What is 5+5? Reply with just the number."}
+                {"role": "user", "content": "Remember this number: 42"},
+                {"role": "assistant", "content": "Got it, the number is 42."},
+                {"role": "user", "content": "What number did I tell you to remember? Reply with just the number."}
             ],
             "max_tokens": 10,
             "temperature": 0.0
@@ -201,10 +199,10 @@ for BACKEND in "${BACKEND_LIST[@]}"; do
 
     CONTENT=$(echo "$RESPONSE" | extract_content 2>/dev/null || echo "PARSE_ERROR")
 
-    if echo "$CONTENT" | grep -q "10"; then
-        pass "[${BACKEND}] Multi-turn: got '${CONTENT}' (contains 10)"
+    if echo "$CONTENT" | grep -q "42"; then
+        pass "[${BACKEND}] Multi-turn: got '${CONTENT}' (contains 42)"
     else
-        fail "[${BACKEND}] Multi-turn: expected 10, got '${CONTENT}'"
+        fail "[${BACKEND}] Multi-turn: expected 42, got '${CONTENT}'"
     fi
 
     # ─── Test 4: Second independent request (tests cache clear) ──────

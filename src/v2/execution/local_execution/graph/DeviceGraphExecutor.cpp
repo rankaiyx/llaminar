@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iomanip>
+#include <optional>
 #include <print>
 #include "fort.hpp"
 #include <sstream>
@@ -139,6 +140,13 @@ namespace llaminar2
     // GraphSegmentCache & GPU graph capture implementations moved to
     // DeviceGraphExecutor_GraphCapture.cpp
     // =========================================================================
+
+    // Forward declarations for static helpers used by runStage()
+    static void printStageOutputs(const std::string &stage_name, const StageDumpInfo &dump_info);
+    static void logWatchedPointerProducer(
+        const std::string &stage_name,
+        const StageDumpInfo &dump_info,
+        const IWorkerGPUContext *gpu_ctx);
 
     // =============================================================================
     // ExecutionMode Helpers
@@ -412,48 +420,57 @@ namespace llaminar2
 
     bool DeviceGraphExecutor::executeSequential(ComputeGraph &graph, IDeviceContext *ctx)
     {
-        // Set HIP device for this thread (critical for multi-GPU LocalTP prefill)
-        // Without this, std::async threads may not have the correct HIP device context,
-        // causing cross-device memory access faults when coherence or kernels allocate memory.
+        return runStages(graph, ctx, StageRunPolicy::full());
+    }
+
+    bool DeviceGraphExecutor::executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx,
+                                                const std::unordered_set<std::string> *collective_nodes)
+    {
+        return runStages(graph, ctx, StageRunPolicy::fastDecode(), collective_nodes);
+    }
+
+    // executeWithGraphCapture, executeDecodeWithCapturePolicy,
+    // executeWithSegmentedGraphCapture → DeviceGraphExecutor_GraphCapture.cpp
+
+    // =========================================================================
+    // Unified Stage Runner: runStages() + runStage()
+    //
+    // ALL execution paths (sequential, fast-decode, graph-capture manual segments)
+    // funnel through these two methods. The StageRunPolicy controls which
+    // phases are active, eliminating the class of bugs caused by divergent
+    // code paths where one path does coherence/validation and another skips it.
+    // =========================================================================
+
+    bool DeviceGraphExecutor::runStages(
+        ComputeGraph &graph,
+        IDeviceContext *ctx,
+        const StageRunPolicy &policy,
+        const std::unordered_set<std::string> *collective_nodes)
+    {
+        // Set GPU device once for the entire pass
         DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
 
-        const auto &order = graph.getExecutionOrder();
-
         // =====================================================================
-        // Mark the last stage as needing event-based dirty marking.
-        // Its outputs will be read back to CPU (for sampling, verification,
-        // or snapshot capture). Without an event recorded on the compute stream,
-        // ensureOnHost() cannot synchronize properly when the compute stream
-        // uses cudaStreamNonBlocking / hipStreamNonBlocking — cudaMemcpy on
-        // the NULL stream does NOT implicitly synchronize with non-blocking
-        // streams, so D2H would race with the final kernel and copy stale data.
+        // Build fast schedule (pre-computed flat array of {node*, is_collective})
+        // Built once, reused across decode iterations. Eliminates string hash
+        // lookups + markCompleted calls from the hot path.
         // =====================================================================
-        if (!order.empty())
+        if (!graph.hasFastSchedule())
         {
-            auto *last_node = graph.getNode(order.back());
-            if (last_node)
-                last_node->is_final_output = true;
+            graph.buildFastSchedule(collective_nodes);
         }
+        const auto &schedule = graph.fastSchedule();
+        if (schedule.empty())
+            return true;
+
+        // Ensure last stage is marked for event-based dirty marking
+        schedule.back().node->is_final_output = true;
 
         // =====================================================================
-        // Multi-GPU Stage Sync
-        //
-        // In LocalTP (multi-device) execution, each device runs its own graph
-        // on a separate std::async thread. Without explicit device-wide
-        // synchronization between stages, HIP/ROCm issues memory access faults
-        // because host-to-device coherence transfers (hipMemcpy on NULL stream)
-        // and compute kernels (on AMDDeviceContext::default_stream_) can race.
-        //
-        // The pre-stage sync ensures all prior GPU work (including RCCL
-        // collectives) has completed before the next stage's coherence
-        // operations begin. The post-stage sync ensures kernel output is
-        // available for subsequent stages or collective reads.
+        // GPU Stage Timing: event-based per-stage profiling
+        // Gated by policy AND env var. ~1μs CPU overhead per event record.
         // =====================================================================
-        const bool multi_gpu_sync = collective_ctx_ && ctx->isGPU();
-        [[maybe_unused]] const int device_ordinal = ctx->isGPU() ? ctx->deviceId().toKernelDeviceIndex() : -1;
-
-        // GPU stage timing instrumentation for cache-miss path
-        const bool timeline_active = debugEnv().gpu_stage_timing && ctx->isGPU();
+        const bool timeline_active = policy.timeline && debugEnv().gpu_stage_timing && ctx->isGPU();
         IWorkerGPUContext *timeline_gpu_ctx = nullptr;
         void *timeline_stream = nullptr;
         if (timeline_active)
@@ -462,90 +479,60 @@ namespace llaminar2
             if (timeline_gpu_ctx)
             {
                 timeline_stream = timeline_gpu_ctx->defaultStream();
-                stage_timeline_.ensureCapacity(timeline_gpu_ctx, order.size());
-                for (size_t i = 0; i < order.size(); ++i)
+                stage_timeline_.ensureCapacity(timeline_gpu_ctx, schedule.size());
+
+                // Pre-populate stage metadata once — names/types never change
+                if (!stage_timeline_info_populated_)
                 {
-                    auto *nd = graph.getNode(order[i]);
-                    if (nd && nd->stage)
-                        stage_timeline_.setStageInfo(i, order[i].c_str(), nd->stage->type());
+                    for (size_t i = 0; i < schedule.size(); ++i)
+                    {
+                        auto *node = schedule[i].node;
+                        if (node && node->stage)
+                            stage_timeline_.setStageInfo(i, node->name, node->stage->type());
+                    }
+                    stage_timeline_info_populated_ = true;
                 }
             }
         }
 
         auto total_start = std::chrono::high_resolution_clock::now();
 
-        int stage_idx = 0;
-        auto prev_time = total_start;
-
-        for (const auto &name : order)
+        // =====================================================================
+        // Main execution loop — every path goes through here
+        // =====================================================================
+        for (size_t i = 0; i < schedule.size(); ++i)
         {
-            auto *node = graph.getNode(name);
+            auto *node = schedule[i].node;
+            const bool is_coll = schedule[i].is_collective;
+
             if (!node || !node->stage)
             {
-                LOG_ERROR("[DeviceGraphExecutor] Invalid node: " << name);
+                LOG_ERROR("[DeviceGraphExecutor] Invalid node at schedule index " << i);
                 return false;
             }
 
             ensureStageGPUStreamBound(*node, ctx);
 
-            auto stage_start = std::chrono::high_resolution_clock::now();
-
-            // GPU pointer diagnostics for multi-GPU (no sync needed - just query attributes)
-            if (multi_gpu_sync && ctx->deviceId().is_gpu() && debugEnv().validation.validate_gpu_ptrs)
-            {
-                auto *gpu_ctx = tryGetWorkerContext(ctx->deviceId());
-                const StageDumpInfo &dump_info = node->stage->getDumpInfo();
-                auto check_ptr = [&](const char *category, const char *tname, ITensor *tensor)
-                {
-                    if (!validateStagePointerSet(
-                            gpu_ctx,
-                            name,
-                            category,
-                            device_ordinal,
-                            tensor,
-                            tname,
-                            /*dump_pointer_events=*/false))
-                    {
-                        LOG_ERROR("[GPU_PTR_CHECK] WRONG DEVICE! stage='" << name
-                                                                          << "' " << category << " tensor='" << (tname ? tname : "?")
-                                                                          << "' expected device " << device_ordinal);
-                    }
-                };
-                for (const auto &inp : dump_info.inputs)
-                    check_ptr("input", inp.name, inp.tensor);
-                for (const auto &out : dump_info.outputs)
-                    check_ptr("output", out.name, out.tensor);
-                for (const auto &w : dump_info.weights)
-                    check_ptr("weight", w.name, const_cast<ITensor *>(w.tensor));
-            }
-
             if (timeline_active && timeline_gpu_ctx)
-                stage_timeline_.recordStart(stage_idx, timeline_gpu_ctx, timeline_stream);
+                stage_timeline_.recordStart(i, timeline_gpu_ctx, timeline_stream);
 
-            if (!executeNode(*node, ctx))
+            if (!runStage(*node, ctx, policy, is_coll))
             {
-                LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << name);
+                LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << node->name);
                 return false;
             }
 
+            // Mark stage completed for graph dependency tracking
+            graph.markCompleted(node->name);
+
             if (timeline_active && timeline_gpu_ctx)
-                stage_timeline_.recordStop(stage_idx, timeline_gpu_ctx, timeline_stream);
-
-            auto stage_end = std::chrono::high_resolution_clock::now();
-            double stage_ms = std::chrono::duration<double, std::milli>(stage_end - stage_start).count();
-
-            // Per-stage timing - TRACE level (use LLAMINAR_EXECUTOR_PROFILING=1 for detailed stats)
-            LOG_TRACE("[DeviceGraphExecutor] Stage " << stage_idx << "/" << order.size() << ": " << name << " took " << stage_ms << "ms");
-            stage_idx++;
-
-            graph.markCompleted(name);
+                stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
         }
 
-        auto total_end = std::chrono::high_resolution_clock::now();
-        double total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
-
-        // Wait for any pending async dumps to complete
-        if (AsyncStageDumper::isInitialized())
+        // =====================================================================
+        // Post-loop: async dump wait + total stats
+        // =====================================================================
+        if (policy.stage_dump && AsyncStageDumper::isInitialized())
         {
             size_t pending = AsyncStageDumper::pendingTasks();
             if (pending > 0)
@@ -555,173 +542,522 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("[DeviceGraphExecutor] Total execution: " << total_ms << "ms for " << order.size() << " stages (" << (total_ms / order.size()) << "ms/stage avg)");
+        auto total_end = std::chrono::high_resolution_clock::now();
+        double total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
 
-        stats_.total_time_ms += total_ms;
-        // Only increment here if profiling is disabled - executeNode already increments when profiling is enabled
-        if (!config_.enable_profiling)
+        if (policy.profiling)
         {
-            stats_.total_stages_executed += order.size();
+            LOG_DEBUG("[DeviceGraphExecutor] Total execution: " << total_ms << "ms for "
+                                                                << schedule.size() << " stages ("
+                                                                << (total_ms / schedule.size()) << "ms/stage avg)");
+
+            stats_.total_time_ms += total_ms;
+            if (!config_.enable_profiling)
+                stats_.total_stages_executed += schedule.size();
+            stats_.total_flops += graph.totalEstimatedFlops();
         }
-        stats_.total_flops += graph.totalEstimatedFlops();
 
         return true;
     }
 
-    bool DeviceGraphExecutor::executeFastDecode(ComputeGraph &graph, IDeviceContext *ctx,
-                                                const std::unordered_set<std::string> *collective_nodes)
+    bool DeviceGraphExecutor::runStage(
+        ComputeNode &node,
+        IDeviceContext *ctx,
+        const StageRunPolicy &policy,
+        bool is_collective)
     {
-        // Set HIP device once for the entire decode pass — eliminates 339+ redundant hipSetDevice calls
-        DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
-
-        // =====================================================================
-        // Fast Schedule: pre-computed flat array of {node*, is_collective}
-        // Built once on first call, reused across decode iterations.
-        // Eliminates ~1590 string hash map lookups per token (3 per stage:
-        // getNode, collective_nodes->count, markCompleted).
-        // =====================================================================
-        if (!graph.hasFastSchedule())
+        if (!node.stage)
         {
-            graph.buildFastSchedule(collective_nodes);
+            LOG_ERROR("[DeviceGraphExecutor] Node '" << node.name << "' has no stage");
+            return false;
         }
-        const auto &schedule = graph.fastSchedule();
 
         // =====================================================================
-        // GPU Stage Timing: event-based per-stage profiling on the fast path.
-        // Gated by LLAMINAR_GPU_STAGE_TIMING=1. ~1μs CPU overhead per event record.
+        // Transfer Profiling: per-stage H2D/D2H transfer tracking
         // =====================================================================
-        const bool timeline_enabled = debugEnv().gpu_stage_timing && ctx->isGPU();
-        IWorkerGPUContext *timeline_gpu_ctx = nullptr;
-        void *timeline_stream = nullptr;
-        if (timeline_enabled)
+        std::optional<TransferProfiler::StageScope> transfer_scope;
+        if (policy.profiling)
+            transfer_scope.emplace(node.name);
+
+        // =====================================================================
+        // Collective Stage Intercept
+        // =====================================================================
+        if (policy.collective_intercept && is_collective)
         {
-            timeline_gpu_ctx = tryGetWorkerContext(ctx->deviceId());
-            if (timeline_gpu_ctx)
+            if (collective_ctx_)
             {
-                timeline_stream = timeline_gpu_ctx->defaultStream();
-                stage_timeline_.ensureCapacity(timeline_gpu_ctx, schedule.size());
-
-                // Pre-populate stage metadata once — stage names/types never change
-                // between decode iterations. Skipping after first pass eliminates
-                // ~312 std::string copies per token on the hot path.
-                if (!stage_timeline_info_populated_)
+                auto stage_type = node.stage->type();
+                if (stage_type == ComputeStageType::ALLREDUCE)
                 {
-                    for (size_t i = 0; i < schedule.size(); ++i)
+                    LOG_DEBUG("[DeviceGraphExecutor] Intercepting ALLREDUCE stage '" << node.name << "' via CollectiveContext");
+                    return executeCollectiveAllreduce(node, ctx);
+                }
+                else if (stage_type == ComputeStageType::ALLGATHER)
+                {
+                    if (debugEnv().execution.gpu_graph_collective_segmented)
                     {
-                        auto *node = schedule[i].node;
-                        if (node && node->stage)
-                        {
-                            stage_timeline_.setStageInfo(i, node->name, node->stage->type());
-                        }
+                        LOG_DEBUG("[DeviceGraphExecutor] Skipping strided ALLGATHER intercept in segmented collective mode for '" << node.name << "'");
                     }
-                    stage_timeline_info_populated_ = true;
+                    else
+                    {
+                        LOG_DEBUG("[DeviceGraphExecutor] Attempting strided ALLGATHER intercept for '" << node.name << "'");
+                        if (executeCollectiveStridedAllgather(node, ctx))
+                            return true;
+                        LOG_DEBUG("[DeviceGraphExecutor] Strided ALLGATHER not available, using stage execution");
+                    }
                 }
             }
+
+            // LOCAL TP: collective_ctx_ is nullptr, stage handles collective internally
+            // In fast decode mode (no coherence), just execute and return
+            if (!policy.coherence)
+            {
+                ensureStageGPUStreamBound(node, ctx);
+                return node.stage->execute(ctx);
+            }
         }
 
-        // Multi-GPU stage sync (same rationale as executeSequential)
-        [[maybe_unused]] const int device_ordinal = ctx->isGPU() ? ctx->deviceId().toKernelDeviceIndex() : -1;
-        [[maybe_unused]] const bool is_rocm = ctx->deviceId().is_rocm();
+        // =====================================================================
+        // Profiling phase breakdown setup
+        // =====================================================================
+        const bool profiling = policy.profiling && config_.enable_profiling;
+        const int layer_idx = config_.current_layer_idx;
 
-        // Helper lambdas for pre/post stage sync
-        // With stream-level sync in the RCCL/NCCL coordinators (event-based pre-sync
-        // + stream sync post-sync), per-stage device sync is no longer needed.
-        // Compute stages run on the same stream (implicit ordering), and the
-        // coordinator handles cross-stream sync for collectives.
-        auto pre_stage_sync = [&]()
-        {
-            // No-op: coordinator handles compute→collective sync via stream-wait-event
-        };
-        auto post_stage_sync = [&]()
-        {
-            // No-op: coordinator handles collective→compute sync via host-side stream sync
-        };
+        std::chrono::high_resolution_clock::time_point phase_start{}, phase_end{};
+        double input_cohere_ms = 0.0, weight_cohere_ms = 0.0, output_alloc_ms = 0.0;
+        double dump_input_ms = 0.0, execute_ms = 0.0, mark_dirty_ms = 0.0;
+        double get_dump_info_ms = 0.0, dump_output_ms = 0.0, verify_ms = 0.0, callback_ms = 0.0;
 
-        for (size_t i = 0; i < schedule.size(); ++i)
+        // =====================================================================
+        // getDumpInfo caching (needed by coherence, dumps, validation, callback)
+        // Skipped entirely in fast decode — zero overhead.
+        // =====================================================================
+        const bool need_dump_info = policy.coherence || policy.stage_dump ||
+                                    policy.pointer_validation || policy.snapshot_callback ||
+                                    (policy.mark_dirty && arena_);
+        StageDumpInfo empty_dump_info{};
+        const StageDumpInfo *dump_info_ptr = &empty_dump_info;
+        if (need_dump_info)
         {
-            auto *node = schedule[i].node;
-            const bool is_collective_node = schedule[i].is_collective;
-
-            // Timeline: record start event before any execution path
-            if (timeline_enabled && timeline_gpu_ctx)
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
+            dump_info_ptr = &node.stage->getDumpInfo();
+            if (profiling)
             {
-                stage_timeline_.recordStart(i, timeline_gpu_ctx, timeline_stream);
+                phase_end = std::chrono::high_resolution_clock::now();
+                get_dump_info_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
             }
+        }
+        const StageDumpInfo &cached_dump_info = *dump_info_ptr;
 
-            // Collective-aware handling for TP collectives
-            if (is_collective_node)
+        // =====================================================================
+        // Stage Coherence: arena contract input/output + weight uploads
+        // =====================================================================
+        const StageBufferContract contract = ((policy.coherence || policy.mark_dirty) && arena_) ? node.stage->bufferContract() : StageBufferContract{};
+        const bool use_contract = !contract.empty() && arena_ != nullptr;
+
+        if (policy.coherence)
+        {
+            auto coh_policy = node.stage->coherencePolicy();
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+
+            LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' coherencePolicy=" << toString(coh_policy)
+                                                      << " target_device=" << target_device.to_string()
+                                                      << " use_contract=" << use_contract);
+
+            if (use_contract)
             {
-                const auto stage_type = node->stage->type();
+                // Contract-based input coherence
+                if (profiling)
+                    phase_start = std::chrono::high_resolution_clock::now();
 
-                if (collective_ctx_ && stage_type == ComputeStageType::ALLREDUCE)
+                for (const auto &binding : contract.allArenaReads())
                 {
-                    pre_stage_sync();
-                    if (!executeCollectiveAllreduce(*node, ctx))
+                    if (!arena_->prepareForRead(binding.id, target_device))
                     {
-                        LOG_ERROR("[DeviceGraphExecutor] Fast decode collective ALLREDUCE failed: " << node->name);
+                        LOG_ERROR("[DeviceGraphExecutor] Arena prepareForRead failed for "
+                                  << bufferIdName(binding.id) << " in stage '" << node.name << "'");
                         return false;
                     }
-                    post_stage_sync();
-                    if (timeline_enabled && timeline_gpu_ctx)
-                        stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
-                    continue;
                 }
 
-                if (collective_ctx_ && stage_type == ComputeStageType::ALLGATHER)
+                if (profiling)
                 {
-                    pre_stage_sync();
-                    if (executeCollectiveStridedAllgather(*node, ctx))
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    input_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                }
+
+                // Weight coherence (not arena-managed, use direct ensureOnDevice)
+                if (policy.weight_coherence && !node.weights_cohered)
+                {
+                    if (profiling)
+                        phase_start = std::chrono::high_resolution_clock::now();
+
+                    if (!contract.weight_tensors.empty())
                     {
-                        post_stage_sync();
-                        if (timeline_enabled && timeline_gpu_ctx)
-                            stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
-                        continue;
+                        for (auto *weight : contract.weight_tensors)
+                        {
+                            if (auto *tb = dynamic_cast<TensorBase *>(weight))
+                                tb->ensureOnDevice(target_device);
+                        }
                     }
-                    post_stage_sync();
+
+                    for (const auto &wi : cached_dump_info.weights)
+                    {
+                        if (wi.tensor)
+                            const_cast<ITensor *>(wi.tensor)->ensureOnDevice(target_device);
+                    }
+
+                    for (const auto &ii : cached_dump_info.inputs)
+                    {
+                        if (ii.tensor)
+                            ii.tensor->ensureOnDevice(target_device);
+                    }
+
+                    if (profiling)
+                    {
+                        phase_end = std::chrono::high_resolution_clock::now();
+                        weight_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                    }
+                    node.weights_cohered = true;
                 }
 
-                // LOCAL TP fast path: When collective_ctx_ is nullptr (LOCAL TP),
-                // the stage itself handles the collective via its ITPContext
-                // (e.g., TPAllreduceStage → LocalTPContext → RCCL on-stream).
-                // Bypass executeNode() to eliminate the CPU-side overhead of
-                // contract construction, arena coherence, getDumpInfo() etc.
-                // that creates a GPU pipeline bubble between compute and collective.
-                // This matches the non-collective fast path below.
-                pre_stage_sync();
-                ensureStageGPUStreamBound(*node, ctx);
-                if (!node->stage->execute(ctx))
+                // Output coherence (arena writes)
+                if (profiling)
+                    phase_start = std::chrono::high_resolution_clock::now();
+
+                for (const auto &binding : contract.allWrites())
                 {
-                    LOG_ERROR("[DeviceGraphExecutor] Fast decode collective stage failed: " << node->name);
+                    if (!arena_->prepareForWrite(binding.id, target_device))
+                    {
+                        LOG_ERROR("[DeviceGraphExecutor] Arena prepareForWrite failed for "
+                                  << bufferIdName(binding.id) << " in stage '" << node.name << "'");
+                        return false;
+                    }
+                }
+
+                if (profiling)
+                {
+                    phase_end = std::chrono::high_resolution_clock::now();
+                    output_alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+                }
+            }
+            else if (coh_policy != CoherencePolicy::NONE)
+            {
+                if (!target_device.is_cpu())
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
+                                                              << "' has coherencePolicy=" << toString(coh_policy)
+                                                              << " but no BufferArena + contract. All GPU stages must implement bufferContract().");
                     return false;
                 }
-                post_stage_sync();
-                if (timeline_enabled && timeline_gpu_ctx)
-                    stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
-                continue;
             }
-
-            // Maximal fast path for non-collective stages (both single-GPU and TP graphs).
-            // All collective stages are already handled above by the is_collective_node checks.
-            // In steady-state decode, arena buffers are already on-device and weights are
-            // cohered, so the full executeNode() path (contract building, arena coherence
-            // checks, vector allocations) is unnecessary overhead. In TP=2 this overhead
-            // is amplified by thread contention on the heap allocator.
-            pre_stage_sync();
-            if (!node->stage->execute(ctx))
-            {
-                LOG_ERROR("[DeviceGraphExecutor] Fast decode stage failed: " << node->name);
-                return false;
-            }
-            post_stage_sync();
-            if (timeline_enabled && timeline_gpu_ctx)
-                stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
         }
 
-        return true;
-    }
+        // =====================================================================
+        // ENTRY Verification (Debug/Integration only)
+        // =====================================================================
+#if LLAMINAR_ASSERTIONS_ACTIVE
+        if (policy.validation && debugEnv().validation.validate_inputs)
+        {
+            verifyStageEntry(node, layer_idx);
+        }
+#endif
 
-    // executeWithGraphCapture, executeDecodeWithCapturePolicy,
-    // executeWithSegmentedGraphCapture → DeviceGraphExecutor_GraphCapture.cpp
+        // =====================================================================
+        // Stage Dump: input snapshots
+        // =====================================================================
+        StageDumpContext dump_ctx;
+        const bool should_dump = policy.stage_dump && StageDumper::shouldDump(
+                                                          node.stage.get(),
+                                                          node.name,
+                                                          config_.current_layer_idx,
+                                                          config_.current_iteration,
+                                                          config_.mpi_rank);
+
+        if (should_dump)
+        {
+            const auto &dump_cfg = debugEnv().stage_dump;
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
+            dump_ctx = StageDumper::beginDump(
+                node.stage.get(),
+                node.name,
+                config_.current_layer_idx,
+                config_.current_iteration,
+                config_.mpi_rank);
+
+            if (dump_cfg.async_dump)
+            {
+                if (!AsyncStageDumper::isInitialized())
+                    AsyncStageDumper::initialize(dump_cfg.async_threads);
+                AsyncStageDumper::enqueueInputs(dump_ctx, cached_dump_info);
+            }
+            else
+            {
+                StageDumper::dumpInputs(dump_ctx, node.stage.get());
+            }
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                dump_input_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
+        }
+
+        // =====================================================================
+        // GPU Pointer Validation
+        // =====================================================================
+        if (policy.pointer_validation && debugEnv().validation.validate_gpu_ptrs)
+        {
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+            if (target_device.is_gpu())
+            {
+                const int expected_ordinal = target_device.toKernelDeviceIndex();
+                auto *gpu_ctx = tryGetWorkerContext(target_device);
+                bool ptr_validation_failed = false;
+                auto validatePtr = [&](const char *label, const char *tensor_name, ITensor *tensor)
+                {
+                    if (!validateStagePointerSet(
+                            gpu_ctx, node.name, label, expected_ordinal,
+                            tensor, tensor_name, /*dump_pointer_events=*/true))
+                    {
+                        ptr_validation_failed = true;
+                    }
+                };
+                for (const auto &input : cached_dump_info.inputs)
+                    validatePtr("input", input.name ? input.name : "(unnamed)", const_cast<ITensor *>(input.tensor));
+                for (const auto &output : cached_dump_info.outputs)
+                    validatePtr("output", output.name ? output.name : "(unnamed)", output.tensor);
+                for (const auto &weight : cached_dump_info.weights)
+                    validatePtr("weight", weight.name ? weight.name : "(unnamed)", const_cast<ITensor *>(weight.tensor));
+
+                if (ptr_validation_failed)
+                {
+                    LOG_ERROR("[GPU_PTR_VIOLATION_ABORT] Aborting stage execute: stage='"
+                              << node.name << "' target=" << target_device.to_string()
+                              << " expected_ordinal=" << expected_ordinal);
+                    return false;
+                }
+            }
+        }
+
+        // =====================================================================
+        // EXECUTE
+        // =====================================================================
+        if (profiling)
+            phase_start = std::chrono::high_resolution_clock::now();
+
+        ensureStageGPUStreamBound(node, ctx);
+        bool success = node.stage->execute(ctx);
+
+        if (success && debugEnv().validation.sync_each_stage)
+        {
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+            if (target_device.is_gpu())
+            {
+                if (auto *gpu_ctx = tryGetWorkerContext(target_device); gpu_ctx && !gpu_ctx->debugSynchronize())
+                {
+                    LOG_ERROR("[SYNC_EACH_STAGE] stage='" << node.name
+                                                          << "' device=" << target_device.to_string()
+                                                          << " device debug synchronization failed");
+                    success = false;
+                }
+            }
+        }
+
+        if (profiling)
+        {
+            phase_end = std::chrono::high_resolution_clock::now();
+            execute_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+        }
+
+        // =====================================================================
+        // Mark Outputs Dirty (contract-based)
+        // =====================================================================
+        if (success && policy.mark_dirty && use_contract)
+        {
+            auto coh_policy = node.stage->coherencePolicy();
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
+
+            const bool need_event = node.is_final_output
+#if LLAMINAR_ASSERTIONS_ACTIVE
+                                    || debugEnv().validation.validate_buffers
+#endif
+                ;
+
+            for (const auto &binding : contract.allWrites())
+            {
+                if (need_event)
+                    arena_->markWritten(binding.id, target_device, node.stage->gpuStream());
+                else
+                    arena_->markWrittenFlagsOnly(binding.id, target_device);
+            }
+
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                mark_dirty_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
+
+            logWatchedPointerProducer(
+                node.name,
+                cached_dump_info,
+                tryGetWorkerContext(node.device.is_valid() ? node.device : node.stage->device()));
+            printStageOutputs(node.name, cached_dump_info);
+        }
+
+        // =====================================================================
+        // Stage Dump: output snapshots
+        // =====================================================================
+        if (should_dump && success)
+        {
+            const auto &dump_cfg = debugEnv().stage_dump;
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
+
+            if (dump_cfg.async_dump)
+            {
+                AsyncStageDumper::enqueueOutputs(dump_ctx, cached_dump_info);
+            }
+            else
+            {
+                StageDumper::dumpOutputs(dump_ctx, node.stage.get());
+                StageDumper::finalizeDump(dump_ctx, execute_ms);
+            }
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                dump_output_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
+        }
+
+        // =====================================================================
+        // EXIT Verification (Debug/Integration only)
+        // =====================================================================
+#if LLAMINAR_ASSERTIONS_ACTIVE
+        if (success && policy.validation && debugEnv().validation.validate_buffers)
+        {
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
+            verifyStageExit(node, layer_idx);
+            success = validateStageOutputs(node);
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                verify_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
+        }
+#endif
+
+        // =====================================================================
+        // Snapshot Callback
+        // =====================================================================
+        if (success && policy.snapshot_callback && config_.snapshot_callback)
+        {
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
+            cached_dump_info.ensureOutputsOnHost();
+            LOG_DEBUG("[DeviceGraphExecutor::runStage] Invoking callback for " << node.name);
+            config_.snapshot_callback(node.name, cached_dump_info);
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                callback_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
+        }
+
+        // =====================================================================
+        // Profiling Stats
+        // =====================================================================
+        if (profiling)
+        {
+            double total_overhead_ms = input_cohere_ms + weight_cohere_ms + output_alloc_ms +
+                                       dump_input_ms + mark_dirty_ms + dump_output_ms +
+                                       verify_ms + callback_ms + get_dump_info_ms;
+            double total_ms = total_overhead_ms + execute_ms;
+
+            if (total_ms > 1.0 || input_cohere_ms > 0.5 || weight_cohere_ms > 0.5 ||
+                output_alloc_ms > 0.5 || execute_ms > 0.5 || verify_ms > 0.5 || callback_ms > 0.5)
+            {
+                LOG_TRACE("[DeviceGraphExecutor::PHASES] " << node.name
+                                                           << " input_cohere=" << input_cohere_ms << "ms"
+                                                           << " weight_cohere=" << weight_cohere_ms << "ms"
+                                                           << " output_alloc=" << output_alloc_ms << "ms"
+                                                           << " dump_input=" << dump_input_ms << "ms"
+                                                           << " execute=" << execute_ms << "ms"
+                                                           << " mark_dirty=" << mark_dirty_ms << "ms"
+                                                           << " dump_out=" << dump_output_ms << "ms"
+                                                           << " verify=" << verify_ms << "ms"
+                                                           << " callback=" << callback_ms << "ms"
+                                                           << " get_dump_info=" << get_dump_info_ms << "ms"
+                                                           << " total=" << total_ms << "ms");
+            }
+
+            stats_.stage_times_ms[node.name] = total_ms;
+            stats_.total_execute_ms += execute_ms;
+            stats_.total_stages_executed++;
+            const std::string stage_type_name = computeStageTypeName(node.stage->type());
+            stats_.stage_type_execute_ms[stage_type_name] += execute_ms;
+            stats_.stage_type_counts[stage_type_name]++;
+
+            const auto stype = node.stage->type();
+            if (stype == ComputeStageType::ALLREDUCE ||
+                stype == ComputeStageType::ALLGATHER ||
+                stype == ComputeStageType::ALLGATHER_V)
+            {
+                stats_.total_collective_ms += execute_ms;
+                stats_.total_collective_calls++;
+            }
+
+            stats_.overhead.input_cohere_ms += input_cohere_ms;
+            stats_.overhead.weight_cohere_ms += weight_cohere_ms;
+            stats_.overhead.output_alloc_ms += output_alloc_ms;
+            stats_.overhead.mark_dirty_ms += mark_dirty_ms;
+            stats_.overhead.dump_input_ms += dump_input_ms;
+            stats_.overhead.dump_output_ms += dump_output_ms;
+            stats_.overhead.verify_ms += verify_ms;
+            stats_.overhead.callback_ms += callback_ms;
+            stats_.overhead.get_dump_info_ms += get_dump_info_ms;
+
+            const auto phase = GraphExecutorStats::currentPhase();
+            PhaseStats *phase_stats = nullptr;
+            if (phase == ExecutionPhase::PREFILL)
+                phase_stats = &stats_.prefill;
+            else if (phase == ExecutionPhase::DECODE)
+                phase_stats = &stats_.decode;
+
+            if (phase_stats)
+            {
+                phase_stats->total_execute_ms += execute_ms;
+                phase_stats->total_stages_executed++;
+                phase_stats->stage_type_execute_ms[stage_type_name] += execute_ms;
+                phase_stats->stage_type_counts[stage_type_name]++;
+                if (stype == ComputeStageType::ALLREDUCE ||
+                    stype == ComputeStageType::ALLGATHER ||
+                    stype == ComputeStageType::ALLGATHER_V)
+                {
+                    phase_stats->total_collective_ms += execute_ms;
+                    phase_stats->total_collective_calls++;
+                }
+                phase_stats->overhead.input_cohere_ms += input_cohere_ms;
+                phase_stats->overhead.weight_cohere_ms += weight_cohere_ms;
+                phase_stats->overhead.output_alloc_ms += output_alloc_ms;
+                phase_stats->overhead.mark_dirty_ms += mark_dirty_ms;
+                phase_stats->overhead.dump_input_ms += dump_input_ms;
+                phase_stats->overhead.dump_output_ms += dump_output_ms;
+                phase_stats->overhead.verify_ms += verify_ms;
+                phase_stats->overhead.callback_ms += callback_ms;
+                phase_stats->overhead.get_dump_info_ms += get_dump_info_ms;
+            }
+
+            LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' took " << total_ms << " ms (execute=" << execute_ms << "ms, overhead=" << total_overhead_ms << "ms)");
+        }
+
+        return success;
+    }
 
     bool DeviceGraphExecutor::executeMultiDevice(
         ComputeGraph &graph,
@@ -932,541 +1268,14 @@ namespace llaminar2
 
     bool DeviceGraphExecutor::executeNode(ComputeNode &node, IDeviceContext *ctx)
     {
-        if (!node.stage)
-        {
-            LOG_ERROR("[DeviceGraphExecutor] Node '" << node.name << "' has no stage");
-            return false;
-        }
-
-        // =========================================================================
-        // Transfer Profiling: Set stage context for per-stage transfer tracking
-        // Uses RAII to automatically clear context when function exits
-        // =========================================================================
-        TransferProfiler::StageScope transfer_scope(node.name);
-
-        // =========================================================================
-        // Collective Stage Intercept: Use CollectiveContext for GPU-native collectives
-        // This bypasses the stage's internal MPI fallback path when CollectiveContext
-        // is available, enabling RCCL/NCCL/PCIeBAR backends.
-        // =========================================================================
-        if (collective_ctx_)
-        {
-            auto stage_type = node.stage->type();
-            if (stage_type == ComputeStageType::ALLREDUCE)
-            {
-                LOG_DEBUG("[DeviceGraphExecutor] Intercepting ALLREDUCE stage '" << node.name << "' via CollectiveContext");
-                return executeCollectiveAllreduce(node, ctx);
-            }
-            else if (stage_type == ComputeStageType::ALLGATHER)
-            {
-                // Try GPU-native strided allgather (NCCL + CUDA deinterleave kernel)
-                // Falls back to stage's MPI path if not CUDA or NCCL unavailable
-                // In segmented-collective graph mode, prefer stage execution path
-                // to preserve the same coherence/intercept behavior as baseline.
-                if (debugEnv().execution.gpu_graph_collective_segmented)
-                {
-                    LOG_DEBUG("[DeviceGraphExecutor] Skipping strided ALLGATHER intercept in segmented collective mode for '" << node.name << "'");
-                }
-                else
-                {
-                    LOG_DEBUG("[DeviceGraphExecutor] Attempting strided ALLGATHER intercept for '" << node.name << "'");
-                    if (executeCollectiveStridedAllgather(node, ctx))
-                    {
-                        return true;
-                    }
-                    // Fall through to normal execution if strided path not available
-                    LOG_DEBUG("[DeviceGraphExecutor] Strided ALLGATHER not available, using stage execution");
-                }
-            }
-        }
-
-        // Extract layer index from config
-        const int layer_idx = config_.current_layer_idx;
-        const bool profiling = config_.enable_profiling;
-
-        // Timing variables for phase breakdown (only initialized if profiling enabled)
-        std::chrono::high_resolution_clock::time_point phase_start{}, phase_end{};
-        double input_cohere_ms = 0.0;
-        double weight_cohere_ms = 0.0;
-        double output_alloc_ms = 0.0;
-        double dump_input_ms = 0.0;
-        double execute_ms = 0.0;
-        double mark_dirty_ms = 0.0;
-        double get_dump_info_ms = 0.0;
-
-        // =========================================================================
-        // OPTIMIZATION: Cache getDumpInfo() once at start (avoid 3-4 calls per stage)
-        // getDumpInfo() now caches internally, so this is just a reference lookup after first call
-        // =========================================================================
-        if (profiling)
-            phase_start = std::chrono::high_resolution_clock::now();
-        const StageDumpInfo &cached_dump_info = node.stage->getDumpInfo();
-        if (profiling)
-        {
-            phase_end = std::chrono::high_resolution_clock::now();
-            get_dump_info_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-        }
-
-        // =========================================================================
-        // Stage Coherence: Ensure inputs are on target device BEFORE execution
-        // =========================================================================
-
-        // Phase 2: Check if this stage has a contract and arena is available
-        const StageBufferContract contract = (arena_) ? node.stage->bufferContract() : StageBufferContract{};
-        const bool use_contract = !contract.empty() && arena_ != nullptr;
-
-        {
-            auto policy = node.stage->coherencePolicy();
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
-
-            LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' coherencePolicy=" << toString(policy)
-                                                      << " target_device=" << target_device.to_string()
-                                                      << " use_contract=" << use_contract);
-
-            if (use_contract)
-            {
-                // ── Contract-based coherence (Phase 2) ──────────────────────
-                // The arena handles all H2D/D2H transfers based on the contract.
-                if (profiling)
-                    phase_start = std::chrono::high_resolution_clock::now();
-
-                // Cohere arena-managed reads (inputs + inouts)
-                for (const auto &binding : contract.allArenaReads())
-                {
-                    if (!arena_->prepareForRead(binding.id, target_device))
-                    {
-                        LOG_ERROR("[DeviceGraphExecutor] Arena prepareForRead failed for "
-                                  << bufferIdName(binding.id) << " in stage '" << node.name << "'");
-                        return false;
-                    }
-                }
-
-                if (profiling)
-                {
-                    phase_end = std::chrono::high_resolution_clock::now();
-                    input_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                }
-
-                // Cohere weights (not arena-managed, use direct ensureOnDevice)
-                if (!node.weights_cohered)
-                {
-                    if (profiling)
-                        phase_start = std::chrono::high_resolution_clock::now();
-
-                    if (!contract.weight_tensors.empty())
-                    {
-                        // Contract-declared weights (highest priority)
-                        for (auto *weight : contract.weight_tensors)
-                        {
-                            if (auto *tb = dynamic_cast<TensorBase *>(weight))
-                                tb->ensureOnDevice(target_device);
-                        }
-                    }
-
-                    // Upload getDumpInfo weights (covers correctly-classified weights)
-                    for (const auto &wi : cached_dump_info.weights)
-                    {
-                        if (wi.tensor)
-                            const_cast<ITensor *>(wi.tensor)->ensureOnDevice(target_device);
-                    }
-
-                    // Upload non-arena getDumpInfo inputs (e.g., gamma norms classified
-                    // as inputs rather than weights). For arena-managed tensors already
-                    // on device, ensureOnDevice() returns early (near-no-op).
-                    for (const auto &ii : cached_dump_info.inputs)
-                    {
-                        if (ii.tensor)
-                            ii.tensor->ensureOnDevice(target_device);
-                    }
-
-                    if (profiling)
-                    {
-                        phase_end = std::chrono::high_resolution_clock::now();
-                        weight_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                    }
-                    node.weights_cohered = true;
-                }
-
-                // Cohere arena-managed writes (outputs + inouts)
-                if (profiling)
-                    phase_start = std::chrono::high_resolution_clock::now();
-
-                for (const auto &binding : contract.allWrites())
-                {
-                    if (!arena_->prepareForWrite(binding.id, target_device))
-                    {
-                        LOG_ERROR("[DeviceGraphExecutor] Arena prepareForWrite failed for "
-                                  << bufferIdName(binding.id) << " in stage '" << node.name << "'");
-                        return false;
-                    }
-                }
-
-                if (profiling)
-                {
-                    phase_end = std::chrono::high_resolution_clock::now();
-                    output_alloc_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                }
-            }
-            else if (policy != CoherencePolicy::NONE)
-            {
-                if (!target_device.is_cpu())
-                {
-                    // GPU stages with INPUT/OUTPUT/FULL policy must have a contract + arena.
-                    LOG_ERROR("[DeviceGraphExecutor] Stage '" << node.name
-                                                              << "' has coherencePolicy=" << toString(policy)
-                                                              << " but no BufferArena + contract. All GPU stages must implement bufferContract().");
-                    return false;
-                }
-                // CPU stages: coherence is a no-op (data already on host), safe to continue without arena
-            }
-        }
-
-#if LLAMINAR_ASSERTIONS_ACTIVE
-        // ENTRY verification - validate inputs BEFORE execute()
-        if (debugEnv().validation.validate_inputs)
-        {
-            verifyStageEntry(node, layer_idx); // Throws VerificationFailure on error
-        }
-#endif
-
-        // Check if stage dumping is enabled for this stage
-        StageDumpContext dump_ctx;
-        const auto &dump_cfg = debugEnv().stage_dump;
-        const bool should_dump = StageDumper::shouldDump(
-            node.stage.get(),
-            node.name, // Pass node name for LLAMINAR_STAGE_DUMP_NAMES filtering
-            config_.current_layer_idx,
-            config_.current_iteration,
-            config_.mpi_rank);
-
-        if (should_dump)
-        {
-            if (profiling)
-                phase_start = std::chrono::high_resolution_clock::now();
-            dump_ctx = StageDumper::beginDump(
-                node.stage.get(),
-                node.name, // Pass node name for directory naming
-                config_.current_layer_idx,
-                config_.current_iteration,
-                config_.mpi_rank);
-
-            // Use async dumping if enabled (default: true)
-            if (dump_cfg.async_dump)
-            {
-                // Lazy initialization of async dumper
-                if (!AsyncStageDumper::isInitialized())
-                {
-                    AsyncStageDumper::initialize(dump_cfg.async_threads);
-                }
-                // Enqueue inputs for async writing (fast memcpy only)
-                // Use cached dump_info instead of calling getDumpInfo() again
-                AsyncStageDumper::enqueueInputs(dump_ctx, cached_dump_info);
-            }
-            else
-            {
-                // Synchronous dump (legacy path)
-                StageDumper::dumpInputs(dump_ctx, node.stage.get());
-            }
-            if (profiling)
-            {
-                phase_end = std::chrono::high_resolution_clock::now();
-                dump_input_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-            }
-        }
-
-        // =========================================================================
-        // GPU Pointer Device Validation (diagnostic for multi-GPU memory faults)
-        // Validates all GPU pointers belong to the expected device before execution.
-        // Gated by LLAMINAR_VALIDATE_GPU_PTRS=1 to avoid hipPointerGetAttributes overhead.
-        // =========================================================================
-        if (debugEnv().validation.validate_gpu_ptrs)
-        {
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
-            if (target_device.is_gpu())
-            {
-                const int expected_ordinal = target_device.toKernelDeviceIndex();
-                auto *gpu_ctx = tryGetWorkerContext(target_device);
-                bool ptr_validation_failed = false;
-                auto validatePtr = [&](const char *label, const char *tensor_name, ITensor *tensor)
-                {
-                    if (!validateStagePointerSet(
-                            gpu_ctx,
-                            node.name,
-                            label,
-                            expected_ordinal,
-                            tensor,
-                            tensor_name,
-                            /*dump_pointer_events=*/true))
-                    {
-                        ptr_validation_failed = true;
-                    }
-                };
-
-                // Validate inputs from dump info
-                for (const auto &input : cached_dump_info.inputs)
-                {
-                    validatePtr("input", input.name ? input.name : "(unnamed)", const_cast<ITensor *>(input.tensor));
-                }
-                // Validate outputs from dump info
-                for (const auto &output : cached_dump_info.outputs)
-                {
-                    validatePtr("output", output.name ? output.name : "(unnamed)", output.tensor);
-                }
-                // Validate weights from dump info
-                for (const auto &weight : cached_dump_info.weights)
-                {
-                    validatePtr("weight", weight.name ? weight.name : "(unnamed)", const_cast<ITensor *>(weight.tensor));
-                }
-
-                if (ptr_validation_failed)
-                {
-                    LOG_ERROR("[GPU_PTR_VIOLATION_ABORT] Aborting stage execute before kernel launch: stage='"
-                              << node.name << "' target=" << target_device.to_string()
-                              << " expected_ordinal=" << expected_ordinal);
-                    return false;
-                }
-            }
-        }
-
-        if (profiling)
-            phase_start = std::chrono::high_resolution_clock::now();
-
-        ensureStageGPUStreamBound(node, ctx);
-
-        bool success = node.stage->execute(ctx);
-
-        if (success && debugEnv().validation.sync_each_stage)
-        {
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
-            if (target_device.is_gpu())
-            {
-                if (auto *gpu_ctx = tryGetWorkerContext(target_device); gpu_ctx && !gpu_ctx->debugSynchronize())
-                {
-                    LOG_ERROR("[SYNC_EACH_STAGE] stage='" << node.name
-                                                          << "' device=" << target_device.to_string()
-                                                          << " device debug synchronization failed");
-                    success = false;
-                }
-            }
-        }
-
-        if (profiling)
-        {
-            phase_end = std::chrono::high_resolution_clock::now();
-            execute_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-        }
-
-        // =========================================================================
-        // Stage Coherence: Mark outputs as device-dirty IMMEDIATELY after execution
-        // This must happen BEFORE any output data access (dump, verification, callback)
-        // so that data() calls will sync from GPU when needed.
-        // =========================================================================
-        if (success)
-        {
-            auto policy = node.stage->coherencePolicy();
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
-
-            if (use_contract)
-            {
-                // ── Contract-based output marking (Phase 2) ─────────────────
-                if (profiling)
-                    phase_start = std::chrono::high_resolution_clock::now();
-
-                const bool need_event = node.is_final_output
-#if LLAMINAR_ASSERTIONS_ACTIVE
-                                        || debugEnv().validation.validate_buffers
-#endif
-                    ;
-
-                for (const auto &binding : contract.allWrites())
-                {
-                    if (need_event)
-                    {
-                        arena_->markWritten(binding.id, target_device, node.stage->gpuStream());
-                    }
-                    else
-                    {
-                        arena_->markWrittenFlagsOnly(binding.id, target_device);
-                    }
-                }
-
-                if (profiling)
-                {
-                    phase_end = std::chrono::high_resolution_clock::now();
-                    mark_dirty_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-                }
-
-                // Stage output printing (after coherence, so GPU→host sync has occurred)
-                logWatchedPointerProducer(
-                    node.name,
-                    cached_dump_info,
-                    tryGetWorkerContext(node.device.is_valid() ? node.device : node.stage->device()));
-                printStageOutputs(node.name, cached_dump_info);
-            }
-        }
-
-        // Timing for dump and validation phases (after core execution)
-        double dump_output_ms = 0.0;
-        double verify_ms = 0.0;
-        double callback_ms = 0.0;
-
-        // Dump outputs after execution (if dumping enabled)
-        if (should_dump && success)
-        {
-            if (profiling)
-                phase_start = std::chrono::high_resolution_clock::now();
-
-            if (dump_cfg.async_dump)
-            {
-                // Enqueue outputs for async writing (fast memcpy only)
-                // Use cached dump_info instead of calling getDumpInfo() again
-                AsyncStageDumper::enqueueOutputs(dump_ctx, cached_dump_info);
-                // Note: finalizeDump not needed for async mode since metadata
-                // is written synchronously in beginDump
-            }
-            else
-            {
-                // Synchronous dump (legacy path)
-                StageDumper::dumpOutputs(dump_ctx, node.stage.get());
-                StageDumper::finalizeDump(dump_ctx, execute_ms);
-            }
-            if (profiling)
-            {
-                phase_end = std::chrono::high_resolution_clock::now();
-                dump_output_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-            }
-        }
-
-        // EXIT verification - validate outputs AFTER execute()
-        // (only compiles in Debug/Integration builds with assertions active)
-#if LLAMINAR_ASSERTIONS_ACTIVE
-        if (success && debugEnv().validation.validate_buffers)
-        {
-            if (profiling)
-                phase_start = std::chrono::high_resolution_clock::now();
-            // New exception-based validation (throws VerificationFailure)
-            verifyStageExit(node, layer_idx);
-
-            // Legacy bool-based validation (for compatibility)
-            success = validateStageOutputs(node);
-            if (profiling)
-            {
-                phase_end = std::chrono::high_resolution_clock::now();
-                verify_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-            }
-        }
-#endif
-
-        // Invoke snapshot callback if configured (uses cached dump info for efficiency)
-        LOG_DEBUG("[DeviceGraphExecutor::executeNode] success=" << success << " callback=" << (config_.snapshot_callback ? "set" : "null") << " node=" << node.name);
-        if (success && config_.snapshot_callback)
-        {
-            if (profiling)
-                phase_start = std::chrono::high_resolution_clock::now();
-            // IMPORTANT: Sync outputs from GPU before callback reads them
-            cached_dump_info.ensureOutputsOnHost();
-            LOG_DEBUG("[DeviceGraphExecutor::executeNode] Invoking callback for " << node.name);
-            config_.snapshot_callback(node.name, cached_dump_info);
-            if (profiling)
-            {
-                phase_end = std::chrono::high_resolution_clock::now();
-                callback_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-            }
-        }
-
-        // Log phase breakdown at TRACE level (only for stages taking >1ms total or any phase >0.5ms)
-        double total_overhead_ms = input_cohere_ms + weight_cohere_ms + output_alloc_ms + dump_input_ms + mark_dirty_ms + dump_output_ms + verify_ms + callback_ms + get_dump_info_ms;
-        double total_ms = total_overhead_ms + execute_ms;
-        if (profiling && (total_ms > 1.0 || input_cohere_ms > 0.5 || weight_cohere_ms > 0.5 ||
-                          output_alloc_ms > 0.5 || execute_ms > 0.5 || verify_ms > 0.5 || callback_ms > 0.5))
-        {
-            LOG_TRACE("[DeviceGraphExecutor::PHASES] " << node.name
-                                                       << " input_cohere=" << input_cohere_ms << "ms"
-                                                       << " weight_cohere=" << weight_cohere_ms << "ms"
-                                                       << " output_alloc=" << output_alloc_ms << "ms"
-                                                       << " dump_input=" << dump_input_ms << "ms"
-                                                       << " execute=" << execute_ms << "ms"
-                                                       << " mark_dirty=" << mark_dirty_ms << "ms"
-                                                       << " dump_out=" << dump_output_ms << "ms"
-                                                       << " verify=" << verify_ms << "ms"
-                                                       << " callback=" << callback_ms << "ms"
-                                                       << " get_dump_info=" << get_dump_info_ms << "ms"
-                                                       << " total=" << total_ms << "ms");
-        }
-
-        if (config_.enable_profiling)
-        {
-            stats_.stage_times_ms[node.name] = total_ms;
-            stats_.total_execute_ms += execute_ms;
-            stats_.total_stages_executed++;
-            const std::string stage_type_name = computeStageTypeName(node.stage->type());
-            stats_.stage_type_execute_ms[stage_type_name] += execute_ms;
-            stats_.stage_type_counts[stage_type_name]++;
-
-            // Track collective time separately (for stages that went through
-            // stage->execute() rather than the executeCollectiveAllreduce intercept,
-            // e.g. local TP where collective_ctx_ is null)
-            const auto stype = node.stage->type();
-            if (stype == ComputeStageType::ALLREDUCE ||
-                stype == ComputeStageType::ALLGATHER ||
-                stype == ComputeStageType::ALLGATHER_V)
-            {
-                stats_.total_collective_ms += execute_ms;
-                stats_.total_collective_calls++;
-
-                // NOTE: Do NOT record to KernelProfiler here — the stage's
-                // execute() already has KERNEL_PROFILE_SCOPE(KernelType::ALLREDUCE/ALLGATHER)
-                // which records the timing. Recording here too would double-count
-                // both call count and elapsed time.
-            }
-
-            // Accumulate overhead breakdown
-            stats_.overhead.input_cohere_ms += input_cohere_ms;
-            stats_.overhead.weight_cohere_ms += weight_cohere_ms;
-            stats_.overhead.output_alloc_ms += output_alloc_ms;
-            stats_.overhead.mark_dirty_ms += mark_dirty_ms;
-            stats_.overhead.dump_input_ms += dump_input_ms;
-            stats_.overhead.dump_output_ms += dump_output_ms;
-            stats_.overhead.verify_ms += verify_ms;
-            stats_.overhead.callback_ms += callback_ms;
-            stats_.overhead.get_dump_info_ms += get_dump_info_ms;
-
-            // Phase-split accumulation
-            const auto phase = GraphExecutorStats::currentPhase();
-            PhaseStats *phase_stats = nullptr;
-            if (phase == ExecutionPhase::PREFILL)
-                phase_stats = &stats_.prefill;
-            else if (phase == ExecutionPhase::DECODE)
-                phase_stats = &stats_.decode;
-
-            if (phase_stats)
-            {
-                phase_stats->total_execute_ms += execute_ms;
-                phase_stats->total_stages_executed++;
-                phase_stats->stage_type_execute_ms[stage_type_name] += execute_ms;
-                phase_stats->stage_type_counts[stage_type_name]++;
-                if (stype == ComputeStageType::ALLREDUCE ||
-                    stype == ComputeStageType::ALLGATHER ||
-                    stype == ComputeStageType::ALLGATHER_V)
-                {
-                    phase_stats->total_collective_ms += execute_ms;
-                    phase_stats->total_collective_calls++;
-                }
-                phase_stats->overhead.input_cohere_ms += input_cohere_ms;
-                phase_stats->overhead.weight_cohere_ms += weight_cohere_ms;
-                phase_stats->overhead.output_alloc_ms += output_alloc_ms;
-                phase_stats->overhead.mark_dirty_ms += mark_dirty_ms;
-                phase_stats->overhead.dump_input_ms += dump_input_ms;
-                phase_stats->overhead.dump_output_ms += dump_output_ms;
-                phase_stats->overhead.verify_ms += verify_ms;
-                phase_stats->overhead.callback_ms += callback_ms;
-                phase_stats->overhead.get_dump_info_ms += get_dump_info_ms;
-            }
-
-            LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' took " << total_ms << " ms (execute=" << execute_ms << "ms, overhead=" << total_overhead_ms << "ms)");
-        }
-
-        return success;
+        // Legacy entry point — delegates to unified runStage with full policy.
+        // Retained for backward compatibility (used by executeMultiDevice and
+        // graph capture's non-captured segment execution).
+        const bool is_collective = node.stage &&
+                                   (node.stage->type() == ComputeStageType::ALLREDUCE ||
+                                    node.stage->type() == ComputeStageType::ALLGATHER ||
+                                    node.stage->type() == ComputeStageType::ALLGATHER_V);
+        return runStage(node, ctx, StageRunPolicy::full(), is_collective);
     }
 
     // =============================================================================

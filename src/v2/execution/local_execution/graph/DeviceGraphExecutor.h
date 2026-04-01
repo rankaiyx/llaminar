@@ -52,6 +52,65 @@ namespace llaminar2
     class TensorBase;
 
     /**
+     * @brief Policy controlling what happens during stage execution.
+     *
+     * All execution paths (full, fast-decode, graph-capture manual segments)
+     * use a single `runStages()` loop parameterised by this policy. This
+     * eliminates the class of bugs caused by divergent code paths where one
+     * path does coherence / validation / profiling and another silently skips it.
+     *
+     * Factory methods provide canonical configurations:
+     *   - full()       — first-time execution (prefill, cache miss)
+     *   - fastDecode() — cached decode graphs where buffers are already on-device
+     *   - debug()      — full + timeline (for diagnostics)
+     */
+    struct StageRunPolicy
+    {
+        bool coherence = true;            ///< Arena contract-based input/output coherence
+        bool weight_coherence = true;     ///< Upload weights to device
+        bool mark_dirty = true;           ///< Mark outputs device-authoritative after execute
+        bool validation = true;           ///< NaN/Inf output validation (Debug/Integration only)
+        bool profiling = true;            ///< Per-stage timing breakdown
+        bool collective_intercept = true; ///< Use CollectiveContext for allreduce/allgather
+        bool timeline = false;            ///< GPU event-based per-stage profiling
+        bool stage_dump = true;           ///< Stage dump framework (input/output snapshots)
+        bool snapshot_callback = true;    ///< Invoke snapshot callback after execution
+        bool pointer_validation = false;  ///< GPU pointer device validation
+
+        /// Full execution — coherence, validation, profiling, everything.
+        static StageRunPolicy full()
+        {
+            return StageRunPolicy{};
+        }
+
+        /// Fast decode — minimal overhead for cached decode graphs.
+        /// Buffers are already on-device, weights already uploaded.
+        static StageRunPolicy fastDecode()
+        {
+            StageRunPolicy p;
+            p.coherence = false;
+            p.weight_coherence = false;
+            p.mark_dirty = true;
+            p.validation = false;
+            p.profiling = false;
+            p.stage_dump = false;
+            p.snapshot_callback = false;
+            p.pointer_validation = false;
+            p.timeline = true;
+            return p;
+        }
+
+        /// Debug — everything on, including timeline.
+        static StageRunPolicy debug()
+        {
+            StageRunPolicy p;
+            p.timeline = true;
+            p.pointer_validation = true;
+            return p;
+        }
+    };
+
+    /**
      * @brief Orchestrates execution of compute stages within a graph
      *
      * DeviceGraphExecutor manages the execution of compute graphs by handling
@@ -455,7 +514,49 @@ namespace llaminar2
         StageTimeline stage_timeline_;                 ///< GPU event-based per-stage timeline profiler
         bool stage_timeline_info_populated_ = false;   ///< True after first setStageInfo pass (names never change)
 
-        // Internal execution helpers
+        // =====================================================================
+        // Unified stage runner (replaces divergent paths)
+        // =====================================================================
+
+        /**
+         * @brief Execute all stages in a graph according to the given policy.
+         *
+         * This is the ONE execution loop used by every entry point:
+         *   - execute()/executeSequential()  → full policy
+         *   - executeFastDecode()             → fastDecode policy
+         *   - graph capture non-captured segs → full policy
+         *
+         * @param graph            Compute graph with stages to run
+         * @param ctx              Device context for execution
+         * @param policy           Controls coherence, validation, profiling etc.
+         * @param collective_nodes Pre-identified collective stage names (optional)
+         * @return true if all stages executed successfully
+         */
+        bool runStages(ComputeGraph &graph,
+                       IDeviceContext *ctx,
+                       const StageRunPolicy &policy,
+                       const std::unordered_set<std::string> *collective_nodes = nullptr);
+
+        /**
+         * @brief Execute a single stage according to the given policy.
+         *
+         * Implements every per-stage phase (coherence, execution, marking,
+         * validation, profiling, dumps) gated by the policy flags.
+         *
+         * @param node          The compute node to execute
+         * @param ctx           Device context
+         * @param policy        Controls which phases are active
+         * @param is_collective Pre-computed flag: true if stage is collective
+         * @return true if stage executed successfully
+         */
+        bool runStage(ComputeNode &node,
+                      IDeviceContext *ctx,
+                      const StageRunPolicy &policy,
+                      bool is_collective);
+
+        // =====================================================================
+        // Legacy internal helpers (now delegate to runStages/runStage)
+        // =====================================================================
         bool executeSequential(ComputeGraph &graph, IDeviceContext *ctx);
         // executeParallel removed — PARALLEL mode falls through to executeSequential
         bool executeNode(ComputeNode &node, IDeviceContext *ctx);

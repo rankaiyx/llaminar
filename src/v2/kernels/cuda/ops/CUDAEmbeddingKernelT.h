@@ -253,6 +253,7 @@ namespace llaminar2
         int max_token_ids_ = 0;
         int dynamic_token_count_ = 0;
         bool dynamic_params_active_ = false;
+        void *preload_stream_ = nullptr; ///< Stream used for the last setDynamicTokenIds H2D copy
     };
 
     // Convenience alias

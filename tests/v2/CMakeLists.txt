@@ -1107,6 +1107,22 @@ add_v2_test(V2_Unit_GraphExecutorCollective
     MPI_PROCS 1
 )
 
+# Test: StageRunPolicy - Unified execution policy tests
+add_executable(v2_unit_stage_run_policy unit/execution/local_execution/graph/Test__StageRunPolicy.cpp)
+target_include_directories(v2_unit_stage_run_policy PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_unit_stage_run_policy 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_StageRunPolicy
+    COMMAND $<TARGET_FILE:v2_unit_stage_run_policy>
+    LABELS "V2;Unit;DeviceGraphExecutor;Execution;StageRunPolicy"
+    MPI_PROCS 1
+)
+
 # Test: MockMPIContext - Mock MPI context for unit testing distributed logic
 add_executable(v2_unit_mock_mpi_context unit/mocks/Test__MockMPIContext.cpp)
 target_include_directories(v2_unit_mock_mpi_context PRIVATE 

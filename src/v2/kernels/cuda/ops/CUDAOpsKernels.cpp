@@ -1236,6 +1236,7 @@ namespace llaminar2
 
         dynamic_token_count_ = num_tokens;
         dynamic_params_active_ = true;
+        preload_stream_ = gpu_stream_;
     }
 
     void CUDAEmbeddingKernelT::resetDynamicState()
@@ -1304,7 +1305,14 @@ namespace llaminar2
         // Verify preloaded data matches current request to prevent stale tokens
         // after clear_cache(). The kernel is cached in KernelFactory and
         // dynamic_params_active_ persists across graph rebuilds.
-        const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens && h_token_ids_ && std::memcmp(h_token_ids_, token_ids, token_bytes) == 0;
+        // Also verify stream match: setDynamicTokenIds() may have run on a
+        // different stream than the current gpu_stream_ if the graph capture
+        // controller reassigned stage streams after updateDynamicParams().
+        const bool token_ids_preloaded = dynamic_params_active_ &&
+                                         dynamic_token_count_ == num_tokens &&
+                                         preload_stream_ == gpu_stream_ &&
+                                         h_token_ids_ &&
+                                         std::memcmp(h_token_ids_, token_ids, token_bytes) == 0;
         if (!token_ids_preloaded)
         {
             dynamic_params_active_ = false;

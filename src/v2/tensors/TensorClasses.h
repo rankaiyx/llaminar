@@ -970,8 +970,6 @@ namespace llaminar2
         virtual void *gpu_data_ptr();
         virtual const void *gpu_data_ptr() const;
 
-
-
         /**
          * @brief Clear the device completion event without destroying it through the backend
          *
