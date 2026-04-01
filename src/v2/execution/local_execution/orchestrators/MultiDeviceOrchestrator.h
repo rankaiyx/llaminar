@@ -67,10 +67,11 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class DeviceGraphOrchestrator;
     class IModelContext;
     class ILocalTPContext;
     class TensorBase;
+    class LogitsGatherer;
+    class DeviceSampler;
     struct GraphExecutorStats;
     struct PlacementPlan;
 
@@ -330,7 +331,7 @@ namespace llaminar2
          * @code
          * // Test setup with mocks
          * auto model_ctx = std::make_shared<MockModelContext>(preset);
-         * std::vector<std::unique_ptr<DeviceGraphOrchestrator>> runners;
+         * std::vector<std::unique_ptr<IInferenceRunner>> runners;
          * runners.push_back(createMockRunner(cuda0));
          * runners.push_back(createMockRunner(cuda1));
          * auto tp_ctx = std::make_unique<MockLocalTPContext>(devices, weights);
@@ -341,7 +342,7 @@ namespace llaminar2
          */
         static std::unique_ptr<MultiDeviceOrchestrator> createForTest(
             std::shared_ptr<IModelContext> model_ctx,
-            std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners,
+            std::vector<std::unique_ptr<IInferenceRunner>> device_runners,
             std::unique_ptr<ILocalTPContext> tp_ctx,
             const Config &config);
 
@@ -422,7 +423,7 @@ namespace llaminar2
          * When enabled, forwardTP() skips gatherLogits for decode tokens.
          * Caller MUST use sampleGreedyOnDevice() instead of logits() for decode.
          */
-        void setSkipLogitsGatherDecode(bool skip) { skip_logits_gather_decode_ = skip; }
+        void setSkipLogitsGatherDecode(bool skip) override;
 
         /**
          * @brief Skip logits gather after prefill (seq_len > 1)
@@ -431,7 +432,7 @@ namespace llaminar2
          * the first generated token comes from a decode step. Skipping the
          * D2H gather eliminates massive PCIe traffic for multi-token forwards.
          */
-        void setSkipLogitsGatherPrefill(bool skip) { skip_logits_gather_prefill_ = skip; }
+        void setSkipLogitsGatherPrefill(bool skip) override;
 
         void setSuppressTimeline(bool suppress) override;
         void setAccumulatePrefill(bool accumulate) override;
@@ -700,7 +701,7 @@ namespace llaminar2
          */
         MultiDeviceOrchestrator(
             std::shared_ptr<IModelContext> model_ctx,
-            std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners,
+            std::vector<std::unique_ptr<IInferenceRunner>> device_runners,
             std::unique_ptr<ILocalTPContext> tp_ctx,
             const Config &config);
 
@@ -754,26 +755,6 @@ namespace llaminar2
         bool forwardPP(const int *tokens, int seq_len);
 
         /**
-         * @brief Gather partial logits from all devices
-         *
-         * Performs AllGather of local logits shards into combined buffer.
-         *
-         * @param seq_len The actual sequence length (number of tokens) for this forward pass.
-         *                Required because logits_local buffer is pre-allocated for max_seq_len,
-         *                but for decode we only want to gather 1 row.
-         * @return true if gather succeeded
-         */
-        bool gatherLogits(size_t seq_len);
-
-        /**
-         * @brief Copy logits from a specific stage to combined buffer
-         *
-         * Used in PP mode to get logits from the final stage.
-         *
-         * @param stage_idx Index of the stage with logits
-         */
-        void copyLogitsFromStage(int stage_idx);
-
         /**
          * @brief Aggregate stats from all device runners
          */
@@ -796,10 +777,9 @@ namespace llaminar2
         ParallelismMode mode_ = ParallelismMode::TP;
 
         /// Per-device inference runners
-        /// In TP mode: one DeviceGraphOrchestrator per device
-        /// In PP mode: one DeviceGraphOrchestrator per stage
-        /// In TP+PP mode: one MultiDeviceOrchestrator (as IInferenceRunner) per stage
-        std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners_;
+        /// In TP mode: one runner per device
+        /// In PP mode: one runner per stage
+        std::vector<std::unique_ptr<IInferenceRunner>> device_runners_;
 
         /// PP stage runners (when stages are TP domains, these are MultiDeviceOrchestrator)
         /// Only used in TP+PP mode - in pure PP mode, device_runners_ holds stage runners
@@ -808,23 +788,8 @@ namespace llaminar2
         /// Configuration
         Config config_;
 
-        /// Combined logits buffer after AllGather [vocab_size]
-        std::unique_ptr<TensorBase> combined_logits_;
-
-        /// Whether combined_logits_ is pinned via hipHostRegister (for fast DMA)
-        bool combined_logits_pinned_ = false;
-
-        /// When true, forwardTP() skips gatherLogits for decode (seq_len=1).
-        /// Caller uses sampleGreedyOnDevice() instead for GPU-side argmax.
-        bool skip_logits_gather_decode_ = false;
-
-        /// When true, forwardTP() skips gatherLogits for prefill (seq_len > 1).
-        /// Prefill logits are never consumed in the standard generation flow.
-        bool skip_logits_gather_prefill_ = false;
-
-        /// Actual size of gathered logits from last gatherLogits() call
-        /// This may be smaller than combined_logits_->numel() for decode (1 token vs max_seq_len)
-        size_t last_gathered_logits_size_ = 0;
+        /// Logits buffer management and D2H gather operations (extracted helper)
+        std::unique_ptr<LogitsGatherer> logits_gatherer_;
 
         /// Aggregated executor stats (mutable for lazy computation)
         mutable std::unique_ptr<GraphExecutorStats> aggregated_stats_;

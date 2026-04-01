@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 #include "v2/tensors/Tensors.h"
+#include "v2/tensors/CoherenceState.h"
 #include "v2/backends/DeviceId.h"
 #include "v2/backends/BackendManager.h"
 #include "v2/utils/Logger.h"
@@ -330,6 +331,82 @@ namespace llaminar2::test
         EXPECT_NE(ptr2, nullptr) << "Should be able to allocate after release";
 
         // Note: ptr1 and ptr2 may or may not be the same (allocator-dependent)
+    }
+
+    // =========================================================================
+    // Coherence Hardening: State Preservation Tests (P0)
+    // =========================================================================
+
+    /**
+     * @brief Verify allocateOnDevice() reuse path preserves DEVICE_AUTHORITATIVE
+     *
+     * When a GPU kernel has written to the buffer (DEVICE_AUTHORITATIVE),
+     * calling allocateOnDevice() again on the same device should NOT reset
+     * the coherence state. The kernel's writes are still valid.
+     *
+     * Regression test for the bug fixed in commit 74de820e where
+     * allocateOnDevice() destructively reset coherence to HOST_AUTHORITATIVE.
+     */
+    TEST_F(Test__TensorAllocateOnDevice, ReusePreservesDeviceAuthoritative)
+    {
+        if (!hasGPU())
+        {
+            GTEST_SKIP() << "No GPU backend available";
+        }
+
+        DeviceId gpu_device = getGPUDevice();
+
+        // Upload to get SYNCED
+        ASSERT_TRUE(tensor_->ensureOnDevice(gpu_device));
+        EXPECT_EQ(tensor_->coherenceState(), TensorCoherenceState::SYNCED);
+
+        // Simulate kernel write → DEVICE_AUTHORITATIVE
+        tensor_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        EXPECT_EQ(tensor_->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        void *ptr_before = tensor_->gpu_data_ptr();
+
+        // Reuse path: allocateOnDevice on same device with buffer already present
+        bool result = tensor_->allocateOnDevice(gpu_device);
+        ASSERT_TRUE(result);
+
+        // State MUST still be DEVICE_AUTHORITATIVE — kernel's writes are valid
+        EXPECT_EQ(tensor_->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE)
+            << "allocateOnDevice() reuse path must not reset DEVICE_AUTHORITATIVE";
+
+        // Same pointer (reuse)
+        EXPECT_EQ(tensor_->gpu_data_ptr(), ptr_before);
+
+        tensor_->releaseDeviceMemory();
+    }
+
+    /**
+     * @brief Verify allocateOnDevice() reuse path preserves SYNCED
+     *
+     * When data is SYNCED (host == device), calling allocateOnDevice()
+     * should not disturb the state.
+     */
+    TEST_F(Test__TensorAllocateOnDevice, ReusePreservesSynced)
+    {
+        if (!hasGPU())
+        {
+            GTEST_SKIP() << "No GPU backend available";
+        }
+
+        DeviceId gpu_device = getGPUDevice();
+
+        // Upload to get SYNCED
+        ASSERT_TRUE(tensor_->ensureOnDevice(gpu_device));
+        EXPECT_EQ(tensor_->coherenceState(), TensorCoherenceState::SYNCED);
+
+        // Reuse path
+        bool result = tensor_->allocateOnDevice(gpu_device);
+        ASSERT_TRUE(result);
+
+        EXPECT_EQ(tensor_->coherenceState(), TensorCoherenceState::SYNCED)
+            << "allocateOnDevice() reuse path must not reset SYNCED state";
+
+        tensor_->releaseDeviceMemory();
     }
 
 } // namespace llaminar2::test

@@ -634,7 +634,7 @@ namespace llaminar2
         // =====================================================================
         const bool need_dump_info = policy.coherence || policy.stage_dump ||
                                     policy.pointer_validation || policy.snapshot_callback ||
-                                    (policy.mark_dirty && arena_);
+                                    (arena_ != nullptr);
         StageDumpInfo empty_dump_info{};
         const StageDumpInfo *dump_info_ptr = &empty_dump_info;
         if (need_dump_info)
@@ -653,7 +653,11 @@ namespace llaminar2
         // =====================================================================
         // Stage Coherence: arena contract input/output + weight uploads
         // =====================================================================
-        const StageBufferContract contract = ((policy.coherence || policy.mark_dirty) && arena_) ? node.stage->bufferContract() : StageBufferContract{};
+        // Contract is ALWAYS fetched when we have an arena. mark_dirty (which
+        // uses the contract) is unconditional because marking outputs
+        // DEVICE_AUTHORITATIVE is a correctness requirement, not overhead.
+        // The coherence flag controls whether prepareForRead/Write are called.
+        const StageBufferContract contract = arena_ ? node.stage->bufferContract() : StageBufferContract{};
         const bool use_contract = !contract.empty() && arena_ != nullptr;
 
         if (policy.coherence)
@@ -872,9 +876,10 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Mark Outputs Dirty (contract-based)
+        // Mark Outputs Dirty (contract-based) — UNCONDITIONAL when arena is
+        // present. Skipping this causes stale host reads on the next iteration.
         // =====================================================================
-        if (success && policy.mark_dirty && use_contract)
+        if (success && use_contract)
         {
             auto coh_policy = node.stage->coherencePolicy();
             DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();

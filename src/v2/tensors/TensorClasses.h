@@ -95,12 +95,14 @@
 #include "SIMDHelpers.h"
 #include "AlignedVector.h"
 #include "CoherenceState.h"       // Explicit coherence state machine
+#include "CoherenceAuditLog.h"    // Per-tensor coherence audit ring buffer
 #include "../backends/DeviceId.h" // DeviceId for ensureOnDevice
 #include <vector>
 #include <memory>
 #include <cstddef>
 #include <cstdint>
 #include <any>
+#include <iostream>
 #include <unordered_map>
 #include <unordered_set>
 #include <mutex>
@@ -1762,18 +1764,67 @@ namespace llaminar2
 
         // ===== Explicit Coherence State Machine (V2) =====
         // coherence_state_ is the SOLE source of truth for host/device validity.
-        // All mutations MUST go through setCoherenceState_() for consistency.
+        // All mutations MUST go through setCoherenceState_() or applyCoherenceOp_().
         // Public accessors hostValid()/deviceValid()/isDeviceValid() derive from this.
         TensorCoherenceState coherence_state_ = TensorCoherenceState::HOST_ONLY;
         MemoryResidency memory_residency_ = MemoryResidency::STANDARD;
 
-        /// Set coherence_state_. This is the ONLY way to mutate coherence state.
+#if LLAMINAR_ASSERTIONS_ACTIVE
+        /// Per-tensor ring buffer of the last 32 coherence transitions.
+        /// Only allocated when LLAMINAR_COHERENCE_AUDIT=1 and assertions are active.
+        CoherenceAuditLog coherence_audit_log_;
+#endif
+
+        /// Raw setter for coherence_state_. Prefer applyCoherenceOp_() for
+        /// transitions that correspond to a CoherenceOp (upload, download, etc.).
+        /// Use this only for residency-mode changes (HOST_ONLY on release,
+        /// MAPPED on init) where no single CoherenceOp applies.
         /// Does NOT acquire coherence_mutex_ — caller must hold it if needed.
         void setCoherenceState_(TensorCoherenceState new_state)
         {
             coherence_state_ = new_state;
         }
 
+        /// Apply a coherence operation through the validated transition table.
+        /// In Debug/Integration builds: asserts on invalid transitions and
+        /// records entries to the coherence audit log.
+        /// In Release builds: identical to setCoherenceState_ (the compiler
+        /// optimises the constexpr lookup away when assertions are inactive).
+        void applyCoherenceOp_(CoherenceOp op,
+                               const char *caller = __builtin_FUNCTION())
+        {
+            auto from = coherence_state_;
+            auto result = coherenceTransition(from, op);
+
+#if LLAMINAR_ASSERTIONS_ACTIVE
+            coherence_audit_log_.record(from,
+                                        result.valid ? result.new_state : TensorCoherenceState::INVALID,
+                                        op, caller, result.valid);
+
+            if (!result.valid)
+            {
+                // Dump the audit log before asserting so the developer sees context
+                dumpCoherenceAuditLog();
+                LLAMINAR_UNREACHABLE("[COHERENCE] Invalid transition: "
+                                     << to_string(from) << " + " << to_string(op)
+                                     << " on tensor " << static_cast<const void *>(this));
+            }
+#endif
+            coherence_state_ = result.valid ? result.new_state : from;
+        }
+
+    public:
+        /// Dump the coherence audit log to stderr (safe to call from any thread).
+        void dumpCoherenceAuditLog() const
+        {
+#if LLAMINAR_ASSERTIONS_ACTIVE
+            coherence_audit_log_.dump(std::cerr,
+                                      debug_name_.empty() ? "(unnamed)" : debug_name_.c_str(),
+                                      static_cast<const void *>(this));
+#endif
+        }
+
+    protected:
         // Injected backend for testing (non-owning). When non-null, resolveBackend()
         // returns this instead of looking up the global CUDA/ROCm backend.
         IBackend *injected_backend_ = nullptr;

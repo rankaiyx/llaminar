@@ -1247,11 +1247,14 @@ add_library(llaminar2_core STATIC
     execution/local_execution/graph/StageTimeline.cpp
     execution/local_execution/device/DomainAwareBufferManager.cpp
     execution/local_execution/graph/GraphResolver.cpp
+    execution/local_execution/graph/GraphBuilderRegistry.cpp
     execution/local_execution/graph/SchemaFactoryRegistry.cpp
     execution/local_execution/model/LayerExecutor.cpp
     execution/local_execution/model/ModelExecutor.cpp
     execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp
     execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
+    execution/local_execution/orchestrators/LogitsGatherer.cpp
+    execution/local_execution/orchestrators/DeviceSampler.cpp
     execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp
     execution/local_execution/model/HeterogeneousLayerExecutor.cpp
     execution/local_execution/coherence/CrossDomainTransfer.cpp
@@ -1329,6 +1332,7 @@ add_library(llaminar2_core STATIC
     # Layer device placement (Phase 2 - multi-device graph building)
     execution/local_execution/device/LayerDevicePlacement.cpp
     # Qwen2 model and graph configuration
+    models/ModelRegistrations.cpp
     models/qwen/Qwen2Graph.cpp
     models/qwen/Qwen2GraphConfigBuilder.cpp
     models/qwen/Qwen2BufferSpec.cpp

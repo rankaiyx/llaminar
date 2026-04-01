@@ -181,7 +181,7 @@ namespace llaminar2
         // Update tensor state on success
         if (result.success)
         {
-            tensor->setCoherenceState_(TensorCoherenceState::SYNCED); // Both host and device now valid
+            tensor->applyCoherenceOp_(CoherenceOp::UPLOAD); // Both host and device now valid
             // gpu_device_ was set by getOrAllocateDeviceBuffer
         }
 
@@ -224,7 +224,7 @@ namespace llaminar2
 
         if (result.success)
         {
-            tensor->setCoherenceState_(TensorCoherenceState::SYNCED); // Both host and device now valid
+            tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD); // Both host and device now valid
         }
 
         return result;
@@ -279,12 +279,12 @@ namespace llaminar2
         {
             if (target_device.is_gpu())
             {
-                tensor->setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                tensor->applyCoherenceOp_(CoherenceOp::MARK_DEVICE_DIRTY);
                 tensor->authoritative_device_ = target_device;
             }
             else
             {
-                tensor->setCoherenceState_(TensorCoherenceState::SYNCED);
+                tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD);
             }
         }
 
@@ -546,7 +546,7 @@ namespace llaminar2
             }
 
             tensor->gpu_device_ = target_device;
-            tensor->setCoherenceState_(TensorCoherenceState::SYNCED);
+            tensor->applyCoherenceOp_(CoherenceOp::UPLOAD);
             return TransferResult::ok(TransferMethod::NOOP);
         }
 
@@ -693,7 +693,7 @@ namespace llaminar2
 
                 tensor->gpu_data_ptr_ = nullptr;
                 tensor->gpu_device_.reset();
-                tensor->setCoherenceState_(TensorCoherenceState::HOST_ONLY);
+                tensor->applyCoherenceOp_(CoherenceOp::RELEASE_DEVICE);
                 tensor->is_bar_backed_ = false;
 
                 LOG_DEBUG("[TransferEngine::uploadFull] Parked previous primary buffer for "
@@ -824,7 +824,7 @@ namespace llaminar2
                 return TransferResult::fail(TransferMethod::HOST_TO_DEVICE, "hostToDevice failed");
             }
 
-            tensor->setCoherenceState_(TensorCoherenceState::SYNCED);
+            tensor->applyCoherenceOp_(CoherenceOp::UPLOAD);
 
             LOG_DEBUG("[TransferEngine::uploadFull] Uploaded " << bytes
                                                                << " bytes to device " << target_device.toString()
@@ -944,7 +944,7 @@ namespace llaminar2
                                                 std::string("hipMemcpy D2H from staging failed: ") + hipGetErrorString(hip_err));
                 }
 
-                tensor->setCoherenceState_(TensorCoherenceState::SYNCED);
+                tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD);
                 tensor->authoritative_device_ = std::nullopt;
 
                 LOG_DEBUG("[TransferEngine::downloadFull] BAR-BACKED: Direct D2H from staging "
@@ -963,7 +963,7 @@ namespace llaminar2
 
             std::memcpy(dst, host_visible_src, bytes);
 
-            tensor->setCoherenceState_(TensorCoherenceState::SYNCED);
+            tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD);
             tensor->authoritative_device_ = std::nullopt;
 
             LOG_DEBUG("[TransferEngine::downloadFull] BAR-BACKED: Copied " << bytes << " bytes from BAR region");
@@ -1082,7 +1082,7 @@ namespace llaminar2
                 trace_cfg.recordD2H(bytes);
             }
 
-            tensor->setCoherenceState_(TensorCoherenceState::SYNCED);
+            tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD);
             tensor->authoritative_device_ = std::nullopt;
 
             LOG_DEBUG("[TransferEngine::downloadFull] Downloaded " << bytes

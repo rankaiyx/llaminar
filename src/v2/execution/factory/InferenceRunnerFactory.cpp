@@ -11,7 +11,7 @@
 #include "../../backends/BackendManager.h"
 #include "../local_execution/collective/CollectiveContext.h"
 #include "../mpi_orchestration/DeviceInventory.h"
-#include "../../models/qwen/Qwen2Graph.h"
+#include "../local_execution/graph/GraphBuilderRegistry.h"
 #include "../../models/IGraphConfigBuilder.h"
 #include "../local_execution/graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config
 #include "../local_execution/orchestrators/DeviceGraphOrchestrator.h"
@@ -703,7 +703,7 @@ namespace llaminar2
         std::unique_ptr<DeviceGraphOrchestrator> orchestrator;
         {
             ScopedWeightLoadDetailTimer timer("graph.build.create_orchestrator");
-            auto graph_builder = std::make_shared<Qwen2Graph>(graph_config, mpi_ctx);
+            auto graph_builder = GraphBuilderRegistry::create(architecture, graph_config, mpi_ctx);
             orchestrator = std::make_unique<DeviceGraphOrchestrator>(
                 std::move(graph_builder), mpi_ctx);
         }
@@ -1420,7 +1420,7 @@ namespace llaminar2
         // =====================================================================
         DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = model_ctx;
-        deps.graph_builder = std::make_shared<Qwen2Graph>(graph_config, nullptr);
+        deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
         deps.pipeline_config = pipeline_config;
 
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
@@ -1570,7 +1570,7 @@ namespace llaminar2
         // Create DeviceGraphOrchestrator
         // Note: No MPI context for PP stages - inter-stage comm handled externally
         // =====================================================================
-        auto graph_builder = std::make_shared<Qwen2Graph>(graph_config, nullptr);
+        auto graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(graph_builder), nullptr /* no mpi_ctx */);
 
@@ -1724,7 +1724,7 @@ namespace llaminar2
         // Create Dependencies struct
         DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = model_ctx;
-        deps.graph_builder = std::make_shared<Qwen2Graph>(graph_config, nullptr);
+        deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
         deps.turboquant_ctx = std::move(turboquant_ctx);
         if (config.pp_stage_config.has_value())
             deps.pp_stage_config = config.pp_stage_config.value();
@@ -1843,7 +1843,7 @@ namespace llaminar2
 
     std::unique_ptr<IMultiDeviceOrchestrator> createTestableMultiDeviceOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
-        std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners,
+        std::vector<std::unique_ptr<IInferenceRunner>> device_runners,
         std::unique_ptr<ILocalTPContext> tp_ctx,
         const MultiDeviceOrchestrator::Config &config)
     {

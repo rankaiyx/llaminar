@@ -18,6 +18,7 @@
 #pragma once
 
 #include "GraphSchema.h"
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -96,6 +97,44 @@ namespace llaminar2
          * @return Vector of supported architecture strings
          */
         static std::vector<std::string> supportedArchitectures();
+
+        /**
+         * @brief Register a schema factory for an architecture
+         *
+         * Called during static initialization from model-specific TUs.
+         *
+         * @param architecture Architecture name (case-insensitive)
+         * @param factory Function that creates the schema factory
+         */
+        static void registerFactory(const std::string &architecture,
+                                    std::function<std::unique_ptr<ISchemaFactory>()> factory);
     };
+
+    /**
+     * @brief Static-init registrar helper for SchemaFactoryRegistry
+     *
+     * Place in a model-specific .cpp file:
+     *   static SchemaFactoryRegistrar s_reg("qwen2",
+     *       [] { return std::make_unique<Qwen2SchemaFactory>(); });
+     */
+    struct SchemaFactoryRegistrar
+    {
+        SchemaFactoryRegistrar(const std::string &architecture,
+                               std::function<std::unique_ptr<ISchemaFactory>()> factory)
+        {
+            SchemaFactoryRegistry::registerFactory(architecture, std::move(factory));
+        }
+    };
+
+/**
+ * @brief Convenience macro for schema factory self-registration
+ *
+ * Usage (in a .cpp file):
+ *   REGISTER_SCHEMA_FACTORY("qwen2", Qwen2SchemaFactory);
+ */
+#define REGISTER_SCHEMA_FACTORY(arch_name, FactoryClass)                              \
+    static ::llaminar2::SchemaFactoryRegistrar s_schema_reg_##FactoryClass(arch_name, \
+                                                                           []()       \
+                                                                           { return std::make_unique<FactoryClass>(); })
 
 } // namespace llaminar2

@@ -207,7 +207,7 @@ namespace llaminar2
                 backend->free(gpu_data_ptr_, backend_device_id);
             }
             gpu_data_ptr_ = nullptr;
-            setCoherenceState_(TensorCoherenceState::HOST_ONLY); // GPU memory freed
+            applyCoherenceOp_(CoherenceOp::RELEASE_DEVICE); // GPU memory freed
         }
 
         // Unpin host memory if pinned (after freeing GPU memory)
@@ -1126,7 +1126,7 @@ namespace llaminar2
         // The GPU memory is kept allocated; next ensureOnDevice() will just re-upload.
         if (gpu_data_ptr_)
         {
-            setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE); // Host now the only valid copy
+            applyCoherenceOp_(CoherenceOp::MUTABLE_HOST_ACCESS); // Host now the only valid copy
             // CRITICAL WARNING: Repeated invalidation causes re-uploads!
             if (debugEnv().rocm.trace_coherence)
             {
@@ -1391,7 +1391,7 @@ namespace llaminar2
             }
             gpu_data_ptr_ = nullptr;
             gpu_device_.reset();
-            setCoherenceState_(TensorCoherenceState::HOST_ONLY); // GPU memory freed
+            applyCoherenceOp_(CoherenceOp::RELEASE_DEVICE); // GPU memory freed
         }
 
         // Allocate on target device
@@ -1417,7 +1417,10 @@ namespace llaminar2
             }
 
             gpu_device_ = target_device;
-            // Kernel will write to this buffer — host still valid
+            // Kernel will write to this buffer — host still valid.
+            // Use raw set because this is a fresh allocation (state is HOST_ONLY
+            // or HOST_AUTHORITATIVE from the release above, and MUTABLE_HOST_ACCESS
+            // from HOST_ONLY → HOST_ONLY which is correct but less descriptive).
             setCoherenceState_(TensorCoherenceState::HOST_AUTHORITATIVE);
 
             LOG_DEBUG("[TensorBase::allocateOnDevice] Allocated " << bytes
@@ -1549,7 +1552,7 @@ namespace llaminar2
             LOG_DEBUG("[TensorBase::releaseDeviceMemory] Released device memory on device "
                       << gpu_device_->toString());
             gpu_data_ptr_ = nullptr;
-            setCoherenceState_(TensorCoherenceState::HOST_ONLY); // GPU memory freed
+            applyCoherenceOp_(CoherenceOp::RELEASE_DEVICE); // GPU memory freed
 
             // Unpin host memory since we no longer need fast GPU transfers
             unpinHostMemory();
@@ -2121,8 +2124,8 @@ namespace llaminar2
         gpu_data_ptr_ = dst_ptr;
         gpu_device_ = dst_device;
         authoritative_device_ = dst_device;
-        setCoherenceState_(TensorCoherenceState::DEVICE_AUTHORITATIVE); // Device now authoritative, host stale
-        is_bar_backed_ = dst_is_bar_backed;                             // Track if new primary is BAR-backed
+        applyCoherenceOp_(CoherenceOp::MARK_DEVICE_DIRTY); // Device now authoritative, host stale
+        is_bar_backed_ = dst_is_bar_backed;                // Track if new primary is BAR-backed
 
         // 8. Clear completion event - events are tied to the device/context where created
         // Must clear for ANY cross-device transfer (not just cross-vendor), because CUDA

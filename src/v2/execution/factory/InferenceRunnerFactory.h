@@ -338,7 +338,7 @@ namespace llaminar2
      */
     std::unique_ptr<IMultiDeviceOrchestrator> createTestableMultiDeviceOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
-        std::vector<std::unique_ptr<DeviceGraphOrchestrator>> device_runners,
+        std::vector<std::unique_ptr<IInferenceRunner>> device_runners,
         std::unique_ptr<ILocalTPContext> tp_ctx,
         const MultiDeviceOrchestrator::Config &config);
 

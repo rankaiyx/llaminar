@@ -217,7 +217,7 @@ namespace
 
     TEST_F(Test__InferenceRunnerFactory_MultiDevice, TestableWithNullModelCtxReturnsNull)
     {
-        std::vector<std::unique_ptr<DeviceGraphOrchestrator>> runners;
+        std::vector<std::unique_ptr<IInferenceRunner>> runners;
         // Can't create real runners without model - this tests null check
 
         MultiDeviceOrchestrator::Config config;
@@ -230,7 +230,7 @@ namespace
 
     TEST_F(Test__InferenceRunnerFactory_MultiDevice, TestableWithEmptyRunnersReturnsNull)
     {
-        std::vector<std::unique_ptr<DeviceGraphOrchestrator>> empty_runners;
+        std::vector<std::unique_ptr<IInferenceRunner>> empty_runners;
 
         MultiDeviceOrchestrator::Config config;
         config.devices = {GlobalDeviceAddress::cpu()};

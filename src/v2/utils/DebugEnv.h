@@ -2670,11 +2670,11 @@ namespace llaminar2
      */
     struct CPUVNNIConfig
     {
-        int n_block_chunks = 0;        ///< Override n_block_chunks (0=auto)
-        int k_tile_blocks = 0;         ///< Override k_tile_blocks (0=auto)
-        int m_unroll = 0;              ///< Override m_unroll (0=auto)
-        int k_tiles = 0;              ///< Override k_tiles (0=auto)
-        int min_bpr_k_parallel = 0;   ///< Override MIN_BPR_FOR_K_PARALLEL (0=auto → 256)
+        int n_block_chunks = 0;     ///< Override n_block_chunks (0=auto)
+        int k_tile_blocks = 0;      ///< Override k_tile_blocks (0=auto)
+        int m_unroll = 0;           ///< Override m_unroll (0=auto)
+        int k_tiles = 0;            ///< Override k_tiles (0=auto)
+        int min_bpr_k_parallel = 0; ///< Override MIN_BPR_FOR_K_PARALLEL (0=auto → 256)
 
         CPUVNNIConfig()
         {
@@ -2726,6 +2726,7 @@ namespace llaminar2
         bool skip_allreduce = false;          ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
         bool gpu_stage_timing = true;         ///< GPU event-based per-stage timing (env: LLAMINAR_GPU_STAGE_TIMING)
         bool gpu_stage_timing_detail = false; ///< Print per-stage detail (env: LLAMINAR_GPU_STAGE_TIMING_DETAIL)
+        bool coherence_audit = false;         ///< Per-tensor coherence audit log (env: LLAMINAR_COHERENCE_AUDIT)
 
         /// Global allreduce precision fallback: "fp16", "bf16", or "fp32"
         /// (env: LLAMINAR_ALLREDUCE_PRECISION, default: "fp32")
@@ -2757,6 +2758,8 @@ namespace llaminar2
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
+            const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
+            coherence_audit = coh_audit && std::string(coh_audit) == "1";
         }
 
         void reload()
@@ -2779,6 +2782,8 @@ namespace llaminar2
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
+            const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
+            coherence_audit = coh_audit && std::string(coh_audit) == "1";
             gemm.reload();
             profile.reload();
             rmsnorm.reload();

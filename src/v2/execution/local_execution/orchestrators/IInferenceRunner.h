@@ -9,9 +9,12 @@
 
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 #include <stdexcept>
+
+#include "../../../backends/DeviceId.h"
 
 namespace llaminar2
 {
@@ -20,6 +23,25 @@ namespace llaminar2
     struct PlacementPlan;
     struct GraphExecutorStats;
     struct SamplingParams;
+
+    /**
+     * @brief Lightweight view of a device runner's local logits state
+     *
+     * Returned by getLogitsLocalInfo() to provide GPU pointer, device, and
+     * shape information for column-parallel LM head gather and GPU-side sampling.
+     * This decouples MultiDeviceOrchestrator from DeviceGraphOrchestrator's
+     * internal InferenceState struct.
+     */
+    struct LogitsLocalInfo
+    {
+        const void *gpu_ptr = nullptr;  ///< GPU buffer pointer (nullptr if CPU-only)
+        std::optional<DeviceId> device; ///< GPU device for backend lookup
+        size_t vocab_local = 0;         ///< Local vocab size (columns in logits_local)
+        TensorBase *tensor = nullptr;   ///< Tensor pointer for CPU fallback (data())
+
+        /// True if this info is valid (has a tensor)
+        explicit operator bool() const { return tensor != nullptr; }
+    };
 
     /**
      * @brief Lightweight view of a captured snapshot with 2D shape metadata
@@ -337,6 +359,40 @@ namespace llaminar2
          * @brief Clear hidden state input (reset to normal embedding mode)
          */
         virtual void clearHiddenStateInput() {}
+
+        // =====================================================================
+        // Device & Logits Local API
+        // =====================================================================
+        // These methods expose device identity and column-parallel logits state
+        // so that MultiDeviceOrchestrator can coordinate logits gathering and
+        // GPU-side sampling without downcasting to a concrete runner type.
+
+        /**
+         * @brief Get the primary device this runner executes on
+         *
+         * @return DeviceId of the primary compute device (CPU by default)
+         */
+        virtual DeviceId primaryDeviceId() const { return DeviceId::cpu(); }
+
+        /**
+         * @brief Check if this runner has column-parallel local logits
+         *
+         * True when the LM head is column-parallel and logits_local is allocated.
+         *
+         * @return true if getLogitsLocalInfo() will return valid info
+         */
+        virtual bool hasLogitsLocal() const { return false; }
+
+        /**
+         * @brief Get local logits info for column-parallel gathering
+         *
+         * Returns GPU pointer, device, shape, and tensor pointer for the
+         * per-device logits shard. Used by MultiDeviceOrchestrator for
+         * AllGather of column-parallel LM head output.
+         *
+         * @return LogitsLocalInfo (empty by default)
+         */
+        virtual LogitsLocalInfo getLogitsLocalInfo() const { return {}; }
 
         // =====================================================================
         // Profiling API

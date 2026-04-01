@@ -6,6 +6,7 @@
 #include "CoherenceTracker.h"
 #include "tensors/TensorClasses.h"
 #include "utils/Logger.h"
+#include "utils/Assertions.h"
 
 namespace llaminar2
 {
@@ -14,6 +15,25 @@ namespace llaminar2
     {
         if (!tensor)
             return true; // External or null — nothing to do
+
+#if LLAMINAR_ASSERTIONS_ACTIVE
+        // Invariant: if the arena says DEVICE is authoritative, the tensor
+        // MUST NOT be HOST_AUTHORITATIVE. If it is, something reset the
+        // tensor's coherence state outside arena control (e.g., allocateOnDevice
+        // bug from commit 74de820e).
+        if (state.authority == CoherenceState::DEVICE &&
+            tensor->coherenceState() == TensorCoherenceState::HOST_AUTHORITATIVE)
+        {
+            LOG_ERROR("[COHERENCE_INVARIANT] Arena says DEVICE authoritative but tensor is "
+                      "HOST_AUTHORITATIVE — coherence state was reset outside arena control. "
+                      "tensor=" << static_cast<const void *>(tensor)
+                                << " target=" << target.to_string());
+            tensor->dumpCoherenceAuditLog();
+            LLAMINAR_ASSERT(false,
+                            "Arena/tensor coherence state mismatch — see audit log. "
+                            "Arena: DEVICE, Tensor: HOST_AUTHORITATIVE");
+        }
+#endif
 
         // Use tensor's canonical coherence state for transfer decisions,
         // with arena-level UNINITIALIZED check from CoherenceState

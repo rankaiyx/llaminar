@@ -482,3 +482,24 @@ TEST_F(Test__UnifiedExecution, FastDecode_CorrectDeviceContext_PassedToStages)
         EXPECT_EQ(stage->lastContext(), cpu_ctx_.get());
     }
 }
+
+// =============================================================================
+// Coherence Hardening: mark_dirty is always true (P0/P1)
+// =============================================================================
+
+TEST(Test__StageRunPolicy, MarkDirtyAlwaysTrue_AllFactories)
+{
+    // mark_dirty MUST be true in every factory — it's a correctness invariant,
+    // not a tunable overhead knob. Without mark_dirty, outputs stay
+    // HOST_AUTHORITATIVE after GPU kernel writes, causing stale reads.
+    EXPECT_TRUE(StageRunPolicy::full().mark_dirty);
+    EXPECT_TRUE(StageRunPolicy::fastDecode().mark_dirty);
+    EXPECT_TRUE(StageRunPolicy::debug().mark_dirty);
+}
+
+TEST(Test__StageRunPolicy, MarkDirtyFieldExistsButAlwaysTrue)
+{
+    // Even if someone constructs a policy manually, mark_dirty defaults to true.
+    StageRunPolicy p;
+    EXPECT_TRUE(p.mark_dirty);
+}

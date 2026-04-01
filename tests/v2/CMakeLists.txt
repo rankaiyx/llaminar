@@ -5052,6 +5052,59 @@ add_v2_test(V2_Unit_MultiDeviceOrchestrator
     MPI_PROCS 1
 )
 
+# Test: MDO Interface Decoupling (IInferenceRunner-based device_runners_)
+# Verifies that MultiDeviceOrchestrator works through IInferenceRunner interface
+# without concrete DeviceGraphOrchestrator dependency. Tests primaryDeviceId(),
+# hasLogitsLocal(), getLogitsLocalInfo(), and gatherLogits via CPU-only mocks.
+add_executable(v2_test_mdo_interface_decoupling unit/execution/local_execution/orchestrators/Test__MDO_InterfaceDecoupling.cpp)
+target_include_directories(v2_test_mdo_interface_decoupling PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_mdo_interface_decoupling llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MDO_InterfaceDecoupling
+    COMMAND $<TARGET_FILE:v2_test_mdo_interface_decoupling>
+    LABELS "V2;Unit;LocalTP;MultiDevice;IInferenceRunner;InterfaceDecoupling;Execution"
+    MPI_PROCS 1
+)
+
+# Test: MDO Delegation Coverage (comprehensive delegation pattern tests)
+# Verifies that MultiDeviceOrchestrator correctly delegates to device runners,
+# TP context, and PP stage runners for all public API methods.
+add_executable(v2_test_mdo_delegation_coverage unit/execution/local_execution/orchestrators/Test__MDO_DelegationCoverage.cpp)
+target_include_directories(v2_test_mdo_delegation_coverage PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_mdo_delegation_coverage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MDO_DelegationCoverage
+    COMMAND $<TARGET_FILE:v2_test_mdo_delegation_coverage>
+    LABELS "V2;Unit;LocalTP;MultiDevice;IInferenceRunner;Delegation;Execution"
+    MPI_PROCS 1
+)
+
+# Test: LogitsGatherer (buffer allocation, skip-gather control, single-device gather, copyFromStage)
+add_executable(v2_test_logits_gatherer unit/execution/local_execution/orchestrators/Test__LogitsGatherer.cpp)
+target_include_directories(v2_test_logits_gatherer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_test_logits_gatherer llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_LogitsGatherer
+    COMMAND $<TARGET_FILE:v2_test_logits_gatherer>
+    LABELS "V2;Unit;MultiDevice;LogitsGatherer;Execution"
+    MPI_PROCS 1
+)
+
+# Test: DeviceSampler (edge cases, GPU-fallback paths)
+add_executable(v2_test_device_sampler unit/execution/local_execution/orchestrators/Test__DeviceSampler.cpp)
+target_include_directories(v2_test_device_sampler PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_test_device_sampler llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DeviceSampler
+    COMMAND $<TARGET_FILE:v2_test_device_sampler>
+    LABELS "V2;Unit;MultiDevice;DeviceSampler;Execution"
+    MPI_PROCS 1
+)
+
 # Test: MultiDeviceOrchestrator PP Config (Pipeline Parallelism configuration validation)
 # Tests PPStageConfig validation, ParallelismMode detection, and Config::validate() for PP mode.
 # Phase 1 of MultiDeviceOrchestrator PP support implementation.
@@ -5224,6 +5277,16 @@ add_v2_test(V2_Unit_CoherenceState
     MPI_PROCS 1
 )
 
+# Test: CoherenceAuditLog (ring buffer recording coherence transitions)
+# Tests recording, wrap-around, hasTransition(), dump() formatting.
+add_executable(v2_test_coherence_audit_log unit/tensors/Test__CoherenceAuditLog.cpp)
+target_link_libraries(v2_test_coherence_audit_log llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CoherenceAuditLog
+    COMMAND $<TARGET_FILE:v2_test_coherence_audit_log>
+    LABELS "V2;Unit;Coherence;AuditLog;Debugging"
+    MPI_PROCS 1
+)
+
 # Test: TransferEngine (unified data movement planning and execution)
 # Tests plan logic (pure, no GPU), mock execution via MockBackend, and error handling.
 add_executable(v2_test_transfer_engine unit/transfer/Test__TransferEngine.cpp)
@@ -5333,6 +5396,24 @@ target_link_libraries(v2_test_graph_resolver llaminar2_core GTest::gtest GTest::
 add_v2_test(V2_Unit_GraphResolver
     COMMAND $<TARGET_FILE:v2_test_graph_resolver>
     LABELS "V2;Unit;GraphResolver;GraphSchema;DeclarativeDesign;MultiModel"
+    MPI_PROCS 1
+)
+
+# GraphBuilderRegistry: self-registration pattern for model architectures
+add_executable(v2_test_graph_builder_registry unit/execution/local_execution/graph/Test__GraphBuilderRegistry.cpp)
+target_link_libraries(v2_test_graph_builder_registry llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GraphBuilderRegistry
+    COMMAND $<TARGET_FILE:v2_test_graph_builder_registry>
+    LABELS "V2;Unit;GraphBuilderRegistry;Decoupling;MultiModel"
+    MPI_PROCS 1
+)
+
+# SchemaFactoryRegistry: self-registration pattern for schema factories
+add_executable(v2_test_schema_factory_registry unit/execution/local_execution/graph/Test__SchemaFactoryRegistry.cpp)
+target_link_libraries(v2_test_schema_factory_registry llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SchemaFactoryRegistry
+    COMMAND $<TARGET_FILE:v2_test_schema_factory_registry>
+    LABELS "V2;Unit;SchemaFactoryRegistry;Decoupling;MultiModel"
     MPI_PROCS 1
 )
 

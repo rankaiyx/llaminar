@@ -3,46 +3,104 @@
  * @brief Implementation of SchemaFactoryRegistry
  * @author David Sanftenberg
  * @date February 2026
+ *
+ * Uses self-registration: model-specific TUs register their schema factories
+ * during static initialization. No model-specific includes in this file.
  */
 
 #include "SchemaFactoryRegistry.h"
-#include "../../../models/qwen/Qwen2Schema.h"
-#include "../../../models/qwen3/Qwen3Schema.h"
+#include "../../../models/ModelRegistrations.h"
+#include "utils/Logger.h"
+
+#include <algorithm>
+#include <mutex>
+#include <unordered_map>
 
 namespace llaminar2
 {
 
-    std::unique_ptr<ISchemaFactory> SchemaFactoryRegistry::getFactory(const std::string &architecture)
+    // =========================================================================
+    // Internal registry storage
+    // =========================================================================
+
+    using SchemaFactoryFn = std::function<std::unique_ptr<ISchemaFactory>()>;
+
+    static std::unordered_map<std::string, SchemaFactoryFn> &schemaRegistry()
     {
-        // Normalize architecture string to lowercase for comparison
-        std::string arch_lower = architecture;
-        std::transform(arch_lower.begin(), arch_lower.end(), arch_lower.begin(),
+        static std::unordered_map<std::string, SchemaFactoryFn> s_registry;
+        return s_registry;
+    }
+
+    static std::mutex &schemaRegistryMutex()
+    {
+        static std::mutex s_mutex;
+        return s_mutex;
+    }
+
+    static std::string normalizeArch(const std::string &architecture)
+    {
+        std::string result = architecture;
+        std::transform(result.begin(), result.end(), result.begin(),
                        [](unsigned char c)
                        { return std::tolower(c); });
+        return result;
+    }
 
-        if (arch_lower == "qwen2")
+    // =========================================================================
+    // Registration API (called from model TUs during static init)
+    // =========================================================================
+
+    void SchemaFactoryRegistry::registerFactory(const std::string &architecture,
+                                                std::function<std::unique_ptr<ISchemaFactory>()> factory)
+    {
+        std::lock_guard<std::mutex> lock(schemaRegistryMutex());
+        std::string key = normalizeArch(architecture);
+        schemaRegistry()[key] = std::move(factory);
+        LOG_DEBUG("[SchemaFactoryRegistry] Registered schema factory for '" << key << "'");
+    }
+
+    // =========================================================================
+    // Lazy built-in registration
+    // =========================================================================
+
+    static std::once_flag s_schema_builtin_init;
+
+    static void ensureSchemaBuiltins()
+    {
+        std::call_once(s_schema_builtin_init, registerBuiltinModels);
+    }
+
+    // =========================================================================
+    // Query API
+    // =========================================================================
+
+    std::unique_ptr<ISchemaFactory> SchemaFactoryRegistry::getFactory(const std::string &architecture)
+    {
+        ensureSchemaBuiltins();
+        std::lock_guard<std::mutex> lock(schemaRegistryMutex());
+        std::string key = normalizeArch(architecture);
+
+        auto &reg = schemaRegistry();
+        auto it = reg.find(key);
+        if (it == reg.end())
         {
-            return std::make_unique<Qwen2SchemaFactory>();
+            std::string supported;
+            for (const auto &[name, _] : reg)
+            {
+                if (!supported.empty())
+                    supported += ", ";
+                supported += name;
+            }
+
+            throw std::runtime_error(
+                "SchemaFactoryRegistry: Unsupported architecture '" + architecture + "'. "
+                                                                                     "Registered architectures: [" +
+                supported + "]. "
+                            "To add support, register a factory in your model's .cpp file using "
+                            "REGISTER_SCHEMA_FACTORY(\"your_arch\", YourSchemaFactory).");
         }
 
-        if (arch_lower == "qwen3")
-        {
-            return std::make_unique<Qwen3SchemaFactory>();
-        }
-
-        // Add more architectures here as they are implemented:
-        // else if (arch_lower == "llama") {
-        //     return std::make_unique<LlamaSchemaFactory>();
-        // }
-        // else if (arch_lower == "deepseek") {
-        //     return std::make_unique<DeepSeekSchemaFactory>();
-        // }
-
-        throw std::runtime_error(
-            "SchemaFactoryRegistry: Unsupported architecture '" + architecture + "'. "
-                                                                                 "Supported architectures: qwen2, qwen3. "
-                                                                                 "To add support for a new architecture, create a FooSchemaFactory "
-                                                                                 "class and register it in SchemaFactoryRegistry::getFactory().");
+        return it->second();
     }
 
     WeightShardingConfig SchemaFactoryRegistry::getWeightShardingConfig(const std::string &architecture)
@@ -59,22 +117,21 @@ namespace llaminar2
 
     bool SchemaFactoryRegistry::isSupported(const std::string &architecture)
     {
-        std::string arch_lower = architecture;
-        std::transform(arch_lower.begin(), arch_lower.end(), arch_lower.begin(),
-                       [](unsigned char c)
-                       { return std::tolower(c); });
-
-        return arch_lower == "qwen2" || arch_lower == "qwen3";
-        // Add more architectures as they are implemented:
-        // || arch_lower == "llama"
-        // || arch_lower == "deepseek"
+        ensureSchemaBuiltins();
+        std::lock_guard<std::mutex> lock(schemaRegistryMutex());
+        return schemaRegistry().count(normalizeArch(architecture)) > 0;
     }
 
     std::vector<std::string> SchemaFactoryRegistry::supportedArchitectures()
     {
-        return {"qwen2", "qwen3"};
-        // Add more as implemented:
-        // return {"qwen2", "llama", "deepseek"};
+        ensureSchemaBuiltins();
+        std::lock_guard<std::mutex> lock(schemaRegistryMutex());
+        std::vector<std::string> result;
+        result.reserve(schemaRegistry().size());
+        for (const auto &[name, _] : schemaRegistry())
+            result.push_back(name);
+        std::sort(result.begin(), result.end());
+        return result;
     }
 
 } // namespace llaminar2

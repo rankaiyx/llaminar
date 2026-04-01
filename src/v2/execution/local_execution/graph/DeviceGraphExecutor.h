@@ -68,7 +68,7 @@ namespace llaminar2
     {
         bool coherence = true;            ///< Arena contract-based input/output coherence
         bool weight_coherence = true;     ///< Upload weights to device
-        bool mark_dirty = true;           ///< Mark outputs device-authoritative after execute
+        bool mark_dirty = true;           ///< Mark outputs device-authoritative after execute (ALWAYS ON — correctness, not overhead)
         bool validation = true;           ///< NaN/Inf output validation (Debug/Integration only)
         bool profiling = true;            ///< Per-stage timing breakdown
         bool collective_intercept = true; ///< Use CollectiveContext for allreduce/allgather

@@ -1130,6 +1130,26 @@ namespace llaminar2
          */
         const InferenceState &inferenceState() const { return state_; }
 
+        // =====================================================================
+        // IInferenceRunner: Device & Logits Local API overrides
+        // =====================================================================
+
+        DeviceId primaryDeviceId() const override { return state_.device_id; }
+
+        bool hasLogitsLocal() const override { return state_.logits_local != nullptr; }
+
+        LogitsLocalInfo getLogitsLocalInfo() const override
+        {
+            if (!state_.logits_local)
+                return {};
+            const auto &shape = state_.logits_local->shape();
+            return LogitsLocalInfo{
+                state_.logits_local->gpu_data_ptr(),
+                state_.logits_local->current_device(),
+                shape.size() >= 2 ? shape[1] : 0,
+                state_.logits_local.get()};
+        }
+
         /**
          * @brief Simplified forward pass using orchestrator-owned state
          *
