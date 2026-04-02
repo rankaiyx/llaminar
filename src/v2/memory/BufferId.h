@@ -67,6 +67,12 @@ namespace llaminar2
         MOE_COMBINED_OUTPUT,      ///< Final combined expert output
         MOE_SHARED_EXPERT_OUTPUT, ///< Shared expert FFN output
 
+        // ── GDN (Gated Delta Network) buffers ───────────────────────────
+        ATTN_OUTPUT_GATE,   ///< Sigmoid gate weight for attention output [batch, d_model]
+        GDN_CONV_STATE,     ///< Short convolution causal state [n_heads, conv_kernel-1, head_dim]
+        GDN_RECURRENCE_IN,  ///< GDN recurrence input (after conv+silu)
+        GDN_RECURRENCE_OUT, ///< GDN recurrence output
+
         _COUNT ///< Sentinel – must be last
     };
 
@@ -137,6 +143,14 @@ namespace llaminar2
             return "MOE_COMBINED_OUTPUT";
         case BufferId::MOE_SHARED_EXPERT_OUTPUT:
             return "MOE_SHARED_EXPERT_OUTPUT";
+        case BufferId::ATTN_OUTPUT_GATE:
+            return "ATTN_OUTPUT_GATE";
+        case BufferId::GDN_CONV_STATE:
+            return "GDN_CONV_STATE";
+        case BufferId::GDN_RECURRENCE_IN:
+            return "GDN_RECURRENCE_IN";
+        case BufferId::GDN_RECURRENCE_OUT:
+            return "GDN_RECURRENCE_OUT";
         case BufferId::_COUNT:
             return "_COUNT";
         }

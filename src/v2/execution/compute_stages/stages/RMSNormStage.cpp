@@ -97,10 +97,32 @@ namespace llaminar2
         // Thread GPU stream for graph capture
         bindStageStream(kernel);
 
+        // Apply subtract_one transform if needed: gamma_effective = 1.0 + gamma_stored
+        // This creates a transformed gamma tensor once and reuses it across calls.
+        const TensorBase *effective_gamma = gamma_base;
+        if (params_.subtract_one)
+        {
+            if (!subtract_one_gamma_ ||
+                subtract_one_gamma_->numel() != gamma_base->numel())
+            {
+                subtract_one_gamma_ = std::make_shared<FP32Tensor>(
+                    gamma_base->shape(), DeviceId::cpu());
+                const float *src = gamma_base->data();
+                float *dst = subtract_one_gamma_->mutable_data();
+                for (size_t i = 0; i < gamma_base->numel(); ++i)
+                {
+                    dst[i] = 1.0f + src[i];
+                }
+                LOG_DEBUG("[RMSNormStage] Applied subtract_one transform to gamma ("
+                          << gamma_base->numel() << " elements)");
+            }
+            effective_gamma = subtract_one_gamma_.get();
+        }
+
         // apply_tensor handles input != output cases internally
         bool success = kernel->apply_tensor(
             input_base,
-            gamma_base,
+            effective_gamma,
             output_base,
             seq_len,
             hidden_dim,

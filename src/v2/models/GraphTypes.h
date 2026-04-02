@@ -298,6 +298,81 @@ namespace llaminar2
 
         /// Returns true if this model uses MoE
         bool isMoE() const { return moe_num_experts > 0 && moe_top_k > 0; }
+
+        // =================================================================
+        // Heterogeneous Layer Configuration (Phase B)
+        // =================================================================
+
+        /// Per-layer type names (e.g., "full_attention", "gdn").
+        /// When non-empty, size must equal n_layers.
+        /// Used by schema factories to assign named templates.
+        std::vector<std::string> layer_types;
+
+        /// Per-layer FFN intermediate dimensions (for variable-width FFN).
+        /// When non-empty, size must equal n_layers.
+        /// Empty = all layers use `d_ff`.
+        std::vector<int> layer_d_ff;
+
+        /// Per-layer KV head counts (for variable GQA ratios).
+        /// When non-empty, size must equal n_layers.
+        /// Empty = all layers use `n_kv_heads`.
+        std::vector<int> layer_n_kv_heads;
+
+        /// Per-layer query head counts (for variable head configs).
+        /// When non-empty, size must equal n_layers.
+        /// Empty = all layers use `n_heads`.
+        std::vector<int> layer_n_heads;
+
+        /// Partial RoPE factor — fraction of head_dim that receives rotation.
+        /// 1.0 = full RoPE (default, standard transformers).
+        /// <1.0 = partial RoPE (e.g., 0.5 means first half of head_dim gets RoPE,
+        ///         second half is pass-through). Used by Qwen 3.5 GDN layers.
+        float partial_rotary_factor = 1.0f;
+
+        // ── GDN (Gated Delta Network) Configuration ─────────────────────
+
+        /// GDN short convolution kernel width (e.g., 4 for Qwen 3.5)
+        int gdn_conv_kernel_size = 0;
+
+        /// GDN recurrence state dimension (== head_dim for delta-rule models)
+        int gdn_state_size = 0;
+
+        /// Whether attention output gating (sigmoid) is used
+        bool has_attention_output_gate = false;
+
+        /// Whether RMSNorm uses subtract-one weight transform:
+        /// gamma_effective = 1.0 + gamma_stored (DeepSeek/Qwen3.5 convention)
+        bool rms_norm_subtract_one = false;
+
+        /// Get FFN dimension for a specific layer (falls back to d_ff)
+        int getLayerDFF(int layer_idx) const
+        {
+            if (!layer_d_ff.empty() && layer_idx < static_cast<int>(layer_d_ff.size()))
+                return layer_d_ff[layer_idx];
+            return d_ff;
+        }
+
+        /// Get KV head count for a specific layer (falls back to n_kv_heads)
+        int getLayerNKVHeads(int layer_idx) const
+        {
+            if (!layer_n_kv_heads.empty() && layer_idx < static_cast<int>(layer_n_kv_heads.size()))
+                return layer_n_kv_heads[layer_idx];
+            return n_kv_heads;
+        }
+
+        /// Get query head count for a specific layer (falls back to n_heads)
+        int getLayerNHeads(int layer_idx) const
+        {
+            if (!layer_n_heads.empty() && layer_idx < static_cast<int>(layer_n_heads.size()))
+                return layer_n_heads[layer_idx];
+            return n_heads;
+        }
+
+        /// Returns true if this model has GDN (gated delta network) layers
+        bool hasGDN() const { return gdn_conv_kernel_size > 0 && gdn_state_size > 0; }
+
+        /// Returns true if this model has heterogeneous layer types
+        bool hasHeterogeneousLayers() const { return !layer_types.empty(); }
     };
 
     // =========================================================================

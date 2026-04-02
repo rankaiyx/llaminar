@@ -322,6 +322,10 @@ namespace llaminar2
 
         // Fused operations (GPU optimization)
         FUSED_RESIDUAL_NORM,
+
+        // GDN (Gated Delta Network) stages
+        ATTENTION_OUTPUT_GATE, ///< Sigmoid gate on attention output
+        GATED_RMS_NORM,        ///< RMSNorm with learned multiplicative gate
     };
 
     /**

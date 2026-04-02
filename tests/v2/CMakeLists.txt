@@ -9159,4 +9159,18 @@ add_v2_test(V2_Unit_MoEPipeline
     LABELS "V2;Unit;MoE;Pipeline;MockModel;Rebalancing"
 )
 
+# Test: HeterogeneousLayers — Phase B: named_templates, per-layer dispatch,
+# AttentionOutputGateStage, GatedRMSNormStage, HybridCacheManager, GraphConfig
+add_executable(v2_test_heterogeneous_layers unit/execution/Test__HeterogeneousLayers.cpp)
+target_link_libraries(v2_test_heterogeneous_layers
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_HeterogeneousLayers
+    COMMAND $<TARGET_FILE:v2_test_heterogeneous_layers>
+    LABELS "V2;Unit;HeterogeneousLayers;GraphSchema;GDN;PhaseB"
+    MPI_PROCS 1
+)
+
 endif()

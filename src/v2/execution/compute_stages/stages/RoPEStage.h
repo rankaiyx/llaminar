@@ -49,6 +49,11 @@ namespace llaminar2
             float theta_base = 10000.0f; ///< RoPE theta base
             int seq_len = 0;             ///< Explicit sequence length (for pre-allocated buffers)
 
+            /// Partial rotary factor: fraction of head_dim that gets rotation.
+            /// 1.0 = full RoPE (default), 0.5 = first half rotated, second half pass-through.
+            /// Used by models like Qwen 3.5 GDN attention layers.
+            float partial_rotary_factor = 1.0f;
+
             // Per-token position IDs for batched execution (optional, overrides pos_offset)
             // When set, this array should have seq_len elements (total_tokens for batched)
             // For batched mode with batch_size=2, seq_len=2: [pos0_t0, pos0_t1, pos1_t0, pos1_t1]

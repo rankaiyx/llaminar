@@ -87,6 +87,10 @@ namespace llaminar2
 
         // Per-head normalization (Qwen3)
         QKNorm,
+
+        // GDN (Gated Delta Network) stages
+        AttentionOutputGate, ///< Sigmoid gate on attention output
+        GatedRMSNorm,        ///< RMSNorm with learned multiplicative gate
     };
 
     /**
@@ -199,8 +203,15 @@ namespace llaminar2
         /// For RMSNorm: epsilon value
         std::optional<float> rms_norm_eps;
 
+        /// For RMSNorm: subtract-one weight mode (gamma_effective = 1.0 + gamma_stored)
+        std::optional<bool> subtract_one;
+
         /// For RoPE: theta base
         std::optional<float> rope_theta;
+
+        /// For RoPE: partial rotary factor (fraction of head_dim that gets rotation).
+        /// Overrides runtime default. 1.0 = full RoPE, 0.5 = half rotated.
+        std::optional<float> partial_rotary_factor;
 
         /// For Attention: causal mask
         std::optional<bool> causal;
@@ -522,8 +533,43 @@ namespace llaminar2
         // =================================================================
 
         StageSpec embedding;                   ///< Embedding lookup stage
-        LayerTemplate layer_template;          ///< Template for transformer layers
+        LayerTemplate layer_template;          ///< Template for transformer layers (default/fallback)
         std::vector<StageSpec> lm_head_stages; ///< Final norm + LM head
+
+        // =================================================================
+        // Heterogeneous Layer Support (Phase B)
+        // =================================================================
+
+        /// Named layer templates for heterogeneous architectures.
+        /// Models with mixed layer types (e.g., full attention + GDN layers) define
+        /// multiple templates here and assign them to layers via `layer_template_names`.
+        /// When empty, all layers use `layer_template` (backward compatible).
+        std::unordered_map<std::string, LayerTemplate> named_templates;
+
+        /// Per-layer template name assignment.
+        /// Maps layer index → template name in `named_templates`.
+        /// Size must equal n_layers when non-empty.
+        /// When empty, all layers use the default `layer_template`.
+        std::vector<std::string> layer_template_names;
+
+        /// Get the LayerTemplate for a specific layer index.
+        /// Falls back to `layer_template` when named_templates is empty or
+        /// layer_template_names is not set.
+        const LayerTemplate &getTemplateForLayer(int layer_idx) const
+        {
+            if (!layer_template_names.empty() && !named_templates.empty() &&
+                layer_idx >= 0 &&
+                layer_idx < static_cast<int>(layer_template_names.size()))
+            {
+                const auto &name = layer_template_names[layer_idx];
+                auto it = named_templates.find(name);
+                if (it != named_templates.end())
+                {
+                    return it->second;
+                }
+            }
+            return layer_template;
+        }
 
         // =================================================================
         // Buffer specifications

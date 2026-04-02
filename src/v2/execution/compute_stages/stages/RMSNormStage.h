@@ -10,11 +10,13 @@
 #include "../../../memory/BufferId.h"
 
 #include <optional>
+#include <memory>
 
 namespace llaminar2
 {
-    // Forward declaration
+    // Forward declarations
     class ITensorRMSNorm;
+    class FP32Tensor;
 
     /**
      * @brief RMS normalization stage
@@ -38,6 +40,11 @@ namespace llaminar2
             const ITensor *gamma = nullptr; ///< Gamma weights tensor
 
             float eps = 1e-6f; ///< Epsilon for numerical stability
+
+            /// Subtract-one weight mode: gamma_effective = 1.0 + gamma_stored.
+            /// Used by DeepSeek and Qwen 3.5 variants where norm weights are stored
+            /// as (gamma - 1.0) in the GGUF file.
+            bool subtract_one = false;
 
             // Explicit seq_len override for pre-allocated buffers
             // If 0, derives from input tensor dimensions
@@ -68,6 +75,10 @@ namespace llaminar2
         Params params_;
         mutable llaminar2::ITensorRMSNorm *cached_kernel_ = nullptr;
         mutable int cached_kernel_tensor_type_ = -1;
+
+        /// Lazily-allocated gamma with subtract_one transform applied.
+        /// Only populated when params_.subtract_one is true.
+        mutable std::shared_ptr<FP32Tensor> subtract_one_gamma_;
     };
 
 } // namespace llaminar2

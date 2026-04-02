@@ -169,6 +169,13 @@ namespace llaminar2
         /// matching this precision will use the overridden dtype instead of
         /// the default. See BufferSpec::dtype_overrides.
         ActivationPrecision activation_precision = ActivationPrecision::FP32;
+
+        // =================================================================
+        // Heterogeneous Layer Configuration (Phase B)
+        // =================================================================
+
+        /// Partial RoPE factor (fraction of head_dim rotated). Default 1.0 = full.
+        float partial_rotary_factor = 1.0f;
     };
 
     /**

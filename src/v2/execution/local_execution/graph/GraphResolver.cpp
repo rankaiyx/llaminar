@@ -169,7 +169,8 @@ namespace llaminar2
 
         for (int layer = 0; layer < runtime.n_layers; ++layer)
         {
-            auto layer_stages = resolveLayer(schema.layer_template, layer, runtime, tensors);
+            const auto &tmpl = schema.getTemplateForLayer(layer);
+            auto layer_stages = resolveLayer(tmpl, layer, runtime, tensors);
 
             // Update dependencies: first stage of layer depends on previous layer's final
             if (!layer_stages.empty() && layer > 0)
@@ -536,10 +537,12 @@ namespace llaminar2
         {
         case StageType::RMSNorm:
             resolved.float_params["eps"] = spec.rms_norm_eps.value_or(runtime.rms_norm_eps);
+            resolved.bool_params["subtract_one"] = spec.subtract_one.value_or(false);
             break;
 
         case StageType::RoPE:
             resolved.float_params["theta_base"] = spec.rope_theta.value_or(runtime.rope_theta);
+            resolved.float_params["partial_rotary_factor"] = spec.partial_rotary_factor.value_or(runtime.partial_rotary_factor);
             resolved.int_params["n_heads"] = runtime.local_n_heads > 0 ? runtime.local_n_heads : runtime.n_heads;
             resolved.int_params["n_kv_heads"] = runtime.local_n_kv_heads > 0 ? runtime.local_n_kv_heads : runtime.n_kv_heads;
             resolved.int_params["head_dim"] = runtime.head_dim;
@@ -596,6 +599,15 @@ namespace llaminar2
 
         case StageType::SwiGLU:
             // seq_len already set above
+            break;
+
+        case StageType::AttentionOutputGate:
+            // Uses seq_len and d_model from common params
+            break;
+
+        case StageType::GatedRMSNorm:
+            resolved.float_params["eps"] = spec.rms_norm_eps.value_or(runtime.rms_norm_eps);
+            resolved.bool_params["subtract_one"] = spec.subtract_one.value_or(false);
             break;
 
         default:

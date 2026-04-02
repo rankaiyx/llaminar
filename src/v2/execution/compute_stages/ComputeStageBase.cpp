@@ -112,6 +112,10 @@ namespace llaminar2
             return "ATTENTION_COMPUTE";
         case ComputeStageType::QUANTIZE_Q16_1:
             return "QUANTIZE_Q16_1";
+        case ComputeStageType::ATTENTION_OUTPUT_GATE:
+            return "ATTENTION_OUTPUT_GATE";
+        case ComputeStageType::GATED_RMS_NORM:
+            return "GATED_RMS_NORM";
         default:
             return "UNKNOWN";
         }
