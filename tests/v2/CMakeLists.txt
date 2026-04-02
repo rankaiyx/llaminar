@@ -690,6 +690,23 @@ if(HAVE_CUDA AND HAVE_ROCM)
         RESOURCE_LOCK "PCIeBAR_P2P"
     )
 
+    # Test: PCIeBARBackend HardwareInit - Hardware initialization, lifecycle, and BAR allocation tests
+    # These were moved from unit/ because they call DirectP2PEngine::probeCapabilities()
+    # and backend_->initialize() which maps 1GB BAR regions and benchmarks bandwidth.
+    add_executable(v2_integration_pcie_bar_backend_hw_init integration/collective/backends/Test__PCIeBARBackend_HardwareInit.cpp)
+    target_link_libraries(v2_integration_pcie_bar_backend_hw_init 
+        llaminar2_core 
+        device_benchmarks
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_PCIeBARBackend_HardwareInit 
+        COMMAND $<TARGET_FILE:v2_integration_pcie_bar_backend_hw_init>
+        LABELS "V2;Integration;Collective;PCIeBARBackend;P2P;CUDA;ROCm;CrossVendor"
+        MPI_PROCS 1
+        RESOURCE_LOCK "PCIeBAR_P2P"
+    )
+
     # Test: PCIeBARBackend Multi-Pair - Multi-pair CUDA↔ROCm collective operations
     # Tests GCD-based parallel bridging where multiple device pairs perform
     # allreduce operations simultaneously. Requires 2+ CUDA and 2+ ROCm devices
@@ -1020,7 +1037,6 @@ if(HAVE_CUDA AND HAVE_ROCM)
     add_executable(v2_unit_pcie_bar_backend unit/collective/backends/Test__PCIeBARBackend.cpp)
     target_link_libraries(v2_unit_pcie_bar_backend 
         llaminar2_core 
-        device_benchmarks
         GTest::gtest
         GTest::gtest_main
     )

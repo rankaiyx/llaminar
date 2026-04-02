@@ -139,9 +139,9 @@ echo ""
 echo -e "${YELLOW}[5/5] Running performance regression benchmarks...${NC}"
 echo ""
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
 set +e
-"$SCRIPT_DIR/run_benchmark_check.sh"
+"$REPO_ROOT/.githooks/run_benchmark_check.sh"
 BENCH_EXIT_CODE=$?
 set -e
 
