@@ -59,6 +59,14 @@ namespace llaminar2
         Q_QUANTIZED, ///< Q quantized to Q16_1
         K_QUANTIZED, ///< K quantized to Q16_1
 
+        // ── MoE buffers ─────────────────────────────────────────────────────
+        MOE_ROUTER_LOGITS,        ///< Router gate logits [batch, num_experts]
+        MOE_EXPERT_INDICES,       ///< Top-k expert indices per token
+        MOE_EXPERT_WEIGHTS,       ///< Top-k routing weights per token
+        MOE_EXPERT_OUTPUT,        ///< Scratch for per-expert FFN output
+        MOE_COMBINED_OUTPUT,      ///< Final combined expert output
+        MOE_SHARED_EXPERT_OUTPUT, ///< Shared expert FFN output
+
         _COUNT ///< Sentinel – must be last
     };
 
@@ -117,6 +125,18 @@ namespace llaminar2
             return "Q_QUANTIZED";
         case BufferId::K_QUANTIZED:
             return "K_QUANTIZED";
+        case BufferId::MOE_ROUTER_LOGITS:
+            return "MOE_ROUTER_LOGITS";
+        case BufferId::MOE_EXPERT_INDICES:
+            return "MOE_EXPERT_INDICES";
+        case BufferId::MOE_EXPERT_WEIGHTS:
+            return "MOE_EXPERT_WEIGHTS";
+        case BufferId::MOE_EXPERT_OUTPUT:
+            return "MOE_EXPERT_OUTPUT";
+        case BufferId::MOE_COMBINED_OUTPUT:
+            return "MOE_COMBINED_OUTPUT";
+        case BufferId::MOE_SHARED_EXPERT_OUTPUT:
+            return "MOE_SHARED_EXPERT_OUTPUT";
         case BufferId::_COUNT:
             return "_COUNT";
         }

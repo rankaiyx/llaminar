@@ -1227,6 +1227,14 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEStages.cpp
+    execution/moe/IMoERouter.cpp
+    execution/moe/IMoEDispatcher.cpp
+    execution/moe/IMoEExpertExecutor.cpp
+    execution/moe/IMoECombiner.cpp
+    execution/moe/ExpertPlacementMap.cpp
+    execution/moe/ExpertWeightCache.cpp
+    execution/moe/ExpertRebalancer.cpp
+    execution/moe/MoEPipeline.cpp
     execution/compute_stages/stages/AttentionWithKVCacheStage.cpp
     execution/compute_stages/stages/KVCacheAppendStage.cpp
     execution/compute_stages/stages/KVCacheGatherStage.cpp

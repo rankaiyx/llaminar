@@ -9047,4 +9047,116 @@ set_tests_properties(V2_Integration_Python_Qwen35Inference PROPERTIES
     TIMEOUT 600
 )
 
+# =============================================================================
+# MoE Infrastructure Unit Tests
+# =============================================================================
+
+# Test: MoERouter — SoftmaxTopKRouter: softmax, top-k selection, normalization
+add_executable(v2_test_moe_router unit/moe/Test__MoERouter.cpp)
+target_link_libraries(v2_test_moe_router
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoERouter
+    COMMAND $<TARGET_FILE:v2_test_moe_router>
+    LABELS "V2;Unit;MoE;Router;Softmax"
+)
+
+# Test: MoEDispatcher — StandardMoEDispatcher: token grouping by expert
+add_executable(v2_test_moe_dispatcher unit/moe/Test__MoEDispatcher.cpp)
+target_link_libraries(v2_test_moe_dispatcher
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEDispatcher
+    COMMAND $<TARGET_FILE:v2_test_moe_dispatcher>
+    LABELS "V2;Unit;MoE;Dispatcher"
+)
+
+# Test: MoEExpertExecutor — CPUMoEExpertExecutor: SwiGLU FFN correctness
+add_executable(v2_test_moe_expert_executor unit/moe/Test__MoEExpertExecutor.cpp)
+target_link_libraries(v2_test_moe_expert_executor
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEExpertExecutor
+    COMMAND $<TARGET_FILE:v2_test_moe_expert_executor>
+    LABELS "V2;Unit;MoE;Expert;SwiGLU;FFN"
+)
+
+# Test: MoECombiner — CPUMoECombiner: weighted combination of expert outputs
+add_executable(v2_test_moe_combiner unit/moe/Test__MoECombiner.cpp)
+target_link_libraries(v2_test_moe_combiner
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoECombiner
+    COMMAND $<TARGET_FILE:v2_test_moe_combiner>
+    LABELS "V2;Unit;MoE;Combiner"
+)
+
+# Test: ExpertPlacementMap — placement strategies, usage tracking, rebalancing
+add_executable(v2_test_expert_placement_map unit/moe/Test__ExpertPlacementMap.cpp)
+target_link_libraries(v2_test_expert_placement_map
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ExpertPlacementMap
+    COMMAND $<TARGET_FILE:v2_test_expert_placement_map>
+    LABELS "V2;Unit;MoE;Placement;WeightPlacement"
+)
+
+# Test: ExpertWeightCache — LRU/FIFO eviction, mock IExpertWeightStorage
+add_executable(v2_test_expert_weight_cache unit/moe/Test__ExpertWeightCache.cpp)
+target_link_libraries(v2_test_expert_weight_cache
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ExpertWeightCache
+    COMMAND $<TARGET_FILE:v2_test_expert_weight_cache>
+    LABELS "V2;Unit;MoE;Cache;LRU;WeightCache"
+)
+
+# Test: ExpertRebalancer — histogram-based dynamic weight movement
+add_executable(v2_test_expert_rebalancer unit/moe/Test__ExpertRebalancer.cpp)
+target_link_libraries(v2_test_expert_rebalancer
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ExpertRebalancer
+    COMMAND $<TARGET_FILE:v2_test_expert_rebalancer>
+    LABELS "V2;Unit;MoE;Rebalancer;Histogram;DynamicPlacement"
+)
+
+# Test: MoEConfig — configuration validation, isMoELayer()
+add_executable(v2_test_moe_config unit/moe/Test__MoEConfig.cpp)
+target_link_libraries(v2_test_moe_config
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEConfig
+    COMMAND $<TARGET_FILE:v2_test_moe_config>
+    LABELS "V2;Unit;MoE;Config"
+)
+
+# Test: MoEPipeline — full pipeline dry-run with mock model + rebalancing loop
+add_executable(v2_test_moe_pipeline unit/moe/Test__MoEPipeline.cpp)
+target_link_libraries(v2_test_moe_pipeline
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEPipeline
+    COMMAND $<TARGET_FILE:v2_test_moe_pipeline>
+    LABELS "V2;Unit;MoE;Pipeline;MockModel;Rebalancing"
+)
+
 endif()

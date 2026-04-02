@@ -283,6 +283,21 @@ namespace llaminar2
         {
             return activation_precision == ActivationPrecision::HybridQ16;
         }
+
+        // =================================================================
+        // MoE Configuration (zero = no MoE)
+        // =================================================================
+
+        int moe_num_experts = 0;              ///< Total expert count (e.g. 256 for Qwen3.5)
+        int moe_top_k = 0;                    ///< Experts activated per token (e.g. 8)
+        int moe_intermediate_size = 0;        ///< Per-expert FFN intermediate dim
+        bool moe_norm_topk_prob = false;      ///< Normalize top-k routing weights
+        bool moe_has_shared_expert = false;   ///< Has always-active shared expert
+        int moe_shared_intermediate_size = 0; ///< Shared expert FFN intermediate dim
+        bool moe_shared_expert_gate = false;  ///< Has sigmoid gating on shared expert
+
+        /// Returns true if this model uses MoE
+        bool isMoE() const { return moe_num_experts > 0 && moe_top_k > 0; }
     };
 
     // =========================================================================
