@@ -2520,4 +2520,130 @@ namespace llaminar2
         }
     };
 
+    // =========================================================================
+    // GDN (Gated Delta Network) Kernel Interfaces
+    // =========================================================================
+
+    /**
+     * @brief Interface for short causal depthwise conv1d + activation
+     *
+     * Used by GDN layers for the QKV preprocessing convolution.
+     * Implementations: CPUShortConvolution (Phase C), CUDAShortConvolution (Phase F)
+     *
+     * @see ShortConv1dStage for the compute stage that delegates to this interface
+     */
+    class ITensorShortConvolution
+    {
+    public:
+        virtual ~ITensorShortConvolution() = default;
+
+        /**
+         * @brief Apply causal depthwise conv1d + optional SiLU activation
+         *
+         * Handles both prefill (seq_len > 1) and decode (seq_len == 1):
+         * - Prefill: full causal conv1d over sequence with zero-padding
+         * - Decode: single-step update using conv_state history
+         *
+         * @param input     Input data [seq_len, channels]
+         * @param weight    Conv weight [channels, kernel_size]
+         * @param bias      Optional bias [channels] (nullptr = no bias)
+         * @param output    Output [seq_len, channels]
+         * @param conv_state Conv state [channels, kernel_size-1] for decode continuity
+         *                   (nullptr allowed for prefill-only, required for decode)
+         * @param seq_len   Sequence length (1 = decode mode)
+         * @param channels  Number of channels (depthwise)
+         * @param kernel_size Convolution kernel width
+         * @param apply_silu Whether to apply SiLU activation after convolution
+         * @return true on success
+         */
+        virtual bool forward(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int channels, int kernel_size,
+            bool apply_silu = true) = 0;
+    };
+
+    /**
+     * @brief Interface for Gated Delta Net recurrence kernel
+     *
+     * Implements the delta rule linear attention recurrence:
+     *   S_t = exp(g_t) * S_{t-1}
+     *   kv = S_t * k_t
+     *   delta = (v_t - kv) * beta_t
+     *   S_t += outer(k_t, delta)
+     *   o_t = S_t * q_t
+     *
+     * Inputs are pre-processed: Q/K are already L2-normalized and scaled,
+     * gate/beta are already computed (exp-decay gate, sigmoid-beta).
+     *
+     * Implementations: CPUGatedDeltaNet (Phase C), CUDAGatedDeltaNet (Phase F)
+     *
+     * @see GDNRecurrenceStage for the compute stage that delegates to this interface
+     */
+    class ITensorGatedDeltaNet
+    {
+    public:
+        virtual ~ITensorGatedDeltaNet() = default;
+
+        /**
+         * @brief Chunk-parallel prefill: process full sequence
+         *
+         * The kernel is responsible for ALL math: L2 normalization,
+         * query scaling, gate computation, and recurrence.
+         *
+         * @param Q         Raw query [seq_len, n_heads * d_k]
+         * @param K         Raw key [seq_len, n_heads * d_k]
+         * @param V         Value [seq_len, n_heads * d_v]
+         * @param alpha     A projection [seq_len, n_heads]
+         * @param beta_raw  B projection [seq_len, n_heads]
+         * @param A_log     Learnable log-space gate [n_heads]
+         * @param dt_bias   Learnable dt bias [n_heads]
+         * @param output    Output context [seq_len, n_heads * d_v]
+         * @param state     Recurrence state [n_heads, d_k, d_v] (updated in-place)
+         * @param seq_len   Sequence length
+         * @param n_heads   Number of attention heads
+         * @param d_k       Key head dimension
+         * @param d_v       Value head dimension
+         * @param chunk_size Chunk size for chunked processing (0 = sequential)
+         * @param use_qk_l2norm Apply L2 normalization to Q and K
+         * @return true on success
+         */
+        virtual bool chunk_forward(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm) = 0;
+
+        /**
+         * @brief Single-step decode recurrence
+         *
+         * The kernel is responsible for ALL math: L2 normalization,
+         * query scaling, gate computation, and recurrence.
+         *
+         * @param q         Raw query [n_heads * d_k]
+         * @param k         Raw key [n_heads * d_k]
+         * @param v         Value [n_heads * d_v]
+         * @param alpha     A projection [n_heads]
+         * @param beta_raw  B projection [n_heads]
+         * @param A_log     Learnable log-space gate [n_heads]
+         * @param dt_bias   Learnable dt bias [n_heads]
+         * @param output    Output context [n_heads * d_v]
+         * @param state     Recurrence state [n_heads, d_k, d_v] (updated in-place)
+         * @param n_heads   Number of attention heads
+         * @param d_k       Key head dimension
+         * @param d_v       Value head dimension
+         * @param use_qk_l2norm Apply L2 normalization to Q and K
+         * @return true on success
+         */
+        virtual bool recurrent_step(
+            const float *q, const float *k, const float *v,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int n_heads, int d_k, int d_v,
+            bool use_qk_l2norm) = 0;
+    };
+
 } // namespace llaminar2

@@ -1229,6 +1229,9 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/MoEStages.cpp
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
+    execution/compute_stages/stages/GDNProjectionStage.cpp
+    execution/compute_stages/stages/ShortConv1dStage.cpp
+    execution/compute_stages/stages/GDNRecurrenceStage.cpp
     execution/moe/IMoERouter.cpp
     execution/moe/IMoEDispatcher.cpp
     execution/moe/IMoEExpertExecutor.cpp
@@ -1397,6 +1400,9 @@ add_library(llaminar2_core STATIC
     kernels/cpu/ops/CPUEmbeddingKernelT.cpp    # Typed Embedding lookup with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/attention/CPUAttentionKernelT.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
     kernels/cpu/attention/CPUFlashAttentionKernelT.cpp # FlashAttention2-style tiled CPU attention (FP32 with fallbacks)
+    # GDN kernel implementations (Gated Delta Net)
+    kernels/cpu/gdn/CPUShortConvolution.cpp
+    kernels/cpu/gdn/CPUGatedDeltaNet.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
     # Universal device kernel cache (hipBLAS, cuBLAS handles, etc.)

@@ -326,6 +326,9 @@ namespace llaminar2
         // GDN (Gated Delta Network) stages
         ATTENTION_OUTPUT_GATE, ///< Sigmoid gate on attention output
         GATED_RMS_NORM,        ///< RMSNorm with learned multiplicative gate
+        GDN_PROJECTION,        ///< 4 separate GEMMs: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b
+        SHORT_CONV1D,          ///< Causal depthwise conv1d (kernel=4) + SiLU
+        GDN_RECURRENCE,        ///< Delta rule recurrence (chunk prefill, single-step decode)
     };
 
     /**

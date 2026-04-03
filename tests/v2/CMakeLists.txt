@@ -9173,4 +9173,19 @@ add_v2_test(V2_Unit_HeterogeneousLayers
     MPI_PROCS 1
 )
 
+# Test: GDN Kernels — Phase C: GDNProjectionStage, ShortConv1dStage,
+# GDNRecurrenceStage (recurrent step + chunk-parallel prefill)
+add_executable(v2_test_gdn_kernels unit/execution/Test__GDNKernels.cpp)
+target_link_libraries(v2_test_gdn_kernels
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+    GTest::gmock
+)
+add_v2_test(V2_Unit_GDNKernels
+    COMMAND $<TARGET_FILE:v2_test_gdn_kernels>
+    LABELS "V2;Unit;GDNKernels;GDN;PhaseC"
+    MPI_PROCS 1
+)
+
 endif()

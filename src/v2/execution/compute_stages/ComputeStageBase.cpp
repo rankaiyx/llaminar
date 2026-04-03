@@ -116,6 +116,12 @@ namespace llaminar2
             return "ATTENTION_OUTPUT_GATE";
         case ComputeStageType::GATED_RMS_NORM:
             return "GATED_RMS_NORM";
+        case ComputeStageType::GDN_PROJECTION:
+            return "GDN_PROJECTION";
+        case ComputeStageType::SHORT_CONV1D:
+            return "SHORT_CONV1D";
+        case ComputeStageType::GDN_RECURRENCE:
+            return "GDN_RECURRENCE";
         default:
             return "UNKNOWN";
         }
