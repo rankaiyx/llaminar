@@ -6,18 +6,13 @@
 #include "Qwen35Graph.h"
 #include "Qwen35Schema.h"
 #include "../../execution/compute_stages/ComputeStages.h"
-#include "../../execution/compute_stages/stages/GDNProjectionStage.h"
-#include "../../execution/compute_stages/stages/ShortConv1dStage.h"
-#include "../../execution/compute_stages/stages/GDNRecurrenceStage.h"
-#include "../../execution/compute_stages/stages/GatedRMSNormStage.h"
-#include "../../execution/compute_stages/stages/AttentionOutputGateStage.h"
-#include "../../kernels/cpu/gdn/CPUShortConvolution.h"
-#include "../../kernels/cpu/gdn/CPUGatedDeltaNet.h"
+#include "../../kernels/KernelFactory.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../utils/Logger.h"
 
 namespace llaminar2
 {
+    using KernelFactory = llaminar::v2::kernels::KernelFactory;
 
     // =========================================================================
     // Constructors
@@ -89,12 +84,12 @@ namespace llaminar2
             const int recurrence_state_size = n_heads * d_k * d_v;
             recurrence_states_[i].resize(recurrence_state_size, 0.0f);
 
-            // Create kernel instances (lifetime tied to Qwen35Graph)
-            conv_kernels_[i] = std::make_shared<CPUShortConvolution>();
-            rec_kernels_[i] = std::make_shared<CPUGatedDeltaNet>();
+            // Create kernel instances via KernelFactory (lifetime tied to Qwen35Graph)
+            conv_kernels_[i] = KernelFactory::createShortConvolution(DeviceType::CPU);
+            rec_kernels_[i] = KernelFactory::createGatedDeltaNet(DeviceType::CPU);
 
             LOG_DEBUG("[Qwen35Graph] Layer " << i << " GDN state: conv_state="
-                      << conv_state_size << " recurrence_state=" << recurrence_state_size);
+                                             << conv_state_size << " recurrence_state=" << recurrence_state_size);
         }
     }
 
@@ -227,9 +222,9 @@ namespace llaminar2
         const int qkv_dim = inner_size; // 2 * n_heads * d_k + n_heads * d_v
 
         LOG_DEBUG("[Qwen35Graph] Building GDN attention for layer " << layer_idx
-                  << ": total_tokens=" << total_tokens
-                  << " n_heads=" << n_heads << " d_k=" << d_k << " d_v=" << d_v
-                  << " qkv_dim=" << qkv_dim);
+                                                                    << ": total_tokens=" << total_tokens
+                                                                    << " n_heads=" << n_heads << " d_k=" << d_k << " d_v=" << d_v
+                                                                    << " qkv_dim=" << qkv_dim);
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm
@@ -302,7 +297,7 @@ namespace llaminar2
         proj_params.output_b_buffer_id = BufferId::GDN_BETA;
 
         graph.addNode(prefix + "gdn_proj",
-                      std::make_unique<GDNProjectionStage>(proj_params),
+                      ComputeStageFactory::createGDNProjection(proj_params),
                       device);
         graph.addDependency(prefix + "gdn_proj", prefix + "attn_norm");
 
@@ -327,7 +322,7 @@ namespace llaminar2
         conv_params.output_buffer_id = BufferId::GDN_QKV;
 
         graph.addNode(prefix + "short_conv",
-                      std::make_unique<ShortConv1dStage>(conv_params),
+                      ComputeStageFactory::createShortConv1d(conv_params),
                       device);
         graph.addDependency(prefix + "short_conv", prefix + "gdn_proj");
 
@@ -340,12 +335,12 @@ namespace llaminar2
         GDNRecurrenceStage::Params rec_params;
         rec_params.device_id = device;
         rec_params.layer_idx = layer_idx;
-        rec_params.Q = buffers.gdn_qkv;      // Will be split by kernel
-        rec_params.K = buffers.gdn_qkv;      // Same tensor, offset by kernel
-        rec_params.V = buffers.gdn_qkv;      // Same tensor, offset by kernel
+        rec_params.Q = buffers.gdn_qkv; // Will be split by kernel
+        rec_params.K = buffers.gdn_qkv; // Same tensor, offset by kernel
+        rec_params.V = buffers.gdn_qkv; // Same tensor, offset by kernel
         rec_params.alpha = buffers.gdn_alpha;
         rec_params.beta = buffers.gdn_beta;
-        rec_params.A_log = layer.ssm_a;      // Learnable log-space gate
+        rec_params.A_log = layer.ssm_a; // Learnable log-space gate
         rec_params.dt_bias = layer.ssm_dt_bias;
         rec_params.output = buffers.attn_output;
         rec_params.recurrence_state = recurrence_states_[layer_idx].data();
@@ -361,7 +356,7 @@ namespace llaminar2
         rec_params.kernel = rec_kernels_[layer_idx].get();
 
         graph.addNode(prefix + "gdn_recurrence",
-                      std::make_unique<GDNRecurrenceStage>(rec_params),
+                      ComputeStageFactory::createGDNRecurrence(rec_params),
                       device);
         graph.addDependency(prefix + "gdn_recurrence", prefix + "short_conv");
 
@@ -382,7 +377,7 @@ namespace llaminar2
         gnorm_params.output_buffer_id = BufferId::ATTN_OUTPUT;
 
         graph.addNode(prefix + "gated_norm",
-                      std::make_unique<GatedRMSNormStage>(gnorm_params),
+                      ComputeStageFactory::createGatedRMSNorm(gnorm_params),
                       device);
         graph.addDependency(prefix + "gated_norm", prefix + "gdn_recurrence");
 
@@ -429,7 +424,7 @@ namespace llaminar2
             gate_params.output_buffer_id = BufferId::ATTN_PROJ;
 
             graph.addNode(prefix + "attn_output_gate",
-                          std::make_unique<AttentionOutputGateStage>(gate_params),
+                          ComputeStageFactory::createAttentionOutputGate(gate_params),
                           device);
             graph.addDependency(prefix + "attn_output_gate", prefix + "gdn_out_proj");
         }
@@ -457,7 +452,7 @@ namespace llaminar2
         graph.addDependency(prefix + "attn_residual", residual_dep);
 
         LOG_DEBUG("[Qwen35Graph] GDN attention graph for layer " << layer_idx
-                  << " has " << graph.size() << " nodes");
+                                                                 << " has " << graph.size() << " nodes");
 
         return graph;
     }

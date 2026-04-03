@@ -28,6 +28,11 @@
 #include "stages/MoEStages.h"
 #include "stages/QKNormStage.h"
 #include "stages/FusedResidualNormStage.h"
+#include "stages/GDNProjectionStage.h"
+#include "stages/ShortConv1dStage.h"
+#include "stages/GDNRecurrenceStage.h"
+#include "stages/GatedRMSNormStage.h"
+#include "stages/AttentionOutputGateStage.h"
 
 namespace llaminar2
 {
@@ -187,6 +192,40 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createMoECombine(
             const MoECombineStage::Params &params);
+
+        // =====================================================================
+        // GDN (Gated Delta Net) Stages
+        // =====================================================================
+
+        /**
+         * @brief Create a GDN 4-way projection stage (QKV + Z + alpha + beta)
+         */
+        static std::unique_ptr<IComputeStage> createGDNProjection(
+            const GDNProjectionStage::Params &params);
+
+        /**
+         * @brief Create a short 1D causal convolution stage for GDN
+         */
+        static std::unique_ptr<IComputeStage> createShortConv1d(
+            const ShortConv1dStage::Params &params);
+
+        /**
+         * @brief Create a GDN delta-rule linear attention recurrence stage
+         */
+        static std::unique_ptr<IComputeStage> createGDNRecurrence(
+            const GDNRecurrenceStage::Params &params);
+
+        /**
+         * @brief Create a gated RMSNorm stage: RMSNorm(x) * SiLU(gate)
+         */
+        static std::unique_ptr<IComputeStage> createGatedRMSNorm(
+            const GatedRMSNormStage::Params &params);
+
+        /**
+         * @brief Create an attention output gate stage: sigmoid(gate) * input
+         */
+        static std::unique_ptr<IComputeStage> createAttentionOutputGate(
+            const AttentionOutputGateStage::Params &params);
 
         // =====================================================================
         // MPI Communication Stages

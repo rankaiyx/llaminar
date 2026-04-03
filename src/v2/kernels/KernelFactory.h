@@ -99,6 +99,8 @@ namespace llaminar2
     class ITensorEmbedding;
     class ITensorFusedQKVGemm;
     class ITensorFusedGateUpGemm;
+    class ITensorShortConvolution;
+    class ITensorGatedDeltaNet;
     class IQ4_NLTensor;
     class Q4_0Tensor;
     class Q4_1Tensor;
@@ -963,6 +965,34 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorResidualAdd> createResidualAdd(
                     const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
+
+                // ==========================================================================
+                // GDN (Gated Delta Net) Kernel Creation - Device-aware dispatch
+                // ==========================================================================
+
+                /**
+                 * @brief Create ShortConvolution kernel for GDN layers
+                 *
+                 * GDN's 1D causal short convolution (FP32-only, no per-precision overloads).
+                 *
+                 * @param dev_type Target device type (CPU/CUDA/ROCm)
+                 * @param device_ordinal GPU ordinal (-1 for CPU)
+                 * @return ITensorShortConvolution implementation
+                 */
+                static std::unique_ptr<llaminar2::ITensorShortConvolution> createShortConvolution(
+                    DeviceType dev_type, int device_ordinal = -1);
+
+                /**
+                 * @brief Create GatedDeltaNet kernel for GDN layers
+                 *
+                 * GDN's delta-rule linear attention recurrence (FP32-only).
+                 *
+                 * @param dev_type Target device type (CPU/CUDA/ROCm)
+                 * @param device_ordinal GPU ordinal (-1 for CPU)
+                 * @return ITensorGatedDeltaNet implementation
+                 */
+                static std::unique_ptr<llaminar2::ITensorGatedDeltaNet> createGatedDeltaNet(
+                    DeviceType dev_type, int device_ordinal = -1);
 
                 // ==========================================================================
                 // Generic TensorBase* Factory Methods - Auto-dispatch by native_type()

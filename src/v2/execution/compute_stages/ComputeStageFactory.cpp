@@ -21,6 +21,11 @@
 #include "stages/RMSNormStage.h"\n #include "stages/QKNormStage.h"
 #include "stages/RoPEStage.h"
 #include "stages/SendActivationsStage.h"
+#include "stages/GDNProjectionStage.h"
+#include "stages/ShortConv1dStage.h"
+#include "stages/GDNRecurrenceStage.h"
+#include "stages/GatedRMSNormStage.h"
+#include "stages/AttentionOutputGateStage.h"
 
 namespace llaminar2
 {
@@ -165,6 +170,40 @@ namespace llaminar2
     {
         // Unified: AttentionComputeStage uses KernelFactory at execute-time
         return std::make_unique<AttentionComputeStage>(params);
+    }
+
+    // =============================================================================
+    // GDN (Gated Delta Net) Stage Factories
+    // =============================================================================
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createGDNProjection(
+        const GDNProjectionStage::Params &params)
+    {
+        return std::make_unique<GDNProjectionStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createShortConv1d(
+        const ShortConv1dStage::Params &params)
+    {
+        return std::make_unique<ShortConv1dStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createGDNRecurrence(
+        const GDNRecurrenceStage::Params &params)
+    {
+        return std::make_unique<GDNRecurrenceStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createGatedRMSNorm(
+        const GatedRMSNormStage::Params &params)
+    {
+        return std::make_unique<GatedRMSNormStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createAttentionOutputGate(
+        const AttentionOutputGateStage::Params &params)
+    {
+        return std::make_unique<AttentionOutputGateStage>(params);
     }
 
     // =============================================================================

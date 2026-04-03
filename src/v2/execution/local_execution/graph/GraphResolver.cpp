@@ -16,11 +16,6 @@
 #include "GraphResolver.h"
 #include "DeviceGraphExecutor.h" // For ComputeGraph
 #include "../../compute_stages/ComputeStages.h"
-#include "../../compute_stages/stages/GDNProjectionStage.h"
-#include "../../compute_stages/stages/ShortConv1dStage.h"
-#include "../../compute_stages/stages/GDNRecurrenceStage.h"
-#include "../../compute_stages/stages/GatedRMSNormStage.h"
-#include "../../compute_stages/stages/AttentionOutputGateStage.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -841,9 +836,9 @@ namespace llaminar2
             return ComputeStageFactory::createAllGather(params);
         }
 
-        // =====================================================================
-        // GDN (Gated Delta Net) Stages
-        // =====================================================================
+            // =====================================================================
+            // GDN (Gated Delta Net) Stages
+            // =====================================================================
 
         case StageType::GDNProjection:
         {
@@ -872,7 +867,7 @@ namespace llaminar2
             if (params.w_b)
                 params.n_b = static_cast<int>(params.w_b->shape()[0]);
             params.device_id = stage.device;
-            return std::make_unique<GDNProjectionStage>(params);
+            return ComputeStageFactory::createGDNProjection(params);
         }
 
         case StageType::ShortConv1d:
@@ -887,7 +882,7 @@ namespace llaminar2
             params.kernel_size = stage.int_params.count("kernel_size") ? stage.int_params.at("kernel_size") : 4;
             // conv_state and kernel are set at runtime by the graph builder
             params.device_id = stage.device;
-            return std::make_unique<ShortConv1dStage>(params);
+            return ComputeStageFactory::createShortConv1d(params);
         }
 
         case StageType::GDNRecurrence:
@@ -909,7 +904,7 @@ namespace llaminar2
             params.use_qk_l2norm = stage.bool_params.count("use_qk_l2norm") ? stage.bool_params.at("use_qk_l2norm") : true;
             // recurrence_state and kernel are set at runtime by the graph builder
             params.device_id = stage.device;
-            return std::make_unique<GDNRecurrenceStage>(params);
+            return ComputeStageFactory::createGDNRecurrence(params);
         }
 
         case StageType::GatedRMSNorm:
@@ -923,7 +918,7 @@ namespace llaminar2
             params.subtract_one = stage.bool_params.count("subtract_one") ? stage.bool_params.at("subtract_one") : false;
             params.seq_len = seq_len;
             params.device_id = stage.device;
-            return std::make_unique<GatedRMSNormStage>(params);
+            return ComputeStageFactory::createGatedRMSNorm(params);
         }
 
         case StageType::AttentionOutputGate:
@@ -934,7 +929,7 @@ namespace llaminar2
             params.output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
             params.seq_len = seq_len;
             params.device_id = stage.device;
-            return std::make_unique<AttentionOutputGateStage>(params);
+            return ComputeStageFactory::createAttentionOutputGate(params);
         }
 
         default:

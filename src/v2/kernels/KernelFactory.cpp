@@ -16,6 +16,8 @@
 #include "cpu/ops/CPUEmbeddingKernelT.h"
 #include "cpu/attention/CPUAttentionKernelT.h"
 #include "cpu/attention/CPUFlashAttentionKernelT.h"
+#include "cpu/gdn/CPUShortConvolution.h"
+#include "cpu/gdn/CPUGatedDeltaNet.h"
 #include "../utils/Assertions.h"
 #include <unordered_set>
 
@@ -1886,6 +1888,58 @@ namespace llaminar
 
                 default:
                     throwUnsupportedKernel(dev_type, "ResidualAdd", "FP16");
+                }
+            }
+
+            // ==========================================================================
+            // GDN (Gated Delta Net) Kernel Creation - FP32 only
+            // ==========================================================================
+
+            std::unique_ptr<llaminar2::ITensorShortConvolution> KernelFactory::createShortConvolution(
+                DeviceType dev_type, int device_ordinal)
+            {
+                (void)device_ordinal;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUShortConvolution>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedKernel(dev_type, "ShortConvolution", "FP32");
+#endif
+
+#ifdef HAVE_ROCM
+                case DeviceType::ROCm:
+                    throwUnsupportedKernel(dev_type, "ShortConvolution", "FP32");
+#endif
+
+                default:
+                    throwUnsupportedKernel(dev_type, "ShortConvolution", "FP32");
+                }
+            }
+
+            std::unique_ptr<llaminar2::ITensorGatedDeltaNet> KernelFactory::createGatedDeltaNet(
+                DeviceType dev_type, int device_ordinal)
+            {
+                (void)device_ordinal;
+                switch (dev_type)
+                {
+                case DeviceType::CPU:
+                    return std::make_unique<llaminar2::CPUGatedDeltaNet>();
+
+#ifdef HAVE_CUDA
+                case DeviceType::CUDA:
+                    throwUnsupportedKernel(dev_type, "GatedDeltaNet", "FP32");
+#endif
+
+#ifdef HAVE_ROCM
+                case DeviceType::ROCm:
+                    throwUnsupportedKernel(dev_type, "GatedDeltaNet", "FP32");
+#endif
+
+                default:
+                    throwUnsupportedKernel(dev_type, "GatedDeltaNet", "FP32");
                 }
             }
 
