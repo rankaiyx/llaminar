@@ -802,6 +802,15 @@ namespace llaminar2::test::parity::qwen2
 
         void applyModelOverrides() override
         {
+            // Qwen2 defaults (pushed down from ParityTestBase)
+            if (config_.model_path.empty())
+                config_.model_path = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+            if (config_.prompt.empty())
+                config_.prompt = "The quick brown fox jumps over the lazy dog";
+            if (config_.token_ids.empty())
+                config_.token_ids = {785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562};
+
+            // Per-test overrides (from TestConfig)
             if (!cfg().model_path.empty())
                 config_.model_path = cfg().model_path;
             if (!cfg().snapshot_dir.empty())

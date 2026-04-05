@@ -70,9 +70,27 @@ namespace llaminar2::cpu::native_vnni
                 if (q8)
                 {
                     int actual_start = (row_start >= 0) ? row_start : 0;
-                    native_q8_0_blocks_ = q8->typed_data() +
-                                          static_cast<size_t>(actual_start) * packed_.blocks_per_row;
+                    const Q8_0Block *src_blocks = q8->typed_data() +
+                                                  static_cast<size_t>(actual_start) * packed_.blocks_per_row;
                     native_q8_0_bpr_ = packed_.blocks_per_row;
+
+                    // For mmap-backed tensors (is_view), the data survives
+                    // release_raw_data() — safe to use a direct pointer.
+                    // For owned-data tensors (column-sliced TP weights), the
+                    // underlying vector is freed by WeightPreloader after packing.
+                    // We must copy the blocks to avoid a dangling pointer.
+                    if (q8->is_raw_data_released() || !q8->is_view())
+                    {
+                        const size_t n_blocks = static_cast<size_t>(packed_.N) * native_q8_0_bpr_;
+                        native_q8_0_owned_.assign(
+                            reinterpret_cast<const uint8_t *>(src_blocks),
+                            reinterpret_cast<const uint8_t *>(src_blocks + n_blocks));
+                        native_q8_0_blocks_ = reinterpret_cast<const Q8_0Block *>(native_q8_0_owned_.data());
+                    }
+                    else
+                    {
+                        native_q8_0_blocks_ = src_blocks;
+                    }
                 }
             }
 
@@ -81,7 +99,8 @@ namespace llaminar2::cpu::native_vnni
                       << " weights (codebook=" << (int)packed_.codebook_id
                       << ", payload=" << packed_.payload_bytes << " B/block"
                       << ", asymmetric=" << packed_.is_asymmetric
-                      << ", native_q8_0=" << (native_q8_0_blocks_ != nullptr) << ")");
+                      << ", native_q8_0=" << (native_q8_0_blocks_ != nullptr)
+                      << ", owned_copy=" << (!native_q8_0_owned_.empty()) << ")");
 
             // Pick up activation rotation from the weight tensor (if set).
             // When present, activations will be rotated before Q8_1 quantization
@@ -424,6 +443,9 @@ namespace llaminar2::cpu::native_vnni
         // Set for codebook_id==19 (Q8_0) to enable single-stream GEMV at M=1.
         const Q8_0Block *native_q8_0_blocks_ = nullptr;
         int native_q8_0_bpr_ = 0;
+        // Owned copy of Q8_0 blocks for non-mmap tensors (e.g. column-sliced TP weights)
+        // whose raw data is freed by WeightPreloader after GEMM packing.
+        std::vector<uint8_t> native_q8_0_owned_;
 
         // Cached scratch buffer for fused SwiGLU+GEMM (avoids malloc per decode token)
         mutable std::vector<float> swiglu_scratch_;

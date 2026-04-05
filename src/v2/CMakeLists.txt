@@ -1343,6 +1343,7 @@ add_library(llaminar2_core STATIC
     execution/local_execution/device/LayerDevicePlacement.cpp
     # Qwen2 model and graph configuration
     models/ModelRegistrations.cpp
+    models/qwen/QwenGraphBase.cpp
     models/qwen/Qwen2Graph.cpp
     models/qwen/Qwen2GraphConfigBuilder.cpp
     models/qwen/Qwen2BufferSpec.cpp

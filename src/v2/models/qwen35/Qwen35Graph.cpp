@@ -23,7 +23,7 @@ namespace llaminar2
         std::shared_ptr<ModelContext> model_ctx,
         std::shared_ptr<MPIContext> mpi_ctx,
         const GraphConfig &config)
-        : Qwen2Graph(std::move(model_ctx), std::move(mpi_ctx), config)
+        : QwenGraphBase(std::move(model_ctx), std::move(mpi_ctx), config)
     {
         ensureGDNStates();
     }
@@ -31,7 +31,7 @@ namespace llaminar2
     Qwen35Graph::Qwen35Graph(
         const GraphConfig &config,
         std::shared_ptr<MPIContext> mpi_ctx)
-        : Qwen2Graph(config, std::move(mpi_ctx))
+        : QwenGraphBase(config, std::move(mpi_ctx))
     {
         ensureGDNStates();
     }
@@ -46,23 +46,37 @@ namespace llaminar2
             return;
 
         const int n_layers = config_.n_layers;
-        const int conv_kernel = config_.gdn_conv_kernel_size;
+        const int conv_kernel = config_.gdn.conv_kernel_size;
 
         // GDN dimensions: Qwen 3.5 can have different key and value head counts.
         // n_k_heads: number of key/query heads (gdn_group_count)
         // n_v_heads: number of value heads (gdn_time_step_rank)
         // When n_v_heads > n_k_heads, Q and K are repeat_interleaved before recurrence.
-        const int n_k_heads = config_.gdn_group_count > 0
-                                  ? config_.gdn_group_count
-                                  : config_.n_heads;
-        const int n_v_heads = config_.gdn_time_step_rank > 0
-                                  ? config_.gdn_time_step_rank
-                                  : n_k_heads;
-        const int d_v = config_.gdn_state_size;
+        const int n_k_heads_full = config_.gdn.group_count > 0
+                                       ? config_.gdn.group_count
+                                       : config_.n_heads;
+        const int n_v_heads_full = config_.gdn.time_step_rank > 0
+                                       ? config_.gdn.time_step_rank
+                                       : n_k_heads_full;
+
+        // TP-aware local head counts: states must match local weight dimensions
+        int n_k_heads = n_k_heads_full;
+        int n_v_heads = n_v_heads_full;
+        if (config_.qkv_column_parallel && config_.local_n_heads > 0 && config_.n_heads > 0)
+        {
+            n_k_heads = n_k_heads_full * config_.local_n_heads / config_.n_heads;
+            n_v_heads = n_v_heads_full * config_.local_n_heads / config_.n_heads;
+            if (n_k_heads <= 0)
+                n_k_heads = 1;
+            if (n_v_heads <= 0)
+                n_v_heads = 1;
+        }
+
+        const int d_v = config_.gdn.state_size;
         const int d_k = d_v;
         const int key_dim = n_k_heads * d_k;
-        const int value_dim = config_.gdn_inner_size > 0
-                                  ? config_.gdn_inner_size
+        const int value_dim = config_.gdn.inner_size > 0
+                                  ? (config_.gdn.inner_size * n_v_heads / n_v_heads_full)
                                   : n_v_heads * d_v;
         const int qkv_dim = 2 * key_dim + value_dim; // Q(key_dim) + K(key_dim) + V(value_dim)
 
@@ -128,7 +142,7 @@ namespace llaminar2
 
     void Qwen35Graph::setArena(BufferArena *arena)
     {
-        Qwen2Graph::setArena(arena);
+        QwenGraphBase::setArena(arena);
         // GDN extension buffers are automatically discovered by
         // initializeInferenceStateFromArena() via forEachRegistered().
         // No manual wiring needed — the schema + resolver config register
@@ -142,30 +156,55 @@ namespace llaminar2
     GraphResolverConfig Qwen35Graph::getResolverConfig(int seq_len) const
     {
         // Start with Qwen2's resolver config (covers standard dimensions)
-        GraphResolverConfig config = Qwen2Graph::getResolverConfig(seq_len);
+        GraphResolverConfig config = QwenGraphBase::getResolverConfig(seq_len);
 
         // Add GDN-specific shape formulas (used by Qwen35Schema buffer specs)
-        // n_k_heads: key/query head count, n_v_heads: value head count
-        // key_dim = n_k_heads * d_k, value_dim = n_v_heads * d_v = gdn_inner_size
-        // qkv_dim = 2 * key_dim + value_dim (Q + K + V)
-        const int n_k_heads = config_.gdn_group_count > 0
-                                  ? config_.gdn_group_count
-                                  : config_.n_heads;
-        const int d_k = config_.gdn_state_size;
-        const int key_dim = n_k_heads * d_k;
-        const int gdn_inner = config_.gdn_inner_size > 0
-                                  ? config_.gdn_inner_size
-                                  : n_k_heads * config_.gdn_state_size;
+        // Use TP-aware local dimensions: scale GDN head counts by the same ratio
+        // as the FA attention path (local_n_heads / n_heads).
+        const int n_k_heads_full = config_.gdn.group_count > 0
+                                       ? config_.gdn.group_count
+                                       : config_.n_heads;
+        const int n_v_heads_full = config_.gdn.time_step_rank > 0
+                                       ? config_.gdn.time_step_rank
+                                       : n_k_heads_full;
+        int n_k_heads_local = n_k_heads_full;
+        int n_v_heads_local = n_v_heads_full;
+        if (config_.qkv_column_parallel && config_.local_n_heads > 0 && config_.n_heads > 0)
+        {
+            n_k_heads_local = n_k_heads_full * config_.local_n_heads / config_.n_heads;
+            n_v_heads_local = n_v_heads_full * config_.local_n_heads / config_.n_heads;
+            if (n_k_heads_local <= 0)
+                n_k_heads_local = 1;
+            if (n_v_heads_local <= 0)
+                n_v_heads_local = 1;
+        }
+        const int d_k = config_.gdn.state_size;
+        const int key_dim = n_k_heads_local * d_k;
+        const int gdn_inner = config_.gdn.inner_size > 0
+                                  ? (config_.gdn.inner_size * n_v_heads_local / n_v_heads_full)
+                                  : n_v_heads_local * config_.gdn.state_size;
         config.custom_formulas["gdn_inner_size"] =
             static_cast<size_t>(gdn_inner);
         config.custom_formulas["gdn_qkv_dim"] =
             static_cast<size_t>(2 * key_dim + gdn_inner);
         config.custom_formulas["gdn_time_step_rank"] =
-            static_cast<size_t>(config_.gdn_time_step_rank);
+            static_cast<size_t>(n_v_heads_local);
 
         // FA-specific: Q projection outputs query + sigmoid gate (2× normal Q dim)
+        // Use local head count for TP
+        const int local_n_heads_fa = (config_.qkv_column_parallel && config_.local_n_heads > 0)
+                                         ? config_.local_n_heads
+                                         : config_.n_heads;
         config.custom_formulas["fa_q_full_dim"] =
-            static_cast<size_t>(config_.n_heads * config_.head_dim * 2);
+            static_cast<size_t>(local_n_heads_fa * config_.head_dim * 2);
+
+        // attn_output must be wide enough for BOTH FA (local_qkv_dim) and GDN (gdn_inner_size).
+        // GDN layers write n_v_heads * d_v elements per row; FA layers write local_n_heads * head_dim.
+        // GatedRMSNorm and GEMV stride are derived from this buffer's column count,
+        // so it MUST match the actual data width written by each layer type.
+        const size_t local_qkv_dim = static_cast<size_t>(config.local_n_heads * config.head_dim);
+        config.custom_formulas["attn_output_dim"] =
+            std::max(local_qkv_dim, static_cast<size_t>(gdn_inner));
 
         // Add GDN buffer name → BufferId mappings
         config.buffer_name_to_id["gdn_qkv"] = BufferId::GDN_QKV;
@@ -175,56 +214,25 @@ namespace llaminar2
         config.buffer_name_to_id["fa_gate"] = BufferId::FA_GATE;
         config.buffer_name_to_id["fa_q_raw"] = BufferId::FA_Q_RAW;
 
-        LOG_DEBUG("[Qwen35Graph::getResolverConfig] GDN formulas: "
+        LOG_DEBUG("[Qwen35Graph::getResolverConfig] GDN formulas (TP-local): "
                   << "gdn_inner_size=" << gdn_inner
                   << ", gdn_qkv_dim=" << (2 * key_dim + gdn_inner)
-                  << ", gdn_time_step_rank=" << config_.gdn_time_step_rank);
+                  << ", n_k_heads=" << n_k_heads_local << "/" << n_k_heads_full
+                  << ", n_v_heads=" << n_v_heads_local << "/" << n_v_heads_full);
 
         return config;
     }
 
     // =========================================================================
-    // Full Forward Graph — inherited from Qwen2Graph.
-    // Qwen2Graph::buildFullForwardGraph() calls buildAttentionGraph()
+    // Full Forward Graph — inherited from QwenGraphBase.
+    // QwenGraphBase::buildFullForwardGraph() calls buildAttentionGraph()
     // virtually, which dispatches to GDN or FA via Qwen35Graph override.
     // No need to override here.
     // =========================================================================
 
-    // =========================================================================
-    // Layer Graph
-    // =========================================================================
-
-    ComputeGraph Qwen35Graph::buildLayerGraph(const LayerContext &ctx)
-    {
-        int max_layers = config_.total_n_layers > 0 ? config_.total_n_layers : config_.n_layers;
-        if (ctx.layer_idx < 0 || ctx.layer_idx >= max_layers)
-        {
-            LOG_ERROR("[Qwen35Graph::buildLayerGraph] Invalid layer index: " << ctx.layer_idx);
-            return ComputeGraph{};
-        }
-
-        if (!weights_.get_layer_weights)
-        {
-            LOG_ERROR("[Qwen35Graph::buildLayerGraph] Layer weight accessor not set");
-            return ComputeGraph{};
-        }
-
-        LayerWeights layer_weights = weights_.get_layer_weights(ctx.layer_idx);
-
-        ComputeGraph attn_graph = buildAttentionGraph(
-            layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
-            ctx.batch_size, ctx.kv_cache, ctx.position_ids, ctx.device,
-            ctx.sequence_lengths);
-
-        ComputeGraph ffn_graph = buildFFNGraph(
-            layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
-            ctx.batch_size, ctx.device);
-
-        std::string attn_last = attn_graph.terminalNode();
-        attn_graph.merge(std::move(ffn_graph), attn_last);
-
-        return attn_graph;
-    }
+    // buildLayerGraph() — inherited from QwenGraphBase.
+    // The base implementation calls buildAttentionGraph() (virtual dispatch)
+    // and buildFFNGraph(), so GDN dispatch is automatic.
 
     // =========================================================================
     // Attention Graph Dispatch
@@ -271,27 +279,53 @@ namespace llaminar2
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         int total_tokens = batch_size * seq_len;
 
-        const int n_k_heads = config_.gdn_group_count > 0
-                                  ? config_.gdn_group_count
-                                  : config_.n_heads;
-        const int n_v_heads = config_.gdn_time_step_rank > 0
-                                  ? config_.gdn_time_step_rank
-                                  : n_k_heads;
+        // Full (global) head counts from model config
+        const int n_k_heads_full = config_.gdn.group_count > 0
+                                       ? config_.gdn.group_count
+                                       : config_.n_heads;
+        const int n_v_heads_full = config_.gdn.time_step_rank > 0
+                                       ? config_.gdn.time_step_rank
+                                       : n_k_heads_full;
         const int d_model = config_.d_model;
-        const int d_v = config_.gdn_state_size;
-        const int d_k = d_v;                 // Qwen3.5 GDN: d_k == d_v == state_size
-        const int key_dim = n_k_heads * d_k; // Q/K projection width
-        const int value_dim = config_.gdn_inner_size > 0
-                                  ? config_.gdn_inner_size
-                                  : n_v_heads * d_v; // V projection width
-        const int qkv_dim = 2 * key_dim + value_dim; // Q + K + V merged
+        const int d_v = config_.gdn.state_size;
+        const int d_k = d_v; // Qwen3.5 GDN: d_k == d_v == state_size
+
+        // TP-aware local dimensions: derive from actual (possibly sharded) weight shapes.
+        // When column-parallel TP is active, weights are already sharded by WeightManager
+        // so shape[0] reflects the local output dimension for this rank.
+        int qkv_dim, value_dim, n_k_heads, n_v_heads;
+        if (layer.attn_qkv)
+        {
+            // Derive from actual weight shape (works for both sharded and full)
+            qkv_dim = static_cast<int>(layer.attn_qkv->shape()[0]);
+            value_dim = layer.attn_gate
+                            ? static_cast<int>(layer.attn_gate->shape()[0])
+                            : (config_.gdn.inner_size > 0
+                                   ? config_.gdn.inner_size
+                                   : n_v_heads_full * d_v);
+            // Compute local head counts from local dimensions
+            // qkv_dim = 2 * n_k_heads * d_k + value_dim, so:
+            n_k_heads = (qkv_dim - value_dim) / (2 * d_k);
+            n_v_heads = value_dim / d_v;
+        }
+        else
+        {
+            // Fallback to config (no weight tensor available yet)
+            n_k_heads = n_k_heads_full;
+            n_v_heads = n_v_heads_full;
+            const int key_dim = n_k_heads * d_k;
+            value_dim = config_.gdn.inner_size > 0
+                            ? config_.gdn.inner_size
+                            : n_v_heads * d_v;
+            qkv_dim = 2 * key_dim + value_dim;
+        }
 
         LOG_DEBUG("[Qwen35Graph] Building GDN attention for layer " << layer_idx
                                                                     << ": total_tokens=" << total_tokens
-                                                                    << " n_k_heads=" << n_k_heads << " n_v_heads=" << n_v_heads
+                                                                    << " n_k_heads=" << n_k_heads << " (full=" << n_k_heads_full << ")"
+                                                                    << " n_v_heads=" << n_v_heads << " (full=" << n_v_heads_full << ")"
                                                                     << " d_k=" << d_k << " d_v=" << d_v
-                                                                    << " key_dim=" << key_dim << " value_dim=" << value_dim
-                                                                    << " qkv_dim=" << qkv_dim);
+                                                                    << " qkv_dim=" << qkv_dim << " value_dim=" << value_dim);
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm
@@ -380,7 +414,7 @@ namespace llaminar2
         conv_params.conv_state = conv_states_[layer_idx].data();
         conv_params.seq_len = total_tokens;
         conv_params.channels = qkv_dim;
-        conv_params.kernel_size = config_.gdn_conv_kernel_size;
+        conv_params.kernel_size = config_.gdn.conv_kernel_size;
 
         // Use stored kernel instance (lifetime tied to Qwen35Graph)
         conv_params.kernel = conv_kernels_[layer_idx].get();
@@ -477,6 +511,36 @@ namespace llaminar2
                       device);
         graph.addDependency(prefix + "gdn_out_proj", prefix + "gated_norm");
 
+        std::string terminal_node = prefix + "gdn_out_proj";
+
+        // =====================================================================
+        // Stage 6b: TP AllReduce for ssm_out (same pattern as FA Wo AllReduce)
+        // =====================================================================
+        // ssm_out is INPUT_PARALLEL (row-parallel sharded), so each rank computes
+        // a partial sum that must be reduced across ranks.
+        if (layer.ssm_out)
+        {
+            bool wo_is_sharded = graph_utils::isRowParallelSharded(layer.ssm_out);
+            if (wo_is_sharded && needsTPAllreduce())
+            {
+                size_t allreduce_count = static_cast<size_t>(total_tokens) * d_model;
+                TensorBase *allreduce_buffer = buffers.attn_proj;
+                BufferId wo_allreduce_bid = BufferId::ATTN_PROJ;
+                std::string stage_name = prefix + "gdn_wo_allreduce";
+
+                auto allreduce_stage = createTPAllreduceStage(
+                    allreduce_buffer, allreduce_count, device, layer_idx,
+                    /*is_attention=*/true, stage_name, wo_allreduce_bid);
+
+                if (allreduce_stage)
+                {
+                    graph.addNode(stage_name, std::move(allreduce_stage), device);
+                    graph.addDependency(stage_name, prefix + "gdn_out_proj");
+                    terminal_node = stage_name;
+                }
+            }
+        }
+
         // NOTE: GDN layers do NOT apply a sigmoid output gate after out_proj.
         // The Z projection is consumed entirely by GatedRMSNorm (SiLU gating).
         // Only FA layers use a sigmoid output gate (embedded in Q projection).
@@ -485,6 +549,8 @@ namespace llaminar2
         // (from buildFFNGraph) fuses the attention residual add with FFN norm:
         //   HIDDEN_STATE = HIDDEN_STATE + ATTN_PROJ, then RMSNorm(HIDDEN_STATE)
         // This matches the Qwen2Graph convention for FA layers.
+
+        graph.setTerminalNode(terminal_node);
 
         LOG_DEBUG("[Qwen35Graph] GDN attention graph for layer " << layer_idx
                                                                  << " has " << graph.size() << " nodes");

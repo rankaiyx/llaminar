@@ -1,9 +1,17 @@
 #!/bin/bash
 # Performance regression benchmark check for Llaminar pre-commit hook.
 #
-# Runs --benchmark on each device listed in the baseline JSON, parses
-# prefill/decode tok/s, and fails if any metric regresses beyond the
-# configured threshold.
+# Runs --benchmark for each model × device combination listed in the
+# baseline JSON, parses prefill/decode tok/s, and fails if any metric
+# regresses beyond the configured threshold.
+#
+# Baseline JSON format (array of model configs):
+#   { "regression_threshold_pct": 10,
+#     "models": [
+#       { "name": "...", "model": "...", "decode_tokens": 128,
+#         "devices": { "cpu": { "prefill_tok_s": ..., "decode_tok_s": ... }, ... } },
+#       ...
+#     ] }
 #
 # Usage:
 #   .githooks/run_benchmark_check.sh                  # normal regression check
@@ -60,66 +68,81 @@ fi
 echo -e "${GREEN}✓ Release build complete${NC}"
 
 # ---------------------------------------------------------------------------
-# Read baseline
+# Read global settings
 # ---------------------------------------------------------------------------
-MODEL=$(jq -r '.model' "$BASELINE_FILE")
-DECODE_TOKENS=$(jq -r '.decode_tokens' "$BASELINE_FILE")
-THRESHOLD_PCT=$(jq -r '.regression_threshold_pct' "$BASELINE_FILE")
-DEVICES=$(jq -r '.devices | keys[]' "$BASELINE_FILE")
+GLOBAL_THRESHOLD_PCT=$(jq -r '.regression_threshold_pct' "$BASELINE_FILE")
+NUM_MODELS=$(jq '.models | length' "$BASELINE_FILE")
 
-MODEL_PATH="$ROOT_DIR/$MODEL"
-if [[ ! -f "$MODEL_PATH" ]]; then
-    echo -e "${RED}Error: Model not found: $MODEL_PATH${NC}" >&2
+if [[ "$NUM_MODELS" -eq 0 ]]; then
+    echo -e "${RED}Error: No models defined in baseline file${NC}" >&2
     exit 1
 fi
 
 # ---------------------------------------------------------------------------
-# Run benchmarks and collect results
+# Helpers
 # ---------------------------------------------------------------------------
-declare -A RESULTS_PREFILL
-declare -A RESULTS_DECODE
-OVERALL_PASS=true
-FAILED_CHECKS=""
-
 parse_benchmark_output() {
     local output="$1"
     local prefill_tps decode_tps
-    # Extract tok/s values from the benchmark table output
     prefill_tps=$(echo "$output" | grep -A4 "PREFILL" | grep "Throughput" | grep -oP '[0-9]+\.[0-9]+' | head -1)
     decode_tps=$(echo "$output" | grep -A4 "DECODE" | grep "Throughput" | grep -oP '[0-9]+\.[0-9]+' | head -1)
     echo "${prefill_tps:-0} ${decode_tps:-0}"
 }
 
-echo -e "${BLUE}Running performance benchmarks (model: $(basename "$MODEL"))${NC}"
-echo -e "${BLUE}Default regression threshold: ${THRESHOLD_PCT}% (per-device overrides may apply)${NC}"
-echo ""
+# Results are keyed by "model_idx:device" to avoid collisions across models
+declare -A RESULTS_PREFILL
+declare -A RESULTS_DECODE
+OVERALL_PASS=true
+FAILED_CHECKS=""
 
-for DEVICE in $DEVICES; do
-    echo -ne "  Benchmarking ${BOLD}${DEVICE}${NC} ... "
+# ---------------------------------------------------------------------------
+# Run benchmarks for all models × devices
+# ---------------------------------------------------------------------------
+for (( mi=0; mi<NUM_MODELS; mi++ )); do
+    MODEL_NAME=$(jq -r ".models[$mi].name" "$BASELINE_FILE")
+    MODEL=$(jq -r ".models[$mi].model" "$BASELINE_FILE")
+    DECODE_TOKENS=$(jq -r ".models[$mi].decode_tokens" "$BASELINE_FILE")
+    DEVICES=$(jq -r ".models[$mi].devices | keys[]" "$BASELINE_FILE")
 
-    set +e
-    BENCH_OUTPUT=$("$RELEASE_BIN" --benchmark -d "$DEVICE" -m "$MODEL_PATH" -n "$DECODE_TOKENS" 2>&1)
-    BENCH_EXIT=$?
-    set -e
-
-    if [[ $BENCH_EXIT -ne 0 ]]; then
-        echo -e "${YELLOW}SKIPPED (device unavailable or error)${NC}"
+    MODEL_PATH="$ROOT_DIR/$MODEL"
+    if [[ ! -f "$MODEL_PATH" ]]; then
+        echo -e "${YELLOW}Skipping ${MODEL_NAME}: model not found (${MODEL})${NC}"
+        echo ""
         continue
     fi
 
-    read -r PREFILL DECODE <<< "$(parse_benchmark_output "$BENCH_OUTPUT")"
+    echo -e "${BLUE}Benchmarking: ${BOLD}${MODEL_NAME}${NC}"
+    echo -e "${BLUE}  Model: $(basename "$MODEL"), decode tokens: ${DECODE_TOKENS}${NC}"
+    echo ""
 
-    if [[ "$PREFILL" == "0" || "$DECODE" == "0" ]]; then
-        echo -e "${YELLOW}SKIPPED (could not parse output)${NC}"
-        continue
-    fi
+    for DEVICE in $DEVICES; do
+        KEY="${mi}:${DEVICE}"
+        echo -ne "  Benchmarking ${BOLD}${DEVICE}${NC} ... "
 
-    RESULTS_PREFILL[$DEVICE]=$PREFILL
-    RESULTS_DECODE[$DEVICE]=$DECODE
-    echo -e "prefill ${GREEN}${PREFILL}${NC} tok/s, decode ${GREEN}${DECODE}${NC} tok/s"
+        set +e
+        BENCH_OUTPUT=$("$RELEASE_BIN" --benchmark -d "$DEVICE" -m "$MODEL_PATH" -n "$DECODE_TOKENS" 2>&1)
+        BENCH_EXIT=$?
+        set -e
+
+        if [[ $BENCH_EXIT -ne 0 ]]; then
+            echo -e "${YELLOW}SKIPPED (device unavailable or error)${NC}"
+            continue
+        fi
+
+        read -r PREFILL DECODE <<< "$(parse_benchmark_output "$BENCH_OUTPUT")"
+
+        if [[ "$PREFILL" == "0" || "$DECODE" == "0" ]]; then
+            echo -e "${YELLOW}SKIPPED (could not parse output)${NC}"
+            continue
+        fi
+
+        RESULTS_PREFILL[$KEY]=$PREFILL
+        RESULTS_DECODE[$KEY]=$DECODE
+        echo -e "prefill ${GREEN}${PREFILL}${NC} tok/s, decode ${GREEN}${DECODE}${NC} tok/s"
+    done
+
+    echo ""
 done
-
-echo ""
 
 # ---------------------------------------------------------------------------
 # Update baseline mode
@@ -127,22 +150,21 @@ echo ""
 if $UPDATE_BASELINE; then
     echo -e "${YELLOW}Updating baseline file: $BASELINE_FILE${NC}"
 
-    # Build new JSON
-    NEW_DEVICES="{"
-    FIRST=true
-    for DEVICE in $DEVICES; do
-        if [[ -n "${RESULTS_PREFILL[$DEVICE]:-}" ]]; then
-            $FIRST || NEW_DEVICES+=","
-            FIRST=false
-            NEW_DEVICES+="\"$DEVICE\":{\"prefill_tok_s\":${RESULTS_PREFILL[$DEVICE]},\"decode_tok_s\":${RESULTS_DECODE[$DEVICE]}}"
-        fi
+    for (( mi=0; mi<NUM_MODELS; mi++ )); do
+        DEVICES=$(jq -r ".models[$mi].devices | keys[]" "$BASELINE_FILE")
+        for DEVICE in $DEVICES; do
+            KEY="${mi}:${DEVICE}"
+            if [[ -n "${RESULTS_PREFILL[$KEY]:-}" ]]; then
+                jq --argjson mi "$mi" \
+                   --arg dev "$DEVICE" \
+                   --argjson pf "${RESULTS_PREFILL[$KEY]}" \
+                   --argjson dc "${RESULTS_DECODE[$KEY]}" \
+                   '.models[$mi].devices[$dev].prefill_tok_s = $pf |
+                    .models[$mi].devices[$dev].decode_tok_s = $dc' \
+                   "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
+            fi
+        done
     done
-    NEW_DEVICES+="}"
-
-    jq --argjson devs "$NEW_DEVICES" \
-       --arg comment "Canonical performance baselines for Qwen 2.5 7B Instruct Q8_0 (596-token prefill, ${DECODE_TOKENS}-token decode). Generated $(date +%Y-%m-%d). Update with: .githooks/run_benchmark_check.sh --update-baseline" \
-       '.devices = $devs | ._comment = $comment' \
-       "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
 
     echo -e "${GREEN}✓ Baseline updated${NC}"
     exit 0
@@ -151,37 +173,28 @@ fi
 # ---------------------------------------------------------------------------
 # Compare against baseline
 # ---------------------------------------------------------------------------
-echo -e "${BOLD}Performance Regression Check:${NC}"
-echo ""
-printf "  %-10s  %-10s  %12s  %12s  %8s  %s\n" "Device" "Phase" "Baseline" "Current" "Delta" "Status"
-printf "  %-10s  %-10s  %12s  %12s  %8s  %s\n" "------" "------" "--------" "-------" "-----" "------"
-
 check_regression() {
-    local device="$1" phase="$2" baseline="$3" current="$4"
+    local model_idx="$1" model_name="$2" device="$3" phase="$4" baseline="$5" current="$6"
 
     if [[ "$current" == "0" || -z "$current" ]]; then
         return
     fi
 
-    # Per-device threshold overrides the global default
-    local device_threshold
-    device_threshold=$(jq -r ".devices[\"$device\"].regression_threshold_pct // empty" "$BASELINE_FILE")
-    local effective_threshold="${device_threshold:-$THRESHOLD_PCT}"
+    # Threshold priority: per-device > per-model > global
+    local device_threshold model_threshold effective_threshold
+    device_threshold=$(jq -r ".models[$model_idx].devices[\"$device\"].regression_threshold_pct // empty" "$BASELINE_FILE")
+    model_threshold=$(jq -r ".models[$model_idx].regression_threshold_pct // empty" "$BASELINE_FILE")
+    effective_threshold="${device_threshold:-${model_threshold:-$GLOBAL_THRESHOLD_PCT}}"
 
-    # Calculate percentage change: (current - baseline) / baseline * 100
     local delta
     delta=$(echo "scale=4; ($current - $baseline) / $baseline * 100" | bc -l)
-    # Truncate to 1 decimal for display
     delta=$(printf "%.1f" "$delta")
-    local abs_delta
-    abs_delta=$(echo "$delta" | tr -d '-')
 
     local status="${GREEN}✓ OK${NC}"
-    # Negative delta means regression (slower)
     if (( $(echo "$delta < -${effective_threshold}" | bc -l) )); then
         status="${RED}✗ REGRESSED${NC}"
         OVERALL_PASS=false
-        FAILED_CHECKS+="  ${device} ${phase}: ${baseline} → ${current} tok/s (${delta}%, threshold ${effective_threshold}%)\n"
+        FAILED_CHECKS+="  [${model_name}] ${device} ${phase}: ${baseline} → ${current} tok/s (${delta}%, threshold ${effective_threshold}%)\n"
     elif (( $(echo "$delta < 0" | bc -l) )); then
         status="${YELLOW}~ slower${NC}"
     elif (( $(echo "$delta > 0" | bc -l) )); then
@@ -192,23 +205,33 @@ check_regression() {
     echo -e "$status"
 }
 
-for DEVICE in $DEVICES; do
-    if [[ -z "${RESULTS_PREFILL[$DEVICE]:-}" ]]; then
-        printf "  %-10s  %-10s  %12s  %12s  %8s  " "$DEVICE" "prefill" "-" "-" "-"
-        echo -e "${YELLOW}SKIPPED${NC}"
-        printf "  %-10s  %-10s  %12s  %12s  %8s  " "$DEVICE" "decode" "-" "-" "-"
-        echo -e "${YELLOW}SKIPPED${NC}"
-        continue
-    fi
+for (( mi=0; mi<NUM_MODELS; mi++ )); do
+    MODEL_NAME=$(jq -r ".models[$mi].name" "$BASELINE_FILE")
+    DEVICES=$(jq -r ".models[$mi].devices | keys[]" "$BASELINE_FILE")
 
-    BASELINE_PREFILL=$(jq -r ".devices[\"$DEVICE\"].prefill_tok_s" "$BASELINE_FILE")
-    BASELINE_DECODE=$(jq -r ".devices[\"$DEVICE\"].decode_tok_s" "$BASELINE_FILE")
+    echo -e "${BOLD}${MODEL_NAME}:${NC}"
+    printf "  %-10s  %-10s  %12s  %12s  %8s  %s\n" "Device" "Phase" "Baseline" "Current" "Delta" "Status"
+    printf "  %-10s  %-10s  %12s  %12s  %8s  %s\n" "------" "------" "--------" "-------" "-----" "------"
 
-    check_regression "$DEVICE" "prefill" "$BASELINE_PREFILL" "${RESULTS_PREFILL[$DEVICE]}"
-    check_regression "$DEVICE" "decode" "$BASELINE_DECODE" "${RESULTS_DECODE[$DEVICE]}"
+    for DEVICE in $DEVICES; do
+        KEY="${mi}:${DEVICE}"
+        if [[ -z "${RESULTS_PREFILL[$KEY]:-}" ]]; then
+            printf "  %-10s  %-10s  %12s  %12s  %8s  " "$DEVICE" "prefill" "-" "-" "-"
+            echo -e "${YELLOW}SKIPPED${NC}"
+            printf "  %-10s  %-10s  %12s  %12s  %8s  " "$DEVICE" "decode" "-" "-" "-"
+            echo -e "${YELLOW}SKIPPED${NC}"
+            continue
+        fi
+
+        BASELINE_PREFILL=$(jq -r ".models[$mi].devices[\"$DEVICE\"].prefill_tok_s" "$BASELINE_FILE")
+        BASELINE_DECODE=$(jq -r ".models[$mi].devices[\"$DEVICE\"].decode_tok_s" "$BASELINE_FILE")
+
+        check_regression "$mi" "$MODEL_NAME" "$DEVICE" "prefill" "$BASELINE_PREFILL" "${RESULTS_PREFILL[$KEY]}"
+        check_regression "$mi" "$MODEL_NAME" "$DEVICE" "decode" "$BASELINE_DECODE" "${RESULTS_DECODE[$KEY]}"
+    done
+
+    echo ""
 done
-
-echo ""
 
 if $OVERALL_PASS; then
     echo -e "${GREEN}✓ No performance regressions detected${NC}"
@@ -217,67 +240,73 @@ if $OVERALL_PASS; then
     # Ratchet: auto-raise baselines when a new high-water mark is reached
     # ---------------------------------------------------------------------------
     RATCHETED=false
-    for DEVICE in $DEVICES; do
-        if [[ -z "${RESULTS_PREFILL[$DEVICE]:-}" ]]; then
-            continue
-        fi
+    for (( mi=0; mi<NUM_MODELS; mi++ )); do
+        MODEL_NAME=$(jq -r ".models[$mi].name" "$BASELINE_FILE")
+        DEVICES=$(jq -r ".models[$mi].devices | keys[]" "$BASELINE_FILE")
 
-        BASELINE_PREFILL=$(jq -r ".devices[\"$DEVICE\"].prefill_tok_s" "$BASELINE_FILE")
-        BASELINE_DECODE=$(jq -r ".devices[\"$DEVICE\"].decode_tok_s" "$BASELINE_FILE")
-        CUR_PREFILL="${RESULTS_PREFILL[$DEVICE]}"
-        CUR_DECODE="${RESULTS_DECODE[$DEVICE]}"
-
-        RAISE_PREFILL=false
-        RAISE_DECODE=false
-        if (( $(echo "$CUR_PREFILL > $BASELINE_PREFILL" | bc -l) )); then
-            RAISE_PREFILL=true
-        fi
-        if (( $(echo "$CUR_DECODE > $BASELINE_DECODE" | bc -l) )); then
-            RAISE_DECODE=true
-        fi
-
-        if $RAISE_PREFILL || $RAISE_DECODE; then
-            NEW_PREFILL=$( $RAISE_PREFILL && echo "$CUR_PREFILL" || echo "$BASELINE_PREFILL" )
-            NEW_DECODE=$( $RAISE_DECODE && echo "$CUR_DECODE" || echo "$BASELINE_DECODE" )
-            COMMIT_HASH=$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-            COMMENT="High-water mark set at commit ${COMMIT_HASH} on $(date +%Y-%m-%d). Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-
-            # Preserve per-device threshold if it exists
-            DEVICE_THRESHOLD=$(jq -r ".devices[\"$DEVICE\"].regression_threshold_pct // empty" "$BASELINE_FILE")
-
-            if [[ -n "$DEVICE_THRESHOLD" ]]; then
-                jq --arg dev "$DEVICE" \
-                   --argjson pf "$NEW_PREFILL" \
-                   --argjson dc "$NEW_DECODE" \
-                   --argjson thr "$DEVICE_THRESHOLD" \
-                   --arg cmt "$COMMENT" \
-                   '.devices[$dev].prefill_tok_s = $pf |
-                    .devices[$dev].decode_tok_s = $dc |
-                    .devices[$dev].regression_threshold_pct = $thr |
-                    .devices[$dev]._comment = $cmt' \
-                   "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
-            else
-                jq --arg dev "$DEVICE" \
-                   --argjson pf "$NEW_PREFILL" \
-                   --argjson dc "$NEW_DECODE" \
-                   --arg cmt "$COMMENT" \
-                   '.devices[$dev].prefill_tok_s = $pf |
-                    .devices[$dev].decode_tok_s = $dc |
-                    .devices[$dev]._comment = $cmt' \
-                   "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
+        for DEVICE in $DEVICES; do
+            KEY="${mi}:${DEVICE}"
+            if [[ -z "${RESULTS_PREFILL[$KEY]:-}" ]]; then
+                continue
             fi
 
-            RATCHETED=true
-            DETAILS=""
-            $RAISE_PREFILL && DETAILS+="prefill ${BASELINE_PREFILL}→${CUR_PREFILL}"
-            $RAISE_PREFILL && $RAISE_DECODE && DETAILS+=", "
-            $RAISE_DECODE && DETAILS+="decode ${BASELINE_DECODE}→${CUR_DECODE}"
-            echo -e "  ${GREEN}▲ ${DEVICE}: ratcheted baseline (${DETAILS})${NC}"
-        fi
+            BASELINE_PREFILL=$(jq -r ".models[$mi].devices[\"$DEVICE\"].prefill_tok_s" "$BASELINE_FILE")
+            BASELINE_DECODE=$(jq -r ".models[$mi].devices[\"$DEVICE\"].decode_tok_s" "$BASELINE_FILE")
+            CUR_PREFILL="${RESULTS_PREFILL[$KEY]}"
+            CUR_DECODE="${RESULTS_DECODE[$KEY]}"
+
+            RAISE_PREFILL=false
+            RAISE_DECODE=false
+            if (( $(echo "$CUR_PREFILL > $BASELINE_PREFILL" | bc -l) )); then
+                RAISE_PREFILL=true
+            fi
+            if (( $(echo "$CUR_DECODE > $BASELINE_DECODE" | bc -l) )); then
+                RAISE_DECODE=true
+            fi
+
+            if $RAISE_PREFILL || $RAISE_DECODE; then
+                NEW_PREFILL=$( $RAISE_PREFILL && echo "$CUR_PREFILL" || echo "$BASELINE_PREFILL" )
+                NEW_DECODE=$( $RAISE_DECODE && echo "$CUR_DECODE" || echo "$BASELINE_DECODE" )
+                COMMIT_HASH=$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+                COMMENT="High-water mark set at commit ${COMMIT_HASH} on $(date +%Y-%m-%d). Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+
+                DEVICE_THRESHOLD=$(jq -r ".models[$mi].devices[\"$DEVICE\"].regression_threshold_pct // empty" "$BASELINE_FILE")
+
+                if [[ -n "$DEVICE_THRESHOLD" ]]; then
+                    jq --argjson mi "$mi" \
+                       --arg dev "$DEVICE" \
+                       --argjson pf "$NEW_PREFILL" \
+                       --argjson dc "$NEW_DECODE" \
+                       --argjson thr "$DEVICE_THRESHOLD" \
+                       --arg cmt "$COMMENT" \
+                       '.models[$mi].devices[$dev].prefill_tok_s = $pf |
+                        .models[$mi].devices[$dev].decode_tok_s = $dc |
+                        .models[$mi].devices[$dev].regression_threshold_pct = $thr |
+                        .models[$mi].devices[$dev]._comment = $cmt' \
+                       "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
+                else
+                    jq --argjson mi "$mi" \
+                       --arg dev "$DEVICE" \
+                       --argjson pf "$NEW_PREFILL" \
+                       --argjson dc "$NEW_DECODE" \
+                       --arg cmt "$COMMENT" \
+                       '.models[$mi].devices[$dev].prefill_tok_s = $pf |
+                        .models[$mi].devices[$dev].decode_tok_s = $dc |
+                        .models[$mi].devices[$dev]._comment = $cmt' \
+                       "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
+                fi
+
+                RATCHETED=true
+                DETAILS=""
+                $RAISE_PREFILL && DETAILS+="prefill ${BASELINE_PREFILL}→${CUR_PREFILL}"
+                $RAISE_PREFILL && $RAISE_DECODE && DETAILS+=", "
+                $RAISE_DECODE && DETAILS+="decode ${BASELINE_DECODE}→${CUR_DECODE}"
+                echo -e "  ${GREEN}▲ [${MODEL_NAME}] ${DEVICE}: ratcheted baseline (${DETAILS})${NC}"
+            fi
+        done
     done
 
     if $RATCHETED; then
-        # Stage the updated baseline so it becomes part of this commit
         git -C "$ROOT_DIR" add "$BASELINE_FILE"
         echo ""
         echo -e "${GREEN}✓ Baseline ratcheted and staged for commit${NC}"
@@ -287,7 +316,7 @@ if $OVERALL_PASS; then
 else
     echo -e "${RED}✗ Performance regression detected!${NC}"
     echo ""
-    echo -e "${RED}Regressed metrics (>${THRESHOLD_PCT}% slower):${NC}"
+    echo -e "${RED}Regressed metrics:${NC}"
     echo -e "$FAILED_CHECKS"
     echo -e "${YELLOW}If this is expected (e.g. correctness fix), update the baseline:${NC}"
     echo -e "${YELLOW}  .githooks/run_benchmark_check.sh --update-baseline${NC}"

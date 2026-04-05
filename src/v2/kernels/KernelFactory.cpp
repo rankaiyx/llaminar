@@ -581,12 +581,30 @@ namespace llaminar
                 if (quantized)
                 {
                     // Quantized tensor - use INT8 GEMM kernel
+                    //
+                    // For TensorSlice wrapping a pre-sliced inner tensor (INPUT_PARALLEL
+                    // column-sliced weights), unwrap to the inner tensor so the VNNI kernel
+                    // can use the native Q8_0 GEMV bypass (avoids the packed VNNI path
+                    // which has higher overhead for M=1 decode). The inner tensor has the
+                    // correct sliced shape and data.
+                    const llaminar2::TensorBase *kernel_tensor = tensor;
+                    if (auto *slice = dynamic_cast<const llaminar2::TensorSlice *>(tensor))
+                    {
+                        if (slice->metadata().inner_is_presliced)
+                        {
+                            kernel_tensor = slice->inner();
+                            LOG_DEBUG("[KernelFactory] Unwrapped TensorSlice to inner "
+                                      << llaminar2::tensorTypeName(kernel_tensor->native_type())
+                                      << " [" << kernel_tensor->shape()[0] << "x" << kernel_tensor->shape()[1] << "]");
+                        }
+                    }
+
                     switch (dev_type)
                     {
                     case DeviceType::CPU:
                     {
                         // CPUNativeVNNIGemmKernel handles both M=1 and M>1 paths
-                        return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(tensor);
+                        return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(kernel_tensor);
                     }
 #ifdef HAVE_CUDA
                     case DeviceType::CUDA:

@@ -286,19 +286,22 @@ namespace llaminar2
         }
 
         // =================================================================
-        // MoE Configuration (zero = no MoE)
+        // MoE Configuration
         // =================================================================
 
-        int moe_num_experts = 0;              ///< Total expert count (e.g. 256 for Qwen3.5)
-        int moe_top_k = 0;                    ///< Experts activated per token (e.g. 8)
-        int moe_intermediate_size = 0;        ///< Per-expert FFN intermediate dim
-        bool moe_norm_topk_prob = false;      ///< Normalize top-k routing weights
-        bool moe_has_shared_expert = false;   ///< Has always-active shared expert
-        int moe_shared_intermediate_size = 0; ///< Shared expert FFN intermediate dim
-        bool moe_shared_expert_gate = false;  ///< Has sigmoid gating on shared expert
+        struct MoEConfig
+        {
+            int num_experts = 0;              ///< Total expert count (e.g. 256 for Qwen3.5)
+            int top_k = 0;                    ///< Experts activated per token (e.g. 8)
+            int intermediate_size = 0;        ///< Per-expert FFN intermediate dim
+            bool norm_topk_prob = false;      ///< Normalize top-k routing weights
+            bool has_shared_expert = false;   ///< Has always-active shared expert
+            int shared_intermediate_size = 0; ///< Shared expert FFN intermediate dim
+            bool shared_expert_gate = false;  ///< Has sigmoid gating on shared expert
 
-        /// Returns true if this model uses MoE
-        bool isMoE() const { return moe_num_experts > 0 && moe_top_k > 0; }
+            /// Returns true if MoE is enabled
+            bool enabled() const { return num_experts > 0 && top_k > 0; }
+        } moe;
 
         // =================================================================
         // Heterogeneous Layer Configuration (Phase B)
@@ -332,24 +335,21 @@ namespace llaminar2
 
         // ── GDN (Gated Delta Network) Configuration ─────────────────────
 
-        /// GDN short convolution kernel width (e.g., 4 for Qwen 3.5)
-        int gdn_conv_kernel_size = 0;
+        struct GDNConfig
+        {
+            int conv_kernel_size = 0; ///< Short convolution kernel width (e.g., 4 for Qwen 3.5)
+            int state_size = 0;       ///< Recurrence state dimension (== head_dim)
+            int inner_size = 0;       ///< Inner projection size (ssm.inner_size in GGUF)
+            int group_count = 0;      ///< Group count (ssm.group_count in GGUF)
+            int time_step_rank = 0;   ///< Time-step rank (ssm.time_step_rank in GGUF)
 
-        /// GDN recurrence state dimension (== head_dim for delta-rule models)
-        int gdn_state_size = 0;
+            /// Full attention layer interval (e.g. 4 = every 4th layer is FA)
+            /// 0 means all layers use the default template (no hybrid)
+            int full_attention_interval = 0;
 
-        /// GDN inner projection size (ssm.inner_size in GGUF, e.g. 4096)
-        int gdn_inner_size = 0;
-
-        /// GDN group count (ssm.group_count in GGUF, e.g. 16)
-        int gdn_group_count = 0;
-
-        /// GDN time-step rank (ssm.time_step_rank in GGUF, e.g. 32)
-        int gdn_time_step_rank = 0;
-
-        /// Full attention layer interval (e.g. 4 = every 4th layer is FA)
-        /// 0 means all layers use the default template (no hybrid)
-        int full_attention_interval = 0;
+            /// Returns true if GDN is configured
+            bool enabled() const { return conv_kernel_size > 0 && state_size > 0; }
+        } gdn;
 
         /// Per-layer head dimensions (for variable head_dim across layer types).
         /// When non-empty, size must equal n_layers.
@@ -404,7 +404,10 @@ namespace llaminar2
         }
 
         /// Returns true if this model has GDN (gated delta network) layers
-        bool hasGDN() const { return gdn_conv_kernel_size > 0 && gdn_state_size > 0; }
+        bool hasGDN() const { return gdn.enabled(); }
+
+        /// Returns true if this model uses MoE
+        bool isMoE() const { return moe.enabled(); }
 
         /// Returns true if this model has heterogeneous layer types
         bool hasHeterogeneousLayers() const { return !layer_types.empty(); }

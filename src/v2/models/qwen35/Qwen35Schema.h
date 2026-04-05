@@ -92,20 +92,22 @@ namespace llaminar2
                 // SSM output projection is row-parallel (split input dim)
                 {"ssm_out.weight", WeightShardingMode::InputParallel, WeightDimensionType::Heads,
                  "GDN output projection - split input dim, allreduce after"},
-                // SSM alpha/beta are small projections, replicate for now
-                {"ssm_alpha.weight", WeightShardingMode::Replicate, WeightDimensionType::None,
-                 "GDN alpha (decay) - replicated"},
-                {"ssm_beta.weight", WeightShardingMode::Replicate, WeightDimensionType::None,
-                 "GDN beta (input gate) - replicated"},
-                // SSM conv1d/dt_bias/A/norm: replicated (small tensors)
-                {"ssm_conv1d.weight", WeightShardingMode::Replicate, WeightDimensionType::None,
-                 "GDN conv1d kernel - replicated"},
-                {"ssm_dt.bias", WeightShardingMode::Replicate, WeightDimensionType::None,
-                 "GDN dt bias - replicated"},
-                {"ssm_a", WeightShardingMode::Replicate, WeightDimensionType::None,
-                 "GDN decay A - replicated"},
-                {"ssm_norm.weight", WeightShardingMode::Replicate, WeightDimensionType::None,
-                 "GDN output norm - replicated"},
+                // SSM alpha/beta: column-parallel to match local head count in recurrence
+                {"ssm_alpha.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
+                 "GDN alpha (decay) - split by heads for TP"},
+                {"ssm_beta.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
+                 "GDN beta (input gate) - split by heads for TP"},
+                // SSM conv1d: column-parallel (channels == QKV dim, must match sharded QKV)
+                {"ssm_conv1d.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
+                 "GDN conv1d kernel - split channels to match sharded QKV"},
+                // SSM per-head scalars: column-parallel for correct head assignment per rank
+                {"ssm_dt.bias", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
+                 "GDN dt bias - split by heads for TP"},
+                {"ssm_a", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
+                 "GDN decay A - split by heads for TP"},
+                // SSM norm: column-parallel (gamma size = inner_size = n_v_heads * d_v)
+                {"ssm_norm.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
+                 "GDN output norm - split to match local inner_size for TP"},
 
                 // ===== FFN Weights =====
                 {"ffn_gate.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::FFNHidden,
@@ -270,7 +272,7 @@ namespace llaminar2
                 // Shared buffers (used by both GDN and FA)
                 {"normalized", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "RMSNorm output"},
                 {"residual", {"seq_len", "d_model"}, "fp32", BufferSemantic::InOut, "", 0, "Residual stream buffer"},
-                {"attn_output", {"seq_len", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "attn_scratch", 10, "Attention/GDN output"},
+                {"attn_output", {"seq_len", "attn_output_dim"}, "fp32", BufferSemantic::Scratch, "attn_scratch", 10, "Attention/GDN output"},
                 {"attn_proj", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Projection output"},
 
                 // FA-specific buffers

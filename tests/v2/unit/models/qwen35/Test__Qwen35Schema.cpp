@@ -31,6 +31,7 @@
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/stages/GatedRMSNormStage.h"
 #include "execution/compute_stages/stages/AttentionOutputGateStage.h"
+#include "execution/compute_stages/stages/GEMMStage.h"
 #include "memory/BufferId.h"
 #include "../../../utils/TestTensorFactory.h"
 
@@ -325,14 +326,14 @@ TEST(Test__Qwen35Schema, LayerTypes_Interval4)
     // FA at layers 3,7,11,15,19,23,27,31 → 8 FA, 24 GDN
     GraphConfig config;
     config.n_layers = 32;
-    config.full_attention_interval = 4;
+    config.gdn.full_attention_interval = 4;
 
     // Simulate what Qwen35GraphConfigBuilder does
     config.layer_types.resize(32);
     for (int i = 0; i < 32; ++i)
     {
-        bool is_fa = (config.full_attention_interval > 0) &&
-                     ((i + 1) % config.full_attention_interval == 0);
+        bool is_fa = (config.gdn.full_attention_interval > 0) &&
+                     ((i + 1) % config.gdn.full_attention_interval == 0);
         config.layer_types[i] = is_fa ? "full_attention" : "gdn";
     }
 
@@ -362,7 +363,7 @@ TEST(Test__Qwen35Schema, IsFullAttentionLayer_Shortcut)
 {
     GraphConfig config;
     config.n_layers = 8;
-    config.full_attention_interval = 4;
+    config.gdn.full_attention_interval = 4;
     config.layer_types = {"gdn", "gdn", "gdn", "full_attention",
                           "gdn", "gdn", "gdn", "full_attention"};
 
@@ -377,12 +378,12 @@ TEST(Test__Qwen35Schema, IsFullAttentionLayer_Shortcut)
 TEST(Test__Qwen35Schema, HasGDN)
 {
     GraphConfig config;
-    config.gdn_conv_kernel_size = 4;
-    config.gdn_state_size = 128;
+    config.gdn.conv_kernel_size = 4;
+    config.gdn.state_size = 128;
     EXPECT_TRUE(config.hasGDN());
 
     GraphConfig config2;
-    config2.gdn_conv_kernel_size = 0;
+    config2.gdn.conv_kernel_size = 0;
     EXPECT_FALSE(config2.hasGDN());
 }
 
@@ -504,12 +505,12 @@ namespace
             config_.max_seq_len = 32;
 
             // GDN config matching Qwen3.5-4B pattern
-            config_.gdn_conv_kernel_size = 4;
-            config_.gdn_state_size = 16;  // d_v per head
-            config_.gdn_inner_size = 128; // 4 * n_heads * d_v
-            config_.gdn_group_count = 4;
-            config_.gdn_time_step_rank = 8;
-            config_.full_attention_interval = 4;
+            config_.gdn.conv_kernel_size = 4;
+            config_.gdn.state_size = 16;  // d_v per head
+            config_.gdn.inner_size = 128; // 4 * n_heads * d_v
+            config_.gdn.group_count = 4;
+            config_.gdn.time_step_rank = 8;
+            config_.gdn.full_attention_interval = 4;
 
             // Set up layer types: gdn, gdn, gdn, full_attention
             config_.layer_types = {"gdn", "gdn", "gdn", "full_attention"};
@@ -517,28 +518,40 @@ namespace
             // Create mock tensors for weights and buffers
             // Using small sizes for unit tests
             const size_t d = static_cast<size_t>(config_.d_model);
-            const size_t inner = static_cast<size_t>(config_.gdn_inner_size);
+            const size_t inner = static_cast<size_t>(config_.gdn.inner_size);
             const size_t nh = static_cast<size_t>(config_.n_heads);
 
             // Layer weights
+            // Weight shapes must be consistent with GDN config for head count derivation:
+            // qkv_dim = 2*n_k_heads*d_k + n_v_heads*d_v = 2*4*16 + 8*16 = 256
+            // value_dim = n_v_heads*d_v = 8*16 = 128
+            const int n_k = config_.gdn.group_count;     // 4
+            const int n_v = config_.gdn.time_step_rank;  // 8
+            const int dk = config_.gdn.state_size;        // 16
+            const size_t qkv_total = static_cast<size_t>(2 * n_k * dk + n_v * dk);
+            const size_t value_total = static_cast<size_t>(n_v * dk);
+
             norm_weight_ = TestTensorFactory::createFP32Ones({d});
-            attn_qkv_weight_ = TestTensorFactory::createFP32Random({inner, d});
-            attn_gate_weight_ = TestTensorFactory::createFP32Random({nh * 16, d}); // Z proj
-            ssm_alpha_weight_ = TestTensorFactory::createFP32Random({nh, d});
-            ssm_beta_weight_ = TestTensorFactory::createFP32Random({nh, d});
-            ssm_conv_weight_ = TestTensorFactory::createFP32Random({inner, 4});
-            ssm_dt_bias_ = TestTensorFactory::createFP32Zeros({nh});
-            ssm_a_ = TestTensorFactory::createFP32Random({nh});
+            attn_qkv_weight_ = TestTensorFactory::createFP32Random({qkv_total, d});
+            attn_gate_weight_ = TestTensorFactory::createFP32Random({value_total, d}); // Z proj
+            ssm_alpha_weight_ = TestTensorFactory::createFP32Random({static_cast<size_t>(n_v), d});
+            ssm_beta_weight_ = TestTensorFactory::createFP32Random({static_cast<size_t>(n_v), d});
+            ssm_conv_weight_ = TestTensorFactory::createFP32Random({qkv_total, 4});
+            ssm_dt_bias_ = TestTensorFactory::createFP32Zeros({static_cast<size_t>(n_v)});
+            ssm_a_ = TestTensorFactory::createFP32Random({static_cast<size_t>(n_v)});
             ssm_norm_weight_ = TestTensorFactory::createFP32Ones({inner});
             ssm_out_weight_ = TestTensorFactory::createFP32Random({d, inner});
 
             // Activation buffers
             hidden_ = TestTensorFactory::createFP32({2, d});
             normalized_ = TestTensorFactory::createFP32({2, d});
-            gdn_qkv_ = TestTensorFactory::createFP32({2, inner});
-            gdn_z_ = TestTensorFactory::createFP32({2, nh * 16});
-            gdn_alpha_ = TestTensorFactory::createFP32({2, nh});
-            gdn_beta_ = TestTensorFactory::createFP32({2, nh});
+            gdn_qkv_ = TestTensorFactory::createFP32({2, qkv_total});
+            gdn_z_ = TestTensorFactory::createFP32({2, value_total});
+            gdn_alpha_ = TestTensorFactory::createFP32({2, static_cast<size_t>(n_v)});
+            gdn_beta_ = TestTensorFactory::createFP32({2, static_cast<size_t>(n_v)});
+            attn_output_ = TestTensorFactory::createFP32({2, inner});
+            attn_proj_ = TestTensorFactory::createFP32({2, d});
+            gate_ = TestTensorFactory::createFP32({2, value_total});
             attn_output_ = TestTensorFactory::createFP32({2, d});
             attn_proj_ = TestTensorFactory::createFP32({2, d});
             gate_ = TestTensorFactory::createFP32({2, nh * 16});
@@ -849,4 +862,113 @@ TEST_F(Qwen35GraphBuildTest, GatedNorm_UsesCorrectWeightAndBuffers)
     // Gate should be the Z buffer (gdn_z)
     EXPECT_EQ(params.gate, buffers_.get(BufferId::GDN_Z))
         << "Gated RMSNorm gate should be gdn_z buffer";
+}
+
+// ============================================================================
+// Regression: attn_output buffer must be max(local_qkv_dim, gdn_inner_size)
+// Bug: attn_output was sized as local_qkv_dim (FA dimension), which is smaller
+// than gdn_inner_size when the model has more GDN heads than FA heads.
+// GatedRMSNorm reads the buffer column count to determine how many groups to
+// process, so an undersized buffer caused it to skip heads, leaving garbage
+// in the output that produced NaN via Q8_1 FP16 overflow in gdn_out_proj.
+// ============================================================================
+
+TEST_F(Qwen35GraphBuildTest, ResolverConfig_AttnOutputDim_IsMaxOfFAAndGDN)
+{
+    // The existing fixture has: n_heads=4, head_dim=16, gdn_inner=128
+    // Without TP: local_qkv_dim = 4*16=64, gdn_inner=128
+    // attn_output_dim must be max(64, 128) = 128
+    Qwen35Graph graph(config_, nullptr);
+    auto resolver_config = graph.getResolverConfig(/*seq_len=*/2);
+
+    auto it = resolver_config.custom_formulas.find("attn_output_dim");
+    ASSERT_NE(it, resolver_config.custom_formulas.end())
+        << "attn_output_dim must be defined in resolver custom formulas";
+
+    const size_t local_qkv_dim = static_cast<size_t>(config_.n_heads * config_.head_dim);
+    const size_t gdn_inner = static_cast<size_t>(config_.gdn.inner_size);
+    const size_t expected = std::max(local_qkv_dim, gdn_inner);
+
+    EXPECT_EQ(it->second, expected)
+        << "attn_output_dim should be max(local_qkv_dim=" << local_qkv_dim
+        << ", gdn_inner=" << gdn_inner << ") = " << expected;
+}
+
+TEST(Test__Qwen35Schema, ResolverConfig_AttnOutputDim_WithTP)
+{
+    // Regression test for the exact bug: with 2-way TP,
+    // local_n_heads is halved but gdn_inner_size is also halved,
+    // and gdn_inner > local_qkv_dim. The buffer must accommodate both.
+    //
+    // Qwen3.5-4B dimensions: n_heads=20, head_dim=128, gdn_inner=4096,
+    // gdn_group_count=16, gdn_time_step_rank=32, gdn_state_size=64
+    // With TP=2: local_n_heads=10, local_qkv_dim=1280, local_gdn_inner=2048
+    GraphConfig config;
+    config.n_layers = 4;
+    config.d_model = 2560;
+    config.n_heads = 20;
+    config.n_kv_heads = 4;
+    config.head_dim = 128;
+    config.d_ff = 8960;
+    config.vocab_size = 248320;
+    config.rms_norm_eps = 1e-6f;
+    config.rope_theta = 10000.0f;
+    config.default_device = DeviceId::cpu();
+    config.max_seq_len = 2048;
+    config.gdn.conv_kernel_size = 4;
+    config.gdn.state_size = 64;
+    config.gdn.inner_size = 4096;
+    config.gdn.group_count = 16;
+    config.gdn.time_step_rank = 32;
+    config.gdn.full_attention_interval = 4;
+    config.layer_types = {"gdn", "gdn", "gdn", "full_attention"};
+
+    // Simulate 2-way TP: halve the local head count
+    config.qkv_column_parallel = true;
+    config.local_n_heads = 10;  // 20 / 2
+
+    Qwen35Graph graph(config, nullptr);
+    auto resolver_config = graph.getResolverConfig(/*seq_len=*/1);
+
+    auto it = resolver_config.custom_formulas.find("attn_output_dim");
+    ASSERT_NE(it, resolver_config.custom_formulas.end())
+        << "attn_output_dim must be defined in resolver custom formulas";
+
+    // local_qkv_dim = 10 * 128 = 1280
+    // gdn_inner (TP-local) = 4096 * (10/20) = 2048
+    // attn_output_dim = max(1280, 2048) = 2048
+    EXPECT_GE(it->second, static_cast<size_t>(2048))
+        << "attn_output_dim must be at least gdn_inner_size (2048) with TP=2, "
+           "not just local_qkv_dim (1280). Without this, GatedRMSNorm skips "
+           "heads beyond the FA buffer boundary, producing garbage in gdn_out_proj.";
+
+    EXPECT_GE(it->second, static_cast<size_t>(1280))
+        << "attn_output_dim must also accommodate FA local_qkv_dim";
+}
+
+TEST_F(Qwen35GraphBuildTest, GDNOutProj_KDimMatchesGDNInner)
+{
+    // The GEMM K dimension comes from ssm_out weight shape[1], which must
+    // equal gdn_inner_size. The attn_output buffer (A input) must have at
+    // least K valid elements per row for the GEMV to read valid data.
+    Qwen35Graph graph(config_, nullptr);
+
+    ComputeGraph attn_graph = graph.buildAttentionGraph(
+        layer_, buffers_, 0, 2, 1, nullptr, nullptr, DeviceId::cpu());
+
+    auto *gemm_node = attn_graph.getNode("layer0_gdn_out_proj");
+    ASSERT_NE(gemm_node, nullptr);
+
+    auto *gemm_stage = dynamic_cast<GEMMStage *>(gemm_node->stage.get());
+    ASSERT_NE(gemm_stage, nullptr);
+
+    const auto &params = gemm_stage->getParams();
+
+    // K must equal gdn_inner_size (weight shape[1])
+    EXPECT_EQ(params.k, config_.gdn.inner_size)
+        << "gdn_out_proj K dimension must match gdn_inner_size, not local_qkv_dim";
+
+    // N must equal d_model (weight shape[0])
+    EXPECT_EQ(params.n, config_.d_model)
+        << "gdn_out_proj N dimension must be d_model";
 }

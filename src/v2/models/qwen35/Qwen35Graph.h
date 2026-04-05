@@ -2,8 +2,10 @@
  * @file Qwen35Graph.h
  * @brief Qwen 3.5 compute graph builder for hybrid GDN + full attention architecture
  *
- * Extends Qwen2Graph to support the Qwen 3.5 "Dense" architecture which uses
- * heterogeneous transformer layers:
+ * Inherits shared Qwen infrastructure from QwenGraphBase:
+ *   IGraphBuilder → QwenGraphBase → Qwen35Graph
+ *
+ * Supports the Qwen 3.5 "Dense" architecture with heterogeneous transformer layers:
  *   - GDN (Gated Delta Net) layers: linear attention with delta rule recurrence
  *   - Full Attention (FA) layers: standard multi-head attention with RoPE
  *
@@ -32,7 +34,7 @@
 
 #pragma once
 
-#include "../qwen/Qwen2Graph.h"
+#include "../qwen/QwenGraphBase.h"
 #include <memory>
 
 namespace llaminar2
@@ -45,16 +47,12 @@ namespace llaminar2
 {
 
     /**
-     * @brief Qwen 3.5 graph builder extending Qwen2Graph with GDN layer support
+     * @brief Qwen 3.5 graph builder with GDN + FA hybrid attention
      *
-     * Overrides:
-     *   - architectureName()     → "qwen35"
-     *   - getSchema()            → Qwen35SchemaFactory with named templates
-     *   - buildFullForwardGraph() → Dispatches per-layer between GDN and FA paths
-     *   - buildLayerGraph()      → Single-layer dispatch
-     *   - buildAttentionGraph()  → Per-layer dispatch for attention sub-graph
+     * Inherits shared transformer infrastructure from QwenGraphBase.
+     * Implements hybrid attention dispatch per layer type.
      */
-    class Qwen35Graph : public Qwen2Graph
+    class Qwen35Graph : public QwenGraphBase
     {
     public:
         /// Construct with full model context
@@ -76,18 +74,12 @@ namespace llaminar2
 
         GraphSchema getSchema() const override;
 
-        /// Wire GDN-specific arena buffers after base Qwen2 wiring
+        /// Wire GDN-specific arena buffers after base wiring
         void setArena(BufferArena *arena) override;
 
-        /// Extends Qwen2Graph's resolver config with GDN-specific formulas
+        /// Extends base resolver config with GDN-specific formulas
         /// and buffer name→id mappings, keeping core infrastructure agnostic.
         GraphResolverConfig getResolverConfig(int seq_len) const override;
-
-        /// Layer dispatch delegates to GDN or FA based on layer type.
-        /// buildFullForwardGraph() inherited from Qwen2Graph calls
-        /// buildAttentionGraph() virtually, so GDN dispatch is automatic.
-
-        ComputeGraph buildLayerGraph(const LayerContext &ctx) override;
 
         ComputeGraph buildAttentionGraph(
             const LayerWeights &layer,

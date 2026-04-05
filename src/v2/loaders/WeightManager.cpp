@@ -456,9 +456,16 @@ namespace llaminar2
             // Row-parallel: Load ONLY the slice from GGUF (memory efficient!)
             // Get tensor dimensions
             auto dims_opt = loader_.getTensorShape(name);
-            if (!dims_opt || dims_opt->size() != 2)
+            if (!dims_opt || dims_opt->empty())
             {
-                LOG_ERROR("[WeightManager] Rank " << rank << " invalid tensor for row-parallel: " << name);
+                // Tensor doesn't exist in GGUF — return nullptr so the caller
+                // (graph config builder) can probe for layer-type-specific weights.
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for row-parallel: " << name);
+                return nullptr;
+            }
+            if (dims_opt->size() != 2)
+            {
+                LOG_ERROR("[WeightManager] Rank " << rank << " invalid tensor for row-parallel (expected 2D): " << name);
                 return nullptr;
             }
             const auto &dims = *dims_opt;
@@ -538,7 +545,9 @@ namespace llaminar2
             auto dims_opt = loader_.getTensorShape(name);
             if (!dims_opt || dims_opt->empty())
             {
-                LOG_ERROR("[WeightManager] Cannot find tensor for column-parallel: " << name);
+                // Tensor doesn't exist in GGUF — return nullptr so the caller
+                // (graph config builder) can probe for layer-type-specific weights.
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for column-parallel: " << name);
                 return nullptr;
             }
             const auto &dims = *dims_opt;
@@ -677,9 +686,16 @@ namespace llaminar2
 
             // Get tensor dimensions
             auto dims_opt = loader_.getTensorShape(name);
-            if (!dims_opt || dims_opt->size() != 2)
+            if (!dims_opt || dims_opt->empty())
             {
-                LOG_ERROR("[WeightManager] Cannot find 2D tensor for input-parallel: " << name);
+                // Tensor doesn't exist in GGUF — return nullptr so the caller
+                // (graph config builder) can probe for layer-type-specific weights.
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for input-parallel: " << name);
+                return nullptr;
+            }
+            if (dims_opt->size() != 2)
+            {
+                LOG_ERROR("[WeightManager] Invalid tensor for input-parallel (expected 2D): " << name);
                 return nullptr;
             }
             const auto &dims = *dims_opt;
@@ -2760,9 +2776,11 @@ namespace llaminar2
         case ShardingMode::COLUMN_PARALLEL:
         {
             auto dims_opt = loader_.getTensorShape(name);
-            if (!dims_opt)
+            if (!dims_opt || dims_opt->empty())
             {
-                LOG_ERROR("[WeightManager] Tensor not found for column-parallel: " << name);
+                // Tensor doesn't exist in GGUF — return nullptr so the caller
+                // (graph config builder) can probe for layer-type-specific weights.
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for column-parallel: " << name);
                 return nullptr;
             }
             const auto &dims = *dims_opt;
@@ -2786,9 +2804,14 @@ namespace llaminar2
         case ShardingMode::ROW_PARALLEL:
         {
             auto dims_opt = loader_.getTensorShape(name);
-            if (!dims_opt || dims_opt->size() != 2)
+            if (!dims_opt || dims_opt->empty())
             {
-                LOG_ERROR("[WeightManager] Invalid tensor for row-parallel: " << name);
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for row-parallel: " << name);
+                return nullptr;
+            }
+            if (dims_opt->size() != 2)
+            {
+                LOG_ERROR("[WeightManager] Invalid tensor for row-parallel (expected 2D): " << name);
                 return nullptr;
             }
             result = loadRowParallelWeight(name, device, assignment, *dims_opt);
@@ -2798,9 +2821,14 @@ namespace llaminar2
         case ShardingMode::INPUT_PARALLEL:
         {
             auto dims_opt = loader_.getTensorShape(name);
-            if (!dims_opt || dims_opt->size() != 2)
+            if (!dims_opt || dims_opt->empty())
             {
-                LOG_ERROR("[WeightManager] Invalid tensor for input-parallel: " << name);
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for input-parallel: " << name);
+                return nullptr;
+            }
+            if (dims_opt->size() != 2)
+            {
+                LOG_ERROR("[WeightManager] Invalid tensor for input-parallel (expected 2D): " << name);
                 return nullptr;
             }
             result = loadInputParallelWeight(name, device, assignment, *dims_opt);

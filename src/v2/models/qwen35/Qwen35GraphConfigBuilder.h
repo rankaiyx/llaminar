@@ -35,11 +35,11 @@ namespace llaminar2
          * @brief Populate config from IModelContext with Qwen3.5-specific fields
          *
          * In addition to standard fields (n_layers, d_model, etc.), reads:
-         * - ssm.conv_kernel → gdn_conv_kernel_size
-         * - ssm.state_size → gdn_state_size
-         * - ssm.inner_size → gdn_inner_size
-         * - ssm.group_count → gdn_group_count
-         * - ssm.time_step_rank → gdn_time_step_rank
+         * - ssm.conv_kernel → gdn.conv_kernel_size
+         * - ssm.state_size → gdn.state_size
+         * - ssm.inner_size → gdn.inner_size
+         * - ssm.group_count → gdn.group_count
+         * - ssm.time_step_rank → gdn.time_step_rank
          * - full_attention_interval → generates layer_types
          * - partial_rotary_factor from rope.dimension_count
          * - has_attention_output_gate = true

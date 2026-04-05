@@ -561,8 +561,8 @@ TEST(Test__HeterogeneousLayers, GraphConfigFallbackToDefaults)
 TEST(Test__HeterogeneousLayers, GraphConfigGDN)
 {
     GraphConfig config;
-    config.gdn_conv_kernel_size = 4;
-    config.gdn_state_size = 128;
+    config.gdn.conv_kernel_size = 4;
+    config.gdn.state_size = 128;
 
     EXPECT_TRUE(config.hasGDN());
     EXPECT_FALSE(config.hasHeterogeneousLayers());

@@ -121,11 +121,11 @@ namespace llaminar2::test::parity
      */
     struct ParityConfig
     {
-        // Model and test setup
-        std::string model_path = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+        // Model and test setup — MUST be set by subclass (no defaults)
+        std::string model_path;
         std::string snapshot_dir;
-        std::string prompt = "The quick brown fox jumps over the lazy dog";
-        std::vector<int> token_ids = {785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562};
+        std::string prompt;
+        std::vector<int> token_ids;
         int decode_steps = 5;
 
         // Layer-by-layer thresholds

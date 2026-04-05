@@ -34,26 +34,26 @@ namespace llaminar2
         // =====================================================================
         // GDN / SSM metadata
         // =====================================================================
-        config.gdn_conv_kernel_size = loader->getInt(arch + ".ssm.conv_kernel", 0);
-        config.gdn_state_size = loader->getInt(arch + ".ssm.state_size", 0);
-        config.gdn_inner_size = loader->getInt(arch + ".ssm.inner_size", 0);
-        config.gdn_group_count = loader->getInt(arch + ".ssm.group_count", 0);
-        config.gdn_time_step_rank = loader->getInt(arch + ".ssm.time_step_rank", 0);
+        config.gdn.conv_kernel_size = loader->getInt(arch + ".ssm.conv_kernel", 0);
+        config.gdn.state_size = loader->getInt(arch + ".ssm.state_size", 0);
+        config.gdn.inner_size = loader->getInt(arch + ".ssm.inner_size", 0);
+        config.gdn.group_count = loader->getInt(arch + ".ssm.group_count", 0);
+        config.gdn.time_step_rank = loader->getInt(arch + ".ssm.time_step_rank", 0);
 
         LOG_DEBUG("[Qwen35GraphConfigBuilder] GDN config:"
-                  << " conv_kernel=" << config.gdn_conv_kernel_size
-                  << " state_size=" << config.gdn_state_size
-                  << " inner_size=" << config.gdn_inner_size
-                  << " group_count=" << config.gdn_group_count
-                  << " time_step_rank=" << config.gdn_time_step_rank);
+                  << " conv_kernel=" << config.gdn.conv_kernel_size
+                  << " state_size=" << config.gdn.state_size
+                  << " inner_size=" << config.gdn.inner_size
+                  << " group_count=" << config.gdn.group_count
+                  << " time_step_rank=" << config.gdn.time_step_rank);
 
         // =====================================================================
         // Hybrid layer types (full_attention_interval)
         // =====================================================================
-        config.full_attention_interval = loader->getInt(
+        config.gdn.full_attention_interval = loader->getInt(
             arch + ".full_attention_interval", 0);
 
-        if (config.full_attention_interval > 0)
+        if (config.gdn.full_attention_interval > 0)
         {
             const int n_layers = config.n_layers;
             config.layer_types.resize(n_layers);
@@ -64,7 +64,7 @@ namespace llaminar2
             {
                 // Pattern: every Nth layer is full attention (1-indexed check)
                 // Layer indices 3, 7, 11, ... are FA when interval=4
-                if ((i + 1) % config.full_attention_interval == 0)
+                if ((i + 1) % config.gdn.full_attention_interval == 0)
                 {
                     config.layer_types[i] = "full_attention";
                     ++fa_count;
@@ -79,7 +79,7 @@ namespace llaminar2
             LOG_INFO("[Qwen35GraphConfigBuilder] Hybrid architecture:"
                      << " " << gdn_count << " GDN layers + "
                      << fa_count << " FA layers"
-                     << " (interval=" << config.full_attention_interval << ")");
+                     << " (interval=" << config.gdn.full_attention_interval << ")");
         }
 
         // =====================================================================
@@ -104,7 +104,7 @@ namespace llaminar2
         // =====================================================================
         // Per-layer head dimensions (FA: head_dim from GGUF, GDN: state_size)
         // =====================================================================
-        if (!config.layer_types.empty() && config.gdn_state_size > 0)
+        if (!config.layer_types.empty() && config.gdn.state_size > 0)
         {
             const int n_layers = config.n_layers;
             config.layer_head_dim.resize(n_layers);
@@ -116,7 +116,7 @@ namespace llaminar2
                 }
                 else
                 {
-                    config.layer_head_dim[i] = config.gdn_state_size; // GDN state dim (e.g. 128)
+                    config.layer_head_dim[i] = config.gdn.state_size; // GDN state dim (e.g. 128)
                 }
             }
         }

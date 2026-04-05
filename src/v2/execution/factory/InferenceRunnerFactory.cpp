@@ -1026,21 +1026,34 @@ namespace llaminar2
         const auto &env = debugEnv();
         if (env.activation_rotation)
         {
-            const int hidden_dim = model_ctx->embeddingLength();
-            const int ffn_dim = model_ctx->feedForwardLength();
-            const int block_dim = env.rotation_block_dim;
-
-            if (hidden_dim % block_dim == 0 && ffn_dim % block_dim == 0)
+            // Activation rotation pre-rotates weight rows with orthogonal matrix R.
+            // At runtime, CPU VNNI kernels rotate activations with the same R before
+            // Q8_1 quantization, so the rotation cancels out. GPU kernels do NOT
+            // implement runtime activation rotation yet, so skip weight rotation
+            // for GPU devices to avoid numerical corruption.
+            if (device.is_gpu())
             {
-                auto rotator = ModelWeightRotation::create(
-                    hidden_dim, ffn_dim, block_dim);
-                rotator->rotateAllWeights(weights, model_ctx->blockCount(), rotator);
+                LOG_INFO("[InferenceRunner] Activation rotation skipped for GPU device "
+                         << device.toString() << " (GPU kernels do not implement runtime rotation)");
             }
             else
             {
-                LOG_WARN("[InferenceRunner] Activation rotation disabled: block_dim="
-                         << block_dim << " does not divide hidden_dim=" << hidden_dim
-                         << " or ffn_dim=" << ffn_dim);
+                const int hidden_dim = model_ctx->embeddingLength();
+                const int ffn_dim = model_ctx->feedForwardLength();
+                const int block_dim = env.rotation_block_dim;
+
+                if (hidden_dim % block_dim == 0 && ffn_dim % block_dim == 0)
+                {
+                    auto rotator = ModelWeightRotation::create(
+                        hidden_dim, ffn_dim, block_dim);
+                    rotator->rotateAllWeights(weights, model_ctx->blockCount(), rotator);
+                }
+                else
+                {
+                    LOG_WARN("[InferenceRunner] Activation rotation disabled: block_dim="
+                             << block_dim << " does not divide hidden_dim=" << hidden_dim
+                             << " or ffn_dim=" << ffn_dim);
+                }
             }
         }
 
