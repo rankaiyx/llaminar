@@ -1931,16 +1931,15 @@ namespace llaminar2
 
         const auto &shape = state_.logits->shape();
         const size_t vocab = (shape.size() >= 2) ? shape[1] : shape[0];
-        const size_t rows = (shape.size() >= 2) ? shape[0] : 1;
 
-        // Offset to last row (prefill: last token's logits; decode: only row)
-        const void *last_row = static_cast<const char *>(gpu_ptr) +
-                               (rows - 1) * vocab * sizeof(float);
+        // LmHeadStage always writes the last token's logits to row 0
+        // (both prefill and decode), so we always argmax row 0.
+        const void *target_row = gpu_ptr;
 
         float max_val = 0.0f;
         int max_idx = 0;
 
-        if (!backend->argmaxF32(last_row, static_cast<int>(vocab),
+        if (!backend->argmaxF32(target_row, static_cast<int>(vocab),
                                 state_.device_id.gpu_ordinal(),
                                 &max_val, &max_idx))
             return -1;
