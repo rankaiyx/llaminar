@@ -49,10 +49,9 @@ namespace
     {
         auto t = std::make_shared<FP32Tensor>(shape, DeviceId::cpu());
         float *d = t->mutable_data();
-        std::mt19937 rng(42);
-        std::uniform_real_distribution<float> dist(lo, hi);
+        float range = hi - lo;
         for (size_t i = 0; i < t->numel(); ++i)
-            d[i] = dist(rng);
+            d[i] = lo + range * (static_cast<float>(i % 97) / 97.0f);
         return t;
     }
 
