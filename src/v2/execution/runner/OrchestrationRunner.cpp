@@ -57,6 +57,15 @@ namespace llaminar2
     {
     }
 
+    OrchestrationRunner::OrchestrationRunner(
+        OrchestrationConfig config,
+        RankExecutionPlan plan,
+        std::unique_ptr<IInferenceRunner> runner)
+        : config_(std::move(config)), plan_(std::move(plan)), plan_built_(true),
+          runner_(std::move(runner)), initialized_(true), sampler_(0)
+    {
+    }
+
     OrchestrationRunner::~OrchestrationRunner()
     {
         shutdown();
@@ -280,8 +289,12 @@ namespace llaminar2
             sendActivationsToNextStage();
         }
 
-        // Store last token for next decode step
-        last_token_ = prompt_tokens.back();
+        // Signal that prefill logits are ready for sampling.
+        // The first decodeStep() will sample from these logits directly
+        // instead of re-feeding the last prompt token (which would cause
+        // the model to see it twice at consecutive positions, corrupting
+        // GDN recurrence state and KV cache entries).
+        prefill_logits_ready_ = true;
 
         return true;
     }
@@ -296,25 +309,36 @@ namespace llaminar2
             return result;
         }
 
-        // For PP: non-head stages receive from previous
-        if (!isPipelineHead())
+        if (prefill_logits_ready_)
         {
-            receiveActivationsFromPrevStage();
+            // First decode step after prefill: sample from the already-computed
+            // prefill logits instead of re-feeding the last prompt token.
+            // This avoids processing the last token twice (which corrupts GDN
+            // recurrence state and creates duplicate KV cache entries).
+            prefill_logits_ready_ = false;
         }
-
-        // Run single-token forward with last token
-        if (!runner_->forward(&last_token_, 1))
+        else
         {
-            result.error = "Forward pass failed during decode";
-            return result;
-        }
+            // For PP: non-head stages receive from previous
+            if (!isPipelineHead())
+            {
+                receiveActivationsFromPrevStage();
+            }
 
-        // For PP: send to next stage if not tail
-        if (!isPipelineTail())
-        {
-            sendActivationsToNextStage();
-            // Non-tail stages don't sample
-            return result;
+            // Run single-token forward with last token
+            if (!runner_->forward(&last_token_, 1))
+            {
+                result.error = "Forward pass failed during decode";
+                return result;
+            }
+
+            // For PP: send to next stage if not tail
+            if (!isPipelineTail())
+            {
+                sendActivationsToNextStage();
+                // Non-tail stages don't sample
+                return result;
+            }
         }
 
         // Tail stage: try GPU-side sampling first, fall back to CPU
@@ -389,9 +413,11 @@ namespace llaminar2
         }
 
         // Prefill
-        // Skip D2H logits gather for prefill — logits are never consumed;
-        // the first generated token comes from a decode step.
-        runner_->setSkipLogitsGatherPrefill(true);
+        // After prefill, the first decodeStep() samples from the prefill logits
+        // directly (via prefill_logits_ready_ flag) instead of re-feeding the
+        // last prompt token. GPU-side sampling (sampleGreedyOnDevice) works on
+        // device logits without D2H, so no gather is needed for GPU models.
+        // For CPU models, logits are already on host.
         if (!prefill(prompt_tokens))
         {
             result.error = last_error_;
@@ -488,6 +514,7 @@ namespace llaminar2
         {
             runner_->clear_cache();
         }
+        prefill_logits_ready_ = false;
     }
 
     // =========================================================================

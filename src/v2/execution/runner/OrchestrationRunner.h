@@ -92,6 +92,21 @@ namespace llaminar2
             OrchestrationConfig config,
             RankExecutionPlan plan);
 
+        /**
+         * @brief Construct with injected runner for unit testing
+         *
+         * Allows injecting a mock IInferenceRunner to test prefill/decode
+         * logic without loading a real model.
+         *
+         * @param config Orchestration configuration
+         * @param plan Pre-built execution plan
+         * @param runner Pre-built inference runner (takes ownership)
+         */
+        OrchestrationRunner(
+            OrchestrationConfig config,
+            RankExecutionPlan plan,
+            std::unique_ptr<IInferenceRunner> runner);
+
         ~OrchestrationRunner() override;
 
         // Disable copy
@@ -327,6 +342,7 @@ namespace llaminar2
         SamplingParams active_sampling_params_;      // Current sampling params for decodeStep()
         SamplingParams recommended_sampling_params_; // Model-specific defaults
         int32_t last_token_{0};                      // Last token for decode step
+        bool prefill_logits_ready_{false};           // True after prefill(); first decodeStep() samples from existing logits
         std::shared_ptr<ITokenizer> tokenizer_;
     };
 

@@ -8547,6 +8547,28 @@ if(HAVE_CUDA AND HAVE_ROCM)
 endif()
 
 # =============================================================================
+# Phase 5: Prefill→Decode Transition Unit Tests (Regression)
+# =============================================================================
+# Regression test for the prefill→decode last-token double-processing bug.
+# Uses a mock IInferenceRunner to verify that the first decodeStep() samples
+# from prefill logits instead of re-feeding the last prompt token.
+add_executable(v2_unit_prefill_decode_transition
+    unit/execution/runner/Test__PrefillDecodeTransition.cpp
+)
+target_link_libraries(v2_unit_prefill_decode_transition
+    llaminar2_core
+    GTest::gtest
+    GTest::gmock
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PrefillDecodeTransition
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+    LABELS "V2;Unit;Orchestration;OrchestrationRunner;Regression;PrefillDecode"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added prefill→decode transition regression tests")
+
+# =============================================================================
 # Phase 5: OrchestrationRunner Integration Tests
 # =============================================================================
 # Tests the end-to-end OrchestrationRunner that wires all Phase 0-4 components.

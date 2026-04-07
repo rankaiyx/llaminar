@@ -211,6 +211,32 @@ namespace llaminar2
                                                 << " d_k=" << params_.d_k
                                                 << " d_v=" << params_.d_v
                                                 << (params_.seq_len == 1 ? " (decode)" : " (prefill)"));
+
+        // Temporary decode diagnostic: print output/state norms
+        if (params_.seq_len == 1)
+        {
+            const size_t out_size = static_cast<size_t>(params_.n_heads) * params_.d_v;
+            float out_norm_sq = 0.0f;
+            for (size_t i = 0; i < out_size; ++i)
+                out_norm_sq += output_data[i] * output_data[i];
+
+            const size_t state_size = static_cast<size_t>(params_.n_heads) * params_.d_k * params_.d_v;
+            float state_norm_sq = 0.0f;
+            for (size_t i = 0; i < state_size; ++i)
+                state_norm_sq += params_.recurrence_state[i] * params_.recurrence_state[i];
+
+            float q_norm_sq = 0.0f;
+            const size_t qk_total = static_cast<size_t>(params_.n_heads) * params_.d_k;
+            for (size_t i = 0; i < qk_total; ++i)
+                q_norm_sq += q_data[i] * q_data[i];
+
+            LOG_INFO("[GDN_DECODE_DIAG] layer=" << params_.layer_idx
+                                                << " out_norm=" << std::sqrt(out_norm_sq)
+                                                << " state_norm=" << std::sqrt(state_norm_sq)
+                                                << " q_norm=" << std::sqrt(q_norm_sq)
+                                                << " out[0:4]=" << output_data[0] << "," << output_data[1] << "," << output_data[2] << "," << output_data[3]);
+        }
+
         return ok;
     }
 
