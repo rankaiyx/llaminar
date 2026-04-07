@@ -32,6 +32,50 @@
 
 #if defined(__AVX512F__)
 #include <immintrin.h>
+
+// =========================================================================
+// Fast AVX-512 exp/sigmoid approximations
+//
+// exp(x) via range reduction: exp(x) = 2^n · P(f)
+//   n = round(x · log2(e)),  f = x·log2(e) - n ∈ [-0.5, 0.5]
+//   P(f) = degree-5 Horner polynomial for 2^f
+//   2^n via IEEE-754 exponent bit-shift (scalef)
+//
+// Same polynomial used in CPUShortConvolution and GatedRMSNormStage.
+// =========================================================================
+
+static inline __m512 avx512_fast_exp(__m512 vx)
+{
+    const __m512 vlog2e = _mm512_set1_ps(1.4426950408889634f);
+    const __m512 vln2 = _mm512_set1_ps(0.6931471805599453f);
+    const __m512 vc0 = _mm512_set1_ps(1.0f);
+    const __m512 vc1 = _mm512_set1_ps(0.693147180559945f);
+    const __m512 vc2 = _mm512_set1_ps(0.240226506959101f);
+    const __m512 vc3 = _mm512_set1_ps(0.055504108664822f);
+    const __m512 vc4 = _mm512_set1_ps(0.009618129107629f);
+    const __m512 vc5 = _mm512_set1_ps(0.001333355814642f);
+
+    __m512 vt = _mm512_mul_ps(vx, vlog2e);
+    __m512 vn = _mm512_roundscale_ps(vt, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m512 vf = _mm512_sub_ps(vt, vn);
+
+    __m512 vpoly = _mm512_fmadd_ps(vc5, vf, vc4);
+    vpoly = _mm512_fmadd_ps(vpoly, vf, vc3);
+    vpoly = _mm512_fmadd_ps(vpoly, vf, vc2);
+    vpoly = _mm512_fmadd_ps(vpoly, vf, vc1);
+    vpoly = _mm512_fmadd_ps(vpoly, vf, vc0);
+
+    return _mm512_scalef_ps(vpoly, vn);
+}
+
+static inline __m512 avx512_fast_sigmoid(__m512 vx)
+{
+    __m512 vneg = _mm512_sub_ps(_mm512_setzero_ps(), vx);
+    __m512 vexp_neg = avx512_fast_exp(vneg);
+    __m512 vone = _mm512_set1_ps(1.0f);
+    return _mm512_div_ps(vone, _mm512_add_ps(vone, vexp_neg));
+}
+
 #endif
 #include <vector>
 
@@ -138,41 +182,119 @@ namespace llaminar2
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm)
     {
-        // --- Preprocessing: reuse class scratch buffers ---
-        ensureScratch(1, n_heads, d_k, d_v);
+        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
+        constexpr float l2_eps = 1e-6f;
 
-        const size_t qk_total = static_cast<size_t>(n_heads) * d_k;
-        std::memcpy(q_scratch_.data(), q, qk_total * sizeof(float));
-        std::memcpy(k_scratch_.data(), k, qk_total * sizeof(float));
-
-        if (use_qk_l2norm)
-        {
-            l2normalize(q_scratch_.data(), 1, n_heads, d_k);
-            l2normalize(k_scratch_.data(), 1, n_heads, d_k);
-        }
-
-        const float scale = 1.0f / std::sqrt(static_cast<float>(d_k));
-        for (size_t i = 0; i < qk_total; ++i)
-            q_scratch_[i] *= scale;
-
-        computeGates(alpha, beta_raw, A_log, dt_bias,
-                     gate_scratch_.data(), beta_sig_scratch_.data(), 1, n_heads);
-
-        // --- Core recurrence (stack-allocated per-head scratch) ---
+        // Fold ALL preprocessing into the per-head parallel loop.
+        // Each thread uses stack-local Q/K — no shared scratch, no sequential
+        // bottleneck, no OMP barrier between preprocessing and recurrence.
         auto do_work = [&]()
         {
 #pragma omp for schedule(static)
             for (int h = 0; h < n_heads; ++h)
             {
-                float *S = state + static_cast<size_t>(h) * d_k * d_v;
-                const float *q_h = q_scratch_.data() + h * d_k;
-                const float *k_h = k_scratch_.data() + h * d_k;
-                const float *v_h = v + h * d_v;
-                const float g_h = gate_scratch_[h];
-                const float beta_h = beta_sig_scratch_[h];
-                float *o_h = output + h * d_v;
+                // ── Per-head preprocessing (stack-local buffers) ──
+                alignas(64) float q_local[512]; // d_k <= 512
+                alignas(64) float k_local[512];
 
-                const float decay = std::exp(g_h);
+                const float *q_src = q + h * d_k;
+                const float *k_src = k + h * d_k;
+
+                if (use_qk_l2norm)
+                {
+#if defined(__AVX512F__)
+                    const int hd_vec = d_k & ~15;
+                    // Q: fused L2-normalize + scale
+                    {
+                        __m512 vsum = _mm512_setzero_ps();
+                        int d = 0;
+                        for (; d < hd_vec; d += 16)
+                        {
+                            __m512 vv = _mm512_loadu_ps(q_src + d);
+                            vsum = _mm512_fmadd_ps(vv, vv, vsum);
+                        }
+                        float norm_sq = _mm512_reduce_add_ps(vsum);
+                        for (; d < d_k; ++d)
+                            norm_sq += q_src[d] * q_src[d];
+                        const float inv = scale_val / std::max(std::sqrt(norm_sq), l2_eps);
+                        const __m512 vinv = _mm512_set1_ps(inv);
+                        d = 0;
+                        for (; d < hd_vec; d += 16)
+                            _mm512_store_ps(q_local + d,
+                                            _mm512_mul_ps(_mm512_loadu_ps(q_src + d), vinv));
+                        for (; d < d_k; ++d)
+                            q_local[d] = q_src[d] * inv;
+                    }
+                    // K: L2-normalize only
+                    {
+                        __m512 vsum = _mm512_setzero_ps();
+                        int d = 0;
+                        for (; d < hd_vec; d += 16)
+                        {
+                            __m512 vv = _mm512_loadu_ps(k_src + d);
+                            vsum = _mm512_fmadd_ps(vv, vv, vsum);
+                        }
+                        float norm_sq = _mm512_reduce_add_ps(vsum);
+                        for (; d < d_k; ++d)
+                            norm_sq += k_src[d] * k_src[d];
+                        const float inv = 1.0f / std::max(std::sqrt(norm_sq), l2_eps);
+                        const __m512 vinv = _mm512_set1_ps(inv);
+                        d = 0;
+                        for (; d < hd_vec; d += 16)
+                            _mm512_store_ps(k_local + d,
+                                            _mm512_mul_ps(_mm512_loadu_ps(k_src + d), vinv));
+                        for (; d < d_k; ++d)
+                            k_local[d] = k_src[d] * inv;
+                    }
+#else
+                    {
+                        float nq = 0.0f;
+                        for (int d = 0; d < d_k; ++d)
+                            nq += q_src[d] * q_src[d];
+                        const float inv_q = scale_val / std::max(std::sqrt(nq), l2_eps);
+                        for (int d = 0; d < d_k; ++d)
+                            q_local[d] = q_src[d] * inv_q;
+                    }
+                    {
+                        float nk = 0.0f;
+                        for (int d = 0; d < d_k; ++d)
+                            nk += k_src[d] * k_src[d];
+                        const float inv_k = 1.0f / std::max(std::sqrt(nk), l2_eps);
+                        for (int d = 0; d < d_k; ++d)
+                            k_local[d] = k_src[d] * inv_k;
+                    }
+#endif
+                }
+                else
+                {
+#if defined(__AVX512F__)
+                    const int hd_vec = d_k & ~15;
+                    const __m512 vscale = _mm512_set1_ps(scale_val);
+                    int d = 0;
+                    for (; d < hd_vec; d += 16)
+                        _mm512_store_ps(q_local + d,
+                                        _mm512_mul_ps(_mm512_loadu_ps(q_src + d), vscale));
+                    for (; d < d_k; ++d)
+                        q_local[d] = q_src[d] * scale_val;
+#else
+                    for (int d = 0; d < d_k; ++d)
+                        q_local[d] = q_src[d] * scale_val;
+#endif
+                    std::memcpy(k_local, k_src, d_k * sizeof(float));
+                }
+
+                // ── Gate + beta (combined, saves one exp() call) ──
+                const float x = alpha[h] + dt_bias[h];
+                const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
+                const float decay = std::exp(A_log[h] * sp);
+                const float beta_h = 1.0f / (1.0f + std::exp(-beta_raw[h]));
+
+                // ── Core recurrence ──
+                float *S = state + static_cast<size_t>(h) * d_k * d_v;
+                const float *q_h = q_local;
+                const float *k_h = k_local;
+                const float *v_h = v + h * d_v;
+                float *o_h = output + h * d_v;
 
 #if defined(__AVX512F__)
                 // AVX-512 vectorized path — inner loops stride d_v,
@@ -486,12 +608,42 @@ namespace llaminar2
                     const int gi = t * n_heads + h;
                     const float x = alpha[gi] + dt_bias[h];
                     const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
-                    gate_scratch_[gi] = std::exp(A_log[h] * sp);
-                    beta_sig_scratch_[gi] = 1.0f / (1.0f + std::exp(-beta_raw[gi]));
+                    gate_scratch_[gi] = A_log[h] * sp; // store g, NOT exp(g) yet
 
                     // Zero output
                     std::memset(output + out_off, 0, d_v * sizeof(float));
                 }
+
+                // Batch exp(g) and sigmoid across all heads for this token.
+                // Replaces 2×n_heads scalar exp() with 2 AVX-512 fast_exp calls.
+#if defined(__AVX512F__)
+                {
+                    const int gi_base = t * n_heads;
+                    int hh = 0;
+                    const int hh_vec = n_heads & ~15;
+                    for (; hh < hh_vec; hh += 16)
+                    {
+                        __m512 vg = _mm512_loadu_ps(gate_scratch_.data() + gi_base + hh);
+                        _mm512_storeu_ps(gate_scratch_.data() + gi_base + hh, avx512_fast_exp(vg));
+                        __m512 vb = _mm512_loadu_ps(beta_raw + gi_base + hh);
+                        _mm512_storeu_ps(beta_sig_scratch_.data() + gi_base + hh, avx512_fast_sigmoid(vb));
+                    }
+                    for (; hh < n_heads; ++hh)
+                    {
+                        gate_scratch_[gi_base + hh] = std::exp(gate_scratch_[gi_base + hh]);
+                        beta_sig_scratch_[gi_base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[gi_base + hh]));
+                    }
+                }
+#else
+                {
+                    const int gi_base = t * n_heads;
+                    for (int hh = 0; hh < n_heads; ++hh)
+                    {
+                        gate_scratch_[gi_base + hh] = std::exp(gate_scratch_[gi_base + hh]);
+                        beta_sig_scratch_[gi_base + hh] = 1.0f / (1.0f + std::exp(-beta_raw[gi_base + hh]));
+                    }
+                }
+#endif
             }
             // implicit barrier between omp-for regions
 
