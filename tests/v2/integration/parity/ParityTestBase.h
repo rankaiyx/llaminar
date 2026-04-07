@@ -88,6 +88,7 @@
 #include "backends/GlobalDeviceAddress.h"
 #ifdef HAVE_CUDA
 #include "kernels/cuda/ops/CUDAEmbeddingKernelT.h"
+#include <cuda_runtime.h>
 #endif
 #ifdef HAVE_ROCM
 #include "kernels/rocm/ops/ROCmEmbeddingKernelT.h"
@@ -1577,6 +1578,9 @@ namespace llaminar2::test::parity
             if (auto *cuda_backend = llaminar2::getCUDABackend())
             {
                 cuda_backend->synchronize(0);
+                // Clear CUDA sticky error state to prevent async kernel errors
+                // from one test case propagating to the next test's first CUDA API call.
+                cudaGetLastError();
             }
 #endif
 #ifdef HAVE_ROCM

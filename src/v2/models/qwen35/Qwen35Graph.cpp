@@ -59,17 +59,27 @@ namespace llaminar2
                                        ? config_.gdn.time_step_rank
                                        : n_k_heads_full;
 
-        // TP-aware local head counts: states must match local weight dimensions
+        // TP-aware local head counts: states must match local weight dimensions.
+        // For GDN modular repeat (n_v > n_k), Q/K are replicated across TP ranks
+        // so n_k stays at full count. Only n_v is sharded.
         int n_k_heads = n_k_heads_full;
         int n_v_heads = n_v_heads_full;
+        const bool gdn_modular_repeat = (n_v_heads_full > n_k_heads_full);
         if (config_.qkv_column_parallel && config_.local_n_heads > 0 && config_.n_heads > 0)
         {
-            n_k_heads = n_k_heads_full * config_.local_n_heads / config_.n_heads;
+            // V-heads are always sharded
             n_v_heads = n_v_heads_full * config_.local_n_heads / config_.n_heads;
-            if (n_k_heads <= 0)
-                n_k_heads = 1;
             if (n_v_heads <= 0)
                 n_v_heads = 1;
+
+            // K-heads: replicated for GDN modular repeat, sharded otherwise
+            if (!gdn_modular_repeat)
+            {
+                n_k_heads = n_k_heads_full * config_.local_n_heads / config_.n_heads;
+                if (n_k_heads <= 0)
+                    n_k_heads = 1;
+            }
+            // else: n_k_heads stays at full count (replicated)
         }
 
         const int d_v = config_.gdn.state_size;
@@ -462,6 +472,22 @@ namespace llaminar2
         rec_params.d_v = d_v;
         rec_params.chunk_size = 64;
         rec_params.use_qk_l2norm = true;
+
+        // Under TP with GDN modular repeat (repeat_type=1), Q/K are replicated
+        // while V is sharded contiguously. The global_v_head_offset tells the
+        // recurrence stage which global V-heads this rank owns, so it can select
+        // the correct K-heads: k_head = (v_local + offset) % n_k_heads_global.
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1 && n_k_heads > n_v_heads)
+        {
+            rec_params.global_v_head_offset = mpi_ctx_->rank() * n_v_heads;
+        }
+        else if (mpi_ctx_ && mpi_ctx_->world_size() > 1 && n_k_heads == n_v_heads && n_k_heads == n_k_heads_full)
+        {
+            // n_k == n_v_local (e.g. TP=2 with 4B: 16 k_heads, 16 v_heads_local)
+            // Identity mapping for rank 0, rotation for other ranks
+            rec_params.global_v_head_offset = mpi_ctx_->rank() * n_v_heads;
+        }
+
         rec_params.output_buffer_id = BufferId::ATTN_OUTPUT;
 
         // Use stored kernel instance (lifetime tied to Qwen35Graph)

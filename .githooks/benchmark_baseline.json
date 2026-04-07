@@ -14,15 +14,15 @@
           "_comment": "High-water mark set at commit fa2623cc on 2026-04-06. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "rocm:0": {
-          "prefill_tok_s": 1214.62,
-          "decode_tok_s": 74.59,
+          "prefill_tok_s": 1214.71,
+          "decode_tok_s": 74.73,
           "regression_threshold_pct": 5,
-          "_comment": "High-water mark set at commit fa2623cc on 2026-04-06. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit f7159dec on 2026-04-07. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cpu": {
-          "prefill_tok_s": 341.81,
-          "decode_tok_s": 18.24,
-          "_comment": "High-water mark set at commit fa2623cc on 2026-04-06. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "prefill_tok_s": 346.24,
+          "decode_tok_s": 19.21,
+          "_comment": "High-water mark set at commit f7159dec on 2026-04-07. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     },

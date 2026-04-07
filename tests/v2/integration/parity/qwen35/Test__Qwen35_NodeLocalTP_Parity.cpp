@@ -46,17 +46,26 @@ using namespace llaminar2::test::parity::qwen35;
 // Includes GDN-specific stages that are also sharded under TP.
 static const std::vector<std::string> kNodeLocalTPExcludedStages = {
     // Standard attention projections (FA layers) — column-parallel slices
-    "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
-    "Q_ROPE", "K_ROPE",
+    "Q_PROJECTION",
+    "K_PROJECTION",
+    "V_PROJECTION",
+    "Q_ROPE",
+    "K_ROPE",
     "ATTENTION_CONTEXT",
     // FFN sharded intermediates
-    "FFN_GATE", "FFN_UP", "FFN_SWIGLU",
+    "FFN_GATE",
+    "FFN_UP",
+    "FFN_SWIGLU",
     // Row-parallel: outputs are partial sums before allreduce
-    "ATTENTION_OUTPUT", "FFN_DOWN",
+    "ATTENTION_OUTPUT",
+    "FFN_DOWN",
     // These also have sharded intermediate states
-    "ATTN_RESIDUAL", "FFN_RESIDUAL",
+    "ATTN_RESIDUAL",
+    "FFN_RESIDUAL",
     // GDN-specific: QKV projection covers gdn_proj (same snapshot key)
     "QKV_PROJECTION",
+    // GDN-specific: Z gate output is column-parallel (sharded by v_heads)
+    "GDN_Z_PROJECTION",
     // GDN-specific: recurrence output is per-local-heads under TP
     "GDN_DELTA_RULE_OUTPUT",
     // GDN-specific: gated norm output is per-local-heads under TP
@@ -120,7 +129,7 @@ static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
 // =============================================================================
 
 class Qwen35NodeLocalTPParityTest : public Qwen35ConfigDrivenParityTest<Qwen35NodeLocalTPParityTest>,
-                                     public ::testing::WithParamInterface<TestConfig>
+                                    public ::testing::WithParamInterface<TestConfig>
 {
 public:
     const TestConfig &getTestConfig() const { return GetParam(); }
@@ -194,7 +203,7 @@ TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPAllreduce)
         << "Allreduce result should be sum of ranks";
 
     LOG_INFO("[NodeLocalTP Qwen3.5] Rank " << mpi_ctx_->rank() << " allreduce result: "
-             << actual_value << " (expected: " << expected_sum << ")");
+                                           << actual_value << " (expected: " << expected_sum << ")");
 }
 
 /**

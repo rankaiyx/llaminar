@@ -839,10 +839,20 @@ namespace llaminar2
                     // For GDN layers, V may differ from K (n_v_heads != n_k_heads)
                     const size_t sub_block_sizes[3] = {q_rows, kv_rows, v_rows > 0 ? v_rows : kv_rows};
 
+                    // GDN modular repeat (repeat_type=1): v_head j uses k_head j%n_k.
+                    // With contiguous V sharding, v_heads on one rank may need k_heads
+                    // from another rank. Fix: replicate Q and K sub-blocks on every rank,
+                    // only shard V. This ensures all k_heads are locally available.
+                    const bool gdn_replicate_qk = has_gdn_dimensions_ && gdn_n_k_heads_ > 0 && gdn_n_v_heads_ > gdn_n_k_heads_ && (total_rows == 2 * static_cast<size_t>(gdn_n_k_heads_) * gdn_d_state_ + static_cast<size_t>(gdn_n_v_heads_) * gdn_d_state_);
+
                     // Compute per-rank slice within each sub-block
-                    // Q sliced by n_heads, K and V sliced by n_kv_heads
-                    auto compute_slice = [rank, world_size](size_t block_rows) -> std::pair<size_t, size_t>
+                    // For GDN with replicated Q/K: Q and K are loaded in full, only V is sharded.
+                    auto compute_slice = [rank, world_size, gdn_replicate_qk](size_t block_rows, int sub_block_idx) -> std::pair<size_t, size_t>
                     {
+                        // Sub-blocks 0 (Q) and 1 (K): replicate for GDN, shard otherwise
+                        if (gdn_replicate_qk && sub_block_idx < 2)
+                            return {0, block_rows}; // Full sub-block (replicated)
+
                         size_t rows_per_rank = block_rows / world_size;
                         size_t start = rows_per_rank * rank;
                         size_t count = (rank == world_size - 1)
@@ -851,6 +861,50 @@ namespace llaminar2
                         return {start, count};
                     };
 
+                    // Validate sub-block divisibility BEFORE loading slices.
+                    // If any sharded sub-block has fewer rows than the world_size,
+                    // the model is too small for this TP degree — fail early and clearly.
+                    {
+                        static constexpr const char *sub_names[3] = {"Q", "K", "V"};
+                        for (size_t s = 0; s < 3; s++)
+                        {
+                            // Replicated sub-blocks (GDN Q/K) are always valid
+                            if (gdn_replicate_qk && s < 2)
+                                continue;
+
+                            if (sub_block_sizes[s] % static_cast<size_t>(world_size) != 0)
+                            {
+                                std::ostringstream err;
+                                err << "[WeightManager] Cannot shard FusedQKV weight '" << name
+                                    << "': sub-block " << sub_names[s]
+                                    << " has " << sub_block_sizes[s]
+                                    << " rows, which is not evenly divisible by TP degree "
+                                    << world_size << ". ";
+                                if (gdn_replicate_qk)
+                                    err << "GDN modular repeat replicates Q/K, but V ("
+                                        << sub_block_sizes[2] << " rows = "
+                                        << gdn_n_v_heads_ << " heads * " << gdn_d_state_
+                                        << " d_state) must be divisible by " << world_size << ". ";
+                                err << "Reduce the TP degree or use a larger model.";
+                                LOG_ERROR(err.str());
+                                throw std::invalid_argument(err.str());
+                            }
+
+                            if (sub_block_sizes[s] / static_cast<size_t>(world_size) == 0)
+                            {
+                                std::ostringstream err;
+                                err << "[WeightManager] Cannot shard FusedQKV weight '" << name
+                                    << "': sub-block " << sub_names[s]
+                                    << " has " << sub_block_sizes[s]
+                                    << " rows but TP degree is " << world_size
+                                    << " — each rank would get 0 rows. "
+                                    << "Reduce the TP degree or use a larger model.";
+                                LOG_ERROR(err.str());
+                                throw std::invalid_argument(err.str());
+                            }
+                        }
+                    }
+
                     // Load each sub-block's slice from GGUF
                     std::shared_ptr<TensorBase> slices[3];
                     size_t total_out_rows = 0;
@@ -858,7 +912,7 @@ namespace llaminar2
 
                     for (size_t s = 0; s < 3; s++)
                     {
-                        auto [local_start, local_count] = compute_slice(sub_block_sizes[s]);
+                        auto [local_start, local_count] = compute_slice(sub_block_sizes[s], static_cast<int>(s));
                         const size_t abs_row_start = abs_offset + local_start;
                         const size_t abs_row_end = abs_row_start + local_count;
 

@@ -70,24 +70,10 @@ echo ""
 echo -e "${YELLOW}[3/8] Running Qwen2 SingleDevice parity tests (prefill + decode)...${NC}"
 echo ""
 
-PARITY_EXIT_CODE=1
-PARITY_MAX_ATTEMPTS=3
-for PARITY_ATTEMPT in $(seq 1 "$PARITY_MAX_ATTEMPTS"); do
-    set +e
-    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice$" --output-on-failure --timeout 600
-    PARITY_EXIT_CODE=$?
-    set -e
-
-    if [ $PARITY_EXIT_CODE -eq 0 ]; then
-        break
-    fi
-
-    if [ "$PARITY_ATTEMPT" -lt "$PARITY_MAX_ATTEMPTS" ]; then
-        echo ""
-        echo -e "${YELLOW}Parity run was flaky on attempt ${PARITY_ATTEMPT}/${PARITY_MAX_ATTEMPTS}; retrying...${NC}"
-        echo ""
-    fi
-done
+set +e
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice$" --output-on-failure --timeout 600
+PARITY_EXIT_CODE=$?
+set -e
 
 echo ""
 if [ $PARITY_EXIT_CODE -ne 0 ]; then
@@ -113,24 +99,10 @@ echo ""
 echo -e "${YELLOW}[4/8] Running Qwen35 SingleDevice parity tests (prefill + decode)...${NC}"
 echo ""
 
-QWEN35_PARITY_EXIT_CODE=1
-QWEN35_PARITY_MAX_ATTEMPTS=3
-for QWEN35_PARITY_ATTEMPT in $(seq 1 "$QWEN35_PARITY_MAX_ATTEMPTS"); do
-    set +e
-    GTEST_FILTER="*08B*" ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_SingleDevice$" --output-on-failure --timeout 600
-    QWEN35_PARITY_EXIT_CODE=$?
-    set -e
-
-    if [ $QWEN35_PARITY_EXIT_CODE -eq 0 ]; then
-        break
-    fi
-
-    if [ "$QWEN35_PARITY_ATTEMPT" -lt "$QWEN35_PARITY_MAX_ATTEMPTS" ]; then
-        echo ""
-        echo -e "${YELLOW}Qwen35 parity run was flaky on attempt ${QWEN35_PARITY_ATTEMPT}/${QWEN35_PARITY_MAX_ATTEMPTS}; retrying...${NC}"
-        echo ""
-    fi
-done
+set +e
+GTEST_FILTER="*08B*" ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_SingleDevice$" --output-on-failure --timeout 600
+QWEN35_PARITY_EXIT_CODE=$?
+set -e
 
 echo ""
 if [ $QWEN35_PARITY_EXIT_CODE -ne 0 ]; then
@@ -153,24 +125,10 @@ echo ""
 echo -e "${YELLOW}[5/8] Running Qwen2 NodeLocalTP parity tests...${NC}"
 echo ""
 
-QWEN2_NLTP_EXIT_CODE=1
-QWEN2_NLTP_MAX_ATTEMPTS=3
-for QWEN2_NLTP_ATTEMPT in $(seq 1 "$QWEN2_NLTP_MAX_ATTEMPTS"); do
-    set +e
-    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_NodeLocalTP$" --output-on-failure --timeout 600
-    QWEN2_NLTP_EXIT_CODE=$?
-    set -e
-
-    if [ $QWEN2_NLTP_EXIT_CODE -eq 0 ]; then
-        break
-    fi
-
-    if [ "$QWEN2_NLTP_ATTEMPT" -lt "$QWEN2_NLTP_MAX_ATTEMPTS" ]; then
-        echo ""
-        echo -e "${YELLOW}Qwen2 NodeLocalTP run was flaky on attempt ${QWEN2_NLTP_ATTEMPT}/${QWEN2_NLTP_MAX_ATTEMPTS}; retrying...${NC}"
-        echo ""
-    fi
-done
+set +e
+ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_NodeLocalTP$" --output-on-failure --timeout 600
+QWEN2_NLTP_EXIT_CODE=$?
+set -e
 
 echo ""
 if [ $QWEN2_NLTP_EXIT_CODE -ne 0 ]; then
@@ -193,24 +151,10 @@ echo ""
 echo -e "${YELLOW}[6/8] Running Qwen35 NodeLocalTP parity tests...${NC}"
 echo ""
 
-QWEN35_NLTP_EXIT_CODE=1
-QWEN35_NLTP_MAX_ATTEMPTS=3
-for QWEN35_NLTP_ATTEMPT in $(seq 1 "$QWEN35_NLTP_MAX_ATTEMPTS"); do
-    set +e
-    GTEST_FILTER="*08B*" ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_NodeLocalTP$" --output-on-failure --timeout 600
-    QWEN35_NLTP_EXIT_CODE=$?
-    set -e
-
-    if [ $QWEN35_NLTP_EXIT_CODE -eq 0 ]; then
-        break
-    fi
-
-    if [ "$QWEN35_NLTP_ATTEMPT" -lt "$QWEN35_NLTP_MAX_ATTEMPTS" ]; then
-        echo ""
-        echo -e "${YELLOW}Qwen35 NodeLocalTP run was flaky on attempt ${QWEN35_NLTP_ATTEMPT}/${QWEN35_NLTP_MAX_ATTEMPTS}; retrying...${NC}"
-        echo ""
-    fi
-done
+set +e
+GTEST_FILTER="*08B*" ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_NodeLocalTP$" --output-on-failure --timeout 600
+QWEN35_NLTP_EXIT_CODE=$?
+set -e
 
 echo ""
 if [ $QWEN35_NLTP_EXIT_CODE -ne 0 ]; then
