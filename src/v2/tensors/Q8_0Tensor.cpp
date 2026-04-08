@@ -694,4 +694,42 @@ namespace llaminar2
         ctx.scales_array[linear] = blk->d;
     }
 
+    // ===== Static FP32 → Q8_0 quantization =====
+
+    void Q8_0Tensor::quantize_fp32_row(const float *src, Q8_0Block *dst, size_t count)
+    {
+        const size_t n_blocks = (count + 31) / 32;
+        for (size_t b = 0; b < n_blocks; ++b)
+        {
+            const size_t offset = b * 32;
+            const size_t block_len = std::min<size_t>(32, count - offset);
+            const float *block_src = src + offset;
+            Q8_0Block &block = dst[b];
+
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < block_len; ++i)
+                max_abs = std::max(max_abs, std::abs(block_src[i]));
+
+            if (max_abs < 1e-30f)
+            {
+                block.d = 0;
+                std::memset(block.qs, 0, 32);
+                continue;
+            }
+
+            const float scale = max_abs / 127.0f;
+            block.d = fp32_to_fp16(scale);
+            const float inv_scale = 127.0f / max_abs;
+
+            for (size_t i = 0; i < block_len; ++i)
+            {
+                float v = block_src[i] * inv_scale;
+                v = std::max(-127.0f, std::min(127.0f, v));
+                block.qs[i] = static_cast<int8_t>(std::round(v));
+            }
+            for (size_t i = block_len; i < 32; ++i)
+                block.qs[i] = 0;
+        }
+    }
+
 } // namespace llaminar2

@@ -3617,6 +3617,12 @@ namespace llaminar2
         static void decodeBlock(const Q8_0Block &block, float *output);
         static void decodeBlockScalar(const Q8_0Block &block, float *output);
 
+        /// Quantize a contiguous row of FP32 values into Q8_0 blocks.
+        /// @param src    Source FP32 data (count elements)
+        /// @param dst    Destination Q8_0 blocks (must have room for ceil(count/32) blocks)
+        /// @param count  Number of FP32 elements to quantize
+        static void quantize_fp32_row(const float *src, Q8_0Block *dst, size_t count);
+
 #if defined(__AVX512F__)
         static void decodeBlockAVX512(const Q8_0Block &block, float *output);
 #endif

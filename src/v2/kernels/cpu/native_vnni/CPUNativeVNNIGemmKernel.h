@@ -53,7 +53,15 @@ namespace llaminar2::cpu::native_vnni
         explicit CPUNativeVNNIGemmKernel(const TensorBase *weights,
                                          int row_start = 0, int row_end = -1)
         {
-            if (!packWeightsCPUNativeVNNI(weights, packed_, row_start, row_end))
+            // Pick up activation rotation from the weight tensor (if set).
+            // When present, activations will be rotated before Q8_1 quantization
+            // to reduce kurtosis and improve int8 fidelity.
+            // The rotation is also fused into weight packing (dequant→rotate→requant)
+            // so that the original tensor format is preserved.
+            activation_rotation_ = weights->activationRotation();
+
+            if (!packWeightsCPUNativeVNNI(weights, packed_, row_start, row_end,
+                                          activation_rotation_))
             {
                 LOG_ERROR("[CPUNativeVNNIGemmKernel] Failed to pack weights");
                 valid_ = false;
@@ -64,7 +72,10 @@ namespace llaminar2::cpu::native_vnni
             // For Q8_0 (codebook 19): store native block pointer for M=1 GEMV bypass.
             // This avoids the 3-array packed format (weight+scales+comps) which creates
             // too many memory streams for the hardware prefetcher during decode.
-            if (packed_.codebook_id == 19)
+            // IMPORTANT: When rotation is active, the native Q8_0 blocks are NOT rotated
+            // (rotation is fused into the packed VNNI layout), so the bypass must be
+            // disabled to avoid incorrect results.
+            if (packed_.codebook_id == 19 && !activation_rotation_)
             {
                 auto *q8 = dynamic_cast<const Q8_0Tensor *>(weights);
                 if (q8)
@@ -100,12 +111,8 @@ namespace llaminar2::cpu::native_vnni
                       << ", payload=" << packed_.payload_bytes << " B/block"
                       << ", asymmetric=" << packed_.is_asymmetric
                       << ", native_q8_0=" << (native_q8_0_blocks_ != nullptr)
-                      << ", owned_copy=" << (!native_q8_0_owned_.empty()) << ")");
-
-            // Pick up activation rotation from the weight tensor (if set).
-            // When present, activations will be rotated before Q8_1 quantization
-            // to reduce kurtosis and improve int8 fidelity.
-            activation_rotation_ = weights->activationRotation();
+                      << ", owned_copy=" << (!native_q8_0_owned_.empty())
+                      << ", rotation=" << (activation_rotation_ != nullptr) << ")");
         }
 
         /**

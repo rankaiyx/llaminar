@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "CPUNativeVNNIDecode.h"
+#include "kernels/cpu/rotation/ActivationRotation.h"
 #include "tensors/AlignedVector.h"
 #include "tensors/FP16Utils.h"
 #include "tensors/TensorClasses.h"
@@ -224,7 +225,8 @@ namespace llaminar2::cpu::native_vnni
      */
     inline bool packWeightsCPUNativeVNNI(const TensorBase *weights,
                                          CPUNativeVNNIPackedWeights &out,
-                                         int row_start = 0, int row_end = -1)
+                                         int row_start = 0, int row_end = -1,
+                                         const ActivationRotation *rotation = nullptr)
     {
         // Validate
         int full_N = weights->shape()[0];
@@ -271,6 +273,16 @@ namespace llaminar2::cpu::native_vnni
         out.is_asymmetric = fmt->is_asymmetric;
         out.is_superblock = fmt->is_superblock;
         out.is_nibble_lut = is_nibble_lut_format(fmt->codebook_id);
+
+        // When rotation is active, rotation mixes values across the 32-element
+        // quantization block boundaries, so we must dequant → rotate → requant.
+        // The result is always INT8 pre-decoded format (8 groups), regardless of
+        // the original tensor format. We still preserve the original codebook_id
+        // for diagnostic purposes, but the packed layout uses the INT8 path.
+        const bool use_rotated_path = (rotation != nullptr);
+        if (use_rotated_path)
+            out.is_nibble_lut = false; // Force INT8 pre-decoded path
+
         out.data_stride = out.is_nibble_lut ? 1024 : 2048;
         out.interleaved_block_stride = out.data_stride + 256 + (out.is_asymmetric ? 128 : 0);
 
@@ -283,7 +295,144 @@ namespace llaminar2::cpu::native_vnni
 
         bool use_superblock = (unpackable->superblock_size() == 256);
 
-        if (out.is_nibble_lut)
+        if (use_rotated_path)
+        {
+            // =================================================================
+            // ROTATION PATH (any format → rotated INT8)
+            //
+            // Dequantize each row to FP32, apply FWHT rotation, requantize to
+            // INT8 with per-32-element block scales. This fuses rotation into
+            // the one-time packing step so the original tensor is never modified.
+            //
+            // The rotation mixes values across the K dimension, so we must work
+            // on full rows (not individual blocks). After rotation, values are
+            // requantized with symmetric per-block scales and stored in the
+            // same INT8 pre-decoded layout used by Q5_0/Q6_K/etc.
+            //
+            // Asymmetric formats become symmetric after rotation (the rotation
+            // distributes outliers evenly, centering the distribution).
+            // =================================================================
+
+            out.is_asymmetric = false; // Rotated weights are always symmetric
+            out.interleaved_block_stride = 2048 + 256; // Recompute without mins
+
+            size_t int8_total = (size_t)N_chunks * blocks_per_row * 64 * 32;
+            out.int8_flat.resize(int8_total, 0);
+
+            LOG_DEBUG("[CPUNativeVNNI] Rotation packing: dequant→rotate→requant "
+                      << N << "×" << K << " (block_dim=" << rotation->block_dim() << ")");
+
+#pragma omp parallel
+            {
+                // Per-thread scratch for full-row FP32 dequantization + rotation
+                std::vector<float> row_fp32(K);
+
+#pragma omp for schedule(static)
+                for (int n = 0; n < N; ++n)
+                {
+                    int src_row = row_start + n;
+                    int chunk = n / 64;
+                    int n_local = n % 64;
+
+                    // Step 1: Dequantize full row to FP32
+                    weights->to_fp32_row(src_row, row_fp32.data());
+
+                    // Step 2: Apply FWHT rotation in-place
+                    rotation->rotate_inplace(row_fp32.data(), K);
+
+                    // Step 3: Requantize to INT8 with per-32-element block scales
+                    for (int kb = 0; kb < blocks_per_row; ++kb)
+                    {
+                        const float *block_start = row_fp32.data() + kb * 32;
+                        int block_len = std::min(32, K - kb * 32);
+
+                        // Find absmax for symmetric quantization
+                        float amax = 0.0f;
+#if defined(__AVX512F__)
+                        if (block_len == 32)
+                        {
+                            __m512 vmax = _mm512_setzero_ps();
+                            __m512 v0 = _mm512_loadu_ps(block_start);
+                            __m512 v1 = _mm512_loadu_ps(block_start + 16);
+                            // abs via AND with sign-bit mask
+                            const __m512 sign_mask = _mm512_castsi512_ps(
+                                _mm512_set1_epi32(0x7FFFFFFF));
+                            v0 = _mm512_and_ps(v0, sign_mask);
+                            v1 = _mm512_and_ps(v1, sign_mask);
+                            vmax = _mm512_max_ps(v0, v1);
+                            amax = _mm512_reduce_max_ps(vmax);
+                        }
+                        else
+#endif
+                        {
+                            for (int i = 0; i < block_len; ++i)
+                            {
+                                float a = std::fabs(block_start[i]);
+                                if (a > amax)
+                                    amax = a;
+                            }
+                        }
+
+                        float scale = amax / 127.0f;
+                        float inv_scale = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+
+                        size_t idx = (size_t)chunk * blocks_per_row * 64 +
+                                     (size_t)kb * 64 + n_local;
+                        temp_scales[idx] = fp32_to_fp16(scale);
+
+                        // Quantize to int8
+                        size_t flat_offset = idx * 32;
+                        int8_t *dst = out.int8_flat.data() + flat_offset;
+
+#if defined(__AVX512F__)
+                        if (block_len == 32)
+                        {
+                            __m512 vinv = _mm512_set1_ps(inv_scale);
+                            __m512 v0 = _mm512_loadu_ps(block_start);
+                            __m512 v1 = _mm512_loadu_ps(block_start + 16);
+                            v0 = _mm512_mul_ps(v0, vinv);
+                            v1 = _mm512_mul_ps(v1, vinv);
+                            // Round to nearest integer (ROUNDSCALE_RND_MODE=0 = round to nearest even)
+                            __m512i i0 = _mm512_cvtps_epi32(v0);
+                            __m512i i1 = _mm512_cvtps_epi32(v1);
+                            // Pack 32-bit → 16-bit → 8-bit
+                            __m512i packed16 = _mm512_packs_epi32(i0, i1);
+                            // packs interleaves: need to fix lane order
+                            // After packs_epi32: [a0..a7,b0..b7 | a8..a15,b8..b15 | ...]
+                            // We need sequential order
+                            __m512i packed8 = _mm512_packs_epi16(packed16, _mm512_setzero_si512());
+                            // Extract lower 32 bytes (the int8 values are in the lower half of each 128-bit lane)
+                            // Use vpermq to gather them
+                            // After packs_epi16 with zero: each 128-bit lane has 8 valid bytes + 8 zeros
+                            // Lane 0: i0[0..3],i1[0..3], 0,0,0,0,0,0,0,0
+                            // Lane 1: i0[4..7],i1[4..7], 0,0,0,0,0,0,0,0
+                            // etc.
+                            // Simpler: just use scalar store after cvt
+                            // Actually, let me use the straightforward approach with _mm512_cvtsepi32_epi8
+                            __m128i bytes0 = _mm512_cvtsepi32_epi8(i0);  // 16 int8 values from i0
+                            __m128i bytes1 = _mm512_cvtsepi32_epi8(i1);  // 16 int8 values from i1
+                            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst), bytes0);
+                            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + 16), bytes1);
+                        }
+                        else
+#endif
+                        {
+                            for (int i = 0; i < block_len; ++i)
+                            {
+                                int v = static_cast<int>(std::round(block_start[i] * inv_scale));
+                                dst[i] = static_cast<int8_t>(std::max(-128, std::min(127, v)));
+                            }
+                            // Zero-fill tail
+                            for (int i = block_len; i < 32; ++i)
+                                dst[i] = 0;
+                        }
+                    }
+                }
+            }
+
+            // Fall through to the INT8 interleaving path below
+        }
+        else if (out.is_nibble_lut)
         {
             // =================================================================
             // NIBBLE-LUT PATH (Q4_0, IQ4_NL, Q4_1, IQ4_XS)
@@ -510,8 +659,16 @@ namespace llaminar2::cpu::native_vnni
                     unpackable->unpack_block_to_int8(src_row, kb, out.int8_flat.data() + flat_offset);
                 }
             }
+        }
 
-            // Build VNNI-interleaved INT8 buffer (8 groups) + inline comp/scales/mins
+        // =================================================================
+        // INT8 INTERLEAVING (shared by rotation path and INT8 pre-decoded path)
+        //
+        // Build VNNI-interleaved INT8 buffer (8 groups) + inline comp/scales/mins.
+        // Both paths populate int8_flat + temp_scales before reaching here.
+        // =================================================================
+        if (!out.is_nibble_lut)
+        {
             size_t interleaved_total = (size_t)N_chunks * blocks_per_row * out.interleaved_block_stride;
             out.native_interleaved.resize(interleaved_total, 0);
 
