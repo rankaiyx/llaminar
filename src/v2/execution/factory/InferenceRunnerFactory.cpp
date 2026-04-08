@@ -29,7 +29,7 @@
 #include "../../utils/Logger.h"
 #include "../../utils/WeightLoadingProfiler.h"
 #include "../../kernels/cpu/turboquant/TurboQuantContext.h"
-#include "../../kernels/cpu/rotation/ModelWeightRotation.h"
+#include "../../kernels/cpu/rotation/ActivationRotation.h"
 #include <atomic>
 #include <future>
 #include <thread>
@@ -645,12 +645,12 @@ namespace llaminar2
         graph_config.fused_attention_backend = effective_backend;
         LOG_DEBUG("[InferenceRunner] Fused attention backend: " << fusedAttentionBackendToString(effective_backend));
 
-        // Propagate kv_cache_scale for Q16_1 KV cache quantization
-        // This fixed scale determines the FP32 range that maps to INT16 [-32767, +32767]
-        graph_config.kv_cache_scale = config.kv_cache_scale;
+        // Propagate kv_cache_precision for Q16_1 / TQ KV cache selection.
+        // kv_cache_scale_k/v are set by the model config builder (e.g. Qwen2GraphConfigBuilder)
+        // which is the sole authority on K/V scale values for each model architecture.
         graph_config.kv_cache_precision = config.kv_cache_precision;
-        LOG_DEBUG("[InferenceRunner] KV cache scale: " << config.kv_cache_scale
-                                                       << " (±" << config.kv_cache_scale << " FP32 range)");
+        LOG_DEBUG("[InferenceRunner] KV cache scale: K=" << graph_config.kv_cache_scale_k
+                                                         << ", V=" << graph_config.kv_cache_scale_v);
         LOG_DEBUG("[InferenceRunner] KV cache precision mode: "
                   << kvCachePrecisionToString(config.kv_cache_precision));
 
@@ -669,6 +669,27 @@ namespace llaminar2
             LOG_INFO("[InferenceRunner] TurboQuant context created for "
                      << kvCachePrecisionToString(config.kv_cache_precision)
                      << " KV cache (head_dim=" << graph_config.head_dim << ")");
+        }
+
+        // =====================================================================
+        // KV Rotation Context (Q16_1 kurtosis reduction)
+        // =====================================================================
+        // When Q16_1 KV cache precision is active, create a block-diagonal
+        // orthogonal rotation that is applied to K/V before quantization and
+        // correspondingly to Q before the attention dot product. This spreads
+        // outlier energy (from low-frequency RoPE dimensions) across all dims,
+        // dramatically reducing clipping at the fixed Q16_1 scale.
+        // =====================================================================
+        std::shared_ptr<ActivationRotation> kv_rotation;
+        if (config.kv_cache_precision == KVCachePrecision::Q16_1 && debugEnv().kv_rotation)
+        {
+            kv_rotation = std::make_shared<ActivationRotation>(
+                graph_config.head_dim, graph_config.head_dim, /*seed=*/42);
+            graph_config.kv_rotation = kv_rotation.get();
+            LOG_INFO("[InferenceRunner] KV rotation created for Q16_1 cache"
+                     << " (block_dim=" << graph_config.head_dim
+                     << ", kv_cache_scale_k=" << graph_config.kv_cache_scale_k
+                     << ", kv_cache_scale_v=" << graph_config.kv_cache_scale_v << ")");
         }
 
         // =====================================================================
@@ -777,6 +798,12 @@ namespace llaminar2
         if (turboquant_ctx)
         {
             orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
+        }
+
+        // Transfer KV rotation ownership to orchestrator
+        if (kv_rotation)
+        {
+            orchestrator->setKVRotation(std::move(kv_rotation));
         }
 
         // Transfer GlobalTPContext ownership to orchestrator
@@ -1067,7 +1094,17 @@ namespace llaminar2
         WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
 
         // =====================================================================
-        // NOW preload weights for target device (GPU packing/upload)
+        // Weight rotation (activation_rotation) is intentionally NOT registered
+        // as a weight preprocessor. GEMM invariance (R(X) @ R(W)^T = X @ W^T)
+        // means weight rotation produces identical outputs in exact arithmetic,
+        // but the extra quantization step (Q4_0 → FP32 → rotate → INT8) adds
+        // noise that compounds with Q16_1 KV cache quantization, degrading
+        // parity. KV rotation operates independently on K/V/Q activations.
+        // =====================================================================
+        const auto &env = debugEnv();
+
+        // =====================================================================
+        // Preload weights: preprocess → GEMM pack → reclaim (atomic per weight)
         // =====================================================================
         preloadAndUploadWeights(weight_mgr, device, "[InferenceRunner]");
 
@@ -1083,48 +1120,6 @@ namespace llaminar2
         {
             LOG_ERROR("[InferenceRunner] Missing global weights");
             return false;
-        }
-
-        // =====================================================================
-        // Apply block-diagonal activation rotation for Q8_1 kurtosis reduction
-        // =====================================================================
-        // Pre-rotates all GEMM weight rows with an orthogonal rotation R.
-        // At runtime, activations are rotated with the same R before Q8_1
-        // quantization: X'@W'^T = X@R@(W@R)^T = X@R@R^T@W^T = X@W^T.
-        // This spreads outlier energy across quantization blocks, reducing
-        // kurtosis and improving int8 fidelity (e.g., 1191→28 for 4B models).
-        const auto &env = debugEnv();
-        if (env.activation_rotation)
-        {
-            // Activation rotation pre-rotates weight rows with orthogonal matrix R.
-            // At runtime, CPU VNNI kernels rotate activations with the same R before
-            // Q8_1 quantization, so the rotation cancels out. GPU kernels do NOT
-            // implement runtime activation rotation yet, so skip weight rotation
-            // for GPU devices to avoid numerical corruption.
-            if (device.is_gpu())
-            {
-                LOG_INFO("[InferenceRunner] Activation rotation skipped for GPU device "
-                         << device.toString() << " (GPU kernels do not implement runtime rotation)");
-            }
-            else
-            {
-                const int hidden_dim = model_ctx->embeddingLength();
-                const int ffn_dim = model_ctx->feedForwardLength();
-                const int block_dim = env.rotation_block_dim;
-
-                if (hidden_dim % block_dim == 0 && ffn_dim % block_dim == 0)
-                {
-                    auto rotator = ModelWeightRotation::create(
-                        hidden_dim, ffn_dim, block_dim);
-                    rotator->rotateAllWeights(weights, model_ctx->blockCount(), rotator);
-                }
-                else
-                {
-                    LOG_WARN("[InferenceRunner] Activation rotation disabled: block_dim="
-                             << block_dim << " does not divide hidden_dim=" << hidden_dim
-                             << " or ffn_dim=" << ffn_dim);
-                }
-            }
         }
 
         orchestrator->setWeights(weights);
@@ -1641,8 +1636,7 @@ namespace llaminar2
         graph_config.fused_attention_backend = resolveEffectiveAttentionBackend(
             config.activation_precision, config.fused_attention_backend);
 
-        // Propagate kv_cache_scale
-        graph_config.kv_cache_scale = config.kv_cache_scale;
+        // kv_cache_scale_k/v set by config builder — don't overwrite
         graph_config.kv_cache_precision = config.kv_cache_precision;
 
         // TurboQuant context for TQ4/TQ KV cache
@@ -1652,6 +1646,15 @@ namespace llaminar2
         {
             turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
             graph_config.turboquant_ctx = turboquant_ctx.get();
+        }
+
+        // KV rotation for Q16_1 kurtosis reduction
+        std::shared_ptr<ActivationRotation> kv_rotation;
+        if (config.kv_cache_precision == KVCachePrecision::Q16_1 && debugEnv().kv_rotation)
+        {
+            kv_rotation = std::make_shared<ActivationRotation>(
+                graph_config.head_dim, graph_config.head_dim, /*seed=*/42);
+            graph_config.kv_rotation = kv_rotation.get();
         }
 
         // PP layer offset for KV cache indexing:
@@ -1689,6 +1692,8 @@ namespace llaminar2
 
         if (turboquant_ctx)
             orchestrator->setTurboQuantContext(std::move(turboquant_ctx));
+        if (kv_rotation)
+            orchestrator->setKVRotation(std::move(kv_rotation));
 
         // =====================================================================
         // Set PP stage configuration - CRITICAL for correct graph building
@@ -1791,7 +1796,7 @@ namespace llaminar2
         graph_config.default_device = device;
         graph_config.activation_precision = config.activation_precision;
         graph_config.fused_attention_backend = config.fused_attention_backend;
-        graph_config.kv_cache_scale = config.kv_cache_scale;
+        // kv_cache_scale_k/v set by config builder — don't overwrite
         graph_config.kv_cache_precision = config.kv_cache_precision;
 
         // TurboQuant context for TQ4/TQ KV cache
@@ -1801,6 +1806,15 @@ namespace llaminar2
         {
             turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
             graph_config.turboquant_ctx = turboquant_ctx.get();
+        }
+
+        // KV rotation for Q16_1 kurtosis reduction
+        std::shared_ptr<ActivationRotation> kv_rotation;
+        if (config.kv_cache_precision == KVCachePrecision::Q16_1 && debugEnv().kv_rotation)
+        {
+            kv_rotation = std::make_shared<ActivationRotation>(
+                graph_config.head_dim, graph_config.head_dim, /*seed=*/42);
+            graph_config.kv_rotation = kv_rotation.get();
         }
 
         // PP layer offset for nested TP-in-PP (partial graph with layer offset)
@@ -1842,6 +1856,7 @@ namespace llaminar2
         deps.model_ctx = model_ctx;
         deps.graph_builder = GraphBuilderRegistry::create(architecture, graph_config, nullptr);
         deps.turboquant_ctx = std::move(turboquant_ctx);
+        deps.kv_rotation = std::move(kv_rotation);
         if (config.pp_stage_config.has_value())
             deps.pp_stage_config = config.pp_stage_config.value();
         // topology and collective_ctx left as nullptr for single-rank testing
