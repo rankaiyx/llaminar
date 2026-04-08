@@ -83,7 +83,7 @@ namespace llaminar2
             int num_tokens,
             int d_model,
             float *output,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1);
 
         /**
@@ -95,7 +95,7 @@ namespace llaminar2
             int num_tokens,
             int d_model,
             uint16_t *output,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1);
 
         /**
@@ -107,7 +107,7 @@ namespace llaminar2
             int num_tokens,
             int d_model,
             uint16_t *output,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1);
 
         /**
@@ -119,7 +119,7 @@ namespace llaminar2
             int num_tokens,
             int d_model,
             void *output,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1);
 
         /**
@@ -131,7 +131,7 @@ namespace llaminar2
             int num_tokens,
             int d_model,
             TensorBase *output,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         void setDynamicTokenIds(const int *token_ids, int num_tokens) override;

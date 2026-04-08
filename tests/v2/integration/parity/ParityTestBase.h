@@ -1361,7 +1361,7 @@ namespace llaminar2::test::parity
         std::unordered_map<std::string, std::vector<float>> pytorch_snapshots_;
 
         // MPI context for tensor-parallel tests (optional, null for single-rank)
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
 
         // Modern orchestration runner (for incremental migration from IInferenceRunner)
         // Tests can use either runner_ OR orch_runner_, but not both simultaneously.

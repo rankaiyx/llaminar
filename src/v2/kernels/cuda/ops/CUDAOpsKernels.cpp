@@ -180,7 +180,7 @@ namespace llaminar2
             int rows, int cols,
             float epsilon,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)use_bf16;
@@ -195,7 +195,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             float epsilon,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)mpi_ctx;
@@ -260,7 +260,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             float epsilon,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)mpi_ctx;
@@ -324,7 +324,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             float epsilon,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)mpi_ctx;
@@ -378,7 +378,7 @@ namespace llaminar2
             const float *gate, const float *up, float *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)add_residual; // TODO: implement residual addition
@@ -393,7 +393,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)add_residual;
@@ -448,7 +448,7 @@ namespace llaminar2
             const uint16_t *gate, const uint16_t *up, uint16_t *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)add_residual;
@@ -464,7 +464,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)add_residual;
@@ -518,7 +518,7 @@ namespace llaminar2
             const uint16_t *gate, const uint16_t *up, uint16_t *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)add_residual;
@@ -534,7 +534,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)add_residual;
@@ -1090,7 +1090,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         float *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -1127,7 +1127,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         uint16_t *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)embed_data;
@@ -1147,7 +1147,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         uint16_t *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)embed_data;
@@ -1167,7 +1167,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         void *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)embed_data;
@@ -1252,7 +1252,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         TensorBase *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         // Output must be FP32 (common for all embedding operations)

@@ -50,7 +50,7 @@ protected:
         }
     }
 
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
     std::unique_ptr<FP32Tensor> test_tensor_;
 };
 

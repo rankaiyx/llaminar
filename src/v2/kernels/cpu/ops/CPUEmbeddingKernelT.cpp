@@ -96,7 +96,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         float *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         if constexpr (std::is_same_v<TensorT, FP32Tensor>)
@@ -133,7 +133,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         uint16_t *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         if constexpr (std::is_same_v<TensorT, BF16Tensor>)
@@ -174,7 +174,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         uint16_t *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         if constexpr (std::is_same_v<TensorT, FP16Tensor>)
@@ -215,7 +215,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         void *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         if constexpr (std::is_same_v<TensorT, Q8_1Tensor>)
@@ -263,7 +263,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         TensorBase *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         KERNEL_PROFILE_SCOPE(KernelType::EMBEDDING);

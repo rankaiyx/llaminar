@@ -46,7 +46,7 @@ namespace llaminar2
     class TensorBase;
     class IKVCache;
     class ICPUKVCache;
-    class MPIContext;
+    class IMPIContext;
 
     /**
      * @brief Compute byte size for a tensor region given dtype and dimensions

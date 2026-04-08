@@ -104,10 +104,10 @@ namespace llaminar2
         // - Q16_INTEGER: Pure Q16 integer-domain kernel (experimental)
         FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
 
-        // Fixed scale for Q16_1 KV cache quantization (FP32 range: ±kv_cache_scale)
-        // See RuntimeConfig.h for detailed documentation on scale selection.
-        // Default 64.0f covers Q8_1 activation ranges (max ±35) with ~2× headroom.
-        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130 for Qwen2)
+        // Fixed scales for Q16_1 KV cache quantization (K and V separate)
+        // K has large post-RoPE outliers; V values are much smaller.
+        float kv_cache_scale_k = 256.0f; ///< K scale (FP32 range ±scale_k)
+        float kv_cache_scale_v = 32.0f;  ///< V scale (FP32 range ±scale_v)
 
         // Explicit KV cache precision control.
         // AUTO preserves legacy behavior (derived from activation precision mode).
@@ -173,7 +173,8 @@ namespace llaminar2
             config.activation_precision = plan.runtime.activation_precision;
             config.kv_cache_precision = plan.runtime.kv_cache_precision;
             config.fused_attention_backend = plan.runtime.fused_attention_backend;
-            config.kv_cache_scale = plan.runtime.kv_cache_scale;
+            config.kv_cache_scale_k = plan.runtime.kv_cache_scale_k;
+            config.kv_cache_scale_v = plan.runtime.kv_cache_scale_v;
             return config;
         }
     };
@@ -189,7 +190,7 @@ namespace llaminar2
      */
     std::unique_ptr<IInferenceRunner> createInferenceRunner(
         std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         DeviceId device,
         const InferenceRunnerConfig &config = {});
 

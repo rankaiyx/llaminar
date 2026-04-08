@@ -35,7 +35,7 @@ namespace llaminar2
                 LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
             }
             if (mpi_ctx->world_size() > 1)
-                MPI_Barrier(mpi_ctx->comm());
+                mpi_ctx->barrier();
             runner->shutdown();
             MPI_Finalize();
             return 1;
@@ -76,7 +76,7 @@ namespace llaminar2
 
         // Broadcast token count first
         if (mpi_ctx->world_size() > 1)
-            MPI_Bcast(&token_count, 1, MPI_INT, 0, mpi_ctx->comm());
+            mpi_ctx->broadcast_int32(&token_count, 1, 0);
 
         if (token_count <= 0)
         {
@@ -91,7 +91,7 @@ namespace llaminar2
             token_ids.resize(token_count);
         }
         if (mpi_ctx->world_size() > 1)
-            MPI_Bcast(token_ids.data(), token_count, MPI_INT, 0, mpi_ctx->comm());
+            mpi_ctx->broadcast_int32(token_ids.data(), token_count, 0);
 
         // All ranks participate in prefill
         if (mpi_ctx->rank() == 0)

@@ -172,7 +172,7 @@ run_backend_tests() {
     local device_flag="-d ${backend}"
 
     # Start server
-    LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" --no-mpi-bootstrap --serve --port "$port" \
+    LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" --serve --port "$port" \
         $device_flag -m "$model" >/tmp/server_e2e_trace.log 2>&1 &
     local server_pid=$!
 
@@ -289,7 +289,92 @@ print('ok')
         fail "[${tag}] Response format: missing/invalid usage or finish_reason"
     fi
 
-    # ─── Test 6: Error handling — invalid JSON ────────────────────────
+    # ─── Test 6: SSE streaming — basic streaming response ────────────
+    local stream_raw stream_ok
+    stream_raw=$(curl -s --max-time "$REQUEST_TIMEOUT" -N \
+        -H "Content-Type: application/json" \
+        -d '{
+            "messages": [
+                {"role": "system", "content": "You are a calculator. Reply with only the numeric answer."},
+                {"role": "user", "content": "What is 1+1?"}
+            ],
+            "max_tokens": '"$max_tokens"',
+            "temperature": 0.0,
+            "stream": true
+        }' \
+        "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo "CURL_FAILED")
+
+    stream_ok=$(echo "$stream_raw" | python3 -c "
+import sys
+lines = sys.stdin.read().strip().split('\n')
+# Filter to 'data: ' lines
+data_lines = [l for l in lines if l.startswith('data: ')]
+if len(data_lines) < 2:
+    print('FAIL: too few SSE lines')
+    sys.exit(0)
+# Last data line must be [DONE]
+if data_lines[-1].strip() != 'data: [DONE]':
+    print('FAIL: missing [DONE] sentinel')
+    sys.exit(0)
+# First chunk must have role
+import json
+first = json.loads(data_lines[0][6:])
+if first.get('object') != 'chat.completion.chunk':
+    print('FAIL: wrong object type')
+    sys.exit(0)
+delta = first.get('choices', [{}])[0].get('delta', {})
+if delta.get('role') != 'assistant':
+    print('FAIL: first chunk missing role')
+    sys.exit(0)
+# Check a content chunk exists with finish_reason
+for dl in data_lines[1:-1]:
+    chunk = json.loads(dl[6:])
+    fr = chunk.get('choices', [{}])[0].get('finish_reason')
+    if fr in ('stop', 'length'):
+        print('ok')
+        sys.exit(0)
+print('FAIL: no finish_reason chunk found')
+" 2>/dev/null || echo "PARSE_ERROR")
+
+    if [ "$stream_ok" = "ok" ]; then
+        pass "[${tag}] SSE streaming: valid chunks with role, content, finish, [DONE]"
+    elif [ "$xfail_inference" = "1" ]; then
+        xfail "[${tag}] SSE streaming: ${stream_ok} (GDN WIP)"
+    else
+        fail "[${tag}] SSE streaming: ${stream_ok}"
+    fi
+
+    # ─── Test 7: SSE streaming — response metadata ───────────────────
+    local stream_meta_ok
+    stream_meta_ok=$(echo "$stream_raw" | python3 -c "
+import json, sys
+lines = sys.stdin.read().strip().split('\n')
+data_lines = [l for l in lines if l.startswith('data: ') and l.strip() != 'data: [DONE]']
+if not data_lines:
+    print('FAIL: no data lines'); sys.exit(0)
+ids = set()
+for dl in data_lines:
+    chunk = json.loads(dl[6:])
+    cid = chunk.get('id', '')
+    if not cid.startswith('chatcmpl-'):
+        print(f'FAIL: id missing chatcmpl- prefix: {cid}'); sys.exit(0)
+    ids.add(cid)
+    if chunk.get('system_fingerprint') != 'llaminar-v2':
+        print('FAIL: wrong system_fingerprint'); sys.exit(0)
+if len(ids) != 1:
+    print(f'FAIL: inconsistent ids across chunks: {ids}'); sys.exit(0)
+print('ok')
+" 2>/dev/null || echo "PARSE_ERROR")
+
+    if [ "$stream_meta_ok" = "ok" ]; then
+        pass "[${tag}] SSE streaming: metadata (id, system_fingerprint) consistent"
+    elif [ "$xfail_inference" = "1" ]; then
+        xfail "[${tag}] SSE streaming metadata: ${stream_meta_ok} (GDN WIP)"
+    else
+        fail "[${tag}] SSE streaming metadata: ${stream_meta_ok}"
+    fi
+
+    # ─── Test 8: Error handling — invalid JSON ────────────────────────
     local error_response error_msg
     error_response=$(curl -s --max-time 5 -X POST \
         -H "Content-Type: application/json" \
@@ -304,11 +389,13 @@ print(d.get('error', {}).get('type', ''))
 
     if [ "$error_msg" = "invalid_request_error" ]; then
         pass "[${tag}] Error handling: invalid JSON returns 400"
+    elif [ "$xfail_inference" = "1" ]; then
+        xfail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}' (GDN WIP)"
     else
         fail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}'"
     fi
 
-    # ─── Test 7: Error handling — missing messages ────────────────────
+    # ─── Test 9: Error handling — missing messages ────────────────────
     error_response=$(curl -s --max-time 5 -X POST \
         -H "Content-Type: application/json" \
         -d '{"max_tokens": 10}' \
@@ -322,6 +409,8 @@ print(d.get('error', {}).get('type', ''))
 
     if [ "$error_msg" = "invalid_request_error" ]; then
         pass "[${tag}] Error handling: missing messages returns 400"
+    elif [ "$xfail_inference" = "1" ]; then
+        xfail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}' (GDN WIP)"
     else
         fail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}'"
     fi

@@ -16,7 +16,7 @@ namespace llaminar2
 
     DeviceOrchestrator::DeviceOrchestrator(
         std::shared_ptr<DeviceManager> device_mgr,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         const LegacyOrchestrationConfig &config)
         : device_mgr_(device_mgr), mpi_ctx_(mpi_ctx), config_(config)
     {

@@ -44,7 +44,7 @@ namespace llaminar2
          * @param config Graph configuration
          */
         Qwen2Graph(std::shared_ptr<ModelContext> model_ctx,
-                   std::shared_ptr<MPIContext> mpi_ctx,
+                   std::shared_ptr<IMPIContext> mpi_ctx,
                    const GraphConfig &config);
 
         /**
@@ -54,7 +54,7 @@ namespace llaminar2
          * @param mpi_ctx MPI context (nullptr for single-rank)
          */
         Qwen2Graph(const GraphConfig &config,
-                   std::shared_ptr<MPIContext> mpi_ctx = nullptr);
+                   std::shared_ptr<IMPIContext> mpi_ctx = nullptr);
 
         ~Qwen2Graph() = default;
 

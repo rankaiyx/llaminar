@@ -69,6 +69,20 @@ namespace llaminar2
         virtual bool is_root() const = 0;
 
         // =========================================================================
+        // MPI Communicator Access
+        // =========================================================================
+
+        /**
+         * @brief Get the underlying MPI communicator handle
+         *
+         * Backends that need to make raw MPI/NCCL/RCCL calls can use this
+         * to obtain the communicator. Returns MPI_COMM_NULL for mock contexts.
+         *
+         * @return MPI_Comm handle
+         */
+        virtual MPI_Comm communicator() const = 0;
+
+        // =========================================================================
         // Synchronization
         // =========================================================================
 
@@ -148,6 +162,14 @@ namespace llaminar2
          * @param root Root rank (default: 0)
          */
         virtual void broadcast(float *data, size_t count, int root = 0) const = 0;
+
+        /**
+         * @brief Broadcast int32 data from root to all ranks
+         * @param data Data buffer (input on root, output on others)
+         * @param count Number of elements
+         * @param root Root rank (default: 0)
+         */
+        virtual void broadcast_int32(int32_t *data, size_t count, int root = 0) const = 0;
 
         // =========================================================================
         // All-Gather Operations

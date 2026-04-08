@@ -19,22 +19,24 @@
 #include "../execution/local_execution/graph/GraphBuilderRegistry.h"
 #include "../execution/local_execution/graph/SchemaFactoryRegistry.h"
 
+#include <mutex>
+
 namespace llaminar2
 {
 
-    void registerBuiltinModels()
+    static void doRegisterBuiltinModels()
     {
         // =================================================================
         // Qwen2 (also serves Qwen3 which reuses Qwen2Graph)
         // =================================================================
         GraphBuilderRegistry::registerFactory("qwen2",
-                                              [](const GraphConfig &cfg, std::shared_ptr<MPIContext> mpi)
+                                              [](const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
                                               {
                                                   return std::make_shared<Qwen2Graph>(cfg, std::move(mpi));
                                               });
 
         GraphBuilderRegistry::registerFactory("qwen3",
-                                              [](const GraphConfig &cfg, std::shared_ptr<MPIContext> mpi)
+                                              [](const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
                                               {
                                                   return std::make_shared<Qwen2Graph>(cfg, std::move(mpi));
                                               });
@@ -51,7 +53,7 @@ namespace llaminar2
         // Qwen3.5 Dense (hybrid GDN + Full Attention)
         // =================================================================
         GraphBuilderRegistry::registerFactory("qwen35",
-                                              [](const GraphConfig &cfg, std::shared_ptr<MPIContext> mpi)
+                                              [](const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
                                               {
                                                   return std::make_shared<Qwen35Graph>(cfg, std::move(mpi));
                                               });
@@ -65,6 +67,12 @@ namespace llaminar2
         // =================================================================
         // GraphBuilderRegistry::registerFactory("llama", ...);
         // SchemaFactoryRegistry::registerFactory("llama", ...);
+    }
+
+    void registerBuiltinModels()
+    {
+        static std::once_flag s_flag;
+        std::call_once(s_flag, doRegisterBuiltinModels);
     }
 
 } // namespace llaminar2

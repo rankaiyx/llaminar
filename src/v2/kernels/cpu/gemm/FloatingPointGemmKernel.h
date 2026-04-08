@@ -907,7 +907,7 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const TensorBase *bias = nullptr,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override
@@ -1026,7 +1026,7 @@ namespace llaminar2
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
                 const TensorBase *bias = nullptr,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override
@@ -1123,7 +1123,7 @@ namespace llaminar2
                 int m, int n, int k,
                 bool transpose_B,
                 float alpha, float beta,
-                const MPIContext *mpi_ctx,
+                const IMPIContext *mpi_ctx,
                 int device_idx,
                 ActivationFormat format_A, ActivationFormat format_B)
             {
@@ -1186,7 +1186,7 @@ namespace llaminar2
                 int softmax_axis,
                 const float *mask,
                 bool is_causal,
-                const MPIContext *mpi_ctx,
+                const IMPIContext *mpi_ctx,
                 int device_idx,
                 ActivationFormat format_A, ActivationFormat format_B)
             {
@@ -1241,7 +1241,7 @@ namespace llaminar2
                 const float *A, const float *B, float *C,
                 int m, int n, int k,
                 bool transpose_B, float alpha, float beta,
-                const MPIContext *mpi_ctx, int device_idx)
+                const IMPIContext *mpi_ctx, int device_idx)
             {
                 if (!B && weight_tensor_)
                 {
@@ -1265,7 +1265,7 @@ namespace llaminar2
                 const TensorBase *A, const TensorBase *B, TensorBase *C,
                 bool transpose_B = true,
                 float alpha = 1.0f, float beta = 0.0f,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override
             {
                 const auto &a_shape = A->shape();
@@ -1330,7 +1330,7 @@ namespace llaminar2
                 const float *A, const float *B, float *C,
                 int m, int n, int k,
                 bool transpose_B, int softmax_axis, const float *mask,
-                const MPIContext *mpi_ctx, int device_idx)
+                const IMPIContext *mpi_ctx, int device_idx)
             {
                 // 1. GEMM: C = A * B
                 // Direct weight GEMM via stored weight tensor
@@ -1379,7 +1379,7 @@ namespace llaminar2
                 int softmax_axis,
                 const float *mask,
                 bool is_causal,
-                const MPIContext *mpi_ctx,
+                const IMPIContext *mpi_ctx,
                 int device_idx,
                 ActivationFormat format_A,
                 ActivationFormat format_B) override
@@ -1487,7 +1487,7 @@ namespace llaminar2
                 int m, int n, int k,
                 int lda, int ldb, int ldc,
                 bool transpose_B, float alpha, float beta,
-                const MPIContext *mpi_ctx, int device_idx) override
+                const IMPIContext *mpi_ctx, int device_idx) override
             {
                 (void)mpi_ctx;
                 (void)device_idx;
@@ -1500,7 +1500,7 @@ namespace llaminar2
                 int m, int n, int k,
                 int lda, int ldb, int ldc,
                 bool transpose_B, float alpha, float beta,
-                const MPIContext *mpi_ctx, int device_idx,
+                const IMPIContext *mpi_ctx, int device_idx,
                 ActivationFormat format_A, ActivationFormat format_B) override
             {
                 (void)mpi_ctx;

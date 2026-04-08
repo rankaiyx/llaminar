@@ -364,13 +364,13 @@ namespace llaminar2
      */
     enum class WeightDimensionType
     {
-        None,          ///< Not sharded (replicated weights)
-        Heads,         ///< Attention heads (Q projection) - uses head_start/head_count
-        KVHeads,       ///< KV attention heads (K/V projections) - uses kv_head_start/kv_head_count
-        FFNHidden,     ///< FFN hidden dimension (Gate/Up/Down) - uses d_ff_start/d_ff_count
-        Vocab,         ///< Vocabulary dimension (LM head) - uses vocab_start/vocab_count
-        Bias1D,        ///< 1D bias that follows its weight's dimension type
-        FusedQKVHeads  ///< Fused QKV: 3 equal sub-blocks [Q|K|V] each split by heads
+        None,         ///< Not sharded (replicated weights)
+        Heads,        ///< Attention heads (Q projection) - uses head_start/head_count
+        KVHeads,      ///< KV attention heads (K/V projections) - uses kv_head_start/kv_head_count
+        FFNHidden,    ///< FFN hidden dimension (Gate/Up/Down) - uses d_ff_start/d_ff_count
+        Vocab,        ///< Vocabulary dimension (LM head) - uses vocab_start/vocab_count
+        Bias1D,       ///< 1D bias that follows its weight's dimension type
+        FusedQKVHeads ///< Fused QKV: 3 equal sub-blocks [Q|K|V] each split by heads
     };
 
     /**
@@ -626,7 +626,8 @@ namespace llaminar2
         /// - Models with known activation ranges can use tighter scales for precision
         /// - Use KV activation profiling tool (python/tools/profile_kv_activations.py)
         ///   to determine optimal scales for specific models
-        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must handle Q projection max_abs (~130 for Qwen2)
+        float kv_cache_scale_k = 256.0f; ///< Fixed K Q16 scale (FP32 range ±scale_k)
+        float kv_cache_scale_v = 32.0f;  ///< Fixed V Q16 scale (FP32 range ±scale_v)
 
         // =================================================================
         // TP Allreduce Precision Policy
@@ -676,7 +677,7 @@ namespace llaminar2
         std::unordered_map<std::string, bool> bool_params;
         std::unordered_map<std::string, std::string> string_params;
         std::unordered_map<std::string, TensorBase *> tensor_params;
-        std::unordered_map<std::string, void *> opaque_params; // MPIContext*, ICPUKVCache*, etc.
+        std::unordered_map<std::string, void *> opaque_params; // IMPIContext*, ICPUKVCache*, etc.
     };
 
     /**

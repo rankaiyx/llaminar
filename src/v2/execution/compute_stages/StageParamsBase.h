@@ -29,7 +29,7 @@
  *     struct Params {
  *         // REQUIRED - validated by StageParamsRequired concept
  *         DeviceId device_id = DeviceId::cpu();
- *         const MPIContext* mpi_ctx = nullptr;
+ *         const IMPIContext* mpi_ctx = nullptr;
  *
  *         // Stage-specific fields
  *         ITensor* input = nullptr;
@@ -55,7 +55,7 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class MPIContext;
+    class IMPIContext;
 
     /**
      * @brief Concept ensuring a Params struct has required stage fields
@@ -65,12 +65,12 @@ namespace llaminar2
      *
      * Required fields:
      * - device_id: DeviceId for execution target
-     * - mpi_ctx: const MPIContext* for distributed execution
+     * - mpi_ctx: const IMPIContext* for distributed execution
      */
     template <typename T>
     concept StageParamsRequired = requires(T t) {
         { t.device_id } -> std::convertible_to<DeviceId>;
-        { t.mpi_ctx } -> std::convertible_to<const MPIContext *>;
+        { t.mpi_ctx } -> std::convertible_to<const IMPIContext *>;
     };
 
     /**
@@ -92,6 +92,6 @@ namespace llaminar2
     /** @brief Target device for execution (default: CPU for safety) */ \
     DeviceId device_id = DeviceId::cpu();                               \
     /** @brief MPI context for distributed execution (optional) */      \
-    const MPIContext *mpi_ctx = nullptr
+    const IMPIContext *mpi_ctx = nullptr
 
 } // namespace llaminar2

@@ -626,7 +626,8 @@ namespace llaminar2
                                                  runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
                                                  runner_config.batch_size = config_.batch_size;
                                                  runner_config.activation_precision = config_.activation_precision;
-                                                 runner_config.kv_cache_scale = config_.kv_cache_scale;
+                                                 runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
+                                                 runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                                                  runner_config.kv_cache_precision = config_.kv_cache_precision;
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
                                                  runner_config.use_bar_backed_hidden = config_.use_bar_backed_hidden;
@@ -896,7 +897,8 @@ namespace llaminar2
             runner_config.max_seq_len = static_cast<int>(config_.max_seq_len);
             runner_config.batch_size = config_.batch_size;
             runner_config.activation_precision = config_.activation_precision;
-            runner_config.kv_cache_scale = config_.kv_cache_scale;
+            runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
+            runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
             runner_config.kv_cache_precision = config_.kv_cache_precision;
             runner_config.use_mapped_memory = config_.use_mapped_memory;
 
@@ -930,7 +932,8 @@ namespace llaminar2
                 nested_config.max_seq_len = config_.max_seq_len;
                 nested_config.batch_size = config_.batch_size;
                 nested_config.activation_precision = config_.activation_precision;
-                nested_config.kv_cache_scale = config_.kv_cache_scale;
+                nested_config.kv_cache_scale_k = config_.kv_cache_scale_k;
+                nested_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                 nested_config.kv_cache_precision = config_.kv_cache_precision;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
                 nested_config.use_bar_backed_hidden = needs_bar_backed[stage_idx] || stage_config.requires_bar_backed_hidden;

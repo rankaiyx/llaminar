@@ -29,7 +29,7 @@ namespace
             factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
         }
 
-        std::unique_ptr<MPIContext> mpi_ctx_;
+        std::unique_ptr<IMPIContext> mpi_ctx_;
         std::unique_ptr<TensorFactory> factory_;
     };
 

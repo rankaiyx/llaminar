@@ -476,7 +476,7 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         bool use_bf16,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)use_bf16; // Q8_1 uses native integer path
@@ -980,7 +980,7 @@ namespace llaminar2
         int seq_len,
         int d_model,
         float eps,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)gamma;

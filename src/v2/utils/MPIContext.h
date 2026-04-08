@@ -53,6 +53,7 @@ namespace llaminar2
         int rank() const override { return rank_; }
         int world_size() const override { return world_size_; }
         bool is_root() const override { return rank_ == 0; }
+        MPI_Comm communicator() const override { return comm_; }
         MPI_Comm comm() const { return comm_; }
 
         /**
@@ -315,6 +316,11 @@ namespace llaminar2
         void broadcast(float *data, size_t count, int root = 0) const override
         {
             MPI_Bcast(data, count, MPI_FLOAT, root, comm_);
+        }
+
+        void broadcast_int32(int32_t *data, size_t count, int root = 0) const override
+        {
+            MPI_Bcast(data, count, MPI_INT32_T, root, comm_);
         }
 
         /**

@@ -64,7 +64,7 @@ namespace llaminar2
 
             int rank_;
             int world_size_;
-            std::shared_ptr<MPIContext> mpi_ctx_;
+            std::shared_ptr<IMPIContext> mpi_ctx_;
 
             // Sharding parameters computed in SetUp
             int local_n_kv_heads_;

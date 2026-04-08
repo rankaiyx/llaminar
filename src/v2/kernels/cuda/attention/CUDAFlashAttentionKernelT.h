@@ -150,7 +150,7 @@ namespace llaminar2
                 TensorBase *workspace_context = nullptr,
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             /**
@@ -179,7 +179,7 @@ namespace llaminar2
                 TensorBase *workspace_context = nullptr,
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             /**
@@ -290,7 +290,7 @@ namespace llaminar2
                 TensorBase *workspace_context = nullptr,
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool compute_batch(
@@ -303,7 +303,7 @@ namespace llaminar2
                 TensorBase *workspace_context = nullptr,
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool compute_decode(
@@ -342,7 +342,7 @@ namespace llaminar2
                 int window_size = -1,
                 ITensor *workspace_scores = nullptr,
                 ITensor *workspace_mask = nullptr,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 int head_start = 0,
                 int local_n_heads = -1,
@@ -500,7 +500,7 @@ namespace llaminar2
                 TensorBase *workspace_context = nullptr,
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool compute_batch(
@@ -513,7 +513,7 @@ namespace llaminar2
                 TensorBase *workspace_context = nullptr,
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool compute_decode(
@@ -549,7 +549,7 @@ namespace llaminar2
                 int window_size = -1,
                 ITensor *workspace_scores = nullptr,
                 ITensor *workspace_mask = nullptr,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 int head_start = 0,
                 int local_n_heads = -1,
@@ -639,7 +639,7 @@ namespace llaminar2
                 TensorBase *workspace_context = nullptr,
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool compute_batch(
@@ -652,7 +652,7 @@ namespace llaminar2
                 TensorBase *workspace_context = nullptr,
                 TensorBase *workspace_mask = nullptr,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool compute_decode(
@@ -688,7 +688,7 @@ namespace llaminar2
                 int window_size = -1,
                 ITensor *workspace_scores = nullptr,
                 ITensor *workspace_mask = nullptr,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1,
                 int head_start = 0,
                 int local_n_heads = -1,

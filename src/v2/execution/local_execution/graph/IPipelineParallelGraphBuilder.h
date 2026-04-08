@@ -139,6 +139,6 @@ namespace llaminar2
      * @return Unique pointer to builder instance
      */
     std::unique_ptr<IPipelineParallelGraphBuilder> createPipelineParallelGraphBuilder(
-        MPIContext *mpi_ctx);
+        IMPIContext *mpi_ctx);
 
 } // namespace llaminar2

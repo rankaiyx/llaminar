@@ -41,7 +41,7 @@ namespace llaminar2
             int cols,
             float epsilon,
             bool /*use_bf16*/,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int device_idx)
         {
             // For FP32, assume pointers are already device pointers when device_idx >= 0
@@ -71,7 +71,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             float epsilon,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RMS_NORM, static_cast<hipStream_t>(gpu_stream_));
@@ -121,7 +121,7 @@ namespace llaminar2
             int /*cols*/,
             float /*epsilon*/,
             bool /*use_bf16*/,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int /*device_idx*/)
         {
             LOG_ERROR("ROCmRMSNormKernelT<BF16>::apply(float*) not supported. Use apply_bf16().");
@@ -163,7 +163,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             float epsilon,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RMS_NORM, static_cast<hipStream_t>(gpu_stream_));
@@ -212,7 +212,7 @@ namespace llaminar2
             int /*cols*/,
             float /*epsilon*/,
             bool /*use_bf16*/,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int /*device_idx*/)
         {
             LOG_ERROR("ROCmRMSNormKernelT<FP16>::apply(float*) not supported. Use apply_fp16().");
@@ -254,7 +254,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             float epsilon,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::RMS_NORM, static_cast<hipStream_t>(gpu_stream_));

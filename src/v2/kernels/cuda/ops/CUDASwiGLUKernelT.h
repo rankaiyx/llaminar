@@ -79,14 +79,14 @@ namespace llaminar2
                 const float *gate, const float *up, float *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool apply_bf16(
                 const uint16_t *gate, const uint16_t *up, uint16_t *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)gate;
@@ -104,7 +104,7 @@ namespace llaminar2
                 const uint16_t *gate, const uint16_t *up, uint16_t *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)gate;
@@ -122,7 +122,7 @@ namespace llaminar2
                 const void *gate, const void *up, void *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)gate;
@@ -142,7 +142,7 @@ namespace llaminar2
                 TensorBase *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
             // ===== Typed API =====
@@ -201,7 +201,7 @@ namespace llaminar2
                 const float *gate, const float *up, float *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)gate;
@@ -219,14 +219,14 @@ namespace llaminar2
                 const uint16_t *gate, const uint16_t *up, uint16_t *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool apply_fp16(
                 const uint16_t *gate, const uint16_t *up, uint16_t *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)gate;
@@ -244,7 +244,7 @@ namespace llaminar2
                 const void *gate, const void *up, void *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)gate;
@@ -264,7 +264,7 @@ namespace llaminar2
                 TensorBase *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
             // ===== Typed API =====
@@ -323,7 +323,7 @@ namespace llaminar2
                 const float *gate, const float *up, float *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)gate;
@@ -341,7 +341,7 @@ namespace llaminar2
                 const uint16_t *gate, const uint16_t *up, uint16_t *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)gate;
@@ -359,14 +359,14 @@ namespace llaminar2
                 const uint16_t *gate, const uint16_t *up, uint16_t *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool apply_q8_1(
                 const void *gate, const void *up, void *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)gate;
@@ -386,7 +386,7 @@ namespace llaminar2
                 TensorBase *output,
                 int rows, int cols,
                 bool add_residual,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
             // ===== Typed API =====

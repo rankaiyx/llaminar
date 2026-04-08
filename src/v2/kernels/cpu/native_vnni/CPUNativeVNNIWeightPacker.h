@@ -41,6 +41,10 @@
 #include <cstring>
 #include <vector>
 
+#ifdef __AVX512F__
+#include <immintrin.h>
+#endif
+
 #include "CPUNativeVNNIDecode.h"
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #include "tensors/AlignedVector.h"
@@ -71,6 +75,46 @@ namespace llaminar2::cpu::native_vnni
      *    so the entire working set is a single sequential memory stream per thread.
      *    This improves L3 cache utilization for large-K shapes like FFN_Down.
      */
+    /// Return the native block byte size for a given codebook_id.
+    /// For per-block formats (Q4_0, IQ4_NL, Q8_0, etc.), returns sizeof(BlockType).
+    /// For superblock formats (Q6_K, Q3_K, etc.), returns the superblock byte size.
+    /// Returns 0 for unknown formats.
+    inline size_t native_block_bytes_for_codebook(uint8_t codebook_id)
+    {
+        switch (codebook_id)
+        {
+        case 0:  return 18;  // Q4_0Block
+        case 4:  return 18;  // IQ4_NLBlock
+        case 5:  return 20;  // Q4_1Block
+        case 6:  return 22;  // Q5_0Block
+        case 7:  return 24;  // Q5_1Block
+        case 10: return 210; // Q6_KBlock (superblock, 256 elements)
+        case 11: return 110; // Q3_KBlock (superblock, 256 elements)
+        case 12: return 84;  // Q2_KBlock (superblock, 256 elements)
+        case 13: return 144; // Q4_KBlock (superblock, 256 elements)
+        case 14: return 176; // Q5_KBlock (superblock, 256 elements)
+        case 19: return 34;  // Q8_0Block
+        default: return 0;
+        }
+    }
+
+    /// Return the number of quantized elements per native block for a given codebook_id.
+    /// Per-block formats: 32 elements. Superblock formats: 256 elements.
+    inline int native_block_elements_for_codebook(uint8_t codebook_id)
+    {
+        switch (codebook_id)
+        {
+        case 10: // Q6_K
+        case 11: // Q3_K
+        case 12: // Q2_K
+        case 13: // Q4_K
+        case 14: // Q5_K
+            return 256;
+        default:
+            return 32;
+        }
+    }
+
     struct CPUNativeVNNIPackedWeights
     {
         /// Raw native payload bytes in [N_chunks][blocks_per_row][64][payload_bytes] layout
@@ -85,6 +129,9 @@ namespace llaminar2::cpu::native_vnni
         /// For nibble-LUT formats: 4 groups (1024B data) + 256B metadata = 1280B (symmetric)
         /// For INT8 pre-decoded: 8 groups (2048B data) + 256B metadata = 2304B (symmetric)
         /// Asymmetric formats add 128B for mins.
+        ///
+        /// When deferred packing is active (workspace_data_ is set), this may be empty.
+        /// Accessor methods automatically use workspace_data_ when set.
         AlignedVector<uint8_t> native_interleaved;
 
         /// Flat INT8 buffer used as intermediate during packing (INT8 pre-decoded formats only).
@@ -129,6 +176,30 @@ namespace llaminar2::cpu::native_vnni
         int interleaved_block_stride = 1280;
 
         // -------------------------------------------------------------------
+        // Deferred packing (workspace) support
+        // -------------------------------------------------------------------
+
+        /// When set, accessor methods use this pointer instead of native_interleaved.data().
+        /// This enables deferred packing: native blocks are stored permanently, and
+        /// interleaved data is repacked into a shared workspace on demand.
+        mutable const uint8_t *workspace_data_ = nullptr;
+
+        /// Set the workspace pointer for deferred packing.
+        /// After calling this, all accessor methods (interleavedB, chunkComp, etc.)
+        /// will read from the workspace buffer instead of native_interleaved.
+        void setWorkspace(const uint8_t *data) const { workspace_data_ = data; }
+
+        /// Clear the workspace pointer. Accessors will revert to native_interleaved.
+        void clearWorkspace() const { workspace_data_ = nullptr; }
+
+        /// Returns the active interleaved data base pointer.
+        /// Uses workspace_data_ if set, otherwise native_interleaved.data().
+        inline const uint8_t *interleavedBase() const
+        {
+            return workspace_data_ ? workspace_data_ : native_interleaved.data();
+        }
+
+        // -------------------------------------------------------------------
         // Accessors for the kernel inner loop
         // -------------------------------------------------------------------
 
@@ -156,7 +227,7 @@ namespace llaminar2::cpu::native_vnni
         {
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
             return reinterpret_cast<const uint16_t *>(
-                native_interleaved.data() + block_offset + data_stride + 128);
+                interleavedBase() + block_offset + data_stride + 128);
         }
 
         /// Mins pointer for N-chunk c, K-block kb (contiguous 64 FP16 values, inline in native_interleaved)
@@ -164,7 +235,7 @@ namespace llaminar2::cpu::native_vnni
         {
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
             return reinterpret_cast<const uint16_t *>(
-                native_interleaved.data() + block_offset + data_stride + 256);
+                interleavedBase() + block_offset + data_stride + 256);
         }
 
         /// Payload pointer for N-chunk c, K-block kb (contiguous 64 × payload_bytes)
@@ -181,7 +252,7 @@ namespace llaminar2::cpu::native_vnni
         inline const uint8_t *interleavedB(int c, int kb, int group, int z) const
         {
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
-            return native_interleaved.data() + block_offset + group * 256 + z * 64;
+            return interleavedBase() + block_offset + group * 256 + z * 64;
         }
 
         /// Pre-computed compensation for N-chunk c, K-block kb (contiguous 64 INT16, inline in native_interleaved)
@@ -189,7 +260,7 @@ namespace llaminar2::cpu::native_vnni
         {
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
             return reinterpret_cast<const int16_t *>(
-                native_interleaved.data() + block_offset + data_stride);
+                interleavedBase() + block_offset + data_stride);
         }
 
         /// Flat INT8 values for N-chunk c, K-block kb, column n_local (32 INT8 values)
@@ -209,7 +280,308 @@ namespace llaminar2::cpu::native_vnni
             int8_flat.clear();
             int8_flat.shrink_to_fit();
         }
+
+        /// Release the permanent interleaved data to save memory.
+        /// Used with deferred packing: after this, GEMM/GEMV must set workspace_data_
+        /// before accessing interleaved accessors (interleavedB, chunkComp, etc.).
+        /// Also releases the payload array since native blocks are the primary storage.
+        void releaseInterleavedData()
+        {
+            { AlignedVector<uint8_t> empty; native_interleaved.swap(empty); }
+            payload.clear();
+            payload.shrink_to_fit();
+        }
+
+        /// Returns true if the interleaved data is available (either owned or via workspace).
+        bool hasInterleavedData() const
+        {
+            return workspace_data_ != nullptr || !native_interleaved.empty();
+        }
     };
+
+    // =========================================================================
+    // Deferred packing: repack native blocks → VNNI-interleaved workspace
+    //
+    // This function repacks native quantized blocks (Q4_0, IQ4_NL, Q8_0, etc.)
+    // into the VNNI-interleaved format used by GEMM/GEMV. Unlike packWeightsCPUNativeVNNI()
+    // which reads from a tensor, this operates on raw block bytes that were saved
+    // from the original tensor during construction.
+    //
+    // For nibble-LUT formats (Q4_0, IQ4_NL, Q4_1): extracts payload nibbles + scales,
+    // interleaves into 4-group VNNI layout with inline comp/scales.
+    //
+    // For INT8 pre-decoded formats (Q8_0, Q5_0, etc.): extracts INT8 values + scales,
+    // interleaves into 8-group VNNI layout with inline comp/scales.
+    //
+    // Superblock formats (Q6_K, Q3_K, Q2_K) are NOT supported for deferred repacking
+    // because they require the full superblock context for correct decode.
+    // =========================================================================
+
+    /**
+     * @brief Repack native blocks into a pre-allocated VNNI-interleaved workspace.
+     *
+     * @param native_blocks  Raw native block bytes, row-major: [N × blocks_per_row × block_size]
+     * @param block_size     Bytes per native block (e.g., 34 for Q8_0, 18 for Q4_0)
+     * @param meta           Packed weights metadata (N, K, blocks_per_row, codebook_id, etc.)
+     * @param workspace      Output buffer, must be at least N_chunks * blocks_per_row * interleaved_block_stride bytes
+     */
+    inline void repackNativeBlocksToInterleaved(
+        const uint8_t *native_blocks,
+        size_t block_size,
+        const CPUNativeVNNIPackedWeights &meta,
+        uint8_t *workspace)
+    {
+        const int N = meta.N;
+        const int bpr = meta.blocks_per_row;
+        const int N_chunks = (meta.N_padded) / 64;
+        const uint8_t codebook_id = meta.codebook_id;
+
+        // Row stride in native_blocks array (bytes between adjacent rows)
+        const size_t native_row_stride = static_cast<size_t>(bpr) * block_size;
+
+        if (meta.is_nibble_lut)
+        {
+            // ---------------------------------------------------------------
+            // NIBBLE-LUT PATH (Q4_0, IQ4_NL, Q4_1)
+            // 4 groups, payload_bytes per block (16 for Q4_0/IQ4_NL)
+            //
+            // Vectorized interleave: AVX-512 gather from temp buffer
+            // ---------------------------------------------------------------
+            const int pb = meta.payload_bytes;
+            // Payload offset within native block (after scale, optionally after min)
+            const int payload_offset = (codebook_id == 5) ? 4 : 2; // Q4_1=4, others=2
+
+#pragma omp parallel for schedule(static) collapse(2)
+            for (int chunk = 0; chunk < N_chunks; ++chunk)
+            {
+                for (int kb = 0; kb < bpr; ++kb)
+                {
+                    int n_cols = std::min(64, N - chunk * 64);
+
+                    size_t block_offset = ((size_t)chunk * bpr + kb) * meta.interleaved_block_stride;
+                    uint8_t *dst = workspace + block_offset;
+
+                    // Extract payload, scales, mins from native blocks into contiguous temp arrays.
+                    // Layout: payload_buf[col][pb] with col stride = pb.
+                    alignas(64) uint8_t payload_buf[64 * 16]; // max pb=16
+                    alignas(64) uint16_t scales_buf[64];
+                    alignas(64) uint16_t mins_buf[64];
+
+                    // Only zero tail if last chunk has partial columns
+                    if (n_cols < 64)
+                    {
+                        std::memset(payload_buf, 0, 64 * pb);
+                        std::memset(scales_buf, 0, sizeof(scales_buf));
+                        std::memset(mins_buf, 0, sizeof(mins_buf));
+                    }
+
+                    for (int col = 0; col < n_cols; ++col)
+                    {
+                        int row = chunk * 64 + col;
+                        const uint8_t *blk = native_blocks + row * native_row_stride + kb * block_size;
+
+                        std::memcpy(&scales_buf[col], blk, 2);
+                        if (codebook_id == 5)
+                            std::memcpy(&mins_buf[col], blk + 2, 2);
+                        std::memcpy(payload_buf + col * pb, blk + payload_offset, pb);
+                    }
+
+                    // --- Interleave payload into 4-group VNNI layout ---
+                    for (int group = 0; group < 4; ++group)
+                    {
+                        for (int z = 0; z < 4; ++z)
+                        {
+                            uint8_t *zmm_dst = dst + group * 256 + z * 64;
+                            for (int lane = 0; lane < 16; ++lane)
+                            {
+                                int col = z * 16 + lane;
+                                if (col < n_cols)
+                                {
+                                    const uint8_t *p = payload_buf + col * pb;
+                                    std::memcpy(zmm_dst + lane * 4, p + group * 4, 4);
+                                }
+                                else
+                                {
+                                    std::memset(zmm_dst + lane * 4, 0, 4);
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Compute comp (sum of decoded INT8 values per column) ---
+                    int16_t *inline_comp = reinterpret_cast<int16_t *>(dst + 1024);
+                    for (int col = 0; col < n_cols; ++col)
+                    {
+                        int8_t decoded[32];
+                        decode_native_block(codebook_id, payload_buf + col * pb, decoded);
+#ifdef __AVX512F__
+                        // Vectorized sum of 32 signed int8 → int16
+                        __m256i v = _mm256_loadu_si256((const __m256i *)decoded);
+                        __m256i ones = _mm256_set1_epi8(1);
+                        __m256i pair_sums = _mm256_maddubs_epi16(ones, v); // 16 × int16
+                        __m256i ones16 = _mm256_set1_epi16(1);
+                        __m256i quad_sums = _mm256_madd_epi16(pair_sums, ones16); // 8 × int32
+                        __m128i hi = _mm256_extracti128_si256(quad_sums, 1);
+                        __m128i lo = _mm256_castsi256_si128(quad_sums);
+                        __m128i sum128 = _mm_add_epi32(lo, hi);
+                        sum128 = _mm_hadd_epi32(sum128, sum128);
+                        sum128 = _mm_hadd_epi32(sum128, sum128);
+                        inline_comp[col] = static_cast<int16_t>(_mm_cvtsi128_si32(sum128));
+#else
+                        int32_t sum = 0;
+                        for (int i = 0; i < 32; ++i)
+                            sum += decoded[i];
+                        inline_comp[col] = static_cast<int16_t>(sum);
+#endif
+                    }
+                    for (int col = n_cols; col < 64; ++col)
+                        inline_comp[col] = 0;
+
+                    // Write scales inline
+                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(dst + 1024 + 128);
+                    std::memcpy(inline_scales, scales_buf, 64 * sizeof(uint16_t));
+
+                    // Write mins inline (if asymmetric)
+                    if (meta.is_asymmetric)
+                    {
+                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(dst + 1024 + 256);
+                        std::memcpy(inline_mins, mins_buf, 64 * sizeof(uint16_t));
+                    }
+                }
+            }
+        }
+        else
+        {
+            // ---------------------------------------------------------------
+            // INT8 PRE-DECODED PATH (Q8_0, Q5_0, Q5_1)
+            // 8 groups, 32 INT8 values per block
+            // ---------------------------------------------------------------
+
+#pragma omp parallel for schedule(static) collapse(2)
+            for (int chunk = 0; chunk < N_chunks; ++chunk)
+            {
+                for (int kb = 0; kb < bpr; ++kb)
+                {
+                    const int n_cols = std::min(64, N - chunk * 64);
+                    const size_t block_offset_ws = ((size_t)chunk * bpr + kb) * meta.interleaved_block_stride;
+                    uint8_t *dst = workspace + block_offset_ws;
+
+                    // Extract INT8 values, scales, and mins from native blocks.
+                    // int8_buf layout: [col][32] with stride 32 between columns.
+                    alignas(64) int8_t int8_buf[64][32];
+                    alignas(64) uint16_t scales_buf[64];
+                    alignas(64) uint16_t mins_buf[64];
+                    alignas(64) int16_t comp_buf[64];
+
+                    // Only zero tail if last chunk has partial columns
+                    if (n_cols < 64)
+                    {
+                        std::memset(int8_buf, 0, sizeof(int8_buf));
+                        std::memset(scales_buf, 0, sizeof(scales_buf));
+                        std::memset(mins_buf, 0, sizeof(mins_buf));
+                        std::memset(comp_buf, 0, sizeof(comp_buf));
+                    }
+
+                    // Extract blocks + compute comp in a single pass
+                    for (int col = 0; col < n_cols; ++col)
+                    {
+                        const int row = chunk * 64 + col;
+                        const uint8_t *blk = native_blocks + row * native_row_stride + kb * block_size;
+
+                        if (codebook_id == 19) // Q8_0: scale(2) + qs(32) = 34 bytes
+                        {
+                            std::memcpy(&scales_buf[col], blk, 2);
+                            std::memcpy(int8_buf[col], blk + 2, 32);
+                        }
+                        else if (codebook_id == 6) // Q5_0
+                        {
+                            std::memcpy(&scales_buf[col], blk, 2);
+                            Q5_0Block block;
+                            block.d = 0;
+                            std::memcpy(block.qh, blk + 2, 4);
+                            std::memcpy(block.qs, blk + 6, 16);
+                            simd::unpack_q5_0_to_int8(block, int8_buf[col]);
+                        }
+                        else if (codebook_id == 7) // Q5_1
+                        {
+                            std::memcpy(&scales_buf[col], blk, 2);
+                            std::memcpy(&mins_buf[col], blk + 2, 2);
+                            Q5_1Block block;
+                            block.d = 0;
+                            block.m = 0;
+                            std::memcpy(block.qh, blk + 4, 4);
+                            std::memcpy(block.qs, blk + 8, 16);
+                            simd::unpack_q5_1_to_int8(block, int8_buf[col]);
+                        }
+
+                        // Comp: vectorized sum of 32 signed int8
+#ifdef __AVX512F__
+                        __m256i v = _mm256_loadu_si256((const __m256i *)int8_buf[col]);
+                        __m256i ones = _mm256_set1_epi8(1);
+                        __m256i pair_sums = _mm256_maddubs_epi16(ones, v);
+                        __m256i ones16 = _mm256_set1_epi16(1);
+                        __m256i quad_sums = _mm256_madd_epi16(pair_sums, ones16);
+                        __m128i hi = _mm256_extracti128_si256(quad_sums, 1);
+                        __m128i lo = _mm256_castsi256_si128(quad_sums);
+                        __m128i sum128 = _mm_add_epi32(lo, hi);
+                        sum128 = _mm_hadd_epi32(sum128, sum128);
+                        sum128 = _mm_hadd_epi32(sum128, sum128);
+                        comp_buf[col] = static_cast<int16_t>(_mm_cvtsi128_si32(sum128));
+#else
+                        int32_t sum = 0;
+                        for (int i = 0; i < 32; ++i)
+                            sum += int8_buf[col][i];
+                        comp_buf[col] = static_cast<int16_t>(sum);
+#endif
+                    }
+
+                    // --- Interleave INT8 values into 8-group VNNI layout ---
+                    for (int group = 0; group < 8; ++group)
+                    {
+                        for (int z = 0; z < 4; ++z)
+                        {
+                            uint8_t *zmm_dst = dst + group * 256 + z * 64;
+                            for (int lane = 0; lane < 16; ++lane)
+                            {
+                                const int col = z * 16 + lane;
+                                if (col < n_cols)
+                                {
+                                    std::memcpy(zmm_dst + lane * 4,
+                                                int8_buf[col] + group * 4, 4);
+                                }
+                                else
+                                {
+                                    std::memset(zmm_dst + lane * 4, 0, 4);
+                                }
+                            }
+                        }
+                    }
+
+                    // Write comp + scales
+                    int16_t *inline_comp = reinterpret_cast<int16_t *>(dst + meta.data_stride);
+                    std::memcpy(inline_comp, comp_buf, 64 * sizeof(int16_t));
+
+                    uint16_t *inline_scales = reinterpret_cast<uint16_t *>(
+                        dst + meta.data_stride + 128);
+                    std::memcpy(inline_scales, scales_buf, 64 * sizeof(uint16_t));
+
+                    if (meta.is_asymmetric)
+                    {
+                        uint16_t *inline_mins = reinterpret_cast<uint16_t *>(
+                            dst + meta.data_stride + 256);
+                        std::memcpy(inline_mins, mins_buf, 64 * sizeof(uint16_t));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compute the workspace buffer size needed for repackNativeBlocksToInterleaved().
+    inline size_t interleavedWorkspaceSize(const CPUNativeVNNIPackedWeights &meta)
+    {
+        int N_chunks = meta.N_padded / 64;
+        return (size_t)N_chunks * meta.blocks_per_row * meta.interleaved_block_stride;
+    }
 
     /**
      * @brief Pack tensor weights into CPUNativeVNNIPackedWeights.

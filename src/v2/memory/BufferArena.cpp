@@ -15,6 +15,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 
 namespace llaminar2
@@ -27,8 +30,18 @@ namespace llaminar2
     BufferArena::ManagedBuffer &BufferArena::buf(BufferId id)
     {
         auto idx = static_cast<size_t>(id);
+        if (idx >= kBufferCount)
+        {
+            LOG_ERROR("BufferArena::buf() - BufferId out of range: " << bufferIdName(id)
+                                                                     << " (index=" << idx << ", max=" << kBufferCount << ")");
+        }
         assert(idx < kBufferCount && "BufferId out of range");
         auto &b = buffers_[idx];
+        if (!b.registered)
+        {
+            LOG_ERROR("BufferArena::buf() - Buffer not registered: " << bufferIdName(id)
+                                                                     << " (index=" << idx << ")");
+        }
         assert(b.registered && "Buffer not registered");
         return b;
     }
@@ -36,8 +49,18 @@ namespace llaminar2
     const BufferArena::ManagedBuffer &BufferArena::buf(BufferId id) const
     {
         auto idx = static_cast<size_t>(id);
+        if (idx >= kBufferCount)
+        {
+            LOG_ERROR("BufferArena::buf() - BufferId out of range: " << bufferIdName(id)
+                                                                     << " (index=" << idx << ", max=" << kBufferCount << ")");
+        }
         assert(idx < kBufferCount && "BufferId out of range");
         auto &b = buffers_[idx];
+        if (!b.registered)
+        {
+            LOG_ERROR("BufferArena::buf() - Buffer not registered: " << bufferIdName(id)
+                                                                     << " (index=" << idx << ")");
+        }
         assert(b.registered && "Buffer not registered");
         return b;
     }
@@ -205,6 +228,22 @@ namespace llaminar2
             return BufferId::K_ROPE;
         if (name == "V_dequant")
             return BufferId::V_DEQUANT;
+
+        // GDN (Gated Delta Network) buffers
+        if (name == "gdn_qkv")
+            return BufferId::GDN_QKV;
+        if (name == "gdn_z")
+            return BufferId::GDN_Z;
+        if (name == "gdn_alpha")
+            return BufferId::GDN_ALPHA;
+        if (name == "gdn_beta")
+            return BufferId::GDN_BETA;
+
+        // FA (Full Attention) extended buffers
+        if (name == "fa_q_raw")
+            return BufferId::FA_Q_RAW;
+        if (name == "fa_gate")
+            return BufferId::FA_GATE;
 
         // Model-level buffers
         if (name == "current_hidden" || name == "hidden")
@@ -380,6 +419,76 @@ namespace llaminar2
         LOG_DEBUG("[BufferArena] Allocated " << stats_.total_buffers << " buffers, "
                                              << (stats_.total_bytes / 1024.0 / 1024.0) << " MB total");
         return true;
+    }
+
+    void BufferArena::logAllocationSummary() const
+    {
+        if (!allocated_)
+            return;
+
+        // Collect registered buffers, sorted by size descending
+        struct BufInfo
+        {
+            const char *name;
+            size_t rows;
+            size_t cols;
+            const char *dtype;
+            size_t bytes;
+        };
+        std::vector<BufInfo> infos;
+        infos.reserve(stats_.total_buffers);
+
+        for (size_t i = 0; i < kBufferCount; ++i)
+        {
+            const auto &b = buffers_[i];
+            if (!b.registered)
+                continue;
+            auto bid = static_cast<BufferId>(i);
+            size_t bytes = 0;
+            if (b.owned_tensor)
+                bytes = b.owned_tensor->size_bytes();
+            else if (b.external_tensor)
+                bytes = b.external_tensor->size_bytes();
+            infos.push_back({bufferIdName(bid), b.rows, b.cols,
+                             b.dtype ? b.dtype : "ext", bytes});
+        }
+
+        std::sort(infos.begin(), infos.end(),
+                  [](const BufInfo &a, const BufInfo &b)
+                  { return a.bytes > b.bytes; });
+
+        // Find max name length for alignment
+        size_t max_name = 6; // "Buffer" header
+        for (const auto &info : infos)
+            max_name = std::max(max_name, std::strlen(info.name));
+
+        // Log header + each buffer
+        std::ostringstream summary;
+        summary << "Activation buffer allocation plan (" << infos.size() << " buffers, "
+                << std::fixed << std::setprecision(1)
+                << (stats_.total_bytes / (1024.0 * 1024.0)) << " MB total):\n";
+
+        // Header
+        summary << "  " << std::left << std::setw(static_cast<int>(max_name + 2)) << "Buffer"
+                << std::right << std::setw(14) << "Shape"
+                << std::setw(8) << "Dtype"
+                << std::setw(12) << "Size (MB)"
+                << "\n";
+        summary << "  " << std::string(max_name + 2 + 14 + 8 + 12, '-') << "\n";
+
+        // Rows
+        for (const auto &info : infos)
+        {
+            std::string shape_str = std::to_string(info.rows) + "x" + std::to_string(info.cols);
+            double mb = info.bytes / (1024.0 * 1024.0);
+            summary << "  " << std::left << std::setw(static_cast<int>(max_name + 2)) << info.name
+                    << std::right << std::setw(14) << shape_str
+                    << std::setw(8) << info.dtype
+                    << std::setw(12) << std::fixed << std::setprecision(1) << mb
+                    << "\n";
+        }
+
+        LOG_INFO("[BufferArena] " << summary.str());
     }
 
     // =========================================================================

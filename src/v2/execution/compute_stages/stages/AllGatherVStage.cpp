@@ -212,7 +212,7 @@ namespace llaminar2
             scaled_recv_counts.data(),
             scaled_displacements.data(),
             MPI_FLOAT,
-            params_.mpi_ctx->comm());
+            params_.mpi_ctx->communicator());
 
         if (mpi_env.log_timing)
         {

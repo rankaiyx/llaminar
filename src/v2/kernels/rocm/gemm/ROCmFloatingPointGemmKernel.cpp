@@ -7,7 +7,7 @@
  * (not hipcc), avoiding MPI/TensorKernels.h compilation issues.
  *
  * **Design**: The adapter:
- * 1. Implements ITensorGemm (includes MPIContext, etc.)
+ * 1. Implements ITensorGemm (includes IMPIContext, etc.)
  * 2. Uses shared HipBLASGemmKernel* from DeviceKernelCache (avoids JIT overhead)
  * 3. Handles tensor type introspection in multiply_tensor()
  *
@@ -165,7 +165,7 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const TensorBase *bias,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int /*device_idx*/,
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
@@ -190,7 +190,7 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const TensorBase *bias,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int /*device_idx*/,
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
@@ -392,7 +392,7 @@ namespace llaminar2
             int /*m*/, int /*n*/, int /*k*/,
             bool /*transpose_B*/,
             float /*alpha*/, float /*beta*/,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int /*device_idx*/)
         {
             LOG_ERROR("[ROCmFloatingPointGemmKernel] multiply_activations not supported - use dedicated attention kernel");
@@ -405,7 +405,7 @@ namespace llaminar2
             int /*lda*/, int /*ldb*/, int /*ldc*/,
             bool /*transpose_B*/,
             float /*alpha*/, float /*beta*/,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int /*device_idx*/)
         {
             LOG_ERROR("[ROCmFloatingPointGemmKernel] multiply_activations_strided not supported - use dedicated attention kernel");

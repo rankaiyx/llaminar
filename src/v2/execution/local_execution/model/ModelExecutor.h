@@ -55,7 +55,7 @@ namespace llaminar2
          * @param config Executor configuration
          */
         ModelExecutor(std::shared_ptr<ModelContext> model_ctx,
-                      std::shared_ptr<MPIContext> mpi_ctx,
+                      std::shared_ptr<IMPIContext> mpi_ctx,
                       const ModelExecutorConfig &config = ModelExecutorConfig{});
 
         ~ModelExecutor() override = default;
@@ -137,7 +137,7 @@ namespace llaminar2
     protected:
         // Context
         std::shared_ptr<ModelContext> model_ctx_;
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         ModelExecutorConfig config_;
 
         // Layer executor for per-layer orchestration

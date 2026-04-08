@@ -344,7 +344,7 @@ namespace llaminar2
         // This is only really used to simplify testing. Normally we expect a factory.
         if (!factory_)
         {
-            // Create a single-rank MPIContext for the factory
+            // Create a single-rank IMPIContext for the factory
             // (rank=0, world_size=1, no actual MPI comm)
             owned_mpi_ctx_ = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
             owned_factory_ = std::make_unique<TensorFactory>(*owned_mpi_ctx_);

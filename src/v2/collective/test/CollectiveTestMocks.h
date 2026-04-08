@@ -286,7 +286,7 @@ namespace llaminar2
         public:
             std::unique_ptr<ICollectiveBackend> createBackend(
                 CollectiveBackendType type,
-                std::shared_ptr<MPIContext> mpi_ctx) override
+                std::shared_ptr<IMPIContext> mpi_ctx) override
             {
                 create_calls_++;
 

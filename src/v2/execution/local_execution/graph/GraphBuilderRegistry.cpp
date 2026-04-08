@@ -52,17 +52,15 @@ namespace llaminar2
         LOG_DEBUG("[GraphBuilderRegistry] Registered graph builder for '" << key << "'");
     }
 
-    static std::once_flag s_builtin_init;
-
     void GraphBuilderRegistry::ensureBuiltins()
     {
-        std::call_once(s_builtin_init, registerBuiltinModels);
+        registerBuiltinModels();
     }
 
     std::shared_ptr<IGraphBuilder> GraphBuilderRegistry::create(
         const std::string &architecture,
         const GraphConfig &config,
-        std::shared_ptr<MPIContext> mpi_ctx)
+        std::shared_ptr<IMPIContext> mpi_ctx)
     {
         ensureBuiltins();
         std::lock_guard<std::mutex> lock(mutex());

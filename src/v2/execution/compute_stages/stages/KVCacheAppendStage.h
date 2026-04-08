@@ -21,6 +21,7 @@ namespace llaminar2
     class TQ4Tensor;
     class TQ8Tensor;
     class TurboQuantContext;
+    class ActivationRotation;
 
     /**
      * @brief Explicit KV cache append stage
@@ -65,9 +66,11 @@ namespace llaminar2
             // VNNI-Safe Quantization Parameters (Q16_1 cache)
             // =========================================================
 
-            /// Fixed scale for Q16_1 quantization (from GraphSchema::kv_cache_scale)
-            /// Default 8.0 = ±8.0 FP32 range. Set to 0.0 to use legacy adaptive scaling.
-            float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover projection max (~130)
+            /// Fixed scales for Q16_1 quantization (from GraphConfig).
+            /// K and V use separate scales: K has large post-RoPE outliers,
+            /// V values are much smaller. Separate scales maximize INT16 precision.
+            float kv_cache_scale_k = 256.0f; ///< K scale (FP32 range ±scale_k)
+            float kv_cache_scale_v = 32.0f;  ///< V scale (FP32 range ±scale_v)
 
             /// Attention head dimension (for VNNI clipping limits)
             /// Required for proper MAX_SAFE_INT16 selection. Common values: 64, 96, 128, 192.
@@ -76,6 +79,10 @@ namespace llaminar2
             /// TurboQuant context (rotation matrix) for TQ4 KV cache quantization.
             /// Required when cache precision is TQ4. Not owned by this struct.
             const TurboQuantContext *turboquant_ctx = nullptr;
+
+            /// Block-diagonal orthogonal rotation for Q16_1 kurtosis reduction.
+            /// When set, K and V are rotated before fixed-scale quantization.
+            const ActivationRotation *kv_rotation = nullptr;
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> k_buffer_id;
@@ -138,6 +145,10 @@ namespace llaminar2
         std::shared_ptr<TQ4Tensor> tq4_k_scratch_;
         std::shared_ptr<TQ4Tensor> tq4_v_scratch_;
         std::shared_ptr<TQ8Tensor> tq8_k_scratch_; ///< For split TQ (TQ8 K + TQ4 V)
+
+        /// Workspace for kv_rotation: holds FP32 copy for in-place rotation
+        /// before Q16_1 quantization. Lazy-allocated, reused across calls.
+        std::vector<float> kv_rotation_scratch_;
     };
 
 } // namespace llaminar2

@@ -87,7 +87,7 @@ namespace llaminar2
          * @param weight_precision How weights are loaded (NATIVE, CONVERT_TO_FP32, etc.)
          */
         WeightManager(IModelLoader &loader,
-                      std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+                      std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
                       std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
                       WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
                       WeightPrecision weight_precision = WeightPrecision::CONVERT_TO_FP32);
@@ -236,6 +236,11 @@ namespace llaminar2
             gdn_n_v_heads_ = n_v_heads;
             gdn_d_state_ = d_state;
             has_gdn_dimensions_ = true;
+        }
+
+        void setWeightPreprocessor(WeightPreprocessor preprocessor) override
+        {
+            weight_preprocessor_ = std::move(preprocessor);
         }
 
         /**
@@ -520,7 +525,7 @@ namespace llaminar2
         bool packWeight(TensorBase *tensor, DeviceId target_device, bool release_raw_data);
 
         IModelLoader &loader_;                                                      ///< Model loader (GGUF, mock, etc.)
-        std::shared_ptr<MPIContext> mpi_ctx_;                                       ///< MPI context (nullptr = single rank)
+        std::shared_ptr<IMPIContext> mpi_ctx_;                                       ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
         std::shared_ptr<TensorParallelConfig> tp_config_;                           ///< Tensor parallelism configuration (optional)
         WeightDistributionStrategy strategy_;                                       ///< Distribution strategy
@@ -530,20 +535,21 @@ namespace llaminar2
         mutable std::unordered_map<std::string, ShardingMode> sharding_mode_cache_; ///< Cached sharding modes
         WeightShardingConfig sharding_config_;                                      ///< Model-specific sharding patterns
         bool has_sharding_config_ = false;                                          ///< True if config was set explicitly
+        WeightPreprocessor weight_preprocessor_;                                    ///< Optional per-weight transform before packing
 
         // =========================================================================
         // Model head dimensions for FusedQKV sub-block computation
         // =========================================================================
-        int model_n_heads_ = 0;           ///< Number of query attention heads
-        int model_n_kv_heads_ = 0;        ///< Number of KV attention heads (GQA)
-        int model_head_dim_ = 0;          ///< Dimension per attention head
+        int model_n_heads_ = 0;             ///< Number of query attention heads
+        int model_n_kv_heads_ = 0;          ///< Number of KV attention heads (GQA)
+        int model_head_dim_ = 0;            ///< Dimension per attention head
         bool has_model_dimensions_ = false; ///< True if setModelDimensions() was called
 
         // GDN (Gated Delta Net) head dimensions for FusedQKV sharding
         int gdn_n_k_heads_ = 0;           ///< Number of GDN key heads (ssm.group_count)
         int gdn_n_v_heads_ = 0;           ///< Number of GDN value heads (ssm.time_step_rank)
         int gdn_d_state_ = 0;             ///< GDN state dimension per head (ssm.state_size)
-        bool has_gdn_dimensions_ = false;  ///< True if setGDNDimensions() was called
+        bool has_gdn_dimensions_ = false; ///< True if setGDNDimensions() was called
 
         // Decode weight shard cache (separate from prefill cache)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache

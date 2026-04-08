@@ -2,7 +2,7 @@
  * @file Test__MPI_PrecisionAwareAllreduce.cpp
  * @brief MPI integration tests for precision-aware allreduce operations
  *
- * Tests the actual MPI allreduce methods in MPIContext with real multi-rank
+ * Tests the actual MPI allreduce methods in IMPIContext with real multi-rank
  * communication. Verifies correctness of Q8_1, FP16, BF16, and FP32 allreduce
  * across MPI ranks.
  *
@@ -32,7 +32,7 @@ namespace
     class Test__MPI_PrecisionAwareAllreduce : public ::testing::Test
     {
     protected:
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         int rank_ = 0;
         int world_size_ = 1;
         std::mt19937 rng_;

@@ -7,7 +7,7 @@
  * (not nvcc), avoiding MPI/TensorKernels.h compilation issues.
  *
  * **Design**:
- * 1. Implements ITensorGemm (includes MPIContext, TensorBase, etc.)
+ * 1. Implements ITensorGemm (includes IMPIContext, TensorBase, etc.)
  * 2. Delegates CUDA work to CUDAQuantisedGemmKernel_Impl (in .cu file)
  * 3. Handles tensor type introspection in multiply_tensor()
  * 4. Manages lazy weight conversion to INT8 + scales
@@ -1183,7 +1183,7 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const TensorBase *bias,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
@@ -1208,7 +1208,7 @@ namespace llaminar2
             bool /*transpose_B*/,
             float alpha, float beta,
             const TensorBase *bias,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int /*device_idx*/,
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
@@ -1472,7 +1472,7 @@ namespace llaminar2
             const TensorBase *input,
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             DeviceWorkspaceManager *workspace)
         {
             // Use passed workspace if provided, otherwise fall back to bound workspace
@@ -2448,7 +2448,7 @@ namespace llaminar2
             int /*m*/, int /*n*/, int /*k*/,
             bool /*transpose_B*/,
             float /*alpha*/, float /*beta*/,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int /*device_idx*/)
         {
             LOG_ERROR("[CUDAQuantisedGemmKernel] multiply_activations not supported - use dedicated attention kernel");
@@ -2461,7 +2461,7 @@ namespace llaminar2
             int /*lda*/, int /*ldb*/, int /*ldc*/,
             bool /*transpose_B*/,
             float /*alpha*/, float /*beta*/,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             int /*device_idx*/)
         {
             LOG_ERROR("[CUDAQuantisedGemmKernel] multiply_activations_strided not supported - use dedicated attention kernel");

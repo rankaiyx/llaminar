@@ -91,6 +91,11 @@ namespace llaminar2
             /// TurboQuant context for TQ4 KV cache dequantization
             const TurboQuantContext *turboquant_ctx = nullptr;
 
+            /// Block-diagonal orthogonal rotation for Q16_1 kurtosis reduction.
+            /// When set, Q is rotated before the dot product and the attention
+            /// output is inverse-rotated after weighted-V accumulation.
+            const ActivationRotation *kv_rotation = nullptr;
+
             // RoPE-on-read: apply RoPE to K inside this attention stage.
             // When enabled, K in the KV cache is stored pre-RoPE, and position
             // embeddings are fused into the TQ4 dequant / applied in-place for FP32.

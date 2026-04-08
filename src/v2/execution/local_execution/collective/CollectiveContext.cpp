@@ -111,7 +111,7 @@ namespace llaminar2
 
     CollectiveContext::CollectiveContext(
         std::unique_ptr<IBackendRouter> router,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         std::vector<DeviceId> local_devices)
         : mpi_ctx_(std::move(mpi_ctx)),
           router_(std::move(router)),
@@ -945,7 +945,7 @@ namespace llaminar2
     }
 
     std::unique_ptr<CollectiveContext> CollectiveContextFactory::createMPI(
-        std::shared_ptr<MPIContext> mpi_ctx)
+        std::shared_ptr<IMPIContext> mpi_ctx)
     {
         CollectiveContext::Config config;
         config.mpi_ctx = std::move(mpi_ctx);
@@ -954,7 +954,7 @@ namespace llaminar2
 
     std::unique_ptr<CollectiveContext> CollectiveContextFactory::createIntraNode(
         const ClusterInventory &inventory,
-        std::shared_ptr<MPIContext> mpi_ctx)
+        std::shared_ptr<IMPIContext> mpi_ctx)
     {
         CollectiveContext::Config config;
         config.mpi_ctx = std::move(mpi_ctx);
@@ -964,7 +964,7 @@ namespace llaminar2
 
     std::unique_ptr<CollectiveContext> CollectiveContextFactory::createWithRouter(
         std::unique_ptr<IBackendRouter> router,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         std::vector<DeviceId> local_devices)
     {
         return std::make_unique<CollectiveContext>(

@@ -58,7 +58,7 @@ namespace llaminar2::test
          */
         std::unique_ptr<WeightManager> createWeightManager(
             ModelLoader &loader,
-            std::shared_ptr<MPIContext> mpi_ctx,
+            std::shared_ptr<IMPIContext> mpi_ctx,
             WeightDistributionStrategy strategy = WeightDistributionStrategy::SHARDED)
         {
             auto mgr = std::make_unique<WeightManager>(loader, mpi_ctx, nullptr, strategy);

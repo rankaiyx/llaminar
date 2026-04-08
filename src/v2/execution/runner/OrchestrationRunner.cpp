@@ -66,6 +66,17 @@ namespace llaminar2
     {
     }
 
+    OrchestrationRunner::OrchestrationRunner(
+        OrchestrationConfig config,
+        RankExecutionPlan plan,
+        std::unique_ptr<IInferenceRunner> runner,
+        std::shared_ptr<IMPIContext> mpi_ctx)
+        : config_(std::move(config)), plan_(std::move(plan)), plan_built_(true),
+          mpi_ctx_(std::move(mpi_ctx)), runner_(std::move(runner)),
+          initialized_(true), sampler_(0)
+    {
+    }
+
     OrchestrationRunner::~OrchestrationRunner()
     {
         shutdown();
@@ -91,7 +102,7 @@ namespace llaminar2
 
             int ok = local_ok ? 1 : 0;
             int global_ok = 0;
-            MPI_Allreduce(&ok, &global_ok, 1, MPI_INT, MPI_MIN, mpi_ctx_->comm());
+            MPI_Allreduce(&ok, &global_ok, 1, MPI_INT, MPI_MIN, mpi_ctx_->communicator());
             if (global_ok == 0)
             {
                 if (local_ok)
@@ -261,6 +272,17 @@ namespace llaminar2
             return false;
         }
 
+        // Broadcast to worker ranks so they prefill with the same tokens
+        if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
+        {
+            broadcastCommand(MPICommand::PREFILL);
+            int32_t n_tokens = static_cast<int32_t>(prompt_tokens.size());
+            mpi_ctx_->broadcast_int32(&n_tokens, 1, 0);
+            // const_cast is safe: rank 0 is the sender, buffer is not modified
+            mpi_ctx_->broadcast_int32(const_cast<int32_t *>(prompt_tokens.data()),
+                                     static_cast<size_t>(n_tokens), 0);
+        }
+
         // For PP: head stage receives activations from external source
         // (handled by MPI in distributed setting)
         if (!isPipelineHead())
@@ -308,6 +330,10 @@ namespace llaminar2
             result.error = "Runner not initialized";
             return result;
         }
+
+        // Broadcast to worker ranks so they run decode in lockstep
+        if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
+            broadcastCommand(MPICommand::DECODE_STEP);
 
         if (prefill_logits_ready_)
         {
@@ -510,6 +536,10 @@ namespace llaminar2
 
     void OrchestrationRunner::clearCache()
     {
+        // Broadcast to worker ranks so they clear their KV caches in lockstep
+        if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
+            broadcastCommand(MPICommand::CLEAR_CACHE);
+
         if (runner_)
         {
             runner_->clear_cache();
@@ -589,7 +619,7 @@ namespace llaminar2
         ModelConfig model_config;
         if (!config_.model_path.empty())
         {
-            std::shared_ptr<MPIContext> metadata_mpi_ctx = mpi_ctx_;
+            std::shared_ptr<IMPIContext> metadata_mpi_ctx = mpi_ctx_;
             if (!metadata_mpi_ctx)
             {
                 metadata_mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
@@ -762,7 +792,8 @@ namespace llaminar2
         // Multi-rank execution: build local RankInventory and exchange via MPI_Allgatherv.
         const int world_size = mpi_ctx_->world_size();
         const int rank = mpi_ctx_->rank();
-        MPI_Comm comm = mpi_ctx_->comm();
+
+        MPI_Comm comm = mpi_ctx_->communicator();
 
         RankInventory local_rank_inv;
         local_rank_inv.rank = rank;
@@ -1463,6 +1494,14 @@ namespace llaminar2
 
     void OrchestrationRunner::setSkipLogitsGatherDecode(bool skip)
     {
+        // Broadcast to worker ranks
+        if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
+        {
+            broadcastCommand(MPICommand::SKIP_LOGITS_DECODE);
+            int32_t val = skip ? 1 : 0;
+            mpi_ctx_->broadcast_int32(&val, 1, 0);
+        }
+
         if (runner_)
         {
             runner_->setSkipLogitsGatherDecode(skip);
@@ -1503,6 +1542,18 @@ namespace llaminar2
 
     void OrchestrationRunner::setSamplingParams(const SamplingParams &params)
     {
+        // Broadcast to worker ranks
+        if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
+        {
+            broadcastCommand(MPICommand::SET_SAMPLING);
+            float params_buf[4] = {
+                params.temperature,
+                params.top_p,
+                static_cast<float>(params.top_k),
+                static_cast<float>(params.seed)};
+            mpi_ctx_->broadcast(params_buf, 4, 0);
+        }
+
         active_sampling_params_ = params;
         // Reset token history for new conversation/request so penalties start fresh
         sampler_.reset_history();
@@ -1511,6 +1562,109 @@ namespace llaminar2
     SamplingParams OrchestrationRunner::getRecommendedSamplingParams() const
     {
         return recommended_sampling_params_;
+    }
+
+    // =========================================================================
+    // MPI Worker Loop (non-root ranks in server mode)
+    // =========================================================================
+
+    void OrchestrationRunner::broadcastCommand(MPICommand cmd)
+    {
+        if (!mpi_coordinated_mode_ || !mpi_ctx_ || mpi_ctx_->world_size() <= 1)
+            return;
+
+        int32_t tag = static_cast<int32_t>(cmd);
+        mpi_ctx_->broadcast_int32(&tag, 1, 0);
+    }
+
+    void OrchestrationRunner::shutdownMPIWorkers()
+    {
+        if (!mpi_ctx_ || mpi_ctx_->world_size() <= 1)
+            return;
+
+        LOG_INFO("[MPI] Rank 0 sending SHUTDOWN to worker ranks");
+        broadcastCommand(MPICommand::SHUTDOWN);
+    }
+
+    void OrchestrationRunner::runMPIWorkerLoop()
+    {
+        if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
+        {
+            LOG_WARN("[MPIWorkerLoop] Should only be called on non-root ranks");
+            return;
+        }
+
+        LOG_INFO("[MPIWorkerLoop] Rank " << mpi_ctx_->rank()
+                                         << " entering worker loop");
+
+        while (true)
+        {
+            // Wait for command from rank 0
+            int32_t tag = 0;
+            mpi_ctx_->broadcast_int32(&tag, 1, 0);
+            auto cmd = static_cast<MPICommand>(tag);
+
+            switch (cmd)
+            {
+            case MPICommand::CLEAR_CACHE:
+            {
+                clearCache();
+                break;
+            }
+
+            case MPICommand::SET_SAMPLING:
+            {
+                // Receive sampling params
+                float params_buf[4]; // temperature, top_p, top_k, seed
+                mpi_ctx_->broadcast(params_buf, 4, 0);
+                SamplingParams sp;
+                sp.temperature = params_buf[0];
+                sp.top_p = params_buf[1];
+                sp.top_k = static_cast<int>(params_buf[2]);
+                sp.seed = static_cast<uint64_t>(params_buf[3]);
+                setSamplingParams(sp);
+                break;
+            }
+
+            case MPICommand::PREFILL:
+            {
+                // Receive token count then tokens
+                int32_t n_tokens = 0;
+                mpi_ctx_->broadcast_int32(&n_tokens, 1, 0);
+
+                std::vector<int32_t> tokens(n_tokens);
+                mpi_ctx_->broadcast_int32(tokens.data(), static_cast<size_t>(n_tokens), 0);
+
+                prefill(tokens);
+                break;
+            }
+
+            case MPICommand::DECODE_STEP:
+            {
+                decodeStep();
+                break;
+            }
+
+            case MPICommand::SKIP_LOGITS_DECODE:
+            {
+                int32_t skip = 0;
+                mpi_ctx_->broadcast_int32(&skip, 1, 0);
+                runner_->setSkipLogitsGatherDecode(skip != 0);
+                break;
+            }
+
+            case MPICommand::SHUTDOWN:
+            {
+                LOG_INFO("[MPIWorkerLoop] Rank " << mpi_ctx_->rank()
+                                                 << " received SHUTDOWN");
+                return;
+            }
+
+            default:
+                LOG_WARN("[MPIWorkerLoop] Unknown command: " << tag);
+                break;
+            }
+        }
     }
 
 } // namespace llaminar2

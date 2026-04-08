@@ -2377,7 +2377,7 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const TensorBase *bias,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
@@ -2412,7 +2412,7 @@ namespace llaminar2
             bool transpose_B,
             float alpha, float beta,
             const TensorBase *bias,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             DeviceWorkspaceManager *workspace,
             int activation_row_offset)
@@ -3695,7 +3695,7 @@ namespace llaminar2
             const TensorBase *input,
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k,
-            const MPIContext * /*mpi_ctx*/,
+            const IMPIContext * /*mpi_ctx*/,
             DeviceWorkspaceManager *workspace)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM, static_cast<hipStream_t>(gpu_stream_));
@@ -4865,7 +4865,7 @@ namespace llaminar2
             int m, int n, int k,
             bool transpose_B,
             float alpha, float beta,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             // Activation-activation GEMM is not supported by quantized kernel
@@ -4879,7 +4879,7 @@ namespace llaminar2
             int lda, int ldb, int ldc,
             bool transpose_B,
             float alpha, float beta,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             // Strided activation GEMM is not supported

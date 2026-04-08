@@ -267,7 +267,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)workspace_scores;
@@ -298,7 +298,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)workspace_scores;
@@ -484,7 +484,7 @@ namespace llaminar2
             int window_size,
             ITensor *workspace_scores,
             ITensor *workspace_mask,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             int head_start,
             int local_n_heads,
@@ -960,7 +960,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             // FP16 kernel with FP32 interface - convert internally
@@ -1001,7 +1001,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)workspace_scores;
@@ -1106,7 +1106,7 @@ namespace llaminar2
             int window_size,
             ITensor *workspace_scores,
             ITensor *workspace_mask,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             int head_start,
             int local_n_heads,
@@ -1323,7 +1323,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             // MI50 doesn't have native BF16 support - fall back to FP32
@@ -1359,7 +1359,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)workspace_scores;
@@ -1463,7 +1463,7 @@ namespace llaminar2
             int window_size,
             ITensor *workspace_scores,
             ITensor *workspace_mask,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             int head_start,
             int local_n_heads,

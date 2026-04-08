@@ -4,7 +4,7 @@
  * @author David Sanftenberg
  *
  * This header provides a simplified TensorFactory for unit tests that:
- * - Does NOT require MPIContext (uses CPU device -1)
+ * - Does NOT require IMPIContext (uses CPU device -1)
  * - Provides random data filling
  * - Supports creating quantized tensors with test patterns
  * - Supports VNNI-packed weight creation for Q16 attention tests

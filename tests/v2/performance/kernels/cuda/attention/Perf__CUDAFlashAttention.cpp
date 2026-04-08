@@ -400,7 +400,7 @@ namespace
         int compute_capability_;
         cudaEvent_t start_event_ = nullptr;
         cudaEvent_t stop_event_ = nullptr;
-        std::unique_ptr<MPIContext> mpi_ctx_;
+        std::unique_ptr<IMPIContext> mpi_ctx_;
         std::unique_ptr<CUDAFlashAttentionKernelT<ActivationPrecision::FP32>> kernel_;
     };
 

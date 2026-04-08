@@ -663,7 +663,7 @@ namespace llaminar2
         int cols,
         float epsilon,
         bool use_bf16,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)use_bf16;

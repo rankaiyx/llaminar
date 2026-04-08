@@ -376,6 +376,39 @@ namespace llaminar2
          * as defaults when the user hasn't specified explicit values.
          */
         virtual SamplingParams getRecommendedSamplingParams() const { return {}; }
+
+        // =====================================================================
+        // MPI Worker Loop (for non-root ranks in server mode)
+        // =====================================================================
+
+        /**
+         * @brief Run as MPI worker for non-root ranks in server mode.
+         *
+         * Blocks in a loop, participating in inference collectives when
+         * rank 0 initiates them. Returns when rank 0 signals shutdown.
+         * Default implementation is a no-op (single-rank doesn't need this).
+         */
+        virtual void runMPIWorkerLoop() {}
+
+        /**
+         * @brief Signal all MPI worker ranks to shut down their worker loops.
+         *
+         * Called by rank 0 when the server is stopping. Workers will return
+         * from runMPIWorkerLoop() after receiving this signal.
+         */
+        virtual void shutdownMPIWorkers() {}
+
+        /**
+         * @brief Enable MPI coordinated mode.
+         *
+         * When enabled, rank 0 broadcasts commands so non-root ranks
+         * (in their worker loops) can participate in inference collectives.
+         * Must be called on rank 0 before workers enter runMPIWorkerLoop().
+         *
+         * Modes where all ranks run the same code (SingleShotChat, Completion)
+         * must NOT enable this — they already coordinate inline.
+         */
+        virtual void setMPICoordinatedMode(bool /*enabled*/) {}
     };
 
 } // namespace llaminar2

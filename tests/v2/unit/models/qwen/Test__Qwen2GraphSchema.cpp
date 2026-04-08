@@ -1000,33 +1000,130 @@ TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolveLayerBuffers)
     Qwen2SchemaFactory factory;
     GraphSchema schema = factory.createSchema();
 
+    // Qwen2.5-0.5B dimensions (non-TP, default precision)
     GraphResolverConfig config{};
     config.d_model = 896;
     config.n_heads = 14;
     config.n_kv_heads = 2;
     config.head_dim = 64;
     config.seq_len = 512;
+    config.batch_size = 1;
     config.local_n_heads = 14;
     config.local_n_kv_heads = 2;
     config.local_d_ff = 4864;
 
-    // Resolve layer buffers
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    // Should have buffers
-    EXPECT_FALSE(reqs.buffers.empty()) << "Should have layer buffers";
-
-    // All buffers should have non-empty shapes
-    for (const auto &buf : reqs.buffers)
+    // Helper to find a buffer by name
+    auto findBuf = [&](const std::string &name) -> const BufferDescriptor *
     {
-        EXPECT_FALSE(buf.shape.empty())
-            << "Buffer " << buf.name << " should have non-empty shape";
-        for (size_t dim : buf.shape)
-        {
-            EXPECT_GT(dim, 0u)
-                << "Buffer " << buf.name << " has zero dimension";
-        }
-    }
+        for (const auto &b : reqs.buffers)
+            if (b.name == name)
+                return &b;
+        return nullptr;
+    };
+
+    // Qwen2 has 16 layer_buffers in schema, but 3 are conditional (Q_rope, K_rope, V_dequant)
+    // which are filtered out at default precision. So 13 should be resolved.
+    EXPECT_EQ(reqs.buffers.size(), 13u) << "Expected 13 layer buffers (16 - 3 conditional)";
+
+    // ── Verify exact shapes for each buffer ──
+
+    // normalized: [seq_len, d_model] = [512, 896]
+    auto *normalized = findBuf("normalized");
+    ASSERT_NE(normalized, nullptr);
+    ASSERT_EQ(normalized->shape.size(), 2u);
+    EXPECT_EQ(normalized->shape[0], 512u);
+    EXPECT_EQ(normalized->shape[1], 896u);
+
+    // residual: [seq_len, d_model] = [512, 896]
+    auto *residual = findBuf("residual");
+    ASSERT_NE(residual, nullptr);
+    ASSERT_EQ(residual->shape.size(), 2u);
+    EXPECT_EQ(residual->shape[0], 512u);
+    EXPECT_EQ(residual->shape[1], 896u);
+
+    // Q: [seq_len, local_qkv_dim] = [512, 14*64=896]
+    auto *Q = findBuf("Q");
+    ASSERT_NE(Q, nullptr);
+    ASSERT_EQ(Q->shape.size(), 2u);
+    EXPECT_EQ(Q->shape[0], 512u);
+    EXPECT_EQ(Q->shape[1], 896u);
+
+    // K: [seq_len, local_kv_dim] = [512, 2*64=128]
+    auto *K = findBuf("K");
+    ASSERT_NE(K, nullptr);
+    ASSERT_EQ(K->shape.size(), 2u);
+    EXPECT_EQ(K->shape[0], 512u);
+    EXPECT_EQ(K->shape[1], 128u);
+
+    // V: [seq_len, local_kv_dim] = [512, 128]
+    auto *V = findBuf("V");
+    ASSERT_NE(V, nullptr);
+    ASSERT_EQ(V->shape.size(), 2u);
+    EXPECT_EQ(V->shape[0], 512u);
+    EXPECT_EQ(V->shape[1], 128u);
+
+    // attn_output: [seq_len, local_qkv_dim] = [512, 896]
+    auto *attn_output = findBuf("attn_output");
+    ASSERT_NE(attn_output, nullptr);
+    ASSERT_EQ(attn_output->shape.size(), 2u);
+    EXPECT_EQ(attn_output->shape[0], 512u);
+    EXPECT_EQ(attn_output->shape[1], 896u);
+
+    // attn_proj: [seq_len, d_model] = [512, 896]
+    auto *attn_proj = findBuf("attn_proj");
+    ASSERT_NE(attn_proj, nullptr);
+    ASSERT_EQ(attn_proj->shape.size(), 2u);
+    EXPECT_EQ(attn_proj->shape[0], 512u);
+    EXPECT_EQ(attn_proj->shape[1], 896u);
+
+    // gate: [seq_len, local_d_ff] = [512, 4864]
+    auto *gate = findBuf("gate");
+    ASSERT_NE(gate, nullptr);
+    ASSERT_EQ(gate->shape.size(), 2u);
+    EXPECT_EQ(gate->shape[0], 512u);
+    EXPECT_EQ(gate->shape[1], 4864u);
+
+    // up: [seq_len, local_d_ff] = [512, 4864]
+    auto *up = findBuf("up");
+    ASSERT_NE(up, nullptr);
+    ASSERT_EQ(up->shape.size(), 2u);
+    EXPECT_EQ(up->shape[0], 512u);
+    EXPECT_EQ(up->shape[1], 4864u);
+
+    // ffn_output: [seq_len, d_model] = [512, 896]
+    auto *ffn_output = findBuf("ffn_output");
+    ASSERT_NE(ffn_output, nullptr);
+    ASSERT_EQ(ffn_output->shape.size(), 2u);
+    EXPECT_EQ(ffn_output->shape[0], 512u);
+    EXPECT_EQ(ffn_output->shape[1], 896u);
+
+    // workspace_scores: [batch_size*local_n_heads*seq_len, seq_len] = [1*14*512, 512] = [7168, 512]
+    auto *ws_scores = findBuf("workspace_scores");
+    ASSERT_NE(ws_scores, nullptr);
+    ASSERT_EQ(ws_scores->shape.size(), 2u);
+    EXPECT_EQ(ws_scores->shape[0], 7168u);
+    EXPECT_EQ(ws_scores->shape[1], 512u);
+
+    // workspace_context: [batch_size*local_n_heads*seq_len, head_dim] = [7168, 64]
+    auto *ws_context = findBuf("workspace_context");
+    ASSERT_NE(ws_context, nullptr);
+    ASSERT_EQ(ws_context->shape.size(), 2u);
+    EXPECT_EQ(ws_context->shape[0], 7168u);
+    EXPECT_EQ(ws_context->shape[1], 64u);
+
+    // workspace_mask: [batch_size*seq_len, seq_len] = [512, 512]
+    auto *ws_mask = findBuf("workspace_mask");
+    ASSERT_NE(ws_mask, nullptr);
+    ASSERT_EQ(ws_mask->shape.size(), 2u);
+    EXPECT_EQ(ws_mask->shape[0], 512u);
+    EXPECT_EQ(ws_mask->shape[1], 512u);
+
+    // Conditional buffers should NOT be present at default precision
+    EXPECT_EQ(findBuf("Q_rope"), nullptr) << "Q_rope should be filtered out at default precision";
+    EXPECT_EQ(findBuf("K_rope"), nullptr) << "K_rope should be filtered out at default precision";
+    EXPECT_EQ(findBuf("V_dequant"), nullptr) << "V_dequant should be filtered out at default precision";
 }
 
 /**
@@ -1043,31 +1140,73 @@ TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolveModelBuffers)
     config.seq_len = 512;
     config.local_vocab = 151936;
 
-    // Resolve model buffers
     auto reqs = BufferAllocator::resolveModelBuffers(schema, config);
 
-    // Should have model buffers
-    EXPECT_FALSE(reqs.buffers.empty()) << "Should have model buffers";
+    EXPECT_EQ(reqs.buffers.size(), 3u) << "Should have 3 model buffers";
 
-    // Find hidden buffer
-    auto hidden_it = std::find_if(
-        reqs.buffers.begin(),
-        reqs.buffers.end(),
-        [](const BufferDescriptor &b)
-        { return b.name == "hidden"; });
-    ASSERT_NE(hidden_it, reqs.buffers.end()) << "Should have hidden buffer";
-    EXPECT_EQ(hidden_it->shape.size(), 2u);
-    EXPECT_EQ(hidden_it->shape[0], 512u); // seq_len
-    EXPECT_EQ(hidden_it->shape[1], 896u); // d_model
+    auto findBuf = [&](const std::string &name) -> const BufferDescriptor *
+    {
+        for (const auto &b : reqs.buffers)
+            if (b.name == name)
+                return &b;
+        return nullptr;
+    };
 
-    // Find logits buffer
-    auto logits_it = std::find_if(
-        reqs.buffers.begin(),
-        reqs.buffers.end(),
-        [](const BufferDescriptor &b)
-        { return b.name == "logits"; });
-    ASSERT_NE(logits_it, reqs.buffers.end()) << "Should have logits buffer";
-    EXPECT_EQ(logits_it->shape.size(), 2u);
-    EXPECT_EQ(logits_it->shape[0], 512u);    // seq_len
-    EXPECT_EQ(logits_it->shape[1], 151936u); // vocab_size
+    // hidden: [seq_len, d_model] = [512, 896]
+    auto *hidden = findBuf("hidden");
+    ASSERT_NE(hidden, nullptr);
+    ASSERT_EQ(hidden->shape.size(), 2u);
+    EXPECT_EQ(hidden->shape[0], 512u);
+    EXPECT_EQ(hidden->shape[1], 896u);
+
+    // logits: [1, vocab_size] — only 1 row (last-token logits only)
+    auto *logits = findBuf("logits");
+    ASSERT_NE(logits, nullptr);
+    ASSERT_EQ(logits->shape.size(), 2u);
+    EXPECT_EQ(logits->shape[0], 1u);
+    EXPECT_EQ(logits->shape[1], 151936u);
+
+    // logits_local: [1, local_vocab]
+    auto *logits_local = findBuf("logits_local");
+    ASSERT_NE(logits_local, nullptr);
+    ASSERT_EQ(logits_local->shape.size(), 2u);
+    EXPECT_EQ(logits_local->shape[0], 1u);
+    EXPECT_EQ(logits_local->shape[1], 151936u);
+}
+
+/**
+ * Test model buffer shapes with TP=2 (local_vocab < vocab_size)
+ */
+TEST(Test__Qwen2GraphSchema, BufferAllocator_ResolveModelBuffers_TP2)
+{
+    Qwen2SchemaFactory factory;
+    GraphSchema schema = factory.createSchema();
+
+    GraphResolverConfig config{};
+    config.d_model = 896;
+    config.vocab_size = 151936;
+    config.seq_len = 512;
+    config.local_vocab = 75968; // TP=2
+
+    auto reqs = BufferAllocator::resolveModelBuffers(schema, config);
+
+    auto findBuf = [&](const std::string &name) -> const BufferDescriptor *
+    {
+        for (const auto &b : reqs.buffers)
+            if (b.name == name)
+                return &b;
+        return nullptr;
+    };
+
+    // logits: [1, vocab_size] — full vocab, NOT scaled by seq_len
+    auto *logits = findBuf("logits");
+    ASSERT_NE(logits, nullptr);
+    EXPECT_EQ(logits->shape[0], 1u);
+    EXPECT_EQ(logits->shape[1], 151936u);
+
+    // logits_local: [1, local_vocab] — half vocab under TP=2
+    auto *logits_local = findBuf("logits_local");
+    ASSERT_NE(logits_local, nullptr);
+    EXPECT_EQ(logits_local->shape[0], 1u);
+    EXPECT_EQ(logits_local->shape[1], 75968u);
 }

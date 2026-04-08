@@ -100,7 +100,7 @@ protected:
 
     std::unique_ptr<ModelLoader> loader_;
     std::unique_ptr<WeightManager> weight_manager_;
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
     std::shared_ptr<TensorFactory> factory_;
     WeightShardingConfig sharding_config_;
 

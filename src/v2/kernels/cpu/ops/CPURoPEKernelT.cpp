@@ -365,7 +365,7 @@ namespace llaminar2
         const int *pos_ids,
         int batch_size, int seq_len, int head_dim, int num_heads,
         float theta_base, bool interleaved,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)output;      // In-place operation
@@ -388,7 +388,7 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx,
         int pos_offset)
     {
@@ -442,7 +442,7 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx,
         int pos_offset)
     {
@@ -496,7 +496,7 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx,
         int pos_offset)
     {
@@ -553,7 +553,7 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx,
         int pos_offset)
     {
@@ -597,7 +597,7 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -667,7 +667,7 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -741,7 +741,7 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -817,7 +817,7 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         float kv_cache_scale,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -898,7 +898,7 @@ namespace llaminar2
         int head_dim,
         float rope_theta,
         float kv_cache_scale,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -1094,7 +1094,7 @@ namespace llaminar2
         int n_kv_heads,
         int head_dim,
         float rope_theta,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx,
         int pos_offset)
     {

@@ -89,6 +89,8 @@ namespace
 
         void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> /*config*/) override {}
 
+        void setWeightPreprocessor(WeightPreprocessor /*preprocessor*/) override {}
+
         // New methods folded from WeightPreloader
         bool packGemmWeights(DeviceId /*target_device*/,
                              PreloadProgressCallback /*progress_cb*/,

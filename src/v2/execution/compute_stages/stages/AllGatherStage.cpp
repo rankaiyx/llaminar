@@ -183,7 +183,7 @@ namespace llaminar2
         }
         else
         {
-            comm = params_.mpi_ctx->comm();
+            comm = params_.mpi_ctx->communicator();
             LOG_DEBUG("[AllGatherStage] Using MPI context communicator (legacy path)");
         }
 

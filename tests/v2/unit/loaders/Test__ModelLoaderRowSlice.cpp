@@ -44,7 +44,7 @@ namespace llaminar2
             }
 
             std::string model_path_;
-            std::shared_ptr<MPIContext> mpi_ctx_;
+            std::shared_ptr<IMPIContext> mpi_ctx_;
             std::unique_ptr<TensorFactory> factory_;
             std::unique_ptr<ModelLoader> loader_;
         };

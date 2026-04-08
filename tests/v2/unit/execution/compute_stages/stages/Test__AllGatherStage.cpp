@@ -46,7 +46,7 @@ protected:
     }
 
     std::unique_ptr<MockDeviceContext> ctx_;
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
 };
 
 // =============================================================================

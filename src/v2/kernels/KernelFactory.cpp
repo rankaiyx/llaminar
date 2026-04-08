@@ -255,7 +255,7 @@ namespace llaminar
                         int n_kv_heads,
                         int head_dim,
                         float rope_theta,
-                        const llaminar2::MPIContext *mpi_ctx,
+                        const llaminar2::IMPIContext *mpi_ctx,
                         int device_idx,
                         int pos_offset = 0) override
                     {
@@ -313,7 +313,7 @@ namespace llaminar
                         int n_kv_heads,
                         int head_dim,
                         float rope_theta,
-                        const llaminar2::MPIContext *mpi_ctx,
+                        const llaminar2::IMPIContext *mpi_ctx,
                         int device_idx,
                         int pos_offset = 0) override
                     {
@@ -381,7 +381,7 @@ namespace llaminar
                         const float *gate, const float *up, float *output,
                         int rows, int cols,
                         bool add_residual,
-                        const llaminar2::MPIContext *mpi_ctx,
+                        const llaminar2::IMPIContext *mpi_ctx,
                         int device_idx)
                     {
                         (void)add_residual; // Not used in typed kernel
@@ -396,7 +396,7 @@ namespace llaminar
                         llaminar2::TensorBase *output,
                         int rows, int cols,
                         bool add_residual,
-                        const llaminar2::MPIContext *mpi_ctx,
+                        const llaminar2::IMPIContext *mpi_ctx,
                         int device_idx) override
                     {
                         (void)add_residual; // Not used in typed kernel
@@ -447,7 +447,7 @@ namespace llaminar
                         const float *gate, const float *up, float *output,
                         int rows, int cols,
                         bool add_residual,
-                        const llaminar2::MPIContext *mpi_ctx,
+                        const llaminar2::IMPIContext *mpi_ctx,
                         int device_idx)
                     {
                         (void)gate;
@@ -469,7 +469,7 @@ namespace llaminar
                         llaminar2::TensorBase *output,
                         int rows, int cols,
                         bool add_residual,
-                        const llaminar2::MPIContext *mpi_ctx,
+                        const llaminar2::IMPIContext *mpi_ctx,
                         int device_idx) override
                     {
                         (void)add_residual; // Not used in typed kernel

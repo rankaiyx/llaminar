@@ -152,7 +152,8 @@ namespace llaminar2::test
         outer_config.max_seq_len = 2048;
         outer_config.batch_size = 1;
         outer_config.activation_precision = ActivationPrecision::FP32;
-        outer_config.kv_cache_scale = 1.0f;
+        outer_config.kv_cache_scale_k = 1.0f;
+        outer_config.kv_cache_scale_v = 1.0f;
         outer_config.use_mapped_memory = true;
 
         // TP domain stage configuration
@@ -176,7 +177,8 @@ namespace llaminar2::test
         nested_config.max_seq_len = outer_config.max_seq_len;
         nested_config.batch_size = outer_config.batch_size;
         nested_config.activation_precision = outer_config.activation_precision;
-        nested_config.kv_cache_scale = outer_config.kv_cache_scale;
+        nested_config.kv_cache_scale_k = outer_config.kv_cache_scale_k;
+        nested_config.kv_cache_scale_v = outer_config.kv_cache_scale_v;
         nested_config.use_mapped_memory = outer_config.use_mapped_memory;
 
         // Verify nested config has correct TP settings
@@ -199,7 +201,8 @@ namespace llaminar2::test
         EXPECT_EQ(nested_config.max_seq_len, 2048u);
         EXPECT_EQ(nested_config.batch_size, 1);
         EXPECT_EQ(nested_config.activation_precision, ActivationPrecision::FP32);
-        EXPECT_FLOAT_EQ(nested_config.kv_cache_scale, 1.0f);
+        EXPECT_FLOAT_EQ(nested_config.kv_cache_scale_k, 1.0f);
+        EXPECT_FLOAT_EQ(nested_config.kv_cache_scale_v, 1.0f);
         EXPECT_TRUE(nested_config.use_mapped_memory);
 
         // Verify nested config is valid for TP mode
@@ -511,8 +514,8 @@ namespace llaminar2::test
         FactoryPPStageConfig stage0_config;
         stage0_config.first_layer = 0;
         stage0_config.last_layer = 12;
-        stage0_config.has_embedding = true;  // Has embedding (first stage)
-        stage0_config.has_lm_head = false;   // No LM head
+        stage0_config.has_embedding = true; // Has embedding (first stage)
+        stage0_config.has_lm_head = false;  // No LM head
 
         // Stage 1: layers 12-23 (12 layers)
         FactoryPPStageConfig stage1_config;

@@ -422,7 +422,7 @@ namespace
         // =========================================================================
         // Member Variables
         // =========================================================================
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         std::unique_ptr<TensorFactory> tensor_factory_;
         std::shared_ptr<ModelContext> model_ctx_;
 

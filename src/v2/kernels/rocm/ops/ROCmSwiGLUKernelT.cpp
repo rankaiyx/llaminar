@@ -51,7 +51,7 @@ namespace llaminar2
             const float *gate, const float *up, float *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)add_residual; // TODO: implement residual addition
@@ -66,7 +66,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::SWIGLU, static_cast<hipStream_t>(gpu_stream_));
@@ -121,7 +121,7 @@ namespace llaminar2
             const uint16_t *gate, const uint16_t *up, uint16_t *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)add_residual;
@@ -136,7 +136,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::SWIGLU, static_cast<hipStream_t>(gpu_stream_));
@@ -189,7 +189,7 @@ namespace llaminar2
             const uint16_t *gate, const uint16_t *up, uint16_t *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)add_residual;
@@ -204,7 +204,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::SWIGLU, static_cast<hipStream_t>(gpu_stream_));

@@ -44,9 +44,17 @@ namespace llaminar2
             chat_config.top_k = config.top_k;
             chat_config.top_p = config.top_p;
 
+            // Enable coordinated mode so rank 0 broadcasts to worker ranks
+            if (mpi_ctx->world_size() > 1)
+                runner->setMPICoordinatedMode(true);
+
             auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
             ChatUI chat_ui(tokenizer, adapter, chat_config);
             int result = chat_ui.run();
+
+            // Signal non-root ranks to exit their worker loops
+            if (mpi_ctx->world_size() > 1)
+                runner->shutdownMPIWorkers();
 
             runner->shutdown();
             MPI_Finalize();
@@ -54,9 +62,13 @@ namespace llaminar2
         }
         else
         {
-            // Non-rank-0 processes wait for chat to complete
+            // Non-rank-0 processes: enter MPI worker loop to participate
+            // in inference collectives when rank 0 initiates them.
             if (mpi_ctx->world_size() > 1)
-                MPI_Barrier(mpi_ctx->comm());
+            {
+                runner->setMPICoordinatedMode(true);
+                runner->runMPIWorkerLoop();
+            }
             runner->shutdown();
             MPI_Finalize();
             return 0;

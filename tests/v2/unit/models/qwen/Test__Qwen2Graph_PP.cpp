@@ -60,7 +60,7 @@ namespace
             // Create MPI context (single-rank for unit tests)
             mpi_ctx_ = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
 
-            // Create TensorFactory for buffer allocation (requires MPIContext)
+            // Create TensorFactory for buffer allocation (requires IMPIContext)
             tensor_factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
 
             // Create mock weights
@@ -413,7 +413,7 @@ namespace
         // Member Variables
         // =========================================================================
         GraphConfig config_;
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         std::unique_ptr<TensorFactory> tensor_factory_;
 
         // Mock weights storage

@@ -349,7 +349,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)workspace_scores;
@@ -380,7 +380,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             (void)workspace_scores;
@@ -530,7 +530,7 @@ namespace llaminar2
             int window_size,
             ITensor *workspace_scores,
             ITensor *workspace_mask,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             int head_start,
             int local_n_heads,
@@ -1263,7 +1263,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             // TODO: Native FP16 implementation
@@ -1284,7 +1284,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             LOG_WARN("[CUDAFlashAttentionKernelT<FP16>] FP16 not yet implemented, using FP32");
@@ -1350,7 +1350,7 @@ namespace llaminar2
             int window_size,
             ITensor *workspace_scores,
             ITensor *workspace_mask,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             int head_start,
             int local_n_heads,
@@ -1568,7 +1568,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 not yet implemented, using FP32");
@@ -1587,7 +1587,7 @@ namespace llaminar2
             TensorBase *workspace_context,
             TensorBase *workspace_mask,
             bool use_bf16,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx)
         {
             LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 not yet implemented, using FP32");
@@ -1653,7 +1653,7 @@ namespace llaminar2
             int window_size,
             ITensor *workspace_scores,
             ITensor *workspace_mask,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             int head_start,
             int local_n_heads,

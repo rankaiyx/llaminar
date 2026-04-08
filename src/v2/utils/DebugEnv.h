@@ -2738,6 +2738,13 @@ namespace llaminar2
         /// Must divide hidden_dim and ffn_dim evenly. Smaller = less beneficial, larger = more expensive.
         int rotation_block_dim = 128;
 
+        /// Block-diagonal orthogonal rotation for Q16_1 KV cache quantization.
+        /// Spreads outlier energy (from low-frequency RoPE dimensions) across all dims,
+        /// reducing clipping at the fixed Q16_1 scale.
+        /// (env: LLAMINAR_KV_ROTATION, default: "1" = enabled)
+        /// Set to "0" to disable for benchmarking the rotation overhead.
+        bool kv_rotation = true;
+
         /// Global allreduce precision fallback: "fp16", "bf16", or "fp32"
         /// (env: LLAMINAR_ALLREDUCE_PRECISION, default: "fp32")
         /// This is the ULTIMATE FALLBACK — per-layer precision from the model schema
@@ -2776,6 +2783,9 @@ namespace llaminar2
             const char *rot_bdim = std::getenv("LLAMINAR_ROTATION_BLOCK_DIM");
             if (rot_bdim)
                 rotation_block_dim = std::atoi(rot_bdim);
+            const char *kv_rot = std::getenv("LLAMINAR_KV_ROTATION");
+            if (kv_rot && std::string(kv_rot) == "0")
+                kv_rotation = false;
         }
 
         void reload()
@@ -2807,6 +2817,10 @@ namespace llaminar2
             const char *rot_bdim = std::getenv("LLAMINAR_ROTATION_BLOCK_DIM");
             if (rot_bdim)
                 rotation_block_dim = std::atoi(rot_bdim);
+            kv_rotation = true; // default on
+            const char *kv_rot = std::getenv("LLAMINAR_KV_ROTATION");
+            if (kv_rot && std::string(kv_rot) == "0")
+                kv_rotation = false;
             gemm.reload();
             profile.reload();
             rmsnorm.reload();

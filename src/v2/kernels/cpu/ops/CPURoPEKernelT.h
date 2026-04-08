@@ -33,7 +33,7 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class MPIContext;
+    class IMPIContext;
 
     // =========================================================================
     // Precision Metadata Traits (same pattern as CPURMSNormKernelT)
@@ -191,7 +191,7 @@ namespace llaminar2
             const int *pos_ids,
             int batch_size, int seq_len, int head_dim, int num_heads,
             float theta_base, bool interleaved,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1);
 
         // ITensorRoPE interface - apply_tensor() with automatic dispatch
@@ -204,7 +204,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int pos_offset = 0) override;
     };
@@ -272,7 +272,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int pos_offset = 0) override;
     };
@@ -340,7 +340,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int pos_offset = 0) override;
     };
@@ -418,7 +418,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int pos_offset = 0) override;
 
@@ -434,7 +434,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         // HybridQ16 mode: Q8_1 input → Q16_1 output (high-precision integer)
@@ -449,7 +449,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         // HybridQ16 mode with head scales: Q8_1 → Q16 with per-head scale output
@@ -468,7 +468,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         // HybridQ16 mode with FIXED scale: Q8_1 → Q16 with kv_cache_scale output
@@ -486,7 +486,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             float kv_cache_scale,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         // HybridQ16 K precision fix: Q=Q8_1→Q16_1 (fixed), K=Q16_1→Q16_1 (dynamic)
@@ -507,7 +507,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             float kv_cache_scale,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
     };
 
@@ -606,7 +606,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int pos_offset = 0) override;
 

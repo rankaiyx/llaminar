@@ -321,7 +321,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         float *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -350,7 +350,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         uint16_t *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -379,7 +379,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         uint16_t *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -408,7 +408,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         void *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -443,7 +443,7 @@ namespace llaminar2
         int num_tokens,
         int d_model,
         TensorBase *output,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::EMBEDDING_LOOKUP, static_cast<hipStream_t>(getStream()));
@@ -542,12 +542,7 @@ namespace llaminar2
         // Also verify stream match: setDynamicTokenIds() may have run on a
         // different stream than the current gpu_stream_ if the graph capture
         // controller reassigned stage streams after updateDynamicParams().
-        const bool token_ids_preloaded = dynamic_params_active_
-            && dynamic_token_count_ == num_tokens
-            && preload_stream_ == getStream()
-            && h_token_ids_
-            && std::memcmp(h_token_ids_, token_ids,
-                          static_cast<size_t>(num_tokens) * sizeof(int)) == 0;
+        const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens && preload_stream_ == getStream() && h_token_ids_ && std::memcmp(h_token_ids_, token_ids, static_cast<size_t>(num_tokens) * sizeof(int)) == 0;
         if (!token_ids_preloaded)
         {
             dynamic_params_active_ = false;

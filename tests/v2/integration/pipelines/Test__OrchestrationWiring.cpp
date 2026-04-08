@@ -51,7 +51,7 @@ namespace llaminar2
         {
         };
 
-        // Detect if MPIContext has topology() method
+        // Detect if IMPIContext has topology() method
         template <typename T, typename = void>
         struct has_topology_method : std::false_type
         {
@@ -103,7 +103,7 @@ namespace llaminar2
                 mpi_ctx_.reset();
             }
 
-            std::shared_ptr<MPIContext> mpi_ctx_;
+            std::shared_ptr<IMPIContext> mpi_ctx_;
         };
 
         // ============================================================================
@@ -127,23 +127,23 @@ namespace llaminar2
         }
 
         // ============================================================================
-        // Test 2: MPIContext exposes topology accessor
+        // Test 2: IMPIContext exposes topology accessor
         // ============================================================================
 
         /**
-         * @test MPIContext should expose topology for placement computation
+         * @test IMPIContext should expose topology for placement computation
          *
-         * The MPIContext is the primary interface for MPI operations. It should
+         * The IMPIContext is the primary interface for MPI operations. It should
          * expose the topology so that components can compute placement plans.
          */
         TEST_F(Test__OrchestrationWiring, MPIContext_ExposesTopology)
         {
             // Check if topology() accessor exists using SFINAE
-            constexpr bool has_accessor = has_topology_method<MPIContext>::value;
+            constexpr bool has_accessor = has_topology_method<IMPIContext>::value;
 
             ASSERT_TRUE(has_accessor)
-                << "MPIContext should have a topology() accessor.\n"
-                << "To fix: Add 'const MPITopology& topology() const;' to MPIContext";
+                << "IMPIContext should have a topology() accessor.\n"
+                << "To fix: Add 'const MPITopology& topology() const;' to IMPIContext";
         }
 
         // ============================================================================

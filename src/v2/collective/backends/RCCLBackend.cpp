@@ -125,7 +125,7 @@ namespace llaminar2
     // Constructor / Destructor
     // =========================================================================
 
-    RCCLBackend::RCCLBackend(std::shared_ptr<MPIContext> mpi_ctx)
+    RCCLBackend::RCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx)
         : mpi_ctx_(std::move(mpi_ctx))
     {
         LOG_DEBUG("RCCLBackend: Created" << (mpi_ctx_ ? " with MPI context (world_size=" + std::to_string(mpi_ctx_->world_size()) + ")" : ""));
@@ -273,7 +273,7 @@ namespace llaminar2
 
             // Broadcast the unique ID from rank 0 to all other ranks
             int mpi_err = MPI_Bcast(id_buffer.data(), static_cast<int>(id_buffer.size()),
-                                    MPI_BYTE, 0, mpi_ctx_->comm());
+                                    MPI_BYTE, 0, mpi_ctx_->communicator());
             if (mpi_err != MPI_SUCCESS)
             {
                 last_error_ = "MPI_Bcast of ncclUniqueId failed";

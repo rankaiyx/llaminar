@@ -123,7 +123,7 @@ namespace llaminar2
         }
         else
         {
-            comm = params_.mpi_ctx->comm();
+            comm = params_.mpi_ctx->communicator();
             LOG_DEBUG("[AllreduceStage] Using MPI context communicator (legacy path)");
         }
 
@@ -160,7 +160,7 @@ namespace llaminar2
         }
         else if (params_.buffer->native_type() == TensorType::Q16_1)
         {
-            // Q16_1: Use MPIContext::allreduce_q16_1_inplace for efficient SIMD reduction
+            // Q16_1: Use IMPIContext::allreduce_q16_1_inplace for efficient SIMD reduction
             auto *q16_tensor = dynamic_cast<Q16_1Tensor *>(params_.buffer);
             if (q16_tensor)
             {
@@ -168,7 +168,7 @@ namespace llaminar2
                 size_t n_blocks = (count + 31) / 32;
 
                 LOG_DEBUG("[AllreduceStage] Q16_1 path: n_blocks=" << n_blocks
-                                                                   << " using MPIContext allreduce");
+                                                                   << " using IMPIContext allreduce");
 
                 params_.mpi_ctx->allreduce_q16_1_inplace(blocks, n_blocks);
                 success = true;
@@ -176,7 +176,7 @@ namespace llaminar2
         }
         else if (params_.buffer->native_type() == TensorType::Q8_1)
         {
-            // Q8_1: Use MPIContext::allreduce_q8_1_inplace for efficient SIMD reduction
+            // Q8_1: Use IMPIContext::allreduce_q8_1_inplace for efficient SIMD reduction
             auto *q8_tensor = dynamic_cast<Q8_1Tensor *>(params_.buffer);
             if (q8_tensor)
             {
@@ -184,7 +184,7 @@ namespace llaminar2
                 size_t n_blocks = (count + 31) / 32;
 
                 LOG_DEBUG("[AllreduceStage] Q8_1 path: n_blocks=" << n_blocks
-                                                                  << " using MPIContext allreduce");
+                                                                  << " using IMPIContext allreduce");
 
                 params_.mpi_ctx->allreduce_q8_1_inplace(blocks, n_blocks);
                 success = true;

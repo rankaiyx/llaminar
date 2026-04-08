@@ -31,7 +31,7 @@ using namespace llaminar2;
 class Test__MPITopologyIntegration : public ::testing::Test
 {
 protected:
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
     std::unique_ptr<MPITopology> topology_;
     int rank_ = 0;
     int world_size_ = 1;

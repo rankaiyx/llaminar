@@ -32,7 +32,7 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class MPIContext;
+    class IMPIContext;
 
     // =========================================================================
     // Precision Metadata Traits (same pattern as CPURoPEKernelT)
@@ -152,7 +152,7 @@ namespace llaminar2
             const float *input, float *output,
             int rows, int cols,
             bool use_causal_mask,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)mpi_ctx;
@@ -170,7 +170,7 @@ namespace llaminar2
             int rows, int cols,
             bool use_causal_mask,
             float scale = 1.0f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         KernelSnapshotInfo getKernelSnapshotInfo() const override
@@ -232,7 +232,7 @@ namespace llaminar2
             const uint16_t *input, uint16_t *output,
             int rows, int cols,
             bool use_causal_mask,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)mpi_ctx;
@@ -250,7 +250,7 @@ namespace llaminar2
             int rows, int cols,
             bool use_causal_mask,
             float scale = 1.0f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         KernelSnapshotInfo getKernelSnapshotInfo() const override
@@ -312,7 +312,7 @@ namespace llaminar2
             const uint16_t *input, uint16_t *output,
             int rows, int cols,
             bool use_causal_mask,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)mpi_ctx;
@@ -330,7 +330,7 @@ namespace llaminar2
             int rows, int cols,
             bool use_causal_mask,
             float scale = 1.0f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         KernelSnapshotInfo getKernelSnapshotInfo() const override
@@ -410,7 +410,7 @@ namespace llaminar2
             int rows, int cols,
             bool use_causal_mask,
             float scale = 1.0f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         KernelSnapshotInfo getKernelSnapshotInfo() const override

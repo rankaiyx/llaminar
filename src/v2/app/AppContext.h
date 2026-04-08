@@ -21,7 +21,7 @@ namespace llaminar2
     struct AppContext
     {
         OrchestrationConfig config;
-        std::shared_ptr<MPIContext> mpi_ctx;
+        std::shared_ptr<IMPIContext> mpi_ctx;
         std::unique_ptr<IOrchestrationRunner> runner;
         std::shared_ptr<ITokenizer> tokenizer;
 

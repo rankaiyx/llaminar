@@ -21,7 +21,7 @@ namespace llaminar2
 
     Qwen35Graph::Qwen35Graph(
         std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         const GraphConfig &config)
         : QwenGraphBase(std::move(model_ctx), std::move(mpi_ctx), config)
     {
@@ -30,7 +30,7 @@ namespace llaminar2
 
     Qwen35Graph::Qwen35Graph(
         const GraphConfig &config,
-        std::shared_ptr<MPIContext> mpi_ctx)
+        std::shared_ptr<IMPIContext> mpi_ctx)
         : QwenGraphBase(config, std::move(mpi_ctx))
     {
         ensureGDNStates();
@@ -866,9 +866,11 @@ namespace llaminar2
                 kv_append_params.num_tokens = total_tokens;
                 kv_append_params.batch_size = batch_size;
                 kv_append_params.seq_len = seq_len;
-                kv_append_params.kv_cache_scale = config_.kv_cache_scale;
+                kv_append_params.kv_cache_scale_k = config_.kv_cache_scale_k;
+                kv_append_params.kv_cache_scale_v = config_.kv_cache_scale_v;
                 kv_append_params.head_dim = config_.head_dim;
                 kv_append_params.turboquant_ctx = config_.turboquant_ctx;
+                kv_append_params.kv_rotation = config_.kv_rotation;
 
                 graph.addNode(prefix + "kv_append",
                               ComputeStageFactory::createKVCacheAppend(kv_append_params),
@@ -958,6 +960,7 @@ namespace llaminar2
                 attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
                 attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
                 attn_params.turboquant_ctx = config_.turboquant_ctx;
+                attn_params.kv_rotation = config_.kv_rotation;
 
                 if (config_.rope_on_read)
                 {

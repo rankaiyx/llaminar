@@ -102,7 +102,7 @@ namespace llaminar2::test
                 .build();
         }
 
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         ClusterInventory cluster_inventory_;
     };
 

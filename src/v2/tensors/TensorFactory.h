@@ -45,7 +45,7 @@ namespace llaminar2
          * @brief Initialize factory with MPI context
          * @param mpi_ctx MPI context for rank-to-NUMA mapping
          */
-        explicit TensorFactory(const MPIContext &mpi_ctx);
+        explicit TensorFactory(const IMPIContext &mpi_ctx);
 
         /**
          * @brief Create FP32 tensor with NUMA-aware allocation

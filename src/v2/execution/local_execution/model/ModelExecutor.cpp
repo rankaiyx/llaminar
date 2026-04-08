@@ -19,7 +19,7 @@ namespace llaminar2
     // =============================================================================
 
     ModelExecutor::ModelExecutor(std::shared_ptr<ModelContext> model_ctx,
-                                 std::shared_ptr<MPIContext> mpi_ctx,
+                                 std::shared_ptr<IMPIContext> mpi_ctx,
                                  const ModelExecutorConfig &config)
         : model_ctx_(std::move(model_ctx)),
           mpi_ctx_(std::move(mpi_ctx)),

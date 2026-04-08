@@ -85,7 +85,7 @@ namespace llaminar2
         BenchmarkRunner(
             std::shared_ptr<IInferenceRunner> runner,
             std::shared_ptr<ITokenizer> tokenizer,
-            std::shared_ptr<MPIContext> mpi_ctx);
+            std::shared_ptr<IMPIContext> mpi_ctx);
 
         /**
          * @brief Run the benchmark
@@ -107,7 +107,7 @@ namespace llaminar2
     private:
         std::shared_ptr<IInferenceRunner> runner_;
         std::shared_ptr<ITokenizer> tokenizer_;
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
 
         /**
          * @brief Generate a default benchmark prompt if none provided

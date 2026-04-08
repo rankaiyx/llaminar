@@ -169,7 +169,7 @@ namespace llaminar2
         const float *gate, const float *up, float *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)add_residual; // Not used in this kernel
@@ -184,7 +184,7 @@ namespace llaminar2
         TensorBase *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
@@ -219,7 +219,7 @@ namespace llaminar2
         const float *gate, const float *up, float *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)gate;
@@ -238,7 +238,7 @@ namespace llaminar2
         const uint16_t *gate, const uint16_t *up, uint16_t *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)add_residual; // Not used in this kernel
@@ -253,7 +253,7 @@ namespace llaminar2
         TensorBase *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
@@ -298,7 +298,7 @@ namespace llaminar2
         const float *gate, const float *up, float *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)gate;
@@ -317,7 +317,7 @@ namespace llaminar2
         const uint16_t *gate, const uint16_t *up, uint16_t *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)add_residual; // Not used in this kernel
@@ -332,7 +332,7 @@ namespace llaminar2
         TensorBase *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);
@@ -377,7 +377,7 @@ namespace llaminar2
         const float *gate, const float *up, float *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)gate;
@@ -396,7 +396,7 @@ namespace llaminar2
         const void *gate, const void *up, void *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)add_residual; // Not used in this kernel
@@ -415,7 +415,7 @@ namespace llaminar2
         TensorBase *output,
         int rows, int cols,
         bool add_residual,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         KERNEL_PROFILE_SCOPE(KernelType::SWIGLU);

@@ -13,6 +13,7 @@
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantQuantizeTQ8.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantQuantizeTQ4.h"
+#include "../../../kernels/cpu/rotation/ActivationRotation.h"
 #include "../../../utils/OpenMPUtils.h"
 
 #include "../../../utils/KVCacheProfiler.h"
@@ -698,8 +699,40 @@ namespace llaminar2
             const auto conv_start = std::chrono::high_resolution_clock::now();
 
             const size_t kv_dim = params_.K->shape().size() > 1 ? params_.K->shape()[1] : 0;
-            const float kv_cache_scale = params_.kv_cache_scale;
+            const float kv_cache_scale_k = params_.kv_cache_scale_k;
+            const float kv_cache_scale_v = params_.kv_cache_scale_v;
             const int head_dim = params_.head_dim;
+
+            // -----------------------------------------------------------------
+            // KV rotation helper: reduces activation kurtosis before Q16_1
+            // quantization. Copies const FP32 data → scratch, rotates in-place,
+            // returns pointer to rotated data. No-op when kv_rotation is null.
+            // For mutable buffers (e.g. v_fp32_temp), use rotate_mutable instead.
+            // -----------------------------------------------------------------
+            const auto *kv_rot = params_.kv_rotation;
+
+            // Copy const FP32 → scratch → rotate → return scratch pointer
+            auto rotate_const = [&](const float *src, size_t n_elements) -> const float *
+            {
+                if (!kv_rot)
+                    return src;
+                const size_t needed = n_elements;
+                if (kv_rotation_scratch_.size() < needed)
+                    kv_rotation_scratch_.resize(needed);
+                std::memcpy(kv_rotation_scratch_.data(), src, n_elements * sizeof(float));
+                kv_rot->rotate_rows_inplace(kv_rotation_scratch_.data(),
+                                            static_cast<int>(n_elements / kv_dim),
+                                            static_cast<int>(kv_dim));
+                return kv_rotation_scratch_.data();
+            };
+
+            // Rotate mutable FP32 buffer in-place
+            auto rotate_mutable = [&](float *data, int n_rows)
+            {
+                if (!kv_rot)
+                    return;
+                kv_rot->rotate_rows_inplace(data, n_rows, static_cast<int>(kv_dim));
+            };
 
             // VNNI-safe clipping limit: floor(sqrt(INT32_MAX / (head_dim/16)))
             // Prevents INT32 overflow during VPDPWSSD accumulation.
@@ -709,7 +742,8 @@ namespace llaminar2
                                                                                        : 11585;
 
             LOG_DEBUG("[KVCacheAppendStage] Q16_1 cache with VNNI-safe fixed-scale quantization"
-                      << " (scale=" << kv_cache_scale
+                      << " (scale_k=" << kv_cache_scale_k
+                      << ", scale_v=" << kv_cache_scale_v
                       << ", head_dim=" << head_dim
                       << ", max_safe_int16=" << max_safe_int16
                       << ", tokens=" << total_tokens << ")");
@@ -755,8 +789,11 @@ namespace llaminar2
                     ;
                 }
 
+                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
+                k_fp32 = rotate_const(k_fp32, static_cast<size_t>(total_tokens) * kv_dim);
+
                 // Use fixed-scale quantization with VNNI-safe clipping
-                if (!k_q16_owned->copyFrom_fp32_fixed_scale(k_fp32, kv_cache_scale, head_dim))
+                if (!k_q16_owned->copyFrom_fp32_fixed_scale(k_fp32, kv_cache_scale_k, head_dim))
                 {
                     LOG_ERROR("[KVCacheAppendStage] Fixed-scale K quantization failed");
                     return false;
@@ -780,7 +817,10 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!k_q16_owned->copyFrom_fp32_fixed_scale(k_fp32, kv_cache_scale, head_dim))
+                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
+                k_fp32 = rotate_const(k_fp32, static_cast<size_t>(total_tokens) * kv_dim);
+
+                if (!k_q16_owned->copyFrom_fp32_fixed_scale(k_fp32, kv_cache_scale_k, head_dim))
                 {
                     LOG_ERROR("[KVCacheAppendStage] Fixed-scale K quantization failed");
                     return false;
@@ -812,7 +852,10 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32, kv_cache_scale, head_dim))
+                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
+                v_fp32 = rotate_const(v_fp32, static_cast<size_t>(total_tokens) * kv_dim);
+
+                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32, kv_cache_scale_v, head_dim))
                 {
                     LOG_ERROR("[KVCacheAppendStage] Fixed-scale V quantization failed");
                     return false;
@@ -862,8 +905,11 @@ namespace llaminar2
                     std::memcpy(v_fp32_temp.data(), v_fp32, total_tokens * kv_dim * sizeof(float));
                 }
 
+                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
+                rotate_mutable(v_fp32_temp.data(), total_tokens);
+
                 // Requantize with fixed scale and VNNI-safe clipping
-                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32_temp.data(), kv_cache_scale, head_dim))
+                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32_temp.data(), kv_cache_scale_v, head_dim))
                 {
                     LOG_ERROR("[KVCacheAppendStage] Fixed-scale V quantization failed");
                     return false;
@@ -889,7 +935,10 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32, kv_cache_scale, head_dim))
+                // Apply block-diagonal rotation to reduce kurtosis before Q16_1
+                v_fp32 = rotate_const(v_fp32, static_cast<size_t>(total_tokens) * kv_dim);
+
+                if (!v_q16_owned->copyFrom_fp32_fixed_scale(v_fp32, kv_cache_scale_v, head_dim))
                 {
                     LOG_ERROR("[KVCacheAppendStage] Fixed-scale V quantization failed");
                     return false;

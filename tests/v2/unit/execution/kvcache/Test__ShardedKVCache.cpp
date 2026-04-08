@@ -48,7 +48,7 @@ namespace llaminar2
                 mpi_ctx_ = std::make_shared<MPIContext>(0, 1, MPI_COMM_SELF);
             }
 
-            std::shared_ptr<MPIContext> mpi_ctx_;
+            std::shared_ptr<IMPIContext> mpi_ctx_;
         };
 
         // =========================================================================

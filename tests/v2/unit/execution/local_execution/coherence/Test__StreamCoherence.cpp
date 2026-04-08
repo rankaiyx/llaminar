@@ -152,7 +152,7 @@ protected:
         mpi_ctx_ = std::make_shared<MPIContext>(0, 2, MPI_COMM_NULL);
     }
 
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
 };
 
 TEST_F(Test__StreamCoherence, TPAllreduceStage_CoherencePolicy_IsOutput)
@@ -309,7 +309,6 @@ TEST_F(Test__StreamCoherence, WithEvent_ClearsStaleEventAndRecordsNew)
 
     void *fake_stream = reinterpret_cast<void *>(0x1234);
     tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, fake_stream);
-
 
     // Dirty flags must be set
     EXPECT_TRUE(tensor->getDeviceValid());

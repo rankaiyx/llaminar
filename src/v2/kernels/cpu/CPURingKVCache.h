@@ -152,7 +152,7 @@ namespace llaminar2
          * @param device      Device to allocate K/V tensors on (default: CPU).
          * @param layout_mode Memory layout for K/V tensors (default: POSITION_MAJOR).
          */
-        CPURingKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        CPURingKVCache(const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int head_dim, DeviceId device = DeviceId::cpu(),
                        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
@@ -172,7 +172,7 @@ namespace llaminar2
          * @param attention_devices Per-layer device assignment (size >= n_layers).
          * @param layout_mode       Memory layout (default: POSITION_MAJOR).
          */
-        CPURingKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        CPURingKVCache(const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int head_dim, const std::vector<int> &attention_devices,
                        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
 
@@ -194,7 +194,7 @@ namespace llaminar2
          * @param device           Device for all layers (default: CPU).
          * @param layout_mode      Memory layout (default: POSITION_MAJOR).
          */
-        CPURingKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        CPURingKVCache(const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                        int head_dim, DeviceId device = DeviceId::cpu(),
                        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
@@ -216,7 +216,7 @@ namespace llaminar2
          * @param attention_devices Per-layer device assignment (size >= n_layers).
          * @param layout_mode       Memory layout (default: POSITION_MAJOR).
          */
-        CPURingKVCache(const MPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
+        CPURingKVCache(const IMPIContext &mpi_ctx, int n_layers, int batch_size, int max_seq_len,
                        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
                        int head_dim, const std::vector<int> &attention_devices,
                        KVCacheLayoutMode layout_mode = KVCacheLayoutMode::POSITION_MAJOR);
@@ -647,7 +647,7 @@ namespace llaminar2
      */
     std::unique_ptr<ICPUKVCache> createCPURingKVCache(
         ActivationPrecision precision,
-        const MPIContext &mpi_ctx,
+        const IMPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
         DeviceId device = DeviceId::cpu(),
@@ -669,7 +669,7 @@ namespace llaminar2
      */
     std::unique_ptr<ICPUKVCache> createCPURingKVCache(
         ActivationPrecision precision,
-        const MPIContext &mpi_ctx,
+        const IMPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int head_dim,
         const std::vector<int> &attention_devices,
@@ -695,7 +695,7 @@ namespace llaminar2
      */
     std::unique_ptr<ICPUKVCache> createShardedCPURingKVCache(
         ActivationPrecision precision,
-        const MPIContext &mpi_ctx,
+        const IMPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim, DeviceId device = DeviceId::cpu(),
@@ -721,7 +721,7 @@ namespace llaminar2
      */
     std::unique_ptr<ICPUKVCache> createShardedCPURingKVCache(
         ActivationPrecision precision,
-        const MPIContext &mpi_ctx,
+        const IMPIContext &mpi_ctx,
         int n_layers, int batch_size, int max_seq_len,
         int n_kv_heads, int local_n_kv_heads, int kv_head_start,
         int head_dim,

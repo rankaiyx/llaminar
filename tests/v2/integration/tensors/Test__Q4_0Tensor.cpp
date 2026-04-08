@@ -122,7 +122,7 @@ namespace llaminar2
             }
 
             std::string original_simd_path_;
-            std::shared_ptr<MPIContext> mpi_ctx_;
+            std::shared_ptr<IMPIContext> mpi_ctx_;
 
             /**
              * @brief Compute relative L2 error between two output vectors.

@@ -2,7 +2,7 @@
  * @file TensorKernels.h
  * @brief Kernel interfaces for tensor operations
  *
- * All kernels accept MPIContext (distributed coordination) and device_idx (execution device).
+ * All kernels accept IMPIContext (distributed coordination) and device_idx (execution device).
  * Kernels are created by tensors via createGemm(), createRoPE(), etc.
  *
  * @author David Sanftenberg
@@ -356,7 +356,7 @@ namespace llaminar2
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
             const TensorBase *bias = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             DeviceWorkspaceManager *workspace = nullptr,
             int activation_row_offset = 0)
@@ -412,7 +412,7 @@ namespace llaminar2
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
             const TensorBase *bias = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             DeviceWorkspaceManager *workspace = nullptr,
             int activation_row_offset = 0) = 0;
@@ -518,7 +518,7 @@ namespace llaminar2
             const TensorBase *input,
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             DeviceWorkspaceManager *workspace = nullptr)
         {
             // Default implementation: call multiply_tensor() for each projection
@@ -576,7 +576,7 @@ namespace llaminar2
             int m, int n, int k,
             const TensorBase *bias = nullptr,
             bool accumulate = false,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             DeviceWorkspaceManager *workspace = nullptr)
         {
@@ -623,7 +623,7 @@ namespace llaminar2
             int m, int n, int k,
             int q16_block_size = 64,
             const TensorBase *bias = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             DeviceWorkspaceManager *workspace = nullptr)
         {
@@ -668,7 +668,7 @@ namespace llaminar2
             const TensorBase *A, const TensorBase *B, TensorBase *C,
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             // Default: not supported (TensorBase is only forward-declared here)
@@ -718,7 +718,7 @@ namespace llaminar2
             int lda, int ldb, int ldc,
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)A;
@@ -747,7 +747,7 @@ namespace llaminar2
             int lda, int ldb, int ldc,
             bool transpose_B,
             float alpha, float beta,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             ActivationFormat format_A, ActivationFormat format_B)
         {
@@ -841,7 +841,7 @@ namespace llaminar2
             int lda, int ldb, int ldc,
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             ActivationFormat format = ActivationFormat::FP32)
         {
@@ -864,7 +864,7 @@ namespace llaminar2
             int softmax_axis,
             const float *mask,
             bool is_causal,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             ActivationFormat format_A,
             ActivationFormat format_B)
@@ -923,7 +923,7 @@ namespace llaminar2
             int softmax_axis = 1,
             const float *mask = nullptr,
             bool is_causal = false,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             ActivationFormat format = ActivationFormat::FP32)
         {
@@ -1033,7 +1033,7 @@ namespace llaminar2
             const TensorBase *bias = nullptr,
             bool accumulate = false,
             float alpha = 1.0f, float beta = 0.0f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             DeviceWorkspaceManager *workspace = nullptr)
         {
@@ -1084,7 +1084,7 @@ namespace llaminar2
             const TensorBase *bias,
             bool accumulate,
             float alpha, float beta,
-            const MPIContext *mpi_ctx,
+            const IMPIContext *mpi_ctx,
             int device_idx,
             const GemmFusedOps &fused_ops,
             DeviceWorkspaceManager *workspace = nullptr)
@@ -1300,7 +1300,7 @@ namespace llaminar2
             int window_size = -1,
             ITensor *workspace_scores = nullptr,
             ITensor *workspace_mask = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int head_start = 0,        ///< First query head (TP slice start)
             int local_n_heads = -1,    ///< Number of query heads (-1 = all)
@@ -1596,7 +1596,7 @@ namespace llaminar2
          */
         virtual bool compute(
             const FusedAttentionWoParams &params,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
 
         /**
@@ -1616,7 +1616,7 @@ namespace llaminar2
          */
         virtual bool compute_decode(
             const FusedAttentionWoParams &params,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             if (params.seq_len_q != 1)
@@ -1640,7 +1640,7 @@ namespace llaminar2
          */
         virtual bool compute_prefill(
             const FusedAttentionWoParams &params,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             if (params.seq_len_q < 1)
@@ -1692,7 +1692,7 @@ namespace llaminar2
             float *scores_snapshot = nullptr,
             float *context_snapshot = nullptr,
             float *wo_output_snapshot = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             // Default: not supported (subclasses override with type-aware dispatch)
@@ -1948,7 +1948,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)Q_in;
@@ -2001,7 +2001,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)Q_in;
@@ -2057,7 +2057,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)Q_in;
@@ -2121,7 +2121,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             float kv_cache_scale,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)Q_in;
@@ -2190,7 +2190,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta,
             float q_kv_cache_scale, // Fixed scale for Q output
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)Q_in;
@@ -2246,7 +2246,7 @@ namespace llaminar2
             int n_kv_heads,
             int head_dim,
             float rope_theta,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             int pos_offset = 0) = 0;
 
@@ -2298,7 +2298,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             bool add_residual,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
     };
 
@@ -2332,7 +2332,7 @@ namespace llaminar2
             const TensorBase *residual,
             TensorBase *output,
             size_t num_elements,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
     };
 
@@ -2370,7 +2370,7 @@ namespace llaminar2
             int num_tokens,
             int d_model,
             TensorBase *output,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
 
         /**
@@ -2425,7 +2425,7 @@ namespace llaminar2
             int rows, int cols,
             bool use_causal_mask,
             float scale = 1.0f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
     };
 
@@ -2459,7 +2459,7 @@ namespace llaminar2
             TensorBase *output,
             int rows, int cols,
             float epsilon = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
 
         /**
@@ -2504,7 +2504,7 @@ namespace llaminar2
             int rows,
             int cols,
             float epsilon = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)input;

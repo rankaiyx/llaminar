@@ -24,7 +24,7 @@ namespace llaminar2
     // Forward declarations
     class ITensor;
     class IBackendRouter;
-    class MPIContext;
+    class IMPIContext;
     struct TPDomain;
 
     /**
@@ -190,7 +190,7 @@ namespace llaminar2
          * @brief Get the MPI context (may be nullptr)
          * @return Pointer to the MPI context
          */
-        virtual MPIContext *mpiContext() = 0;
+        virtual IMPIContext *mpiContext() = 0;
 
         // =========================================================================
         // Domain-Aware Collective Operations

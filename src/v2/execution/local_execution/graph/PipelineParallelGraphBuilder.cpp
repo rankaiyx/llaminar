@@ -70,7 +70,7 @@ namespace llaminar2
     class PipelineParallelGraphBuilder : public IPipelineParallelGraphBuilder
     {
     public:
-        explicit PipelineParallelGraphBuilder(MPIContext *mpi_ctx)
+        explicit PipelineParallelGraphBuilder(IMPIContext *mpi_ctx)
             : mpi_ctx_(mpi_ctx), async_mode_(false)
         {
         }
@@ -235,7 +235,7 @@ namespace llaminar2
         }
 
     private:
-        MPIContext *mpi_ctx_;
+        IMPIContext *mpi_ctx_;
         bool async_mode_;
     };
 
@@ -244,7 +244,7 @@ namespace llaminar2
     // =========================================================================
 
     std::unique_ptr<IPipelineParallelGraphBuilder> createPipelineParallelGraphBuilder(
-        MPIContext *mpi_ctx)
+        IMPIContext *mpi_ctx)
     {
         return std::make_unique<PipelineParallelGraphBuilder>(mpi_ctx);
     }

@@ -345,14 +345,14 @@ namespace
         size_t weight_bytes = static_cast<size_t>(N) * bpr * sizeof(Q8_0Block);
 
         for (int i = 0; i < WARMUP; ++i)
-            gemv_native_vnni(packed, A, C, blocks, bpr);
+            gemv_native_vnni(packed, A, C);
 
         std::vector<double> times(ITERS);
         for (int i = 0; i < ITERS; ++i)
         {
             flush_cache_range(blocks, weight_bytes);
             auto t0 = std::chrono::high_resolution_clock::now();
-            gemv_native_vnni(packed, A, C, blocks, bpr);
+            gemv_native_vnni(packed, A, C);
             auto t1 = std::chrono::high_resolution_clock::now();
             times[i] = std::chrono::duration<double, std::micro>(t1 - t0).count();
         }

@@ -39,7 +39,7 @@ using namespace llaminar2::test;
 class Test__OrchestratorWiringIntegration : public ::testing::Test
 {
 protected:
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
     std::shared_ptr<MockMPITopology> mock_topology_;
     int rank_ = 0;
     int world_size_ = 1;

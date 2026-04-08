@@ -2,24 +2,13 @@
  * @file CPUNativeVNNIGemv.h
  * @brief Optimized M=1 GEMV kernels for native-interleaved VNNI weights + AVX-512.
  *
- * Contains two GEMV paths under a unified NativeVNNI umbrella:
- *
- * ## 1. Packed VNNI Path (Q4_0, IQ4_NL, Q4_1, IQ4_XS, Q8_0, etc.)
+ * ## Packed VNNI Path (all deferred formats: Q4_0, IQ4_NL, Q4_1, Q8_0, Q5_0, Q5_1)
  *
  * Activations are quantized FP32→Q8_1, weights are pre-packed into VNNI
  * interleaved order. Inner loop uses vpdpbusd (INT8 dot product).
- * Best for 4-bit formats where decode + VNNI amortizes nicely.
- *
- * ## 2. Native Q8_0 Path (Q8_0 only)
- *
- * Weights are read directly from native Q8_0 blocks (34 bytes each).
- * Dequantized to FP32 inline with hardware F16C and multiplied by FP32
- * activations using AVX-512 FMA. Avoids the quantization + 3-array packed
- * format overhead that hurts prefetcher locality for 8-bit formats.
  *
  * Entry points:
- *   - gemv_native_vnni()           — unified dispatch (selects Q8_0 native or packed VNNI)
- *   - q8_0_native_gemv_fused()     — Q8_0 fused multi-projection (single OMP region)
+ *   - gemv_native_vnni()           — quantize FP32→Q8_1 + dispatch to packed VNNI GEMV
  *
  * ## Packed VNNI Architecture
  *
@@ -676,14 +665,15 @@ namespace llaminar2::cpu::native_vnni
     inline void gemv_native_vnni(
         const CPUNativeVNNIPackedWeights &packed,
         const float *A_fp32,
-        float *C,
-        const Q8_0Block *q8_0_blocks = nullptr,
-        int q8_0_bpr = 0)
+        float *C)
     {
 #if defined(__AVX512F__)
-        if (q8_0_blocks)
+        // Q8_0 fast path: workspace contains raw Q8_0 blocks (no interleave).
+        // Use dedicated FP32-dequant GEMV which avoids the Q8_1 quantize step.
+        if (packed.codebook_id == 19 && packed.workspace_data_)
         {
-            q8_0_native_gemv(q8_0_blocks, A_fp32, C, packed.N, packed.K, q8_0_bpr);
+            auto *blocks = reinterpret_cast<const Q8_0Block *>(packed.workspace_data_);
+            q8_0_native_gemv(blocks, A_fp32, C, packed.N, packed.K, packed.blocks_per_row);
             return;
         }
 #endif
@@ -1529,87 +1519,111 @@ namespace llaminar2::cpu::native_vnni
     }
 
     // =========================================================================
-    // Fused multi-projection Q8_0 GEMV (single OMP region)
+    // Fused multi-projection GEMV (single OMP region, all formats)
     // =========================================================================
 
     /**
      * @brief Descriptor for one projection in a fused GEMV call.
+     *
+     * Supports both Q8_0-raw (row-parallel on native blocks) and interleaved
+     * (chunk-parallel on VNNI-packed data) weight layouts.
      */
-    struct FusedProjectionDesc
+    struct FusedGemvDesc
     {
-        const Q8_0Block *weights; // weight blocks [N × bpr]
-        float *output;            // output vector [N]
-        const float *bias;        // optional bias [N], nullptr if none
-        int N;                    // number of output rows
-        int bpr;                  // blocks per row
+        const CPUNativeVNNIPackedWeights *packed; // interleaved packed weights (always set)
+        const Q8_0Block *q8_0_raw;                // non-null for Q8_0 zero-copy (row-parallel)
+        float *output;                            // output vector [N]
+        const float *bias;                        // optional bias [N], nullptr if none
+        int N;                                    // number of output rows
+        int bpr;                                  // blocks per row (for Q8_0 raw path)
     };
 
     /**
-     * @brief Fused multi-projection Q8_0 GEMV in a single OMP region.
+     * @brief Fused multi-projection GEMV in a single OMP region.
      *
      * Processes all projections without re-entering the OMP parallel region.
      * Uses `nowait` between projections so threads finishing one projection
-     * can immediately start the next.
+     * can immediately start the next — critical for work balancing when
+     * projection sizes differ (e.g., Q=3584, K=512, V=512 with 56 threads).
      *
-     * For QKV (3 projections): eliminates 2 OMP fork/join barriers per layer.
-     * For GateUp (2 projections): eliminates 1 OMP fork/join barrier per layer.
+     * Supports mixed formats: Q8_0 deferred (row-parallel on raw blocks) and
+     * any interleaved format (chunk-parallel on VNNI-packed data).
+     *
+     * @param A_q8              Pre-quantized Q8_1 activations [K_blocks]
+     * @param descs             Array of projection descriptors
+     * @param num_descs         Number of projections
      */
-    inline void q8_0_native_gemv_fused(
-        const float *__restrict A,
-        const FusedProjectionDesc *projections,
-        int num_projections)
+    inline void gemv_native_vnni_fused_preq(
+        const Q8_1Block *__restrict A_q8,
+        const FusedGemvDesc *descs,
+        int num_descs)
     {
-        // VNNI path: pre-quantize once, reuse for all projections
-        const int bpr = projections[0].bpr; // all projections share same K
-        static thread_local std::vector<Q8_1Block> a_q8_tls;
-        if (static_cast<int>(a_q8_tls.size()) < bpr)
-            a_q8_tls.resize(bpr);
-        Q8_1Block *A_q8 = a_q8_tls.data();
-
-        // Quantize FP32 activation → Q8_1 (single-threaded, amortized over all projections)
+        auto do_fused = [&]()
         {
-            int kb = 0;
-            for (; kb + 1 < bpr; kb += 2)
-                simd::quantize_two_blocks_avx512(A + kb * 32, A_q8[kb], A_q8[kb + 1]);
-            for (; kb < bpr; ++kb)
-                simd::quantize_single_block(A + kb * 32, A_q8[kb], 32);
-        }
-
-        auto do_gemv = [&]()
-        {
-            for (int p = 0; p < num_projections; ++p)
+            for (int p = 0; p < num_descs; ++p)
             {
-                const auto &proj = projections[p];
-                const int proj_bpr = proj.bpr;
-                const bool last = (p == num_projections - 1);
+                const auto &d = descs[p];
 
-                if (!last)
+                if (d.q8_0_raw)
                 {
+                    // Q8_0 raw blocks: row-parallel (one row per thread)
+                    const int proj_N = d.N;
+                    const int proj_bpr = d.bpr;
+                    const Q8_0Block *__restrict blocks = d.q8_0_raw;
+
 #pragma omp for schedule(static) nowait
-                    for (int n = 0; n < proj.N; ++n)
+                    for (int n = 0; n < proj_N; ++n)
                     {
-                        const Q8_0Block *__restrict row = proj.weights + static_cast<size_t>(n) * proj_bpr;
+                        const Q8_0Block *__restrict row = blocks + static_cast<size_t>(n) * proj_bpr;
                         float val = gemv_dot_row_q8_0_vnni(row, A_q8, proj_bpr);
-                        if (proj.bias)
-                            val += proj.bias[n];
-                        proj.output[n] = val;
+                        if (d.bias)
+                            val += d.bias[n];
+                        d.output[n] = val;
                     }
                 }
                 else
                 {
-#pragma omp for schedule(static)
-                    for (int n = 0; n < proj.N; ++n)
+                    // Interleaved: chunk-parallel (64 columns per chunk)
+                    const auto &packed = *d.packed;
+                    const int N = packed.N;
+                    const int N_chunks = (N + 63) / 64;
+                    const int K_blocks = packed.blocks_per_row;
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                    const __m512i decode_lut = packed.is_nibble_lut
+                                                   ? build_decode_lut(packed.codebook_id)
+                                                   : _mm512_setzero_si512();
+
+#pragma omp for schedule(static) nowait
+                    for (int chunk = 0; chunk < N_chunks; ++chunk)
                     {
-                        const Q8_0Block *__restrict row = proj.weights + static_cast<size_t>(n) * proj_bpr;
-                        float val = gemv_dot_row_q8_0_vnni(row, A_q8, proj_bpr);
-                        if (proj.bias)
-                            val += proj.bias[n];
-                        proj.output[n] = val;
+                        gemv_native_vnni_avx512_block(packed, A_q8, d.output,
+                                                      chunk, 1, K_blocks, N, decode_lut);
+                    }
+#else
+#pragma omp for schedule(static) nowait
+                    for (int chunk = 0; chunk < N_chunks; ++chunk)
+                    {
+                        int n_start = chunk * 64;
+                        int n_cols = std::min(64, N - n_start);
+                        gemv_native_vnni_scalar(packed, A_q8, d.output + n_start, n_cols, K_blocks);
+                    }
+#endif
+                    // Bias applied in separate pass (output may be partial
+                    // from tail chunk writing into aligned temp buffer)
+                    if (d.bias)
+                    {
+#pragma omp for schedule(static) nowait
+                        for (int i = 0; i < d.N; ++i)
+                            d.output[i] += d.bias[i];
                     }
                 }
             }
+
+            // Final barrier: ensure all projections are complete before
+            // the caller reads outputs.
+#pragma omp barrier
         };
-        OMP_WORKSHARE_REGION(do_gemv);
+        OMP_WORKSHARE_REGION(do_fused);
     }
 
 #endif // __AVX512F__

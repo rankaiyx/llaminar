@@ -209,7 +209,7 @@ namespace llaminar2
             const Q16BlockSize block_size = optimal_q16_block_size(params_.head_dim);
             LOG_DEBUG("[RoPEStage] Using HybridQ16 K precision fix mode: Q8_1→Q16_1 (fixed), Q16_1→Q16_1 (dynamic)");
             LOG_DEBUG("[RoPEStage] block_size=" << static_cast<int>(block_size)
-                                                << " kv_cache_scale=" << params_.kv_cache_scale);
+                                                << " kv_cache_scale_k=" << params_.kv_cache_scale_k);
 
             // Debug: Check K_in state from GEMM (TRACE level only - fp32_data() is expensive)
             if (Logger::getInstance().shouldLog(LogLevel::TRACE))
@@ -263,7 +263,7 @@ namespace llaminar2
                 n_kv_heads,
                 params_.head_dim,
                 params_.theta_base,
-                params_.kv_cache_scale, // Fixed scale for Q output
+                params_.kv_cache_scale_k, // Fixed scale for Q output
                 params_.mpi_ctx,
                 params_.device_id.toKernelDeviceIndex());
 
@@ -286,13 +286,13 @@ namespace llaminar2
         }
 
         // HybridQ16 mode (standard): use apply_q8_1_to_q16_fixed_scale() for Q8_1 → Q16_1 with fixed scale
-        // This ensures Q and K have the same scale as V (kv_cache_scale / 32767), enabling integer attention
+        // This ensures Q and K have the same scale as V (kv_cache_scale_k / 32767), enabling integer attention
         if (hybrid_q16_mode)
         {
             // Use optimal block size matching the attention kernel (1 block per head for head_dim=64/128)
             const Q16BlockSize block_size = optimal_q16_block_size(params_.head_dim);
             LOG_DEBUG("[RoPEStage] Using HybridQ16 mode: Q8_1 → Q16_1 with fixed scale "
-                      << params_.kv_cache_scale
+                      << params_.kv_cache_scale_k
                       << ", block_size=" << static_cast<int>(block_size));
 
             // Debug: check INPUT Q8_1 data
@@ -317,7 +317,7 @@ namespace llaminar2
                 n_kv_heads,
                 params_.head_dim,
                 params_.theta_base,
-                params_.kv_cache_scale, // Fixed scale for integer attention
+                params_.kv_cache_scale_k, // Fixed scale for integer attention
                 params_.mpi_ctx,
                 params_.device_id.toKernelDeviceIndex());
 

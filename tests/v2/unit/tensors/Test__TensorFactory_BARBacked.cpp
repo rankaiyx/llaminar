@@ -30,7 +30,7 @@ namespace llaminar2
         {
         protected:
             std::unique_ptr<TensorFactory> factory_;
-            std::unique_ptr<MPIContext> mpi_ctx_;
+            std::unique_ptr<IMPIContext> mpi_ctx_;
 
             void SetUp() override
             {

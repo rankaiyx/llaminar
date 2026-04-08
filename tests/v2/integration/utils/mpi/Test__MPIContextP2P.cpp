@@ -1,6 +1,6 @@
 /**
  * @file Test__MPIContextP2P.cpp
- * @brief Integration tests for MPIContext point-to-point operations
+ * @brief Integration tests for IMPIContext point-to-point operations
  *
  * Tests MPI send/recv, isend/irecv, wait, waitAll, probe, and iprobe
  * operations required for pipeline parallelism.
@@ -42,7 +42,7 @@ protected:
 
     int rank_;
     int world_size_;
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
 };
 
 // ============================================================================

@@ -43,6 +43,20 @@ namespace llaminar2
     enum class WeightDistributionStrategy;
 
     /**
+     * @brief Transforms a weight tensor before GEMM packing.
+     *
+     * Applied once per GEMM weight during packGemmWeights(). The callback
+     * receives the weight name and original tensor, and returns either:
+     *   - A new tensor (e.g., rotated copy) to replace the original
+     *   - The same tensor if no preprocessing is needed
+     *
+     * The returned tensor becomes the cache entry, so subsequent
+     * getWeightForDevice() calls see the preprocessed version.
+     */
+    using WeightPreprocessor = std::function<std::shared_ptr<TensorBase>(
+        const std::string &name, std::shared_ptr<TensorBase> tensor)>;
+
+    /**
      * @brief Interface for managing model weights with distribution strategies
      *
      * Abstracts weight management to enable:
@@ -245,6 +259,18 @@ namespace llaminar2
          * @param config Tensor parallel config from ILocalTPContext
          */
         virtual void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config) = 0;
+
+        /**
+         * @brief Register a preprocessor applied to each GEMM weight before packing.
+         *
+         * Must be called before packGemmWeights(). The preprocessor runs once
+         * per weight inside the packing pipeline: preprocess → pack → reclaim.
+         * The preprocessed tensor replaces the cache entry so that subsequent
+         * getWeightForDevice() calls return it.
+         *
+         * @param preprocessor Callable that transforms (name, tensor) → tensor
+         */
+        virtual void setWeightPreprocessor(WeightPreprocessor preprocessor) = 0;
 
         // =========================================================================
         // Multi-Device Pre-loading

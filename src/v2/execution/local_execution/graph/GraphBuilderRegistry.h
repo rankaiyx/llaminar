@@ -12,7 +12,7 @@
  *   auto builder = GraphBuilderRegistry::create("qwen2", config, mpi_ctx);
  *
  * Registration (in model TU):
- *   REGISTER_GRAPH_BUILDER("qwen2", [](const GraphConfig& cfg, std::shared_ptr<MPIContext> mpi) {
+ *   REGISTER_GRAPH_BUILDER("qwen2", [](const GraphConfig& cfg, std::shared_ptr<IMPIContext> mpi) {
  *       return std::make_shared<Qwen2Graph>(cfg, std::move(mpi));
  *   });
  */
@@ -31,7 +31,7 @@ namespace llaminar2
 
     // Forward declarations — NO model-specific includes
     class IGraphBuilder;
-    class MPIContext;
+    class IMPIContext;
     struct GraphConfig;
 
     /**
@@ -44,10 +44,10 @@ namespace llaminar2
     class GraphBuilderRegistry
     {
     public:
-        /// Factory function signature: (GraphConfig, MPIContext) → IGraphBuilder
+        /// Factory function signature: (GraphConfig, IMPIContext) → IGraphBuilder
         using FactoryFn = std::function<std::shared_ptr<IGraphBuilder>(
             const GraphConfig &config,
-            std::shared_ptr<MPIContext> mpi_ctx)>;
+            std::shared_ptr<IMPIContext> mpi_ctx)>;
 
         /**
          * @brief Register a factory for an architecture
@@ -72,7 +72,7 @@ namespace llaminar2
         static std::shared_ptr<IGraphBuilder> create(
             const std::string &architecture,
             const GraphConfig &config,
-            std::shared_ptr<MPIContext> mpi_ctx);
+            std::shared_ptr<IMPIContext> mpi_ctx);
 
         /**
          * @brief Check if an architecture is registered

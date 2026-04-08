@@ -402,7 +402,7 @@ namespace llaminar2
                 allreduce.outputs.push_back(resolved.outputs[0]); // In-place
             }
 
-            // MPI parameters - store typed MPIContext pointer
+            // MPI parameters - store typed IMPIContext pointer
             allreduce.opaque_params["mpi_ctx"] = const_cast<void *>(static_cast<const void *>(runtime.mpi_ctx));
 
             // Calculate allreduce count
@@ -451,7 +451,7 @@ namespace llaminar2
             allgather.int_params["world_size"] = runtime.world_size;
             allgather.int_params["seq_len"] = runtime.batch_size * runtime.seq_len;
 
-            // MPI parameters - store typed MPIContext pointer
+            // MPI parameters - store typed IMPIContext pointer
             allgather.opaque_params["mpi_ctx"] = const_cast<void *>(static_cast<const void *>(runtime.mpi_ctx));
 
             LOG_TRACE("[GraphResolver] Inserting allgather after " << resolved.name);
@@ -590,7 +590,8 @@ namespace llaminar2
             resolved.int_params["num_tokens"] = runtime.batch_size * runtime.seq_len;
             // Phase 5.4: VNNI-safe Q16 KV cache parameters
             resolved.int_params["head_dim"] = runtime.head_dim;
-            resolved.float_params["kv_cache_scale"] = runtime.kv_cache_scale;
+            resolved.float_params["kv_cache_scale_k"] = runtime.kv_cache_scale_k;
+            resolved.float_params["kv_cache_scale_v"] = runtime.kv_cache_scale_v;
             break;
 
         case StageType::ResidualAdd:
@@ -712,7 +713,8 @@ namespace llaminar2
             params.seq_len = seq_len / batch_size;
             // Phase 5.4: VNNI-safe Q16 KV cache parameters
             params.head_dim = stage.int_params.count("head_dim") ? stage.int_params.at("head_dim") : 128;
-            params.kv_cache_scale = stage.float_params.count("kv_cache_scale") ? stage.float_params.at("kv_cache_scale") : 64.0f;
+            params.kv_cache_scale_k = stage.float_params.count("kv_cache_scale_k") ? stage.float_params.at("kv_cache_scale_k") : 256.0f;
+            params.kv_cache_scale_v = stage.float_params.count("kv_cache_scale_v") ? stage.float_params.at("kv_cache_scale_v") : 32.0f;
             params.device_id = stage.device;
             return ComputeStageFactory::createKVCacheAppend(params);
         }
@@ -815,7 +817,7 @@ namespace llaminar2
             params.buffer = stage.inputs.size() > 0 ? stage.inputs[0] : nullptr;
             if (stage.opaque_params.count("mpi_ctx"))
             {
-                params.mpi_ctx = static_cast<const MPIContext *>(stage.opaque_params.at("mpi_ctx"));
+                params.mpi_ctx = static_cast<const IMPIContext *>(stage.opaque_params.at("mpi_ctx"));
             }
             params.count = stage.int_params.count("count") ? static_cast<size_t>(stage.int_params.at("count")) : 0;
             return ComputeStageFactory::createAllreduce(params);
@@ -828,7 +830,7 @@ namespace llaminar2
             params.full_output = stage.outputs.size() > 0 ? stage.outputs[0] : nullptr;
             if (stage.opaque_params.count("mpi_ctx"))
             {
-                params.mpi_ctx = static_cast<const MPIContext *>(stage.opaque_params.at("mpi_ctx"));
+                params.mpi_ctx = static_cast<const IMPIContext *>(stage.opaque_params.at("mpi_ctx"));
             }
             params.actual_seq_len = stage.int_params.count("actual_seq_len")
                                         ? static_cast<size_t>(stage.int_params.at("actual_seq_len"))

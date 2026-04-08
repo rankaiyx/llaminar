@@ -20,7 +20,7 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class MPIContext;
+    class IMPIContext;
 
     /**
      * @brief Stage that receives activations from the previous pipeline stage (rank)

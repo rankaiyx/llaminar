@@ -41,6 +41,7 @@ namespace llaminar2
         int rank() const override { return rank_; }
         int world_size() const override { return world_size_; }
         bool is_root() const override { return rank_ == 0; }
+        MPI_Comm communicator() const override { return MPI_COMM_NULL; }
 
         void barrier() const override
         {
@@ -79,6 +80,11 @@ namespace llaminar2
         }
 
         void broadcast(float * /*data*/, size_t /*count*/, int /*root*/) const override
+        {
+            // No-op in mock
+        }
+
+        void broadcast_int32(int32_t * /*data*/, size_t /*count*/, int /*root*/) const override
         {
             // No-op in mock
         }

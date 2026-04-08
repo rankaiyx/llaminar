@@ -41,7 +41,7 @@ class GraphBatchedKVCacheTest : public ::testing::Test
 {
 protected:
     std::shared_ptr<ModelContext> model_ctx_;
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
     std::string model_path_;
     int rank_;
     int world_size_;

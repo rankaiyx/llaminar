@@ -37,7 +37,7 @@ protected:
         mpi_ctx_ = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     }
 
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
 
     // Helper: compute relative L2 error
     float compute_relative_l2_error(const float *ref, const float *test, size_t count)

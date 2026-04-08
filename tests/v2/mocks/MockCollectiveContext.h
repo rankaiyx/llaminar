@@ -634,7 +634,7 @@ namespace llaminar2::test
             return nullptr; // Mock doesn't have a real router
         }
 
-        MPIContext *mpiContext() override
+        IMPIContext *mpiContext() override
         {
             return nullptr; // Mock doesn't have a real MPI context
         }

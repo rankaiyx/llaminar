@@ -175,7 +175,7 @@ namespace llaminar2
     }
 
     WeightManager::WeightManager(IModelLoader &loader,
-                                 std::shared_ptr<MPIContext> mpi_ctx,
+                                 std::shared_ptr<IMPIContext> mpi_ctx,
                                  std::shared_ptr<WeightPlacementMap> placement_map,
                                  WeightDistributionStrategy strategy,
                                  WeightPrecision weight_precision)
@@ -2018,6 +2018,38 @@ namespace llaminar2
         {
             LOG_DEBUG("[WeightManager] No GEMM weights to pack");
             return true;
+        }
+
+        // Apply weight preprocessor (e.g., activation rotation) before packing.
+        // This runs once per weight and replaces the cache entry, so that
+        // subsequent getWeightForDevice() returns the preprocessed version.
+        if (weight_preprocessor_)
+        {
+            const auto preproc_start = Clock::now();
+            size_t preprocessed_count = 0;
+
+            for (auto &[name, tensor] : gemm_weights)
+            {
+                auto result = weight_preprocessor_(name, tensor);
+                if (result && result != tensor)
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    cache_[name] = result;
+                    tensor = result;
+                    ++preprocessed_count;
+                }
+            }
+
+            const auto preproc_end = Clock::now();
+            const auto preproc_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        preproc_end - preproc_start)
+                                        .count();
+
+            if (preprocessed_count > 0)
+            {
+                LOG_INFO("[WeightManager] Preprocessed " << preprocessed_count << "/" << gemm_weights.size()
+                                                         << " weights in " << preproc_ms << " ms");
+            }
         }
 
         LOG_DEBUG("[WeightManager] Packing " << gemm_weights.size() << " GEMM weights for "

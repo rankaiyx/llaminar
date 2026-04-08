@@ -454,13 +454,13 @@ TEST_F(Test__StageParamsBase, AllParamsHaveDeviceIdField)
 TEST_F(Test__StageParamsBase, AllParamsHaveMpiCtxField)
 {
     // Test that mpi_ctx field exists and is of correct type
-    static_assert(std::is_same_v<decltype(GEMMStage::Params::mpi_ctx), const MPIContext *>);
-    static_assert(std::is_same_v<decltype(RMSNormStage::Params::mpi_ctx), const MPIContext *>);
-    static_assert(std::is_same_v<decltype(RoPEStage::Params::mpi_ctx), const MPIContext *>);
-    static_assert(std::is_same_v<decltype(ResidualAddStage::Params::mpi_ctx), const MPIContext *>);
-    static_assert(std::is_same_v<decltype(AttentionComputeStage::Params::mpi_ctx), const MPIContext *>);
-    static_assert(std::is_same_v<decltype(AllreduceStage::Params::mpi_ctx), const MPIContext *>);
-    static_assert(std::is_same_v<decltype(AllGatherStage::Params::mpi_ctx), const MPIContext *>);
+    static_assert(std::is_same_v<decltype(GEMMStage::Params::mpi_ctx), const IMPIContext *>);
+    static_assert(std::is_same_v<decltype(RMSNormStage::Params::mpi_ctx), const IMPIContext *>);
+    static_assert(std::is_same_v<decltype(RoPEStage::Params::mpi_ctx), const IMPIContext *>);
+    static_assert(std::is_same_v<decltype(ResidualAddStage::Params::mpi_ctx), const IMPIContext *>);
+    static_assert(std::is_same_v<decltype(AttentionComputeStage::Params::mpi_ctx), const IMPIContext *>);
+    static_assert(std::is_same_v<decltype(AllreduceStage::Params::mpi_ctx), const IMPIContext *>);
+    static_assert(std::is_same_v<decltype(AllGatherStage::Params::mpi_ctx), const IMPIContext *>);
 
     SUCCEED();
 }

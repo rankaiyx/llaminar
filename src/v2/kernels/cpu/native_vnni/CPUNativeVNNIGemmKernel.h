@@ -69,50 +69,54 @@ namespace llaminar2::cpu::native_vnni
             }
             valid_ = true;
 
-            // For Q8_0 (codebook 19): store native block pointer for M=1 GEMV bypass.
-            // This avoids the 3-array packed format (weight+scales+comps) which creates
-            // too many memory streams for the hardware prefetcher during decode.
-            // IMPORTANT: When rotation is active, the native Q8_0 blocks are NOT rotated
-            // (rotation is fused into the packed VNNI layout), so the bypass must be
-            // disabled to avoid incorrect results.
-            if (packed_.codebook_id == 19 && !activation_rotation_)
-            {
-                auto *q8 = dynamic_cast<const Q8_0Tensor *>(weights);
-                if (q8)
-                {
-                    int actual_start = (row_start >= 0) ? row_start : 0;
-                    const Q8_0Block *src_blocks = q8->typed_data() +
-                                                  static_cast<size_t>(actual_start) * packed_.blocks_per_row;
-                    native_q8_0_bpr_ = packed_.blocks_per_row;
+            // Store the native block size for this format
+            native_block_size_ = native_block_bytes_for_codebook(packed_.codebook_id);
 
-                    // For mmap-backed tensors (is_view), the data survives
-                    // release_raw_data() — safe to use a direct pointer.
-                    // For owned-data tensors (column-sliced TP weights), the
-                    // underlying vector is freed by WeightPreloader after packing.
-                    // We must copy the blocks to avoid a dangling pointer.
-                    if (q8->is_raw_data_released() || !q8->is_view())
-                    {
-                        const size_t n_blocks = static_cast<size_t>(packed_.N) * native_q8_0_bpr_;
-                        native_q8_0_owned_.assign(
-                            reinterpret_cast<const uint8_t *>(src_blocks),
-                            reinterpret_cast<const uint8_t *>(src_blocks + n_blocks));
-                        native_q8_0_blocks_ = reinterpret_cast<const Q8_0Block *>(native_q8_0_owned_.data());
-                    }
-                    else
-                    {
-                        native_q8_0_blocks_ = src_blocks;
-                    }
-                }
+            // ---------------------------------------------------------------
+            // Store native blocks for deferred VNNI packing (all formats).
+            //
+            // This enables memory-efficient operation: instead of keeping the
+            // VNNI-interleaved data permanently (~1.1 B/elem overhead), we store
+            // only the native quantized blocks (~0.5-1.06 B/elem) and repack
+            // into a shared workspace on demand for each GEMM/GEMV call.
+            //
+            // Superblock formats (Q6_K, Q3_K, etc.) and rotation paths retain
+            // permanent interleaved data since repacking from native blocks is
+            // not supported (superblocks need full context, rotation fuses into packing).
+            // ---------------------------------------------------------------
+            const bool is_superblock = packed_.is_superblock;
+            const bool can_defer = !is_superblock && !activation_rotation_ && native_block_size_ > 0;
+
+            if (can_defer)
+            {
+                // Store native blocks from the weight tensor
+                storeNativeBlocks(weights, row_start, row_end);
             }
 
-            LOG_DEBUG("[CPUNativeVNNIGemmKernel] Packed "
-                      << packed_.N << "×" << packed_.K
-                      << " weights (codebook=" << (int)packed_.codebook_id
-                      << ", payload=" << packed_.payload_bytes << " B/block"
-                      << ", asymmetric=" << packed_.is_asymmetric
-                      << ", native_q8_0=" << (native_q8_0_blocks_ != nullptr)
-                      << ", owned_copy=" << (!native_q8_0_owned_.empty())
-                      << ", rotation=" << (activation_rotation_ != nullptr) << ")");
+            // Release the permanent interleaved data if deferred packing is active.
+            // The workspace will be populated on demand before each GEMM/GEMV call.
+            if (can_defer && native_blocks_ptr_ != nullptr)
+            {
+                packed_.releaseInterleavedData();
+                deferred_packing_ = true;
+
+                LOG_DEBUG("[CPUNativeVNNIGemmKernel] Deferred packing: "
+                          << packed_.N << "×" << packed_.K
+                          << " (codebook=" << (int)packed_.codebook_id
+                          << ", block_size=" << native_block_size_
+                          << ", owned=" << (!native_blocks_owned_.empty() ? "yes" : "mmap")
+                          << ", saved ~" << (interleavedWorkspaceSize(packed_) / (1024 * 1024)) << " MB)");
+            }
+            else
+            {
+                LOG_DEBUG("[CPUNativeVNNIGemmKernel] Packed "
+                          << packed_.N << "×" << packed_.K
+                          << " weights (codebook=" << (int)packed_.codebook_id
+                          << ", payload=" << packed_.payload_bytes << " B/block"
+                          << ", asymmetric=" << packed_.is_asymmetric
+                          << ", rotation=" << (activation_rotation_ != nullptr)
+                          << ", permanent_interleaved=true)");
+            }
         }
 
         /**
@@ -149,7 +153,7 @@ namespace llaminar2::cpu::native_vnni
             bool transpose_B = true,
             float alpha = 1.0f, float beta = 0.0f,
             const TensorBase *bias = nullptr,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1,
             DeviceWorkspaceManager *workspace = nullptr,
             int activation_row_offset = 0) override
@@ -182,20 +186,27 @@ namespace llaminar2::cpu::native_vnni
                     C_data[i] *= beta;
             }
 
+            // For deferred packing: repack native blocks into shared workspace
+            if (deferred_packing_)
+            {
+                if (m == 1 && packed_.codebook_id == 19)
+                    ensureWorkspaceRaw(); // Q8_0 M=1: just memcpy raw blocks (no interleave)
+                else
+                    ensureWorkspace(); // All other cases: full VNNI interleave
+            }
+
             if (m == 1)
             {
                 // Optimized GEMV path
                 if (beta == 0.0f && alpha == 1.0f)
                 {
-                    gemv_native_vnni(packed_, A_data, C_data,
-                                     native_q8_0_blocks_, native_q8_0_bpr_);
+                    gemv_native_vnni(packed_, A_data, C_data);
                 }
                 else
                 {
                     // General case: C = alpha * A@B + beta * C
                     std::vector<float> temp(n);
-                    gemv_native_vnni(packed_, A_data, temp.data(),
-                                     native_q8_0_blocks_, native_q8_0_bpr_);
+                    gemv_native_vnni(packed_, A_data, temp.data());
                     for (int j = 0; j < n; ++j)
                         C_data[j] += alpha * temp[j];
                 }
@@ -218,6 +229,10 @@ namespace llaminar2::cpu::native_vnni
                     }
                 }
             }
+
+            // Release workspace after compute
+            if (deferred_packing_)
+                packed_.clearWorkspace();
 
             // Apply bias epilogue: C[m, j] += bias[j]
             if (bias)
@@ -282,11 +297,21 @@ namespace llaminar2::cpu::native_vnni
             // Apply activation rotation for kurtosis reduction (if configured)
             const float *gemm_input = maybe_rotate_activation(swiglu_scratch_.data(), m, k);
 
+            // Prepare workspace for deferred packing if needed
+            if (deferred_packing_)
+            {
+                if (m == 1 && packed_.codebook_id == 19)
+                    ensureWorkspaceRaw();
+                else
+                    ensureWorkspace();
+            }
+
             // M=1 fast path: call GEMV directly with raw pointer, skip TensorBase wrapper
             if (m == 1 && alpha == 1.0f && beta == 0.0f)
             {
-                gemv_native_vnni(packed_, gemm_input, output_fp32,
-                                 native_q8_0_blocks_, native_q8_0_bpr_);
+                gemv_native_vnni(packed_, gemm_input, output_fp32);
+                if (deferred_packing_)
+                    packed_.clearWorkspace();
                 return true;
             }
 
@@ -310,6 +335,8 @@ namespace llaminar2::cpu::native_vnni
                         output_fp32[row * n + j] += alpha * temp[j];
                 }
             }
+            if (deferred_packing_)
+                packed_.clearWorkspace();
             return true;
         }
 
@@ -326,7 +353,7 @@ namespace llaminar2::cpu::native_vnni
             const TensorBase *input,
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             DeviceWorkspaceManager *workspace = nullptr) override
         {
             if (!valid_)
@@ -337,75 +364,142 @@ namespace llaminar2::cpu::native_vnni
             // Apply activation rotation for kurtosis reduction (if configured)
             input_data = maybe_rotate_activation(input_data, m, k);
 
-            // Check if all projections support native Q8_0 GEMV (M=1 only).
-            [[maybe_unused]] bool all_native_q8_0 = false;
-#if defined(__AVX512F__)
+            const int K_blocks = (k + 31) / 32;
+
+            // -----------------------------------------------------------
+            // Fused GEMV path (M == 1): all projections in a single OMP
+            // parallel region.  Pre-quantize A→Q8_1 once, prepare all
+            // workspaces, then run the GEMV calls inside one team — each
+            // inner gemv_native_vnni_preq detects omp_in_parallel() and
+            // emits only #pragma omp for (no fork/join per projection).
+            // -----------------------------------------------------------
             if (m == 1)
             {
-                all_native_q8_0 = true;
+                // Check that every projection is a VNNI kernel we can fuse.
+                bool all_vnni = true;
                 for (const auto &proj : projections)
                 {
+                    if (!proj.kernel || !proj.output)
+                        return false;
                     auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
-                    if (!vnni || !vnni->native_q8_0_blocks_)
+                    if (!vnni || !vnni->valid_)
                     {
-                        all_native_q8_0 = false;
+                        all_vnni = false;
                         break;
                     }
                 }
 
-                // Fused FP32-dequant path: process all projections in a
-                // single OMP region, eliminating fork/join overhead.
-                if (all_native_q8_0)
+                if (all_vnni)
                 {
                     const int num_proj = static_cast<int>(projections.size());
-                    FusedProjectionDesc descs[8]; // max 8 projections (QKV=3, GateUp=2)
+
+                    // 1. Prepare workspaces: size the shared buffer for ALL
+                    //    projections at once so their interleaved data coexists.
+                    //    Q8_0 deferred projections use zero-copy (no repack needed).
+                    auto &ws = sharedWorkspace();
+                    size_t total_ws = 0;
+                    for (const auto &proj : projections)
+                    {
+                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                        if (vnni->deferred_packing_ && vnni->packed_.codebook_id != 19)
+                            total_ws += interleavedWorkspaceSize(vnni->packed_);
+                    }
+                    if (total_ws > 0 && ws.size() < total_ws)
+                        ws.resize_uninitialized(total_ws);
+
+                    // Repack each deferred projection at its own offset.
+                    // Q8_0 deferred: zero-copy (point workspace at native blocks).
+                    size_t ws_offset = 0;
+                    for (const auto &proj : projections)
+                    {
+                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                        if (vnni->deferred_packing_)
+                        {
+                            if (vnni->packed_.codebook_id == 19)
+                            {
+                                vnni->packed_.setWorkspace(vnni->native_blocks_ptr_);
+                            }
+                            else
+                            {
+                                const size_t sz = interleavedWorkspaceSize(vnni->packed_);
+                                repackNativeBlocksToInterleaved(
+                                    vnni->native_blocks_ptr_, vnni->native_block_size_,
+                                    vnni->packed_, ws.data() + ws_offset);
+                                vnni->packed_.setWorkspace(ws.data() + ws_offset);
+                                ws_offset += sz;
+                            }
+                        }
+                    }
+
+                    // 2. Quantize activations → Q8_1 once (shared across all projections).
+                    static std::vector<Q8_1Block> shared_q8;
+                    if (static_cast<int>(shared_q8.size()) < K_blocks)
+                        shared_q8.resize(K_blocks);
+                    {
+                        int kb = 0;
+#if defined(__AVX512F__)
+                        const bool k_aligned = (k % 32 == 0);
+                        if (k_aligned)
+                        {
+                            for (; kb + 1 < K_blocks; kb += 2)
+                                simd::quantize_two_blocks_avx512(
+                                    input_data + kb * 32, shared_q8[kb], shared_q8[kb + 1]);
+                        }
+#endif
+                        for (; kb < K_blocks; ++kb)
+                        {
+                            int block_start = kb * 32;
+                            int block_len = std::min(32, k - block_start);
+                            simd::quantize_single_block(input_data + block_start, shared_q8[kb], block_len);
+                        }
+                    }
+
+                    // 3. Build fused descriptors and dispatch.
+                    //    Uses nowait between projections so threads finishing
+                    //    a small projection (K/V = 512 rows) immediately start
+                    //    the next without waiting at a barrier.
+                    FusedGemvDesc descs[8]; // max 8 projections (QKV=3, GateUp=2)
                     for (int p = 0; p < num_proj; ++p)
                     {
                         auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(projections[p].kernel);
-                        descs[p].weights = vnni->native_q8_0_blocks_;
+                        descs[p].packed = &vnni->packed_;
+                        descs[p].q8_0_raw = (vnni->deferred_packing_ && vnni->packed_.codebook_id == 19)
+                                                ? reinterpret_cast<const Q8_0Block *>(vnni->native_blocks_ptr_)
+                                                : nullptr;
                         descs[p].output = projections[p].output->mutable_data();
                         descs[p].bias = projections[p].bias ? projections[p].bias->data() : nullptr;
                         descs[p].N = projections[p].n;
-                        descs[p].bpr = vnni->native_q8_0_bpr_;
+                        descs[p].bpr = vnni->packed_.blocks_per_row;
                     }
 
-                    q8_0_native_gemv_fused(input_data, descs, num_proj);
+                    gemv_native_vnni_fused_preq(shared_q8.data(), descs, num_proj);
+
+                    // 4. Clear workspace pointers.
+                    for (const auto &proj : projections)
+                    {
+                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                        if (vnni->deferred_packing_)
+                            vnni->packed_.clearWorkspace();
+                    }
                     return true;
                 }
             }
-#endif
 
-            // Non-Q8_0 fallback: pre-quantize input to Q8_1
-            const int K_blocks = (k + 31) / 32;
+            // -----------------------------------------------------------
+            // GEMM path (M > 1) or mixed non-VNNI kernels: sequential.
+            // GEMM is compute-bound so OMP overhead is negligible.
+            // -----------------------------------------------------------
             std::vector<Q8_1Block> shared_q8;
-            if (!all_native_q8_0)
+            bool q8_quantized = false;
+            auto ensure_q8_quantized = [&]()
             {
+                if (q8_quantized)
+                    return;
+                q8_quantized = true;
                 shared_q8.resize(static_cast<size_t>(m) * K_blocks);
-                if (m == 1)
-                {
-                    const bool k_aligned = (k % 32 == 0);
-                    int kb = 0;
-#if defined(__AVX512F__)
-                    if (k_aligned)
-                    {
-                        for (; kb + 1 < K_blocks; kb += 2)
-                            simd::quantize_two_blocks_avx512(input_data + kb * 32, shared_q8[kb], shared_q8[kb + 1]);
-                    }
-#endif
-                    for (; kb < K_blocks; ++kb)
-                    {
-                        int block_start = kb * 32;
-                        int block_len = std::min(32, k - block_start);
-                        simd::quantize_single_block(input_data + block_start, shared_q8[kb], block_len);
-                    }
-                }
-                else
-                {
-                    quantize_activations_to_q8_1(input_data, shared_q8.data(), m, k, K_blocks);
-                }
-            }
+                quantize_activations_to_q8_1(input_data, shared_q8.data(), m, k, K_blocks);
+            };
 
-            // Run each projection + apply epilogues
             for (const auto &proj : projections)
             {
                 if (!proj.kernel || !proj.output)
@@ -416,11 +510,14 @@ namespace llaminar2::cpu::native_vnni
                 auto *vnni_kernel = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
                 if (vnni_kernel && vnni_kernel->valid_)
                 {
-                    const auto &proj_packed = vnni_kernel->packed_;
-                    if (m == 1)
-                        gemv_native_vnni_preq(proj_packed, shared_q8.data(), out_data);
-                    else
-                        gemm_native_vnni_preq(proj_packed, shared_q8.data(), out_data, m, proj.n);
+                    if (vnni_kernel->deferred_packing_)
+                        vnni_kernel->ensureWorkspace();
+
+                    ensure_q8_quantized();
+                    gemm_native_vnni_preq(vnni_kernel->packed_, shared_q8.data(), out_data, m, proj.n);
+
+                    if (vnni_kernel->deferred_packing_)
+                        vnni_kernel->packed_.clearWorkspace();
                 }
                 else
                 {
@@ -432,7 +529,6 @@ namespace llaminar2::cpu::native_vnni
                     continue;
                 }
 
-                // Apply bias epilogue
                 if (proj.bias)
                 {
                     const float *bias_data = proj.bias->data();
@@ -446,13 +542,24 @@ namespace llaminar2::cpu::native_vnni
         CPUNativeVNNIPackedWeights packed_;
         bool valid_ = false;
 
-        // Q8_0 native GEMV bypass: pointer into original tensor's contiguous blocks.
-        // Set for codebook_id==19 (Q8_0) to enable single-stream GEMV at M=1.
-        const Q8_0Block *native_q8_0_blocks_ = nullptr;
-        int native_q8_0_bpr_ = 0;
-        // Owned copy of Q8_0 blocks for non-mmap tensors (e.g. column-sliced TP weights)
-        // whose raw data is freed by WeightPreloader after GEMM packing.
-        std::vector<uint8_t> native_q8_0_owned_;
+        // -------------------------------------------------------------------
+        // Native block storage (all formats)
+        // -------------------------------------------------------------------
+
+        /// Owned copy of native quantized blocks for all weight formats.
+        /// Layout: [N × blocks_per_row × block_size] contiguous bytes.
+        /// Used for deferred VNNI repacking.
+        std::vector<uint8_t> native_blocks_owned_;
+
+        /// Pointer to native block data — either into native_blocks_owned_
+        /// (TP-sliced weights) or into the original mmap region (non-TP views).
+        const uint8_t *native_blocks_ptr_ = nullptr;
+
+        /// Size in bytes of a single native quantized block (34 for Q8_0, 18 for Q4_0, etc.)
+        size_t native_block_size_ = 0;
+
+        /// Whether deferred packing is active (interleaved data released, repack on demand)
+        bool deferred_packing_ = false;
 
         // Cached scratch buffer for fused SwiGLU+GEMM (avoids malloc per decode token)
         mutable std::vector<float> swiglu_scratch_;
@@ -464,6 +571,95 @@ namespace llaminar2::cpu::native_vnni
 
         // Cached scratch buffer for rotated activation (avoids malloc per call)
         mutable std::vector<float> rotation_scratch_;
+
+        // -------------------------------------------------------------------
+        // Native block storage helper
+        // -------------------------------------------------------------------
+
+        /// Store native blocks from the weight tensor.
+        /// Uses ITensor::raw_data() + size_bytes() for generic access to any
+        /// quantized format's raw block storage — no per-type dynamic_cast needed.
+        /// For mmap views: keeps a zero-copy pointer.
+        /// For owned data (TP-sliced): copies the raw block bytes.
+        void storeNativeBlocks(const TensorBase *weights, int row_start, int row_end)
+        {
+            if (row_start < 0)
+                row_start = 0;
+            if (row_end < 0)
+                row_end = weights->shape()[0];
+
+            const int total_rows = weights->shape()[0];
+            const int N = row_end - row_start;
+
+            // raw_data() + size_bytes() works for all quantized tensor types
+            const auto *base = reinterpret_cast<const uint8_t *>(weights->raw_data());
+            const size_t total_size = weights->size_bytes();
+
+            if (!base || total_size == 0 || total_rows == 0)
+            {
+                LOG_WARN("[CPUNativeVNNIGemmKernel] Cannot store native blocks: "
+                         << "raw_data()=" << (const void *)base
+                         << " size_bytes()=" << total_size
+                         << " — keeping permanent interleaved data");
+                native_blocks_ptr_ = nullptr;
+                return;
+            }
+
+            // Compute per-row byte size from total storage
+            const size_t bytes_per_row = total_size / total_rows;
+            const size_t src_offset = static_cast<size_t>(row_start) * bytes_per_row;
+            const size_t slice_bytes = static_cast<size_t>(N) * bytes_per_row;
+            const uint8_t *src = base + src_offset;
+
+            if (weights->is_raw_data_released() || !weights->is_view())
+            {
+                // Owned or soon-to-be-released data: must copy
+                native_blocks_owned_.assign(src, src + slice_bytes);
+                native_blocks_ptr_ = native_blocks_owned_.data();
+            }
+            else
+            {
+                // mmap view: zero-copy pointer, data survives release_raw_data()
+                native_blocks_ptr_ = src;
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Workspace management for deferred VNNI packing
+        // -------------------------------------------------------------------
+
+        /// Shared workspace buffer — reused across all GEMM/GEMV calls.
+        /// Thread-safe because inference layers execute sequentially (one GEMM at a time).
+        /// The static ensures the workspace survives across calls and avoids repeated
+        /// mmap/munmap for each GEMM invocation.
+        static AlignedVector<uint8_t> &sharedWorkspace()
+        {
+            static AlignedVector<uint8_t> ws;
+            return ws;
+        }
+
+        /// Ensure the workspace is populated with interleaved data from native blocks.
+        /// Sets packed_.workspace_data_ to point into the workspace buffer.
+        void ensureWorkspace() const
+        {
+            auto &ws = sharedWorkspace();
+            const size_t needed = interleavedWorkspaceSize(packed_);
+            if (ws.size() < needed)
+                ws.resize_uninitialized(needed);
+
+            repackNativeBlocksToInterleaved(
+                native_blocks_ptr_, native_block_size_, packed_, ws.data());
+
+            packed_.setWorkspace(ws.data());
+        }
+
+        /// Q8_0 fast path: point workspace directly at native blocks (zero-copy).
+        /// The GEMV dispatcher detects Q8_0 and redirects to q8_0_native_gemv()
+        /// which reads raw Q8_0Block layout directly.
+        void ensureWorkspaceRaw() const
+        {
+            packed_.setWorkspace(native_blocks_ptr_);
+        }
 
         /// Apply rotation to FP32 activation data, returns pointer to rotated data.
         /// If no rotation is configured, returns the original pointer unchanged.

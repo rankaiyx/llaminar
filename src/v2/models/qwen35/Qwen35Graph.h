@@ -57,12 +57,12 @@ namespace llaminar2
     public:
         /// Construct with full model context
         Qwen35Graph(std::shared_ptr<ModelContext> model_ctx,
-                    std::shared_ptr<MPIContext> mpi_ctx,
+                    std::shared_ptr<IMPIContext> mpi_ctx,
                     const GraphConfig &config);
 
         /// Construct for layer-level operations only
         Qwen35Graph(const GraphConfig &config,
-                    std::shared_ptr<MPIContext> mpi_ctx = nullptr);
+                    std::shared_ptr<IMPIContext> mpi_ctx = nullptr);
 
         ~Qwen35Graph() = default;
 

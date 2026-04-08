@@ -59,7 +59,7 @@ namespace llaminar2
     class ComputeGraph;
     class TensorBase;
     class ICPUKVCache;
-    class MPIContext;
+    class IMPIContext;
 
     /**
      * @brief Configuration for ModelExecutor

@@ -34,7 +34,7 @@ namespace llaminar2
     /**
      * @brief MPI-based collective backend for inter-node communication
      *
-     * Implements collective operations via MPI. Requires an active MPIContext
+     * Implements collective operations via MPI. Requires an active IMPIContext
      * for actual MPI operations. When mpi_ctx is nullptr, operations fail
      * gracefully (useful for unit testing capability queries).
      *
@@ -48,7 +48,7 @@ namespace llaminar2
          * @brief Construct MPI backend
          * @param mpi_ctx MPI context (may be nullptr for testing)
          */
-        explicit MPIBackend(std::shared_ptr<MPIContext> mpi_ctx);
+        explicit MPIBackend(std::shared_ptr<IMPIContext> mpi_ctx);
 
         ~MPIBackend() override;
 
@@ -89,7 +89,7 @@ namespace llaminar2
         /**
          * @brief Check if backend is available
          *
-         * MPI backend requires a valid MPIContext with world_size > 0.
+         * MPI backend requires a valid IMPIContext with world_size > 0.
          *
          * @return true if MPI context is available and valid
          */
@@ -103,7 +103,7 @@ namespace llaminar2
          * @brief Initialize backend for a device group
          *
          * Validates the group configuration and prepares for collective ops.
-         * Requires a valid MPIContext.
+         * Requires a valid IMPIContext.
          *
          * @param group Device group that will participate in collectives
          * @return true on success, false if no MPI context
@@ -229,7 +229,7 @@ namespace llaminar2
         std::string lastError() const override { return last_error_; }
 
     private:
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         DeviceGroup group_;
         bool initialized_ = false;
         mutable std::string last_error_;

@@ -47,7 +47,7 @@ protected:
 
     // Helper to create context with mock router (transfers ownership)
     std::unique_ptr<CollectiveContext> createContextWithMockRouter(
-        std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+        std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
         std::vector<DeviceId> devices = {DeviceId::cpu()})
     {
         return CollectiveContextFactory::createWithRouter(
@@ -57,13 +57,13 @@ protected:
     }
 
     // Helper to create mock MPI context
-    std::shared_ptr<MPIContext> createMockMPIContext(int rank, int world_size)
+    std::shared_ptr<IMPIContext> createMockMPIContext(int rank, int world_size)
     {
-        // Note: MPIContext requires MPI to be initialized, so for unit tests
+        // Note: IMPIContext requires MPI to be initialized, so for unit tests
         // we use nullptr and rely on world_size parameter in the context
         // In a real scenario, we'd need to either:
         // 1. Actually initialize MPI
-        // 2. Create a mock/fake MPIContext
+        // 2. Create a mock/fake IMPIContext
         // For now, return nullptr and test the paths that don't require real MPI
         return nullptr;
     }

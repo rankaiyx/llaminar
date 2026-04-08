@@ -75,10 +75,7 @@ namespace llaminar2
             valid = false;
         }
 
-        // Arena can be null here — it will be lazily created in executeForward()
-        // when managed_buffers_.current_hidden exists (e.g., after clear_cache()
-        // which resets arena_ and relies on lazy re-initialization).
-        if (!arena_ && !managed_buffers_.current_hidden)
+        if (!arena_)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] BufferArena not initialized "
                       "(call initializeInferenceStateFromArena() first)");
@@ -118,6 +115,7 @@ namespace llaminar2
           injected_topology_(std::move(deps.topology)),
           injected_collective_ctx_(std::move(deps.collective_ctx)),
           turboquant_ctx_(std::move(deps.turboquant_ctx)),
+          kv_rotation_(std::move(deps.kv_rotation)),
           pp_stage_config_(std::move(deps.pp_stage_config)),
           pipeline_config_(std::move(deps.pipeline_config)),
           weight_streamer_(std::move(deps.weight_streamer)),
@@ -171,7 +169,7 @@ namespace llaminar2
 
     DeviceGraphOrchestrator::DeviceGraphOrchestrator(
         std::shared_ptr<IGraphBuilder> graph_builder,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         const GraphCacheConfig &cache_config)
         : graph_builder_(std::move(graph_builder)),
           mpi_ctx_(std::move(mpi_ctx)),
@@ -379,6 +377,8 @@ namespace llaminar2
             size_t rows = desc.shape.size() >= 1 ? desc.shape[0] : 0;
             size_t cols = desc.shape.size() >= 2 ? desc.shape[1] : 0;
             const char *dtype = BufferArena::bufferTensorTypeToStr(desc.tensor_type);
+            LOG_DEBUG("[DeviceGraphOrchestrator] Registering layer buffer: '" << desc.name
+                                                                              << "' → " << bufferIdName(id) << " [" << rows << "x" << cols << "] dtype=" << dtype);
             if (!arena_->registerBuffer(id, rows, cols, dtype, desc.device))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to register layer buffer: " << desc.name);
@@ -432,12 +432,8 @@ namespace llaminar2
         // Wire arena to executor for contract-based coherence
         executor_.setArena(arena_.get());
 
-        const auto &stats = arena_->stats();
-        LOG_INFO("[DeviceGraphOrchestrator] Buffer initialization complete: "
-                 << "total=" << (stats.total_bytes / (1024.0 * 1024.0)) << " MB"
-                 << " (" << stats.total_buffers << " buffers"
-                 << ", BAR=" << stats.bar_backed_buffers
-                 << ", mapped=" << stats.mapped_buffers << ")");
+        // Log per-buffer allocation details
+        arena_->logAllocationSummary();
 
         // Log theoretical aliasing savings
         auto [original, optimized] = BufferAllocator::estimateMemorySavings(schema, resolver_config);
@@ -487,55 +483,11 @@ namespace llaminar2
         return &arena_->stats();
     }
 
-    void DeviceGraphOrchestrator::initializeArena()
-    {
-        // Idempotent: skip if already initialized (allows safe re-calls)
-        // In the new flow, arena_ is created in initializeBuffers().
-        // This method is kept for the PP path where initializeBuffers() isn't used
-        // and managed_buffers_ is populated externally.
-        if (arena_)
-            return;
-
-        arena_ = std::make_unique<BufferArena>();
-
-        auto &lb = managed_buffers_.layer_buffers;
-
-        // Register layer activation buffers as external (non-owning).
-        auto reg = [&](BufferId id, TensorBase *t)
-        {
-            if (t)
-                arena_->registerExternalBuffer(id, t);
-        };
-
-        reg(BufferId::RESIDUAL, lb.residual);
-        reg(BufferId::NORMALIZED, lb.normalized);
-        reg(BufferId::Q_PROJ, lb.Q);
-        reg(BufferId::K_PROJ, lb.K);
-        reg(BufferId::V_PROJ, lb.V);
-        reg(BufferId::ATTN_OUTPUT, lb.attn_output);
-        reg(BufferId::ATTN_PROJ, lb.attn_proj);
-        reg(BufferId::GATE_PROJ, lb.gate);
-        reg(BufferId::UP_PROJ, lb.up);
-        reg(BufferId::FFN_OUTPUT, lb.ffn_output);
-        reg(BufferId::ATTN_SCORES_WORKSPACE, lb.workspace_scores);
-        reg(BufferId::ATTN_CONTEXT_WORKSPACE, lb.workspace_context);
-
-        // Hybrid mode buffers
-        reg(BufferId::Q_ROPE, lb.Q_rope);
-        reg(BufferId::K_ROPE, lb.K_rope);
-        reg(BufferId::V_DEQUANT, lb.V_dequant);
-
-        // Model-level buffers
-        reg(BufferId::HIDDEN_STATE, managed_buffers_.current_hidden);
-        reg(BufferId::LOGITS, managed_buffers_.logits);
-        reg(BufferId::LOGITS_LOCAL, managed_buffers_.logits_local);
-
-        // Wire arena to executor for contract-based coherence
-        executor_.setArena(arena_.get());
-
-        LOG_INFO("[DeviceGraphOrchestrator] BufferArena initialized with "
-                 << arena_->registeredCount() << " external buffers");
-    }
+    // NOTE: Legacy initializeArena() was removed. The arena is now exclusively
+    // created and populated by the schema-driven initializeBuffers() path.
+    // The legacy path only registered ~15 standard buffers and missed
+    // model-specific ones (GDN_QKV, FA_GATE, etc.), causing crashes for
+    // architectures like Qwen3.5.
 
     // =========================================================================
     // Execution Methods
@@ -579,13 +531,6 @@ namespace llaminar2
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Invalid sequence length: " << input.seq_len);
             return false;
-        }
-
-        // Lazy arena initialization: ensures contract-based coherence works
-        // for both single-device and PP paths.
-        if (!arena_ && managed_buffers_.current_hidden)
-        {
-            initializeArena();
         }
 
         LOG_TRACE("[DeviceGraphOrchestrator] executeForward: batch_size=" << input.batch_size
@@ -1360,7 +1305,7 @@ namespace llaminar2
         // =====================================================================
         if (!tensor_factory_)
         {
-            std::shared_ptr<MPIContext> local_mpi_ctx = mpi_ctx_;
+            std::shared_ptr<IMPIContext> local_mpi_ctx = mpi_ctx_;
             if (!local_mpi_ctx)
             {
                 local_mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
@@ -1566,7 +1511,7 @@ namespace llaminar2
                            ? pp_stage_config_.value().layerCount()
                            : config.n_layers;
 
-        std::shared_ptr<MPIContext> local_mpi_ctx = mpi_ctx_;
+        std::shared_ptr<IMPIContext> local_mpi_ctx = mpi_ctx_;
         if (!local_mpi_ctx)
         {
             local_mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
@@ -1597,7 +1542,7 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::initializeKVCaches(
         int batch_size, int max_seq_len, int n_layers,
-        DeviceId device, const std::shared_ptr<MPIContext> &local_mpi_ctx)
+        DeviceId device, const std::shared_ptr<IMPIContext> &local_mpi_ctx)
     {
         const auto &config = graph_builder_->config();
         const int n_kv_heads = config.n_kv_heads;

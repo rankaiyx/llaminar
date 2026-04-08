@@ -64,12 +64,13 @@ namespace llaminar2
 {
 
     // Forward declarations
-    class MPIContext;
+    class IMPIContext;
     class IKVCache;
     class WeightManager;
     class WeightPlacementMap;
     class TensorParallelConfig;
     class TurboQuantContext;
+    class ActivationRotation;
 
     /**
      * @brief Configuration for graph caching behavior
@@ -389,6 +390,9 @@ namespace llaminar2
             /// TurboQuant context for TQ KV cache (owns rotation matrix lifetime)
             std::shared_ptr<TurboQuantContext> turboquant_ctx = nullptr;
 
+            /// KV rotation for Q16_1 kurtosis reduction
+            std::shared_ptr<ActivationRotation> kv_rotation = nullptr;
+
             /// Weight streamer for on-demand layer transfer (nullptr = disabled)
             std::shared_ptr<IWeightStreamer> weight_streamer = nullptr;
 
@@ -435,7 +439,7 @@ namespace llaminar2
          */
         DeviceGraphOrchestrator(
             std::shared_ptr<IGraphBuilder> graph_builder,
-            std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+            std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
             const GraphCacheConfig &cache_config = {});
 
         ~DeviceGraphOrchestrator() = default;
@@ -706,6 +710,19 @@ namespace llaminar2
         void setTurboQuantContext(std::shared_ptr<TurboQuantContext> ctx)
         {
             turboquant_ctx_ = std::move(ctx);
+        }
+
+        /**
+         * @brief Set KV rotation for Q16_1 kurtosis reduction
+         *
+         * Block-diagonal orthogonal rotation applied to K/V before Q16_1
+         * quantization and to Q/output during attention. Ownership is shared.
+         *
+         * @param rot Shared pointer to ActivationRotation
+         */
+        void setKVRotation(std::shared_ptr<ActivationRotation> rot)
+        {
+            kv_rotation_ = std::move(rot);
         }
 
         /**
@@ -1527,7 +1544,10 @@ namespace llaminar2
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
             state_.clear();
-            arena_.reset();
+            // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
+            // are expensive and model-specific (e.g., GDN buffers for Qwen3.5).
+            // The arena is created once in initializeBuffers() and persists for
+            // the lifetime of the orchestrator.
             // Reset input-dependent cached state on all kernels (e.g., stale token IDs)
             resetKernelDynamicState();
             // Reset model-internal recurrence state (e.g., GDN conv/recurrence in Qwen3.5)
@@ -1759,7 +1779,7 @@ namespace llaminar2
          * @return true if KV caches initialized successfully
          */
         bool initializeKVCaches(int batch_size, int max_seq_len, int n_layers,
-                                DeviceId device, const std::shared_ptr<MPIContext> &local_mpi_ctx);
+                                DeviceId device, const std::shared_ptr<IMPIContext> &local_mpi_ctx);
 
         /**
          * @brief Synchronize the GPU stream and mark logits as synced at forward
@@ -1826,7 +1846,7 @@ namespace llaminar2
         DeviceGraphExecutor executor_;
 
         /// MPI context for distributed execution
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
 
         /// Graph caching configuration
         GraphCacheConfig cache_config_;
@@ -1917,16 +1937,6 @@ namespace llaminar2
          */
         bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) override;
 
-        /**
-         * @brief Initialize the BufferArena from existing managed buffers (legacy path)
-         *
-         * For paths where managed_buffers_ is populated externally (e.g., PP stages),
-         * this registers all managed_buffers_ activation buffers as external (non-owning)
-         * entries in the arena. In the primary flow, initializeBuffers() creates the
-         * arena directly and this method is a no-op.
-         */
-        void initializeArena();
-
         // =========================================================================
         // Phase-Aware Weight Access Members (Gap 3 - CPU Decode Participation)
         // =========================================================================
@@ -1970,7 +1980,7 @@ namespace llaminar2
         /// Injected model context interface (nullptr if using concrete types)
         std::shared_ptr<IModelContext> injected_model_ctx_;
 
-        /// Injected topology interface (nullptr if using MPIContext directly)
+        /// Injected topology interface (nullptr if using IMPIContext directly)
         std::shared_ptr<IMPITopology> injected_topology_;
 
         /// Injected collective context (nullptr if using default)
@@ -1978,6 +1988,9 @@ namespace llaminar2
 
         /// TurboQuant context for TQ4 KV cache (owns rotation matrix lifetime)
         std::shared_ptr<TurboQuantContext> turboquant_ctx_;
+
+        /// KV rotation for Q16_1 kurtosis reduction
+        std::shared_ptr<ActivationRotation> kv_rotation_;
 
         /// Global TP context for cross-MPI-rank tensor parallelism (owns communicator lifetime)
         std::shared_ptr<IGlobalTPContext> global_tp_ctx_;

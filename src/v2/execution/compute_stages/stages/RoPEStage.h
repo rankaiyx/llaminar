@@ -60,7 +60,8 @@ namespace llaminar2
             const int *position_ids = nullptr; ///< Per-token position IDs array [seq_len]
 
             // Fixed-scale quantization for HybridQ16 mode (used when Q_out is Q16_1)
-            float kv_cache_scale = 256.0f; ///< Fixed scale for Q16 output (d = kv_cache_scale / 32767)
+            // RoPE only processes K projections, so this is the K scale.
+            float kv_cache_scale_k = 256.0f; ///< Fixed scale for K Q16 output (d = scale / 32767)
 
             // Dynamic-scale K output (for HybridQ16 K precision fix)
             // When K is Q16_1 from GEMM, RoPE outputs per-head scales for attention

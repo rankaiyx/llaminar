@@ -196,7 +196,7 @@ namespace llaminar2
         int rows, int cols,
         bool use_causal_mask,
         float scale,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -238,7 +238,7 @@ namespace llaminar2
         int rows, int cols,
         bool use_causal_mask,
         float scale,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -288,7 +288,7 @@ namespace llaminar2
         int rows, int cols,
         bool use_causal_mask,
         float scale,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;
@@ -338,7 +338,7 @@ namespace llaminar2
         int rows, int cols,
         bool use_causal_mask,
         float scale,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         (void)mpi_ctx;

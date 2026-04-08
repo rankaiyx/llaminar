@@ -23,7 +23,7 @@ namespace llaminar2::test
 {
 
     // Single-rank MPI context for unit tests
-    static const MPIContext &getTestMPIContext()
+    static const IMPIContext &getTestMPIContext()
     {
         static MPIContext ctx(0, 1, MPI_COMM_WORLD);
         return ctx;

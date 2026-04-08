@@ -388,10 +388,11 @@ namespace llaminar2
                 {"hidden", {"seq_len", "d_model"}, "fp32", BufferSemantic::InOut, "", 0, "Main hidden state, accumulates residuals"},
 
                 // Final output (full vocab for sampling)
-                {"logits", {"seq_len", "vocab_size"}, "fp32", BufferSemantic::Output, "", 0, "Final logits for sampling"},
+                // Only 1 row needed: LMHeadStage computes only last-token logits
+                {"logits", {"1", "vocab_size"}, "fp32", BufferSemantic::Output, "", 0, "Final logits for sampling"},
 
                 // TP-local logits (before allgather)
-                {"logits_local", {"seq_len", "local_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Local logits shard (TP only)"},
+                {"logits_local", {"1", "local_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "Local logits shard (TP only)"},
             };
 
             // ==============================================================

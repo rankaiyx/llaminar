@@ -29,6 +29,7 @@
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ILocalPPContext.h"
 #include "../../loaders/ModelContext.h"
+#include "../../interfaces/IMPIContext.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/Tokenizer.h"
 #include <memory>
@@ -106,6 +107,23 @@ namespace llaminar2
             OrchestrationConfig config,
             RankExecutionPlan plan,
             std::unique_ptr<IInferenceRunner> runner);
+
+        /**
+         * @brief Construct with injected runner AND MPI context for unit testing
+         *
+         * Allows injecting both a mock IInferenceRunner and a mock IMPIContext
+         * to test MPI coordination logic without real MPI.
+         *
+         * @param config Orchestration configuration
+         * @param plan Pre-built execution plan
+         * @param runner Pre-built inference runner (takes ownership)
+         * @param mpi_ctx MPI context (shared ownership)
+         */
+        OrchestrationRunner(
+            OrchestrationConfig config,
+            RankExecutionPlan plan,
+            std::unique_ptr<IInferenceRunner> runner,
+            std::shared_ptr<IMPIContext> mpi_ctx);
 
         ~OrchestrationRunner() override;
 
@@ -185,7 +203,61 @@ namespace llaminar2
         void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
         void setSamplingParams(const SamplingParams &params) override;
+        SamplingParams getSamplingParams() const { return active_sampling_params_; }
         SamplingParams getRecommendedSamplingParams() const override;
+
+        // =====================================================================
+        // MPI Worker Loop (for non-root ranks in server mode)
+        // =====================================================================
+
+        /**
+         * @brief MPI command tags for rank coordination in server mode.
+         *
+         * Rank 0 broadcasts these tags to tell non-root ranks what to do.
+         */
+        enum class MPICommand : int32_t
+        {
+            CLEAR_CACHE = 1,       ///< Clear KV cache
+            SET_SAMPLING = 2,      ///< Set sampling parameters (followed by SamplingParams broadcast)
+            PREFILL = 3,           ///< Prefill (followed by token count + tokens)
+            DECODE_STEP = 4,       ///< Run one decode step
+            SKIP_LOGITS_DECODE = 5, ///< Set skip-logits-gather for decode
+            SHUTDOWN = 99          ///< Exit the worker loop
+        };
+
+        /**
+         * @brief Run as MPI worker (non-root rank) in server mode.
+         *
+         * Blocks in a loop waiting for commands from rank 0. Participates
+         * in inference collectives (allreduce) as directed by rank 0.
+         * Returns when rank 0 sends SHUTDOWN command.
+         */
+        void runMPIWorkerLoop() override;
+
+        /**
+         * @brief Signal workers to exit their loops.
+         */
+        void shutdownMPIWorkers() override;
+
+        /**
+         * @brief Enable MPI coordinated mode.
+         *
+         * When enabled, rank 0 broadcasts commands before inference operations
+         * so worker ranks can participate in lockstep. Must be enabled on rank 0
+         * before workers enter runMPIWorkerLoop().
+         *
+         * Only server/interactive modes use this. Modes where all ranks run
+         * the same code path (SingleShotChat, Completion) do NOT enable this.
+         */
+        void setMPICoordinatedMode(bool enabled) override { mpi_coordinated_mode_ = enabled; }
+
+        /**
+         * @brief Broadcast an MPI command from rank 0 to all ranks.
+         *
+         * Only broadcasts when mpi_coordinated_mode_ is enabled.
+         * Called internally before operations that require all ranks.
+         */
+        void broadcastCommand(MPICommand cmd);
 
     private:
         // =====================================================================
@@ -323,7 +395,7 @@ namespace llaminar2
 
         // Dependencies (injected or created)
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;
@@ -343,6 +415,7 @@ namespace llaminar2
         SamplingParams recommended_sampling_params_; // Model-specific defaults
         int32_t last_token_{0};                      // Last token for decode step
         bool prefill_logits_ready_{false};           // True after prefill(); first decodeStep() samples from existing logits
+        bool mpi_coordinated_mode_{false};           // When true, rank 0 broadcasts commands for worker loop
         std::shared_ptr<ITokenizer> tokenizer_;
     };
 

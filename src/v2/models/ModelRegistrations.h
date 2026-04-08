@@ -20,7 +20,7 @@
 namespace llaminar2
 {
     /// Force-register all built-in model graph builders and schema factories.
-    /// Safe to call multiple times (idempotent via std::call_once in callers).
+    /// Idempotent: safe to call multiple times (internally guarded by std::once_flag).
     void registerBuiltinModels();
 
 } // namespace llaminar2

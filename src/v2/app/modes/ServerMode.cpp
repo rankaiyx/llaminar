@@ -4,7 +4,7 @@
  *
  * Endpoints:
  *   GET  /health                  — Liveness check
- *   POST /v1/chat/completions     — OpenAI-compatible chat completion
+ *   POST /v1/chat/completions     — OpenAI-compatible chat completion (streaming + non-streaming)
  */
 
 #include "app/modes/ServerMode.h"
@@ -23,6 +23,7 @@
 #include <mutex>
 #include <atomic>
 #include <csignal>
+#include <filesystem>
 
 using json = nlohmann::json;
 
@@ -54,9 +55,13 @@ namespace llaminar2
 
         if (mpi_ctx->world_size() > 1 && mpi_ctx->rank() != 0)
         {
-            // Non-root ranks: participate in MPI collectives but don't run HTTP
-            // For now, single-rank server only
-            LOG_WARN("Server mode only supports single-rank. Rank " << mpi_ctx->rank() << " exiting.");
+            // Non-root ranks: enter MPI worker loop to participate in
+            // inference collectives (allreduce for Global TP) when rank 0
+            // initiates them. Returns when rank 0 sends SHUTDOWN.
+            LOG_INFO("Rank " << mpi_ctx->rank()
+                             << " entering MPI worker loop for inference participation");
+            runner->setMPICoordinatedMode(true);
+            runner->runMPIWorkerLoop();
             runner->shutdown();
             MPI_Finalize();
             return 0;
@@ -65,10 +70,19 @@ namespace llaminar2
         if (!tokenizer->hasChatTemplate())
         {
             LOG_ERROR("Server mode requires a model with a chat template.");
+            if (mpi_ctx->world_size() > 1)
+                runner->shutdownMPIWorkers();
             runner->shutdown();
             MPI_Finalize();
             return 1;
         }
+
+        // Enable coordinated mode so rank 0 broadcasts commands to workers
+        if (mpi_ctx->world_size() > 1)
+            runner->setMPICoordinatedMode(true);
+
+        // Extract model name from path for response metadata
+        std::string model_name = std::filesystem::path(config.model_path).stem().string();
 
         httplib::Server svr;
         g_server_ptr = &svr;
@@ -80,6 +94,18 @@ namespace llaminar2
         // Mutex to serialize inference requests (single model instance)
         std::mutex inference_mutex;
 
+        // CORS headers for Open WebUI and other browser-based clients
+        svr.set_default_headers({{"Access-Control-Allow-Origin", "*"},
+                                 {"Access-Control-Allow-Methods", "GET, POST, OPTIONS"},
+                                 {"Access-Control-Allow-Headers", "Content-Type, Authorization"}});
+
+        // Handle CORS preflight
+        svr.Options("/v1/chat/completions",
+                    [](const httplib::Request &, httplib::Response &res)
+                    {
+                        res.status = 204;
+                    });
+
         // ─── GET /health ─────────────────────────────────────────────
         svr.Get("/health", [](const httplib::Request &, httplib::Response &res)
                 {
@@ -87,16 +113,56 @@ namespace llaminar2
             res.set_content(response.dump(), "application/json"); });
 
         // ─── POST /v1/chat/completions ───────────────────────────────
-        ChatCompletionHandler handler(*runner, *tokenizer);
+        ChatCompletionHandler handler(*runner, *tokenizer, model_name);
 
         svr.Post("/v1/chat/completions",
                  [&](const httplib::Request &req, httplib::Response &res)
                  {
                      std::lock_guard<std::mutex> lock(inference_mutex);
 
-                     auto response = handler.handleRawRequest(req.body);
-                     res.status = response.http_status;
-                     res.set_content(response.json_body, "application/json");
+                     // Check if streaming was requested
+                     ChatCompletionResponse parse_error;
+                     auto parsed_request = ChatCompletionHandler::parseRequest(req.body, parse_error);
+
+                     if (!parsed_request)
+                     {
+                         res.status = parse_error.http_status;
+                         res.set_content(parse_error.json_body, "application/json");
+                         return;
+                     }
+
+                     if (parsed_request->stream)
+                     {
+                         // SSE streaming response
+                         res.set_chunked_content_provider(
+                             "text/event-stream",
+                             [&handler, request = std::move(*parsed_request)](size_t /*offset*/, httplib::DataSink &sink) -> bool
+                             {
+                                 auto chunk_cb = [&sink](const std::string &sse_line) -> bool
+                                 {
+                                     return sink.write(sse_line.c_str(), sse_line.size());
+                                 };
+
+                                 auto response = handler.handleStreamingRequest(request, chunk_cb);
+
+                                 if (!response.ok && !response.json_body.empty())
+                                 {
+                                     // Error before streaming started — emit error as SSE
+                                     std::string error_sse = "data: " + response.json_body + "\n\ndata: [DONE]\n\n";
+                                     sink.write(error_sse.c_str(), error_sse.size());
+                                 }
+
+                                 sink.done();
+                                 return true;
+                             });
+                     }
+                     else
+                     {
+                         // Non-streaming response
+                         auto response = handler.handleRequest(*parsed_request);
+                         res.status = response.http_status;
+                         res.set_content(response.json_body, "application/json");
+                     }
                  });
 
         // Start listening
@@ -107,6 +173,8 @@ namespace llaminar2
             if (!g_shutdown_requested.load())
             {
                 LOG_ERROR("Failed to start server on " << config.serve_host << ":" << config.serve_port);
+                if (mpi_ctx->world_size() > 1)
+                    runner->shutdownMPIWorkers();
                 runner->shutdown();
                 MPI_Finalize();
                 return 1;
@@ -115,6 +183,11 @@ namespace llaminar2
 
         LOG_INFO("Server shut down.");
         g_server_ptr = nullptr;
+
+        // Signal non-root ranks to exit their worker loops
+        if (mpi_ctx->world_size() > 1)
+            runner->shutdownMPIWorkers();
+
         runner->shutdown();
         MPI_Finalize();
         return 0;

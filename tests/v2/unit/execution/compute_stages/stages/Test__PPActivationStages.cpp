@@ -44,7 +44,7 @@ protected:
         mpi_ctx_ = std::make_shared<MPIContext>(0, 2, MPI_COMM_NULL);
     }
 
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
 };
 
 // =============================================================================

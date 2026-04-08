@@ -406,8 +406,9 @@ namespace llaminar2
         /// Fused attention backend selection
         FusedAttentionBackend fused_attention_backend = FusedAttentionBackend::JIT;
 
-        /// Fixed scale for Q16_1 KV cache quantization
-        float kv_cache_scale = 256.0f;
+        /// Fixed scales for Q16_1 KV cache quantization (K and V separate)
+        float kv_cache_scale_k = 256.0f;
+        float kv_cache_scale_v = 32.0f;
 
         /// Explicit KV cache precision (AUTO defaults to FP16)
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;

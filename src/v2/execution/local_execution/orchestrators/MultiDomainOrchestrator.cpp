@@ -33,7 +33,7 @@ namespace llaminar2
 
     std::unique_ptr<MultiDomainOrchestrator> MultiDomainOrchestrator::create(
         MultiDomainOrchestratorConfig config,
-        MPIContext *mpi_ctx)
+        IMPIContext *mpi_ctx)
     {
         auto orchestrator = std::unique_ptr<MultiDomainOrchestrator>(new MultiDomainOrchestrator());
 
@@ -72,7 +72,7 @@ namespace llaminar2
 
     bool MultiDomainOrchestrator::initialize(
         MultiDomainOrchestratorConfig config,
-        MPIContext *mpi_ctx)
+        IMPIContext *mpi_ctx)
     {
         config_ = std::move(config);
 

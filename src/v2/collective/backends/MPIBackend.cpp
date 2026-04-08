@@ -16,7 +16,7 @@ namespace llaminar2
     // Constructor / Destructor
     // =========================================================================
 
-    MPIBackend::MPIBackend(std::shared_ptr<MPIContext> mpi_ctx)
+    MPIBackend::MPIBackend(std::shared_ptr<IMPIContext> mpi_ctx)
         : mpi_ctx_(std::move(mpi_ctx))
     {
     }
@@ -91,7 +91,7 @@ namespace llaminar2
             LOG_DEBUG("MPIBackend shutdown");
         }
         initialized_ = false;
-        // Note: We don't call MPI_Finalize here - that's managed by MPIContext
+        // Note: We don't call MPI_Finalize here - that's managed by IMPIContext
     }
 
     // =========================================================================
@@ -119,7 +119,7 @@ namespace llaminar2
             static_cast<int>(count),
             mpi_dtype,
             mpi_op,
-            mpi_ctx_->comm());
+            mpi_ctx_->communicator());
 
         if (result != MPI_SUCCESS)
         {
@@ -152,7 +152,7 @@ namespace llaminar2
             recv_buf,
             static_cast<int>(send_count),
             mpi_dtype,
-            mpi_ctx_->comm());
+            mpi_ctx_->communicator());
 
         if (result != MPI_SUCCESS)
         {
@@ -188,7 +188,7 @@ namespace llaminar2
             recv_counts.data(),
             displacements.data(),
             mpi_dtype,
-            mpi_ctx_->comm());
+            mpi_ctx_->communicator());
 
         if (result != MPI_SUCCESS)
         {
@@ -226,7 +226,7 @@ namespace llaminar2
             recvcounts.data(),
             mpi_dtype,
             mpi_op,
-            mpi_ctx_->comm());
+            mpi_ctx_->communicator());
 
         if (result != MPI_SUCCESS)
         {
@@ -257,7 +257,7 @@ namespace llaminar2
             static_cast<int>(count),
             mpi_dtype,
             root_rank,
-            mpi_ctx_->comm());
+            mpi_ctx_->communicator());
 
         if (result != MPI_SUCCESS)
         {
@@ -277,7 +277,7 @@ namespace llaminar2
             return false;
         }
 
-        int result = MPI_Barrier(mpi_ctx_->comm());
+        int result = MPI_Barrier(mpi_ctx_->communicator());
 
         if (result != MPI_SUCCESS)
         {

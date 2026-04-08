@@ -72,7 +72,7 @@ protected:
     GlobalDeviceAddress cuda1_;
     GlobalDeviceAddress rocm0_;
     std::unique_ptr<ILocalTPWeightSharder> sharder_;
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
 };
 
 // =============================================================================

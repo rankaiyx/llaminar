@@ -213,7 +213,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             bool use_bf16 = false,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
 
         /**
@@ -238,7 +238,7 @@ namespace llaminar2
             int seq_len,
             int d_model,
             float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) = 0;
 
         /**
@@ -2302,7 +2302,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             bool use_bf16 = false,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool applyRMSNorm(
@@ -2310,7 +2310,7 @@ namespace llaminar2
             int seq_len,
             int d_model,
             float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool from_int32_with_scales(
@@ -2533,7 +2533,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             bool use_bf16 = false,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool applyRMSNorm(
@@ -2541,7 +2541,7 @@ namespace llaminar2
             int seq_len,
             int d_model,
             float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool from_int32_with_scales(
@@ -2757,7 +2757,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             bool use_bf16 = false,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool applyRMSNorm(
@@ -2765,7 +2765,7 @@ namespace llaminar2
             int seq_len,
             int d_model,
             float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool from_int32_with_scales(
@@ -3899,7 +3899,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             bool use_bf16 = false,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool applyRMSNorm(
@@ -3907,7 +3907,7 @@ namespace llaminar2
             int seq_len,
             int d_model,
             float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool from_int32_with_scales(
@@ -4323,7 +4323,7 @@ namespace llaminar2
             int head_dim,
             float rope_theta = 10000.0f,
             bool use_bf16 = false,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool applyRMSNorm(
@@ -4331,7 +4331,7 @@ namespace llaminar2
             int seq_len,
             int d_model,
             float eps = 1e-6f,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override;
 
         bool from_int32_with_scales(

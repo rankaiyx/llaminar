@@ -33,7 +33,7 @@ namespace llaminar2
         else
         {
             // Create a minimal MPI context for single-rank operation
-            // MPIContext requires explicit rank/world_size
+            // MPIContext required for construction (concrete type)
             static MPIContext single_rank_ctx(0, 1); // rank=0, world_size=1
             tensor_factory_ = std::make_unique<TensorFactory>(single_rank_ctx);
         }

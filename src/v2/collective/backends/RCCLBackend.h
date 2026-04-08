@@ -56,7 +56,7 @@ namespace llaminar2
          *                If provided and world_size > 1, uses MPI to coordinate
          *                RCCL communicator creation across processes.
          */
-        explicit RCCLBackend(std::shared_ptr<MPIContext> mpi_ctx = nullptr);
+        explicit RCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx = nullptr);
         ~RCCLBackend() override;
 
         // =====================================================================
@@ -315,7 +315,7 @@ namespace llaminar2
         std::string last_error_;
         int num_ranks_ = 0;
         int local_rank_ = 0;
-        std::shared_ptr<MPIContext> mpi_ctx_;      // Optional MPI context for multi-process
+        std::shared_ptr<IMPIContext> mpi_ctx_;      // Optional MPI context for multi-process
         bool is_multi_gpu_single_process_ = false; // True if multi-GPU without MPI
         bool p2p_available_ = false;               // True if P2P available between all devices
 

@@ -57,7 +57,7 @@ namespace llaminar2
          */
         static std::shared_ptr<ModelContext> create(
             const std::string &model_path,
-            std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+            std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
             std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
             TensorFactory *factory = nullptr,
             WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
@@ -108,7 +108,7 @@ namespace llaminar2
             int last_layer,
             bool has_embedding,
             bool has_lm_head,
-            std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+            std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
             WeightPrecision weight_precision = WeightPrecision::NATIVE);
 
         /**
@@ -123,7 +123,7 @@ namespace llaminar2
          */
         static std::shared_ptr<ModelContext> createForTesting(
             const std::string &model_path = "test.gguf",
-            std::shared_ptr<MPIContext> mpi_ctx = nullptr,
+            std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
             uint32_t block_count = 1);
 
         // =========================================================================
@@ -237,7 +237,7 @@ namespace llaminar2
          * @brief Private constructor (use create() instead)
          */
         ModelContext(const std::string &model_path,
-                     std::shared_ptr<MPIContext> mpi_ctx,
+                     std::shared_ptr<IMPIContext> mpi_ctx,
                      std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
                      TensorFactory *factory = nullptr,
                      WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED);

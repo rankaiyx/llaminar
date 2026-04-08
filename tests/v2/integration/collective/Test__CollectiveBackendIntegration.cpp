@@ -116,7 +116,7 @@ namespace
      * selection in multi-rank scenarios.
      */
     ClusterInventory buildDistributedInventory(
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         int cuda_count,
         int rocm_count)
     {
@@ -155,7 +155,7 @@ namespace
         MPI_Allgather(
             &local_info, sizeof(SerializedRankInfo), MPI_BYTE,
             all_info.data(), sizeof(SerializedRankInfo), MPI_BYTE,
-            mpi_ctx->comm());
+            mpi_ctx->communicator());
 
         // Build ClusterInventory
         ClusterInventory inv;
@@ -210,7 +210,7 @@ namespace
 class Test__CollectiveBackendIntegration : public ::testing::Test
 {
 protected:
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
     int rank_ = 0;
     int world_size_ = 1;
     int cuda_count_ = 0;

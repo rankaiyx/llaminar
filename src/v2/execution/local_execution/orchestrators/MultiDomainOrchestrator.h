@@ -31,7 +31,7 @@ namespace llaminar2
     // Forward declarations
     class DeviceGraphOrchestrator;
     class ICollectiveContext;
-    class MPIContext;
+    class IMPIContext;
 
     /**
      * @brief Configuration for MultiDomainOrchestrator initialization
@@ -103,7 +103,7 @@ namespace llaminar2
          */
         static std::unique_ptr<MultiDomainOrchestrator> create(
             MultiDomainOrchestratorConfig config,
-            MPIContext *mpi_ctx = nullptr);
+            IMPIContext *mpi_ctx = nullptr);
 
         /**
          * @brief Create orchestrator for testing with injected dependencies
@@ -265,7 +265,7 @@ namespace llaminar2
          * @param mpi_ctx MPI context (may be nullptr)
          * @return true if initialization succeeded
          */
-        bool initialize(MultiDomainOrchestratorConfig config, MPIContext *mpi_ctx);
+        bool initialize(MultiDomainOrchestratorConfig config, IMPIContext *mpi_ctx);
 
         /// Inner orchestrator (delegates inference operations)
         /// Stored as IInferenceRunner for testability (can inject mocks)

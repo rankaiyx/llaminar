@@ -55,7 +55,7 @@ namespace llaminar2
         DeviceId default_device = DeviceId::cpu();
 
         /// MPI context for rank-aware allocation
-        const MPIContext *mpi_ctx = nullptr;
+        const IMPIContext *mpi_ctx = nullptr;
     };
 
     /**

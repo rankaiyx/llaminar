@@ -126,7 +126,7 @@ namespace llaminar2
         // (get_kv_converted applies RoPE during incremental dequant)
         // Supported on CPU (all precisions) and GPU (via get_kv_converted override)
         {
-            const char* ror_env = std::getenv("LLAMINAR_ROPE_ON_READ");
+            const char *ror_env = std::getenv("LLAMINAR_ROPE_ON_READ");
             config.rope_on_read = ror_env ? (std::atoi(ror_env) != 0) : true;
         }
 
@@ -394,6 +394,14 @@ namespace llaminar2
         // and saves a kernel launch for all cache types during decode.
         // TODO: Re-enable once the TQ pipeline parity is acceptable
         // config.rope_on_read = true;
+
+        // KV cache scales: separate K and V scales for Q16_1 quantization.
+        // K has large post-RoPE outliers in low-frequency dimensions (up to ±300),
+        // requiring a wider scale. V values are typically much smaller (±3-5).
+        // With block-diagonal rotation enabled, these scales provide
+        // headroom while maximizing precision for each tensor.
+        config.kv_cache_scale_k = 512.0f; // K: ±256 representable after VNNI headroom
+        config.kv_cache_scale_v = 32.0f;  // V: ±16 representable, excellent precision
 
         return true;
     }

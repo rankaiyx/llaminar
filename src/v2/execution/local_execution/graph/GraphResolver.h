@@ -102,7 +102,7 @@ namespace llaminar2
 
         int world_size = 1;                  ///< Number of MPI ranks
         int rank = 0;                        ///< This rank's index
-        const MPIContext *mpi_ctx = nullptr; ///< MPI context (required for TP)
+        const IMPIContext *mpi_ctx = nullptr; ///< MPI context (required for TP)
 
         /// Weight sharding information, keyed by weight name
         std::unordered_map<std::string, ShardingInfo> weight_sharding;
@@ -152,9 +152,10 @@ namespace llaminar2
         // Q16 KV Cache VNNI Safety (Phase 5.4)
         // =================================================================
 
-        /// Fixed scale for Q16 KV cache quantization (FP32 range: ±kv_cache_scale).
+        /// Fixed scales for Q16 KV cache quantization (K and V separate).
         /// Used by KVCacheAppendStage for VNNI-safe quantization.
-        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130 for Qwen2)
+        float kv_cache_scale_k = 256.0f; ///< K scale (FP32 range ±scale_k)
+        float kv_cache_scale_v = 32.0f;  ///< V scale (FP32 range ±scale_v)
 
         // TP-adjusted dimensions
         int local_n_heads = 0;    ///< Heads on this rank

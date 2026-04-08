@@ -19,7 +19,7 @@ using namespace llaminar2;
 class StubGraphBuilder : public IGraphBuilder
 {
 public:
-    StubGraphBuilder(const GraphConfig &cfg, std::shared_ptr<MPIContext> mpi)
+    StubGraphBuilder(const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
         : config_(cfg), mpi_(std::move(mpi)) {}
 
     // Pure virtual overrides
@@ -42,12 +42,12 @@ public:
 
 private:
     GraphConfig config_;
-    std::shared_ptr<MPIContext> mpi_;
+    std::shared_ptr<IMPIContext> mpi_;
 };
 
 // Register a test-only architecture via the registrar helper
 static GraphBuilderRegistrar s_stub_reg("test_stub_arch",
-                                        [](const GraphConfig &cfg, std::shared_ptr<MPIContext> mpi)
+                                        [](const GraphConfig &cfg, std::shared_ptr<IMPIContext> mpi)
                                         {
                                             return std::make_shared<StubGraphBuilder>(cfg, std::move(mpi));
                                         });

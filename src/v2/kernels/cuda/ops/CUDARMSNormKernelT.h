@@ -89,7 +89,7 @@ namespace llaminar2
                 int rows, int cols,
                 float epsilon = 1e-6f,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1);
 
             bool apply_bf16(
@@ -140,7 +140,7 @@ namespace llaminar2
                 TensorBase *output,
                 int rows, int cols,
                 float epsilon = 1e-6f,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
             // ===== Typed API =====
@@ -201,7 +201,7 @@ namespace llaminar2
                 int rows, int cols,
                 float epsilon = 1e-6f,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)input;
@@ -254,7 +254,7 @@ namespace llaminar2
                 TensorBase *output,
                 int rows, int cols,
                 float epsilon = 1e-6f,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
             // ===== Typed API =====
@@ -315,7 +315,7 @@ namespace llaminar2
                 int rows, int cols,
                 float epsilon = 1e-6f,
                 bool use_bf16 = false,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1)
             {
                 (void)input;
@@ -368,7 +368,7 @@ namespace llaminar2
                 TensorBase *output,
                 int rows, int cols,
                 float epsilon = 1e-6f,
-                const MPIContext *mpi_ctx = nullptr,
+                const IMPIContext *mpi_ctx = nullptr,
                 int device_idx = -1) override;
 
             // ===== Typed API =====

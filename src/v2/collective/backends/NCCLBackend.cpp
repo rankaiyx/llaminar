@@ -174,7 +174,7 @@ namespace llaminar2
     // Constructor / Destructor
     // =========================================================================
 
-    NCCLBackend::NCCLBackend(std::shared_ptr<MPIContext> mpi_ctx)
+    NCCLBackend::NCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx)
         : mpi_ctx_(std::move(mpi_ctx))
     {
         LOG_DEBUG("NCCLBackend: Created" << (mpi_ctx_ ? " with MPI context (world_size=" + std::to_string(mpi_ctx_->world_size()) + ")" : " (single-process mode)"));
@@ -291,7 +291,7 @@ namespace llaminar2
             }
 
             // Broadcast unique ID from rank 0 to all other ranks
-            int mpi_err = MPI_Bcast(unique_id_buffer.data(), static_cast<int>(unique_id_size), MPI_BYTE, 0, mpi_ctx_->comm());
+            int mpi_err = MPI_Bcast(unique_id_buffer.data(), static_cast<int>(unique_id_size), MPI_BYTE, 0, mpi_ctx_->communicator());
             if (mpi_err != MPI_SUCCESS)
             {
                 last_error_ = "MPI_Bcast of NCCL unique ID failed";

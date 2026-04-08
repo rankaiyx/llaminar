@@ -42,7 +42,7 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
-    class MPIContext;
+    class IMPIContext;
 
     // =============================================================================
     // GGUF TYPE DEFINITIONS
@@ -389,7 +389,7 @@ namespace llaminar2
         // Tensor factory (created internally if not provided)
         TensorFactory *factory_;
         std::unique_ptr<TensorFactory> owned_factory_; // Owned factory if created internally
-        std::shared_ptr<MPIContext> owned_mpi_ctx_;    // Owned MPI context for owned factory
+        std::shared_ptr<IMPIContext> owned_mpi_ctx_;    // Owned MPI context for owned factory
 
         // Parsing helpers
         bool parseHeader();

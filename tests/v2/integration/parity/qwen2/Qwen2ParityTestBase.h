@@ -324,7 +324,7 @@ namespace llaminar2::test::parity::qwen2
          * GraphConfig setup, weight loading, and graph construction.
          */
         inline TreeToRunnerCompiler::DeviceRunnerFactory makeDeviceFactory(
-            std::shared_ptr<MPIContext> mpi_ctx,
+            std::shared_ptr<IMPIContext> mpi_ctx,
             const InferenceRunnerConfig &base_config)
         {
             return [mpi_ctx, base_config](

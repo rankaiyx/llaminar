@@ -85,7 +85,7 @@ namespace llaminar2
     class IKVCache;
     class ICPUKVCache;
     class ICUDARingKVCache;
-    class MPIContext;
+    class IMPIContext;
     enum class KVCacheLayoutMode : uint8_t;
     class ITensor;
     class TensorBase;
@@ -263,7 +263,7 @@ namespace llaminar
                 ::llaminar2::KVCacheLayoutMode layout_mode{}; // Default-initialized (POSITION_MAJOR = 0)
 
                 // MPI context (required for CPU cache)
-                const ::llaminar2::MPIContext *mpi_ctx = nullptr;
+                const ::llaminar2::IMPIContext *mpi_ctx = nullptr;
 
                 /// TurboQuant context (for TQ4 KV cache). Not owned.
                 const ::llaminar2::TurboQuantContext *turboquant_ctx = nullptr;

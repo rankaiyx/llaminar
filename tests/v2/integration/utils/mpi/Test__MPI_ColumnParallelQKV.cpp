@@ -39,7 +39,7 @@ using namespace llaminar2;
 class Test__MPI_ColumnParallelQKV : public ::testing::Test
 {
 protected:
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
     std::shared_ptr<TensorFactory> factory_;
     int rank_ = 0;
     int world_size_ = 1;

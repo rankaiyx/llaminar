@@ -51,7 +51,7 @@ using namespace llaminar2::test;
 class GraphSnapshotCallbackTest : public ::testing::Test
 {
 protected:
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
     std::unique_ptr<CPUDeviceContext> ctx_;
     int rank_;
     int world_size_;

@@ -39,7 +39,7 @@ namespace llaminar2::test
      * auto mock = std::make_shared<MockMPIContext>(
      *     MockMPIContext::Config{.rank = 1, .world_size = 4});
      *
-     * // Use in place of real MPIContext
+     * // Use in place of real IMPIContext
      * stage->execute(mock.get());
      *
      * // Verify behavior
@@ -119,6 +119,7 @@ namespace llaminar2::test
         int rank() const override { return config_.rank; }
         int world_size() const override { return config_.world_size; }
         bool is_root() const override { return config_.rank == 0; }
+        MPI_Comm communicator() const override { return MPI_COMM_NULL; }
 
         // =========================================================================
         // IMPIContext Implementation - Synchronization
@@ -239,6 +240,15 @@ namespace llaminar2::test
         // =========================================================================
 
         void broadcast(float * /*data*/, size_t /*count*/, int /*root*/) const override
+        {
+            if (config_.track_calls)
+            {
+                broadcast_calls_.fetch_add(1, std::memory_order_relaxed);
+            }
+            // No-op in mock - data unchanged
+        }
+
+        void broadcast_int32(int32_t * /*data*/, size_t /*count*/, int /*root*/) const override
         {
             if (config_.track_calls)
             {

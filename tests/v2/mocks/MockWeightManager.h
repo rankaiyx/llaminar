@@ -146,6 +146,11 @@ namespace llaminar2::test
             tp_config_ = std::move(config);
         }
 
+        void setWeightPreprocessor(WeightPreprocessor /* preprocessor */) override
+        {
+            // Mock: no-op (tests can inject preprocessors via the builder if needed)
+        }
+
         // =========================================================================
         // Weight Packing and Preloading (stub implementations for mock)
         // =========================================================================

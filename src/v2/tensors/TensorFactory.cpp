@@ -24,7 +24,7 @@
 
 namespace llaminar2
 {
-    TensorFactory::TensorFactory(const MPIContext &mpi_ctx)
+    TensorFactory::TensorFactory(const IMPIContext &mpi_ctx)
         : mpi_rank_(mpi_ctx.rank()), numa_node_(-1)
     {
         // Determine NUMA node for this MPI rank

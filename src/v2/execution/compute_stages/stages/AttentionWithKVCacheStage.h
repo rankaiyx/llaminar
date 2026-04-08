@@ -70,7 +70,7 @@ namespace llaminar2
             int window_size = -1;
 
             // MPI configuration - shared_ptr version for lifetime management
-            std::shared_ptr<MPIContext> mpi_ctx_shared;
+            std::shared_ptr<IMPIContext> mpi_ctx_shared;
             int mpi_strategy = 0;
 
             // Workspace buffers

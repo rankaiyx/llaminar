@@ -96,7 +96,7 @@ namespace llaminar2
     };
 
     ModelContext::ModelContext(const std::string &model_path,
-                               std::shared_ptr<MPIContext> mpi_ctx,
+                               std::shared_ptr<IMPIContext> mpi_ctx,
                                std::shared_ptr<WeightPlacementMap> placement_map,
                                TensorFactory *factory,
                                WeightDistributionStrategy strategy)
@@ -108,7 +108,7 @@ namespace llaminar2
 
     std::shared_ptr<ModelContext> ModelContext::create(
         const std::string &model_path,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         std::shared_ptr<WeightPlacementMap> placement_map,
         TensorFactory *factory,
         WeightDistributionStrategy strategy,
@@ -243,7 +243,7 @@ namespace llaminar2
         int last_layer,
         bool has_embedding,
         bool has_lm_head,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         WeightPrecision weight_precision)
     {
         // Create context with LAYER_PARTITIONED strategy
@@ -280,7 +280,7 @@ namespace llaminar2
 
     std::shared_ptr<ModelContext> ModelContext::createForTesting(
         const std::string &model_path,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         uint32_t block_count)
     {
         // Create TensorFactory from MPI context (if provided) to prevent ModelLoader

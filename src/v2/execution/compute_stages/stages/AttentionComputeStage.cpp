@@ -12,6 +12,7 @@
 #include "../../../tensors/TQ4Tensor.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
+#include "../../../kernels/cpu/rotation/ActivationRotation.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include <limits>
@@ -612,6 +613,48 @@ namespace llaminar2
         }
 #endif
 
+        // =================================================================
+        // KV rotation: rotate Q before attention, inverse-rotate output after.
+        // When K/V were rotated by ActivationRotation before Q16_1 quantization
+        // in KVCacheAppendStage, Q must be rotated by the same matrix so that
+        // Q@R @ (K@R)^T = Q@K^T (rotation cancels in the score). The output
+        // (sum of alpha_i * V_i@R) must then be inverse-rotated to recover
+        // the correct unrotated attention result.
+        //
+        // During PREFILL, effective_K/V are the raw projection outputs (unrotated),
+        // since the cache override is only triggered for decode (kv_len > seq_len).
+        // In this case we must also rotate K/V to match the rotated Q.
+        // During DECODE, effective_K/V come from the cache (already rotated),
+        // so only Q rotation is needed.
+        // =================================================================
+        const auto *kv_rot = params_.kv_rotation;
+        const int q_dim = params_.n_heads * params_.head_dim;
+        const int kv_dim = params_.n_kv_heads * params_.head_dim;
+        const bool projections_need_rotation = kv_rot &&
+                                               (effective_K == params_.K) &&
+                                               (effective_V == params_.V);
+
+        if (kv_rot)
+        {
+            float *q_fp32 = params_.Q->mutable_data();
+            if (q_fp32)
+            {
+                kv_rot->rotate_rows_inplace(q_fp32, params_.seq_len, q_dim);
+            }
+
+            // Prefill path: K/V are original projections, not from cache.
+            // Rotate them so Q_rot @ K_rot^T = Q @ K^T and V_rot gives R*context.
+            if (projections_need_rotation)
+            {
+                float *k_fp32 = effective_K->mutable_data();
+                float *v_fp32 = effective_V->mutable_data();
+                if (k_fp32)
+                    kv_rot->rotate_rows_inplace(k_fp32, params_.seq_len, kv_dim);
+                if (v_fp32)
+                    kv_rot->rotate_rows_inplace(v_fp32, params_.seq_len, kv_dim);
+            }
+        }
+
         bool success = kernel->compute_tensor(
             params_.Q, effective_K, effective_V, params_.output,
             params_.batch_size,
@@ -627,16 +670,23 @@ namespace llaminar2
             params_.mpi_ctx,
             device_idx);
 
-        // Device coherence is now handled automatically by DeviceGraphExecutor
-        // at stage boundaries based on the stage's coherencePolicy() (FULL by default)
-
-        if (!success)
+        if (kv_rot)
         {
-            LOG_ERROR("[AttentionComputeStage] Kernel compute_tensor() failed");
-            return false;
+            // Inverse-rotate attention output to undo the V rotation.
+            // output = sum(alpha_i * V_i@R) → R^T * output = sum(alpha_i * V_i)
+            float *out_fp32 = params_.output->mutable_data();
+            if (out_fp32)
+            {
+                kv_rot->inverse_rotate_rows_inplace(out_fp32,
+                                                    params_.seq_len, q_dim);
+            }
+
+            // Q, K, V do NOT need inverse-rotation:
+            // - Q is overwritten by next layer's QKV projection
+            // - K/V during prefill: KVCacheAppend already ran (depends on rope/proj),
+            //   and no downstream stage reads these buffers after attention
         }
 
-        LOG_DEBUG("[AttentionComputeStage] Execute complete (mode=" << attention_mode_name(mode) << ")");
         return true;
     }
 

@@ -40,7 +40,7 @@ namespace llaminar2
     // Forward declarations of factory helpers
     static std::unique_ptr<IInferenceRunner> createDeviceGraphOrchestratorImpl(
         std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         DeviceId device,
         const InferenceRunnerConfig &config,
         const std::string &architecture);
@@ -68,7 +68,7 @@ namespace llaminar2
      * @return ClusterInventory with detected devices
      */
     static ClusterInventory buildLocalClusterInventory(
-        const std::shared_ptr<MPIContext> &mpi_ctx)
+        const std::shared_ptr<IMPIContext> &mpi_ctx)
     {
         ClusterInventory inventory;
         RankInventory rank_inv;
@@ -334,7 +334,7 @@ namespace llaminar2
      */
     static bool applyEqualSplitGlobalTPAssignment(
         GraphConfig &graph_config,
-        const std::shared_ptr<MPIContext> &mpi_ctx)
+        const std::shared_ptr<IMPIContext> &mpi_ctx)
     {
         const int current_rank = mpi_ctx->rank();
         const int world_size = mpi_ctx->world_size();
@@ -408,7 +408,7 @@ namespace llaminar2
         ILocalTPContext *local_tp_ctx,
         int tp_device_idx,
         const TensorParallelConfig *tp_config,
-        const std::shared_ptr<MPIContext> &mpi_ctx,
+        const std::shared_ptr<IMPIContext> &mpi_ctx,
         bool weights_sharded)
     {
         // LOCAL TP activation: also activate if tp_config is set on WeightManager,
@@ -534,7 +534,7 @@ namespace llaminar2
 
     std::unique_ptr<IInferenceRunner> createInferenceRunner(
         std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         DeviceId device,
         const InferenceRunnerConfig &config)
     {
@@ -569,7 +569,7 @@ namespace llaminar2
 
     static std::unique_ptr<IInferenceRunner> createDeviceGraphOrchestratorImpl(
         std::shared_ptr<ModelContext> model_ctx,
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         DeviceId device,
         const InferenceRunnerConfig &config,
         const std::string &architecture)

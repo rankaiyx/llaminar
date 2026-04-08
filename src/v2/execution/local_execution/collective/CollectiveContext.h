@@ -84,7 +84,7 @@ namespace llaminar2
         struct Config
         {
             /// MPI context (nullptr for single-rank, no MPI)
-            std::shared_ptr<MPIContext> mpi_ctx = nullptr;
+            std::shared_ptr<IMPIContext> mpi_ctx = nullptr;
 
             /// Cluster inventory for device discovery
             const ClusterInventory *cluster_inventory = nullptr;
@@ -114,7 +114,7 @@ namespace llaminar2
          */
         CollectiveContext(
             std::unique_ptr<IBackendRouter> router,
-            std::shared_ptr<MPIContext> mpi_ctx,
+            std::shared_ptr<IMPIContext> mpi_ctx,
             std::vector<DeviceId> local_devices);
 
         ~CollectiveContext() override;
@@ -243,7 +243,7 @@ namespace llaminar2
         IBackendRouter *router() override { return router_.get(); }
 
         /// Get the MPI context (may be nullptr)
-        MPIContext *mpiContext() override { return mpi_ctx_.get(); }
+        IMPIContext *mpiContext() override { return mpi_ctx_.get(); }
 
         // =====================================================================
         // Domain-Aware Collective Operations
@@ -335,7 +335,7 @@ namespace llaminar2
 
     private:
         Config config_;
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         std::unique_ptr<IBackendRouter> router_; // Interface, not concrete!
 
         /// Devices on this rank
@@ -368,14 +368,14 @@ namespace llaminar2
          * @brief Create context for MPI-based tensor parallelism (current behavior)
          */
         static std::unique_ptr<CollectiveContext> createMPI(
-            std::shared_ptr<MPIContext> mpi_ctx);
+            std::shared_ptr<IMPIContext> mpi_ctx);
 
         /**
          * @brief Create context for intra-node multi-GPU (NCCL/RCCL)
          */
         static std::unique_ptr<CollectiveContext> createIntraNode(
             const ClusterInventory &inventory,
-            std::shared_ptr<MPIContext> mpi_ctx = nullptr);
+            std::shared_ptr<IMPIContext> mpi_ctx = nullptr);
 
         /**
          * @brief Create context with injected router (for testing)
@@ -386,7 +386,7 @@ namespace llaminar2
          */
         static std::unique_ptr<CollectiveContext> createWithRouter(
             std::unique_ptr<IBackendRouter> router,
-            std::shared_ptr<MPIContext> mpi_ctx,
+            std::shared_ptr<IMPIContext> mpi_ctx,
             std::vector<DeviceId> local_devices);
 
         /**

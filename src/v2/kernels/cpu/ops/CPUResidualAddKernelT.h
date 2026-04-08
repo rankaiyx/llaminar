@@ -41,7 +41,7 @@ namespace llaminar2
         bool apply(
             const float *input, const float *residual, float *output,
             size_t num_elements,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)mpi_ctx;
@@ -65,7 +65,7 @@ namespace llaminar2
             const TensorBase *residual,
             TensorBase *output,
             size_t num_elements,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
             KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
@@ -103,7 +103,7 @@ namespace llaminar2
         bool apply(
             const float *input, const float *residual, float *output,
             size_t num_elements,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)input;
@@ -118,7 +118,7 @@ namespace llaminar2
         bool apply_bf16(
             const uint16_t *input, const uint16_t *residual, uint16_t *output,
             size_t num_elements,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)mpi_ctx;
@@ -144,7 +144,7 @@ namespace llaminar2
             const TensorBase *residual,
             TensorBase *output,
             size_t num_elements,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
             KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);
@@ -182,7 +182,7 @@ namespace llaminar2
         bool apply(
             const float *input, const float *residual, float *output,
             size_t num_elements,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)input;
@@ -197,7 +197,7 @@ namespace llaminar2
         bool apply_fp16(
             const uint16_t *input, const uint16_t *residual, uint16_t *output,
             size_t num_elements,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1)
         {
             (void)mpi_ctx;
@@ -223,7 +223,7 @@ namespace llaminar2
             const TensorBase *residual,
             TensorBase *output,
             size_t num_elements,
-            const MPIContext *mpi_ctx = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
             int device_idx = -1) override
         {
             KERNEL_PROFILE_SCOPE(KernelType::RESIDUAL_ADD);

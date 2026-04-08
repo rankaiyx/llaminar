@@ -748,7 +748,7 @@ namespace llaminar2
         int seq_len,
         int d_model,
         float eps,
-        const MPIContext *mpi_ctx,
+        const IMPIContext *mpi_ctx,
         int device_idx)
     {
         LOG_ERROR("[FP32Tensor::applyRMSNorm] Removed — use ITensorRMSNorm::apply_tensor() via stages");
@@ -804,7 +804,7 @@ namespace llaminar2
         int /*head_dim*/,
         float /*rope_theta*/,
         bool /*use_bf16*/,
-        const MPIContext * /*mpi_ctx*/,
+        const IMPIContext * /*mpi_ctx*/,
         int /*device_idx*/)
     {
         LOG_ERROR("[FP32Tensor::applyRoPE] Legacy raw-pointer path removed. Use RoPEStage with apply_tensor() instead.");

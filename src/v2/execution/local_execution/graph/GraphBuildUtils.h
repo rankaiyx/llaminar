@@ -91,7 +91,7 @@ namespace llaminar2
          * @param mpi_ctx The MPI context (may be null)
          * @return true if mpi_ctx is valid and world_size > 1
          */
-        inline bool hasMultipleRanks(const MPIContext *mpi_ctx)
+        inline bool hasMultipleRanks(const IMPIContext *mpi_ctx)
         {
             return mpi_ctx && mpi_ctx->world_size() > 1;
         }
@@ -105,7 +105,7 @@ namespace llaminar2
          * @param mpi_ctx MPI context for rank count
          * @return true if weight is row-sharded and multiple ranks exist
          */
-        inline bool needsAllReduceAfterGemm(const TensorBase *weight, const MPIContext *mpi_ctx)
+        inline bool needsAllReduceAfterGemm(const TensorBase *weight, const IMPIContext *mpi_ctx)
         {
             return isRowParallelSharded(weight) && hasMultipleRanks(mpi_ctx);
         }

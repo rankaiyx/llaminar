@@ -43,6 +43,7 @@ namespace llaminar2
     class ILocalTPContext;
     class ILocalPPContext;
     class TurboQuantContext;
+    class ActivationRotation;
     struct PipelineConfig;
 
     // =========================================================================
@@ -111,12 +112,14 @@ namespace llaminar2
         // =================================================================
         // Q16 KV Cache VNNI Safety (Phase 5.4)
         // =================================================================
-        /// Fixed scale for Q16 KV cache quantization (FP32 range: ±kv_cache_scale).
-        /// All K/V values are quantized with this scale, producing INT16 values in
-        /// range [-32767 * kv_cache_scale, +32767 * kv_cache_scale]. The value must
-        /// match the expected activation range to avoid clipping.
+        /// Fixed scale for Q16 KV cache quantization.
+        /// K and V use separate scales because their activation ranges differ:
+        /// K has large outliers from RoPE (especially low-frequency dims), while
+        /// V values are typically much smaller. Separate scales avoid wasting
+        /// INT16 precision range on V.
         /// See VNNISafetyConstants.h for VNNI overflow limits.
-        float kv_cache_scale = 256.0f; ///< Fixed Q16 scale. Must cover Q projection max (~130)
+        float kv_cache_scale_k = 256.0f; ///< K scale (FP32 range ±scale_k). Covers post-RoPE K max
+        float kv_cache_scale_v = 32.0f;  ///< V scale (FP32 range ±scale_v). V activations are small
 
         /// Explicit KV cache precision mode (AUTO preserves legacy behavior).
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
@@ -124,6 +127,12 @@ namespace llaminar2
         /// TurboQuant context for TQ4 KV cache quantization.
         /// Holds rotation matrix. Not owned by GraphConfig.
         const TurboQuantContext *turboquant_ctx = nullptr;
+
+        /// Block-diagonal orthogonal rotation applied to K/V before Q16_1
+        /// quantization to reduce activation kurtosis. When non-null, Q is also
+        /// rotated before the attention dot product and the output is inverse-
+        /// rotated after the weighted-V accumulation. Not owned by GraphConfig.
+        const ActivationRotation *kv_rotation = nullptr;
 
         /// RoPE-on-read mode: store pre-RoPE K in the KV cache and apply
         /// position embeddings lazily during attention (fused with TQ4 dequant).

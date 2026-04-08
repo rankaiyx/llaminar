@@ -1880,6 +1880,32 @@ add_v2_test(V2_Unit_KernelFactory
     MPI_PROCS 1  # Kernel factory tests, single rank
 )
 
+# Test: CPU Quantized GEMM/GEMV Parity (all formats, M=1 + M=64)
+add_executable(v2_test_cpu_quantized_gemm_parity unit/kernels/Test__CPUQuantizedGemmParity.cpp)
+target_link_libraries(v2_test_cpu_quantized_gemm_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_CPUQuantizedGemmParity
+    COMMAND $<TARGET_FILE:v2_test_cpu_quantized_gemm_parity>
+    LABELS "V2;Unit;Kernels;GEMM;GEMV;Quantization;Parity;DeferredPacking;VNNI"
+    MPI_PROCS 1
+)
+
+# Performance: VNNI repack micro-benchmark (deferred packing hot path)
+add_executable(v2_perf_vnni_repack performance/kernels/Perf__VNNIRepack.cpp)
+target_link_libraries(v2_perf_vnni_repack
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_VNNIRepack
+    COMMAND $<TARGET_FILE:v2_perf_vnni_repack>
+    LABELS "V2;Performance;GEMM;VNNI;DeferredPacking;Repack;Benchmark"
+    MPI_PROCS 1
+)
+
 # Test: KernelFactory sliced GEMM for tensor parallelism (Phase 2.1)
 add_executable(v2_test_kernel_factory_sliced unit/kernels/Test__KernelFactorySliced.cpp)
 target_link_libraries(v2_test_kernel_factory_sliced
@@ -4348,6 +4374,7 @@ if(ZLIB_FOUND)
         COMMAND $<TARGET_FILE:v2_integration_parity_qwen2_single_device>
         LABELS "V2;Integration;Parity;Qwen2;CPU;CUDA;ROCm;SingleDevice;PyTorch;GoldenReference;FullModel"
         MPI_PROCS 1
+        TIMEOUT 1200
     )
 
     # ---- Local Tensor Parallelism (NCCL, RCCL, PCIeBAR) ----
@@ -5600,6 +5627,15 @@ target_link_libraries(v2_test_qwen2_graph_schema llaminar2_core GTest::gtest GTe
 add_v2_test(V2_Unit_Qwen2GraphSchema
     COMMAND $<TARGET_FILE:v2_test_qwen2_graph_schema>
     LABELS "V2;Unit;Qwen2;GraphSchema;DeclarativeDesign;Phase4d"
+    MPI_PROCS 1
+)
+
+# Test: Qwen3BufferSizes — Lock-in tests for Qwen3 schema buffer sizes
+add_executable(v2_test_qwen3_buffer_sizes unit/models/qwen3/Test__Qwen3BufferSizes.cpp)
+target_link_libraries(v2_test_qwen3_buffer_sizes llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_Qwen3BufferSizes
+    COMMAND $<TARGET_FILE:v2_test_qwen3_buffer_sizes>
+    LABELS "V2;Unit;Qwen3;GraphSchema;BufferSizes"
     MPI_PROCS 1
 )
 
@@ -8568,6 +8604,25 @@ add_v2_test(V2_Unit_PrefillDecodeTransition
 )
 message(STATUS "V2 Tests: Added prefill→decode transition regression tests")
 
+# MPI Coordinated Mode unit tests
+# Tests the MPI worker loop protocol where rank 0 broadcasts commands
+# to non-root ranks for server/interactive mode inference coordination.
+add_executable(v2_unit_mpi_coordinated_mode
+    unit/execution/runner/Test__MPICoordinatedMode.cpp
+)
+target_link_libraries(v2_unit_mpi_coordinated_mode
+    llaminar2_core
+    GTest::gtest
+    GTest::gmock
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MPICoordinatedMode
+    COMMAND $<TARGET_FILE:v2_unit_mpi_coordinated_mode>
+    LABELS "V2;Unit;Orchestration;OrchestrationRunner;MPI;CoordinatedMode"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added MPI coordinated mode unit tests")
+
 # =============================================================================
 # Phase 5: OrchestrationRunner Integration Tests
 # =============================================================================
@@ -9431,6 +9486,22 @@ add_v2_test(V2_Unit_GDNKernels
     MPI_PROCS 1
 )
 
+# Test: GDN Mathematical Correctness — Deep formula-level verification of
+# recurrence, gate computation, softplus edge cases, GatedRMSNorm per-head
+# norm_dim, Conv1d bias, AVX512 scalar tail handling, multi-step accumulation
+add_executable(v2_test_gdn_mathematical_correctness unit/execution/Test__GDNMathematicalCorrectness.cpp)
+target_link_libraries(v2_test_gdn_mathematical_correctness
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+    GTest::gmock
+)
+add_v2_test(V2_Unit_GDNMathematicalCorrectness
+    COMMAND $<TARGET_FILE:v2_test_gdn_mathematical_correctness>
+    LABELS "V2;Unit;GDNKernels;GDN;MathCorrectness"
+    MPI_PROCS 1
+)
+
 # Test: Qwen35Schema — Phase D: Qwen 3.5 Dense schema, config builder,
 # graph builder, and architecture registration
 add_executable(v2_test_qwen35_schema unit/models/qwen35/Test__Qwen35Schema.cpp)
@@ -9442,6 +9513,19 @@ target_link_libraries(v2_test_qwen35_schema
 add_v2_test(V2_Unit_Qwen35Schema
     COMMAND $<TARGET_FILE:v2_test_qwen35_schema>
     LABELS "V2;Unit;Qwen35;GraphSchema;GDN;PhaseD"
+    MPI_PROCS 1
+)
+
+# Test: Qwen35BufferSizes — Lock-in tests for Qwen3.5 schema buffer sizes
+add_executable(v2_test_qwen35_buffer_sizes unit/models/qwen35/Test__Qwen35BufferSizes.cpp)
+target_link_libraries(v2_test_qwen35_buffer_sizes
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Qwen35BufferSizes
+    COMMAND $<TARGET_FILE:v2_test_qwen35_buffer_sizes>
+    LABELS "V2;Unit;Qwen35;GraphSchema;BufferSizes;GDN"
     MPI_PROCS 1
 )
 

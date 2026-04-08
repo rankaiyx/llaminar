@@ -45,7 +45,7 @@ namespace llaminar2
     // =============================================================================
 
     QwenGraphBase::QwenGraphBase(std::shared_ptr<ModelContext> model_ctx,
-                                 std::shared_ptr<MPIContext> mpi_ctx,
+                                 std::shared_ptr<IMPIContext> mpi_ctx,
                                  const GraphConfig &config)
         : config_(config),
           model_ctx_(std::move(model_ctx)),
@@ -65,19 +65,19 @@ namespace llaminar2
     }
 
     QwenGraphBase::QwenGraphBase(const GraphConfig &config,
-                                 std::shared_ptr<MPIContext> mpi_ctx)
+                                 std::shared_ptr<IMPIContext> mpi_ctx)
         : config_(config),
           model_ctx_(nullptr),
           mpi_ctx_(std::move(mpi_ctx))
     {
         LOG_DEBUG("[QwenGraphBase] Initializing (layer-only): d_model=" << config_.d_model
-                                                                       << " d_ff=" << config_.d_ff
-                                                                       << " ffn_column_parallel=" << config_.ffn_column_parallel
-                                                                       << " n_heads=" << config_.n_heads
-                                                                       << " n_kv_heads=" << config_.n_kv_heads
-                                                                       << " mpi_ctx=" << (mpi_ctx_ ? "valid" : "nullptr")
-                                                                       << " world_size=" << (mpi_ctx_ ? mpi_ctx_->world_size() : -1)
-                                                                       << " default_device=" << config_.default_device.to_string());
+                                                                        << " d_ff=" << config_.d_ff
+                                                                        << " ffn_column_parallel=" << config_.ffn_column_parallel
+                                                                        << " n_heads=" << config_.n_heads
+                                                                        << " n_kv_heads=" << config_.n_kv_heads
+                                                                        << " mpi_ctx=" << (mpi_ctx_ ? "valid" : "nullptr")
+                                                                        << " world_size=" << (mpi_ctx_ ? mpi_ctx_->world_size() : -1)
+                                                                        << " default_device=" << config_.default_device.to_string());
 
         LOG_DEBUG("[QwenGraphBase] Initialized (layer-only)");
     }
@@ -455,7 +455,7 @@ namespace llaminar2
         if (first_layer < 0 || last_layer > max_layers || first_layer >= last_layer)
         {
             LOG_ERROR("[QwenGraphBase] Invalid layer range: [" << first_layer << ", " << last_layer
-                                                            << ") for model with " << max_layers << " total layers");
+                                                               << ") for model with " << max_layers << " total layers");
             throw std::invalid_argument("Invalid layer range for partial forward graph");
         }
 
@@ -575,7 +575,7 @@ namespace llaminar2
                 }
 
                 LOG_DEBUG("[QwenGraphBase] PP copy: " << copy_bytes << " bytes to "
-                                                   << config_.default_device.toString());
+                                                      << config_.default_device.toString());
             }
             else
             {
@@ -794,10 +794,10 @@ namespace llaminar2
         for (const auto &pp_stage : config_.pipeline_config->pp_stages)
         {
             LOG_DEBUG("[QwenGraphBase] Building PP stage " << pp_stage.stage_id
-                                                        << " (" << pp_stage.domain_name << "): layers ["
-                                                        << pp_stage.first_layer << ", " << pp_stage.last_layer << ")"
-                                                        << " has_embedding=" << pp_stage.has_embedding
-                                                        << " has_lm_head=" << pp_stage.has_lm_head);
+                                                           << " (" << pp_stage.domain_name << "): layers ["
+                                                           << pp_stage.first_layer << ", " << pp_stage.last_layer << ")"
+                                                           << " has_embedding=" << pp_stage.has_embedding
+                                                           << " has_lm_head=" << pp_stage.has_lm_head);
 
             // -----------------------------------------------------------------
             // 3a. Get domain config for this stage
@@ -806,7 +806,7 @@ namespace llaminar2
             if (!domain)
             {
                 LOG_ERROR("[QwenGraphBase] Domain not found for stage " << pp_stage.stage_id
-                                                                     << " (domain_name=" << pp_stage.domain_name << ")");
+                                                                        << " (domain_name=" << pp_stage.domain_name << ")");
                 throw std::runtime_error("Domain not found for PP stage " +
                                          std::to_string(pp_stage.stage_id));
             }
@@ -821,8 +821,8 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[QwenGraphBase] Stage " << pp_stage.stage_id
-                                            << " device=" << stage_device.to_string()
-                                            << " has_tp_ctx=" << (stage_tp_ctx != nullptr));
+                                               << " device=" << stage_device.to_string()
+                                               << " has_tp_ctx=" << (stage_tp_ctx != nullptr));
 
             // -----------------------------------------------------------------
             // 3b. Build embedding if this is the first stage
@@ -980,7 +980,7 @@ namespace llaminar2
                 prev_node = transfer_name;
 
                 LOG_DEBUG("[QwenGraphBase] Added PP transfer: " << transfer_name
-                                                             << " (source device=" << stage_device.to_string() << ")");
+                                                                << " (source device=" << stage_device.to_string() << ")");
             }
 
             // -----------------------------------------------------------------
@@ -1056,7 +1056,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[QwenGraphBase] Built unified pipeline graph with " << graph.size()
-                                                                    << " nodes across " << config_.pipeline_config->numStages() << " PP stages");
+                                                                       << " nodes across " << config_.pipeline_config->numStages() << " PP stages");
 
         return graph;
     }
@@ -1106,10 +1106,10 @@ namespace llaminar2
         ResolvedGraphSpec resolved = resolver.resolve(schema, config, tensors);
 
         LOG_DEBUG("[QwenGraphBase] Schema resolved: " << resolved.stages.size() << " stages"
-                                                   << " (emitted=" << resolved.stats.stages_emitted
-                                                   << ", skipped=" << resolved.stats.stages_skipped
-                                                   << ", allreduce=" << resolved.stats.allreduce_inserted
-                                                   << ", allgather=" << resolved.stats.allgather_inserted << ")");
+                                                      << " (emitted=" << resolved.stats.stages_emitted
+                                                      << ", skipped=" << resolved.stats.stages_skipped
+                                                      << ", allreduce=" << resolved.stats.allreduce_inserted
+                                                      << ", allgather=" << resolved.stats.allgather_inserted << ")");
 
         // =====================================================================
         // Step 5: Build the ComputeGraph
@@ -1204,8 +1204,8 @@ namespace llaminar2
         TensorBase *logits_local)
     {
         LOG_DEBUG("[QwenGraphBase] Building LM head graph for " << total_tokens << " tokens"
-                                                             << " lm_head_column_parallel=" << config_.lm_head_column_parallel
-                                                             << " vocab_local=" << config_.vocab_local);
+                                                                << " lm_head_column_parallel=" << config_.lm_head_column_parallel
+                                                                << " vocab_local=" << config_.vocab_local);
 
         ComputeGraph graph;
 
@@ -1238,8 +1238,8 @@ namespace llaminar2
         int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
 
         LOG_DEBUG("[QwenGraphBase] LM head: use_column_parallel=" << use_column_parallel
-                                                               << " lm_head_vocab_size=" << lm_head_vocab_size
-                                                               << " lm_head_output=" << lm_head_output);
+                                                                  << " lm_head_vocab_size=" << lm_head_vocab_size
+                                                                  << " lm_head_output=" << lm_head_output);
 
         // LM Head projection
         LMHeadStage::Params lm_params;
@@ -1263,7 +1263,7 @@ namespace llaminar2
         if (use_column_parallel && mpi_ctx_)
         {
             LOG_DEBUG("[QwenGraphBase] Adding lm_head_allgather: world_size=" << mpi_ctx_->world_size()
-                                                                           << " total_tokens=" << total_tokens);
+                                                                              << " total_tokens=" << total_tokens);
 
             AllGatherStage::Params allgather_params;
             allgather_params.local_input = logits_local;
@@ -1585,7 +1585,8 @@ namespace llaminar2
         config.rope_theta = config_.rope_theta;
 
         // Phase 5.4: VNNI-safe Q16 KV cache scale
-        config.kv_cache_scale = config_.kv_cache_scale;
+        config.kv_cache_scale_k = config_.kv_cache_scale_k;
+        config.kv_cache_scale_v = config_.kv_cache_scale_v;
 
         // TP-adjusted local dimensions
         // Use local head counts when QKV is column-parallel

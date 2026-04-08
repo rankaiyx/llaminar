@@ -30,7 +30,7 @@ namespace llaminar2
     // =========================================================================
 
     BackendRouter::BackendRouter(
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         const ClusterInventory &cluster_inventory,
         std::unique_ptr<IBackendFactory> factory)
         : mpi_ctx_(std::move(mpi_ctx)),
@@ -836,7 +836,7 @@ namespace llaminar2
 
     std::unique_ptr<ICollectiveBackend> DefaultBackendFactory::createBackend(
         CollectiveBackendType type,
-        std::shared_ptr<MPIContext> mpi_ctx)
+        std::shared_ptr<IMPIContext> mpi_ctx)
     {
         switch (type)
         {
@@ -928,7 +928,7 @@ namespace llaminar2
     std::unique_ptr<BackendRouter> GlobalBackendRouter::instance_;
 
     void GlobalBackendRouter::init(
-        std::shared_ptr<MPIContext> mpi_ctx,
+        std::shared_ptr<IMPIContext> mpi_ctx,
         const ClusterInventory &cluster_inventory)
     {
         instance_ = std::make_unique<BackendRouter>(std::move(mpi_ctx), cluster_inventory);

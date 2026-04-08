@@ -25,7 +25,7 @@ namespace llaminar2
     struct ModelContextConfig
     {
         // Core Settings
-        std::shared_ptr<MPIContext> mpi_ctx;
+        std::shared_ptr<IMPIContext> mpi_ctx;
         WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED;
         WeightPrecision weight_precision = WeightPrecision::NATIVE;
 

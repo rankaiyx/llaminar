@@ -78,7 +78,7 @@ namespace llaminar2
         /// Create a backend of the specified type
         virtual std::unique_ptr<ICollectiveBackend> createBackend(
             CollectiveBackendType type,
-            std::shared_ptr<MPIContext> mpi_ctx) = 0;
+            std::shared_ptr<IMPIContext> mpi_ctx) = 0;
 
         /// Check if a backend type is available (library compiled in)
         virtual bool isAvailable(CollectiveBackendType type) const = 0;
@@ -163,7 +163,7 @@ namespace llaminar2
          * @param factory Backend factory (nullptr = use default production factory)
          */
         BackendRouter(
-            std::shared_ptr<MPIContext> mpi_ctx,
+            std::shared_ptr<IMPIContext> mpi_ctx,
             const ClusterInventory &cluster_inventory,
             std::unique_ptr<IBackendFactory> factory = nullptr);
 
@@ -331,7 +331,7 @@ namespace llaminar2
         bool hasDomainSupport() const;
 
     private:
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         ClusterInventory cluster_inventory_;
         std::unique_ptr<IBackendFactory> factory_;
 
@@ -377,7 +377,7 @@ namespace llaminar2
     public:
         std::unique_ptr<ICollectiveBackend> createBackend(
             CollectiveBackendType type,
-            std::shared_ptr<MPIContext> mpi_ctx) override;
+            std::shared_ptr<IMPIContext> mpi_ctx) override;
 
         bool isAvailable(CollectiveBackendType type) const override;
     };
@@ -403,7 +403,7 @@ namespace llaminar2
          * Standard initialization for production use.
          */
         static void init(
-            std::shared_ptr<MPIContext> mpi_ctx,
+            std::shared_ptr<IMPIContext> mpi_ctx,
             const ClusterInventory &cluster_inventory);
 
         /**

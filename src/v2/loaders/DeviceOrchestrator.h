@@ -113,7 +113,7 @@ namespace llaminar2
      * - Available hardware (from DeviceManager)
      * - Model architecture (from ModelContext metadata)
      * - User preferences (from CLI flags)
-     * - MPI topology (from MPIContext)
+     * - MPI topology (from IMPIContext)
      *
      * It produces a WeightPlacementMap that encodes fine-grained placement decisions,
      * which the WeightManager then executes.
@@ -140,7 +140,7 @@ namespace llaminar2
          * @param config User-provided configuration
          */
         DeviceOrchestrator(std::shared_ptr<DeviceManager> device_mgr,
-                           std::shared_ptr<MPIContext> mpi_ctx,
+                           std::shared_ptr<IMPIContext> mpi_ctx,
                            const LegacyOrchestrationConfig &config);
 
         /**
@@ -278,7 +278,7 @@ namespace llaminar2
         void logPlacementDecision(const std::string &message) const;
 
         std::shared_ptr<DeviceManager> device_mgr_;
-        std::shared_ptr<MPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> mpi_ctx_;
         LegacyOrchestrationConfig config_;
     };
 

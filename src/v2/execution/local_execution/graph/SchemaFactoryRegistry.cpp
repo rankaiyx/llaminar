@@ -63,11 +63,9 @@ namespace llaminar2
     // Lazy built-in registration
     // =========================================================================
 
-    static std::once_flag s_schema_builtin_init;
-
     static void ensureSchemaBuiltins()
     {
-        std::call_once(s_schema_builtin_init, registerBuiltinModels);
+        registerBuiltinModels();
     }
 
     // =========================================================================

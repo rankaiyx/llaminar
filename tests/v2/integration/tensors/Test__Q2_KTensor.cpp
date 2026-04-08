@@ -38,7 +38,7 @@ protected:
         return std::sqrt(sum_sq_diff / sum_sq_ref);
     }
 
-    std::shared_ptr<MPIContext> mpi_ctx_;
+    std::shared_ptr<IMPIContext> mpi_ctx_;
 };
 
 TEST_F(Test__Q2_KTensor, GemmCorrectness_SingleBlock_Zero)
