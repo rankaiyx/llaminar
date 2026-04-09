@@ -1526,6 +1526,15 @@ namespace llaminar2
 
         /**
          * @brief Clear KV cache (IInferenceRunner override)
+         *
+         * Resets inference state (KV cache, positions, model recurrence) but
+         * preserves the forward graph cache. Cached graphs remain valid because:
+         *   - KVCache::clear() resets ring positions, not buffer memory
+         *   - Stages hold IKVCache* interface pointers, not data pointers
+         *   - resetState() only zeros model-internal buffers (GDN conv/recurrence)
+         *
+         * This avoids the expensive graph rebuild + weight re-coherence cycle
+         * (1-2s on GPU) that would occur if graphs were invalidated.
          */
         void clear_cache() override
         {
@@ -1534,13 +1543,15 @@ namespace llaminar2
                 if (ctx && dev.is_gpu())
                     ctx->synchronize();
             }
-            // Invalidate graph caches but preserve device contexts
+            // Invalidate layer graph caches (lightweight, just validity flags)
             for (auto &entry : layer_graph_cache_)
             {
                 entry.valid = false;
             }
-            if (forward_engine_)
-                forward_engine_->clearCache();
+            // NOTE: Forward engine cache is intentionally preserved.
+            // Cached graphs hold IKVCache* pointers that remain valid after
+            // state_.clear(). Graph rebuild would force weight re-coherence
+            // (~245ms CUDA, ~1840ms ROCm) with zero correctness benefit.
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
             state_.clear();

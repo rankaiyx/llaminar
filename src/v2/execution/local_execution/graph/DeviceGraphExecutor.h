@@ -515,6 +515,7 @@ namespace llaminar2
         BufferArena *arena_ = nullptr;                 ///< Optional arena for contract coherence (not owned)
         StageTimeline stage_timeline_;                 ///< GPU event-based per-stage timeline profiler
         bool stage_timeline_info_populated_ = false;   ///< True after first setStageInfo pass (names never change)
+        bool weights_session_cohered_ = false;         ///< True after first forward completes weight coherence for all nodes
 
         // =====================================================================
         // Unified stage runner (replaces divergent paths)

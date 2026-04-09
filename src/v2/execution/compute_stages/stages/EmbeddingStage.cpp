@@ -475,8 +475,12 @@ namespace llaminar2
         if (!params_.output_buffer_id)
             return {};
 
-        return StageBufferContract::build()
+        auto contract = StageBufferContract::build()
             .addOutput(*params_.output_buffer_id);
+        // Embedding table is a model weight, not arena-managed
+        if (params_.embed_table)
+            contract.addWeight(const_cast<ITensor *>(params_.embed_table));
+        return contract;
     }
 
 } // namespace llaminar2

@@ -224,6 +224,15 @@ namespace llaminar2
             contract.addOutput(*params_.output_a_buffer_id);
         if (params_.output_b_buffer_id)
             contract.addOutput(*params_.output_b_buffer_id);
+        // Model weights are not arena-managed
+        if (params_.w_qkv)
+            contract.addWeight(const_cast<ITensor *>(params_.w_qkv));
+        if (params_.w_z)
+            contract.addWeight(const_cast<ITensor *>(params_.w_z));
+        if (params_.w_a)
+            contract.addWeight(const_cast<ITensor *>(params_.w_a));
+        if (params_.w_b)
+            contract.addWeight(const_cast<ITensor *>(params_.w_b));
         return contract;
     }
 

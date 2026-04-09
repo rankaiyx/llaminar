@@ -88,15 +88,10 @@ namespace llaminar2
         // then the GPU path re-uploads them (wasteful round-trip).
         if (params_.device_id.is_gpu())
         {
-            // Ensure all tensors are on device (gamma is a weight, not arena-managed)
-            auto *input_mut = const_cast<TensorBase *>(input_base);
-            auto *gate_mut = const_cast<TensorBase *>(gate_base);
-            auto *gamma_mut = const_cast<TensorBase *>(gamma_base);
-            input_mut->ensureOnDevice(params_.device_id);
-            gate_mut->ensureOnDevice(params_.device_id);
-            gamma_mut->ensureOnDevice(params_.device_id);
-            output_base->allocateOnDevice(params_.device_id);
-
+            // Coherence is handled by the executor via bufferContract():
+            //   - Arena inputs (ATTN_OUTPUT, GDN_Z) via prepareForRead
+            //   - Model weights (gamma) via contract.weight_tensors
+            //   - Output (ATTN_OUTPUT) via prepareForWrite + markWritten
             const float *inp_gpu = static_cast<const float *>(input_base->active_data_ptr());
             const float *gate_gpu = static_cast<const float *>(gate_base->active_data_ptr());
             const float *gamma_gpu = static_cast<const float *>(gamma_base->active_data_ptr());
@@ -342,6 +337,9 @@ namespace llaminar2
             contract.addInput(*params_.gate_buffer_id);
         if (params_.output_buffer_id)
             contract.addOutput(*params_.output_buffer_id);
+        // gamma is a model weight, not arena-managed
+        if (params_.gamma)
+            contract.addWeight(const_cast<ITensor *>(params_.gamma));
         return contract;
     }
 

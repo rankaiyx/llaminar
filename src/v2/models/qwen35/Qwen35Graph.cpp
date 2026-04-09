@@ -505,6 +505,9 @@ namespace llaminar2
         }
 
         rec_params.output_buffer_id = BufferId::ATTN_OUTPUT;
+        rec_params.qkv_buffer_id = BufferId::GDN_QKV;
+        rec_params.alpha_buffer_id = BufferId::GDN_ALPHA;
+        rec_params.beta_buffer_id = BufferId::GDN_BETA;
 
         // Use stored kernel instance (lifetime tied to Qwen35Graph)
         rec_params.kernel = rec_kernels_[layer_idx].get();

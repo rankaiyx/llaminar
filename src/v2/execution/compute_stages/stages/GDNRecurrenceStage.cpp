@@ -88,16 +88,10 @@ namespace llaminar2
         // =====================================================================
         if (device().is_gpu())
         {
-            // Ensure all inputs are on device (const_cast is safe: ensureOnDevice
-            // is logically const — it changes physical placement, not tensor values)
-            const_cast<TensorBase *>(q_base)->ensureOnDevice(device());
-            const_cast<TensorBase *>(alpha_base)->ensureOnDevice(device());
-            const_cast<TensorBase *>(beta_base)->ensureOnDevice(device());
-            const_cast<TensorBase *>(alog_base)->ensureOnDevice(device());
-            const_cast<TensorBase *>(dtbias_base)->ensureOnDevice(device());
-
-            // Allocate output on device (kernel will overwrite)
-            const_cast<TensorBase *>(out_base)->allocateOnDevice(device());
+            // Coherence is handled by the executor via bufferContract():
+            //   - Arena inputs (QKV, alpha, beta) via prepareForRead
+            //   - Model weights (A_log, dt_bias) via contract.weight_tensors
+            //   - Output (ATTN_OUTPUT) via prepareForWrite + markWritten
 
             // Get device pointers
             const float *d_alpha = static_cast<const float *>(alpha_base->gpu_data_ptr());
@@ -157,10 +151,7 @@ namespace llaminar2
             }
             else
             {
-                // Separate Q, K, V tensors — ensure each on device
-                const_cast<TensorBase *>(k_base)->ensureOnDevice(device());
-                const_cast<TensorBase *>(v_base)->ensureOnDevice(device());
-
+                // Separate Q, K, V tensors — already on device via executor coherence
                 d_q = static_cast<const float *>(q_base->gpu_data_ptr());
                 d_k = static_cast<const float *>(k_base->gpu_data_ptr());
                 d_v = static_cast<const float *>(v_base->gpu_data_ptr());
@@ -193,9 +184,6 @@ namespace llaminar2
                 LOG_ERROR("[GDNRecurrenceStage] GPU kernel failed");
                 return false;
             }
-
-            // Mark output as device-authoritative (kernel wrote to GPU buffer)
-            const_cast<TensorBase *>(out_base)->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device());
 
             LOG_DEBUG("[GDNRecurrenceStage] GPU layer=" << params_.layer_idx
                                                         << " seq_len=" << params_.seq_len
@@ -484,8 +472,21 @@ namespace llaminar2
     StageBufferContract GDNRecurrenceStage::bufferContract() const
     {
         StageBufferContract contract;
+        // Arena-managed activation inputs
+        if (params_.qkv_buffer_id)
+            contract.addInput(*params_.qkv_buffer_id);
+        if (params_.alpha_buffer_id)
+            contract.addInput(*params_.alpha_buffer_id);
+        if (params_.beta_buffer_id)
+            contract.addInput(*params_.beta_buffer_id);
+        // Arena-managed output
         if (params_.output_buffer_id)
             contract.addOutput(*params_.output_buffer_id);
+        // Model weights (not arena-managed)
+        if (params_.A_log)
+            contract.addWeight(const_cast<ITensor *>(params_.A_log));
+        if (params_.dt_bias)
+            contract.addWeight(const_cast<ITensor *>(params_.dt_bias));
         return contract;
     }
 

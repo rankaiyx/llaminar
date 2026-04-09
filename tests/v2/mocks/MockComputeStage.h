@@ -86,12 +86,23 @@ namespace llaminar2
                 return dump_info_;
             }
 
+            StageBufferContract bufferContract() const override
+            {
+                return buffer_contract_;
+            }
+
             // =========================================================================
             // Test Configuration
             // =========================================================================
 
             /// Set whether execute() should return success or failure
             void setShouldSucceed(bool succeed) { should_succeed_ = succeed; }
+
+            /// Set buffer contract for coherence testing
+            void setBufferContract(StageBufferContract contract)
+            {
+                buffer_contract_ = std::move(contract);
+            }
 
             /// Set estimated FLOPS for load balancing tests
             void setEstimatedFlops(size_t flops) { estimated_flops_ = flops; }
@@ -149,6 +160,7 @@ namespace llaminar2
             bool requires_allreduce_ = false;
             std::vector<ComputeBackendType> supported_backends_;
             StageDumpInfo dump_info_;
+            StageBufferContract buffer_contract_;
 
             // Execution tracking
             int execution_count_ = 0;

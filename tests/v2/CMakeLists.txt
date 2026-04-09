@@ -9600,4 +9600,38 @@ add_v2_test(V2_Unit_DynamicBufferExtensions
     MPI_PROCS 1
 )
 
+# =============================================================================
+# Weight Coherence Contract Tests
+# =============================================================================
+
+# Test: StageWeightContracts — Verifies all weight-bearing stages declare weights
+# in bufferContract().addWeight(). Locks in contract-only coherence paradigm.
+add_executable(v2_test_stage_weight_contracts unit/execution/compute_stages/Test__StageWeightContracts.cpp)
+target_include_directories(v2_test_stage_weight_contracts PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ include path
+)
+target_link_libraries(v2_test_stage_weight_contracts llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StageWeightContracts
+    COMMAND $<TARGET_FILE:v2_test_stage_weight_contracts>
+    LABELS "V2;Unit;Execution;ComputeStage;BufferContracts;WeightCoherence"
+    MPI_PROCS 1
+)
+
+# Test: ExecutorWeightCoherence — Tests DeviceGraphExecutor weight coherence system:
+# session-level flag, per-node flags, contract-only processing, policy gating.
+add_executable(v2_test_executor_weight_coherence unit/execution/local_execution/graph/Test__ExecutorWeightCoherence.cpp)
+target_include_directories(v2_test_executor_weight_coherence PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_executor_weight_coherence
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ExecutorWeightCoherence
+    COMMAND $<TARGET_FILE:v2_test_executor_weight_coherence>
+    LABELS "V2;Unit;DeviceGraphExecutor;Execution;WeightCoherence;BufferContracts"
+    MPI_PROCS 1
+)
+
 endif()

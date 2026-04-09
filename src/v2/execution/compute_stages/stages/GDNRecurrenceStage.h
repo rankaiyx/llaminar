@@ -96,7 +96,10 @@ namespace llaminar2
             /// Kernel implementation (set during graph construction)
             ITensorGatedDeltaNet *kernel = nullptr;
 
-            // Optional BufferIds
+            // Optional BufferIds for contract-based coherence
+            std::optional<BufferId> qkv_buffer_id;    ///< Arena: merged QKV tensor
+            std::optional<BufferId> alpha_buffer_id;  ///< Arena: alpha projection
+            std::optional<BufferId> beta_buffer_id;   ///< Arena: beta projection
             std::optional<BufferId> output_buffer_id;
         };
 

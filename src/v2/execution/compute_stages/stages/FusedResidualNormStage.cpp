@@ -294,6 +294,9 @@ namespace llaminar2
             contract.addInOut(*params_.residual_buffer_id);
         if (params_.norm_output_buffer_id)
             contract.addOutput(*params_.norm_output_buffer_id);
+        // Gamma is a model weight, not arena-managed
+        if (params_.gamma)
+            contract.addWeight(const_cast<ITensor *>(params_.gamma));
         return contract;
     }
 

@@ -249,9 +249,15 @@ namespace llaminar2
         if (!params_.input_buffer_id || !params_.output_buffer_id)
             return {};
 
-        return StageBufferContract::build()
+        auto contract = StageBufferContract::build()
             .addInput(*params_.input_buffer_id)
             .addOutput(*params_.output_buffer_id);
+        // Model weight is not arena-managed
+        if (params_.lm_head_weight)
+            contract.addWeight(const_cast<ITensor *>(params_.lm_head_weight));
+        if (params_.bias_tensor)
+            contract.addWeight(const_cast<ITensor *>(static_cast<const ITensor *>(params_.bias_tensor)));
+        return contract;
     }
 
 } // namespace llaminar2

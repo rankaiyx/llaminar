@@ -557,6 +557,12 @@ namespace llaminar2
             stats_.total_flops += graph.totalEstimatedFlops();
         }
 
+        // After first successful pass, all weight tensors are confirmed on-device.
+        // Subsequent graph rebuilds (e.g., after clear_cache) skip per-node
+        // weight coherence since weight data never moves between forwards.
+        if (!weights_session_cohered_)
+            weights_session_cohered_ = true;
+
         return true;
     }
 
@@ -691,31 +697,33 @@ namespace llaminar2
                     input_cohere_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
                 }
 
-                // Weight coherence (not arena-managed, use direct ensureOnDevice)
-                if (policy.weight_coherence && !node.weights_cohered)
+                // Weight coherence (not arena-managed, use direct ensureOnDevice).
+                // Only processes contract.weight_tensors — the canonical weight list.
+                // dump_info.weights duplicates these, and dump_info.inputs are activation
+                // tensors already handled by arena coherence above.
+                //
+                // Session-level fast path: after the first successful forward pass,
+                // all weights are known to be on-device. Skip the per-node check
+                // since weight tensors don't move between forwards.
+                if (policy.weight_coherence && !node.weights_cohered && !weights_session_cohered_)
                 {
                     if (profiling)
                         phase_start = std::chrono::high_resolution_clock::now();
 
-                    if (!contract.weight_tensors.empty())
+                    for (auto *weight : contract.weight_tensors)
                     {
-                        for (auto *weight : contract.weight_tensors)
+                        if (auto *tb = dynamic_cast<TensorBase *>(weight))
                         {
-                            if (auto *tb = dynamic_cast<TensorBase *>(weight))
-                                tb->ensureOnDevice(target_device);
+                            if (!tb->ensureOnDevice(target_device))
+                            {
+                                LOG_ERROR("[DeviceGraphExecutor] Weight upload failed for stage '"
+                                          << node.name << "'"
+                                          << " tensor=" << static_cast<void *>(tb)
+                                          << " type=" << static_cast<int>(tb->native_type())
+                                          << " device=" << target_device.toString());
+                                return false;
+                            }
                         }
-                    }
-
-                    for (const auto &wi : cached_dump_info.weights)
-                    {
-                        if (wi.tensor)
-                            const_cast<ITensor *>(wi.tensor)->ensureOnDevice(target_device);
-                    }
-
-                    for (const auto &ii : cached_dump_info.inputs)
-                    {
-                        if (ii.tensor)
-                            ii.tensor->ensureOnDevice(target_device);
                     }
 
                     if (profiling)

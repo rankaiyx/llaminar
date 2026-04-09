@@ -56,16 +56,10 @@ namespace llaminar2
         // =================================================================
         if (device().is_gpu())
         {
-            // Ensure inputs on device (const_cast is safe: ensureOnDevice
-            // is logically const — changes placement, not tensor values)
-            const_cast<TensorBase *>(input_base)->ensureOnDevice(device());
-            const_cast<TensorBase *>(weight_base)->ensureOnDevice(device());
-
-            // For in-place operation (input == output), allocateOnDevice is skipped
-            // since input is already on device. For separate output, allocate.
-            if (params_.input != params_.output)
-                const_cast<TensorBase *>(output_base)->allocateOnDevice(device());
-
+            // Coherence is handled by the executor via bufferContract():
+            //   - Arena inputs (GDN_QKV) via prepareForRead
+            //   - Model weights (conv1d weight, bias) via contract.weight_tensors
+            //   - Output (GDN_QKV) via prepareForWrite + markWritten
             const float *d_input = static_cast<const float *>(input_base->gpu_data_ptr());
             const float *d_weight = static_cast<const float *>(weight_base->gpu_data_ptr());
             float *d_output = static_cast<float *>(const_cast<TensorBase *>(output_base)->gpu_data_ptr());
@@ -75,10 +69,7 @@ namespace llaminar2
             {
                 auto *bias_base = dynamic_cast<const TensorBase *>(params_.bias);
                 if (bias_base)
-                {
-                    const_cast<TensorBase *>(bias_base)->ensureOnDevice(device());
                     d_bias = static_cast<const float *>(bias_base->gpu_data_ptr());
-                }
             }
 
             bool ok = params_.kernel->forward(
@@ -92,9 +83,6 @@ namespace llaminar2
                 LOG_ERROR("[ShortConv1dStage] GPU kernel forward() failed");
                 return false;
             }
-
-            // Mark output as device-authoritative (kernel wrote to GPU buffer)
-            const_cast<TensorBase *>(output_base)->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device());
 
             LOG_DEBUG("[ShortConv1dStage] GPU: seq_len=" << params_.seq_len
                                                          << " channels=" << params_.channels
@@ -203,6 +191,11 @@ namespace llaminar2
             contract.addInput(*params_.input_buffer_id);
         if (params_.output_buffer_id)
             contract.addOutput(*params_.output_buffer_id);
+        // Conv weights are model parameters, not arena-managed
+        if (params_.weight)
+            contract.addWeight(const_cast<ITensor *>(params_.weight));
+        if (params_.bias)
+            contract.addWeight(const_cast<ITensor *>(params_.bias));
         return contract;
     }
 
