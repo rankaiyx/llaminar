@@ -1089,6 +1089,73 @@ LLAMINAR_STAGE_DUMP_ENABLED=1 LLAMINAR_MPI_LOG_COLLECTIVES=1 \
 ./build_v2_release/llaminar2 -tp 2 --explain-placement -m model.gguf -p "test"
 ```
 
+### CSV Output for Automated Analysis
+
+Parity tests automatically export detailed per-stage and per-layer metrics as CSV files for offline analysis, regression tracking, and plotting. CSV files are written to:
+
+```
+tests/v2/integration/parity/results/<git-hash>/<TestSuite_TestName_Backend>/
+```
+
+The `<git-hash>` prefix (first 8 chars of HEAD) enables A/B comparison across commits. Results are `.gitignore`d and not committed.
+
+**Prefill CSV Files**:
+
+| File | Description |
+|------|-------------|
+| `prefill_layers.csv` | Per-layer aggregate metrics: avg/min cosine, worst stage, kurtosis |
+| `prefill_summary.csv` | LM_HEAD logit metrics: cosine, KL divergence, Top-1/5 overlap |
+| `prefill_stages.csv` | Per-stage detailed distribution stats (39+ columns, see below) |
+
+**Decode CSV Files**:
+
+| File | Description |
+|------|-------------|
+| `decode_steps.csv` | Per-decode-step LM_HEAD metrics: cosine, KL, token predictions, match status |
+| `decode_layers.csv` | Per-step per-layer aggregate metrics: avg/min cosine, worst stage |
+| `decode_stages.csv` | Per-step per-stage detailed distribution stats (39+ columns) |
+
+**Stage CSV Column Layout** (`prefill_stages.csv` and `decode_stages.csv`):
+
+Core columns: `backend`, `layer`, `stage` (plus `step` for decode), followed by parity metrics:
+
+| Column | Description |
+|--------|-------------|
+| `cosine` | Cosine similarity between Llaminar and PyTorch stage output |
+| `rel_l2` | Relative L2 norm of error |
+| `max_abs_diff` | Maximum absolute element-wise difference |
+| `snr_db` | Signal-to-noise ratio in dB |
+| `rmse` | Root mean squared error |
+| `error_entropy` | Shannon entropy of binned error distribution |
+
+Then 15 distribution stats columns are repeated for both `llaminar_` and `pytorch_` prefixed:
+
+| Column | Description |
+|--------|-------------|
+| `{prefix}min/max` | Value range |
+| `{prefix}mean/stddev` | Central tendency and spread |
+| `{prefix}kurtosis/skewness` | Distribution shape |
+| `{prefix}p95/p99` | Tail percentiles |
+| `{prefix}outlier_frac` | Fraction of elements beyond 3σ |
+| `{prefix}dynamic_range` | max/min absolute value ratio |
+| `{prefix}sparsity/zero_frac` | Fraction of near-zero/exactly-zero elements |
+| `{prefix}nan_count/inf_count` | Numerical anomalies |
+| `{prefix}elements` | Total element count |
+
+**Example: Analyzing CSV with pandas**:
+
+```python
+import pandas as pd
+df = pd.read_csv("tests/v2/integration/parity/results/30dd5714/Qwen2_.../decode_stages.csv")
+
+# Find stages with worst cosine per decode step
+worst = df.loc[df.groupby("step")["cosine"].idxmin()]
+print(worst[["step", "layer", "stage", "cosine", "max_abs_diff"]])
+
+# Compare distribution shape between backends
+print(df[df.stage == "Q_PROJ"][["layer", "cosine", "llaminar_kurtosis", "pytorch_kurtosis"]])
+```
+
 ---
 
 ## Kernel Development
