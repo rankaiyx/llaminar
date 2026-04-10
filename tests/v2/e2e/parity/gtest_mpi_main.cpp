@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include "backends/GPUDeviceContextPool.h"
 
 int main(int argc, char **argv)
 {
@@ -18,6 +19,10 @@ int main(int argc, char **argv)
 
     // Run tests
     int result = RUN_ALL_TESTS();
+
+    // Shutdown GPU contexts before MPI_Finalize to avoid SIGSEGV in
+    // HIP runtime teardown (static destruction order fiasco).
+    llaminar2::GPUDeviceContextPool::instance().shutdown();
 
     // Finalize MPI
     MPI_Finalize();

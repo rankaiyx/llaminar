@@ -275,6 +275,25 @@ namespace llaminar2
     {
         LOG_TRACE("[AMDDeviceContext] Cleaning up HIP resources for device " << device_ordinal_);
 
+        // Guard: Check if HIP runtime is still alive before cleanup.
+        // During static destruction (process exit), the HIP runtime's internal
+        // state may already be torn down by atexit handlers. Calling HIP APIs
+        // on dead runtime state causes SIGSEGV (use-after-free at cmpb 0xb8(%rdi)
+        // inside hipHccModuleLaunchKernel). This matches CUDA's approach of
+        // ignoring cudaErrorCudartUnloading during NvidiaDeviceContext cleanup.
+        int device_count = 0;
+        hipError_t probe = hipGetDeviceCount(&device_count);
+        if (probe != hipSuccess)
+        {
+            LOG_TRACE("[AMDDeviceContext] HIP runtime already shut down for device "
+                      << device_ordinal_ << " (hipGetDeviceCount returned "
+                      << hipGetErrorString(probe) << "), skipping cleanup");
+            hipblas_lt_handle_ = nullptr;
+            hipblas_handle_ = nullptr;
+            default_stream_ = nullptr;
+            return;
+        }
+
         // Destroy hipBLASLt handle
         if (hipblas_lt_handle_ != nullptr)
         {

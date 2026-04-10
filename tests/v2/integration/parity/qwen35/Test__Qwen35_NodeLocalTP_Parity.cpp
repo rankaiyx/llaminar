@@ -30,6 +30,7 @@
 #include <mpi.h>
 #include "Qwen35ParityTestBase.h"
 #include "collective/BackendRouter.h"
+#include "backends/GPUDeviceContextPool.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -342,6 +343,7 @@ int main(int argc, char **argv)
     // CRITICAL: Shutdown GlobalBackendRouter before MPI_Finalize to ensure
     // NCCLCoordinator cleanup happens while CUDA runtime is still active.
     GlobalBackendRouter::shutdown();
+    GPUDeviceContextPool::instance().shutdown();
 
     // Finalize MPI
     MPI_Finalize();

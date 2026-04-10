@@ -29,6 +29,7 @@
 #include <mpi.h>
 #include "Qwen35ParityTestBase.h"
 #include "collective/BackendRouter.h"
+#include "backends/GPUDeviceContextPool.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -42,11 +43,16 @@ using namespace llaminar2::test::parity::qwen35;
 // Includes Qwen2-standard exclusions plus GDN-specific sharded stages.
 static const std::vector<std::string> kTPExcludedStages = {
     // Standard attention projections (FA layers)
-    "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
-    "Q_ROPE", "K_ROPE",
+    "Q_PROJECTION",
+    "K_PROJECTION",
+    "V_PROJECTION",
+    "Q_ROPE",
+    "K_ROPE",
     "ATTENTION_CONTEXT",
     // FFN sharded intermediates
-    "FFN_GATE", "FFN_UP", "FFN_SWIGLU",
+    "FFN_GATE",
+    "FFN_UP",
+    "FFN_SWIGLU",
     // GDN-specific: QKV projection covers gdn_proj (same snapshot key)
     "QKV_PROJECTION",
     // GDN-specific: recurrence output is per-local-heads under TP
@@ -227,6 +233,7 @@ int main(int argc, char **argv)
     // CRITICAL: Shutdown GlobalBackendRouter before MPI_Finalize to ensure
     // NCCLCoordinator cleanup happens while CUDA runtime is still active.
     GlobalBackendRouter::shutdown();
+    GPUDeviceContextPool::instance().shutdown();
 
     MPI_Finalize();
     return result;

@@ -37,6 +37,7 @@
 
 #include "Qwen3ParityTestBase.h"
 #include "collective/BackendRouter.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "tensors/Tensors.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "kernels/cpu/turboquant/TurboQuantDequantizeTQ4.h"
@@ -1842,6 +1843,7 @@ int main(int argc, char **argv)
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
     GlobalBackendRouter::shutdown();
+    GPUDeviceContextPool::instance().shutdown();
     MPI_Finalize();
     return result;
 }

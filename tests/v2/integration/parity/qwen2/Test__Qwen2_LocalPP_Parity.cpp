@@ -20,6 +20,7 @@
 #include <mpi.h>
 #include "Qwen2ParityTestBase.h"
 #include "collective/BackendRouter.h"
+#include "backends/GPUDeviceContextPool.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -163,6 +164,7 @@ int main(int argc, char **argv)
     // Without this, the static GlobalBackendRouter::instance_ is destroyed
     // during atexit handlers after CUDA has shut down, causing crashes.
     GlobalBackendRouter::shutdown();
+    GPUDeviceContextPool::instance().shutdown();
 
     MPI_Finalize();
     return result;

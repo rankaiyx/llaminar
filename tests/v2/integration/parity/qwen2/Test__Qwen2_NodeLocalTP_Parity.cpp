@@ -24,6 +24,7 @@
 #include <mpi.h>
 #include "Qwen2ParityTestBase.h"
 #include "collective/BackendRouter.h"
+#include "backends/GPUDeviceContextPool.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test::parity;
@@ -84,8 +85,7 @@ static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
     // 4-way Node-Local TP with CPU (for larger models, if 4 NUMA nodes available)
     {
         .name = "NodeLocalTP_4xMPI_CPU",
-        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU,
-                    ParityDeviceType::CPU, ParityDeviceType::CPU},
+        .devices = {ParityDeviceType::CPU, ParityDeviceType::CPU, ParityDeviceType::CPU, ParityDeviceType::CPU},
         .parallelism = Parallelism::NodeLocalTP,
         .collective = Collective::MPI,
         .thresholds = {
@@ -93,7 +93,7 @@ static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
             .decode_cosine_threshold = 0.95f,
             .early_layers_count = 4,
             .min_early_layers_passed = 3,
-            .kl_threshold = 0.30f,  // More variance with 4-way sharding
+            .kl_threshold = 0.30f, // More variance with 4-way sharding
             .excluded_stages = kNodeLocalTPExcludedStages,
         },
         .mpi_ranks = 4,
@@ -111,7 +111,7 @@ static const std::vector<TestConfig> kNodeLocalTPTestConfigs = {
  * including MPI context creation and GlobalTPContext initialization.
  */
 class Qwen2NodeLocalTPParityTest : public ConfigDrivenParityTest<Qwen2NodeLocalTPParityTest>,
-                                    public ::testing::WithParamInterface<TestConfig>
+                                   public ::testing::WithParamInterface<TestConfig>
 {
 public:
     const TestConfig &getTestConfig() const { return GetParam(); }
@@ -185,7 +185,7 @@ TEST_P(Qwen2NodeLocalTPParityTest, NodeLocalTPAllreduce)
         << "Allreduce result should be sum of ranks";
 
     LOG_INFO("[NodeLocalTP] Rank " << mpi_ctx_->rank() << " allreduce result: "
-             << actual_value << " (expected: " << expected_sum << ")");
+                                   << actual_value << " (expected: " << expected_sum << ")");
 }
 
 /**
@@ -330,6 +330,7 @@ int main(int argc, char **argv)
     // CRITICAL: Shutdown GlobalBackendRouter before MPI_Finalize to ensure
     // NCCLCoordinator cleanup happens while CUDA runtime is still active.
     GlobalBackendRouter::shutdown();
+    GPUDeviceContextPool::instance().shutdown();
 
     // Finalize MPI
     MPI_Finalize();
