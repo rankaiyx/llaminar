@@ -123,10 +123,10 @@ namespace llaminar2::test
         void setHasLMHead(bool has_lm_head) { has_lm_head_ = has_lm_head; }
         void setHasEmbedding(bool has_embedding) { has_embedding_ = has_embedding; }
 
-        size_t cacheSize() const override { return weights_.size(); }
-        void clearCache() override { weights_.clear(); }
-        size_t decodeCacheSize() const override { return decode_weights_.size(); }
-        void clearDecodeCache() override { decode_weights_.clear(); }
+        size_t cacheSize() const { return weights_.size(); }
+        void clearCache() { weights_.clear(); }
+        size_t decodeCacheSize() const { return decode_weights_.size(); }
+        void clearDecodeCache() { decode_weights_.clear(); }
 
         /**
          * @brief Set model-specific weight sharding configuration

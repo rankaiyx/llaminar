@@ -450,10 +450,10 @@ namespace llaminar2
         LOG_DEBUG("MultiDeviceOrchestrator: Initializing " << devices.size() << " device runners");
 
         // =====================================================================
-        // BUILD TENSORPARALLELCONFIG FOR LOCAL TP WEIGHT SHARDING
+        // BUILD WEIGHTMANAGERCONFIG FOR LOCAL TP WEIGHT SHARDING
         // =====================================================================
-        // This enables WeightManager to slice weights by DeviceId instead of
-        // falling back to REPLICATED mode for world_size==1.
+        // Configure WeightManager with TP config, model dimensions, and sharding
+        // in a single configure() call. This replaces the previous multi-setter chain.
         // =====================================================================
         {
             auto weight_mgr = model_ctx_->weightManager();
@@ -478,57 +478,47 @@ namespace llaminar2
                     TensorParallelConfig::fromLocalTPContext(
                         *tp_ctx_, n_heads, n_kv_heads, d_ff, vocab_size));
 
-                weight_mgr->setTensorParallelConfig(tp_config);
+                // Build unified WeightManagerConfig
+                WeightManagerConfig wm_config;
+                wm_config.tp_config = tp_config;
+                wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(model_ctx_->architecture());
 
-                // =====================================================================
-                // SET MODEL DIMENSIONS FOR FUSEDQKV SUB-BLOCK SLICING
-                // =====================================================================
-                // WeightManager needs head dimensions to correctly split fused QKV weights.
-                // For GDN models (Qwen3.5), also set asymmetric QKV dimensions.
+                // Model head dimensions for FusedQKV sub-block slicing
+                const int embed_len = model_ctx_->embeddingLength();
+                const int head_dim = (n_heads > 0) ? (embed_len / n_heads) : 0;
+                if (n_heads > 0 && head_dim > 0)
                 {
-                    const int embed_len = model_ctx_->embeddingLength();
-                    const int head_dim = (n_heads > 0) ? (embed_len / n_heads) : 0;
-                    if (n_heads > 0 && head_dim > 0)
-                    {
-                        weight_mgr->setModelDimensions(n_heads, n_kv_heads, head_dim);
-                    }
+                    wm_config.dimensions.n_heads = n_heads;
+                    wm_config.dimensions.n_kv_heads = n_kv_heads;
+                    wm_config.dimensions.head_dim = head_dim;
+                }
 
-                    // GDN dimensions from GGUF metadata for asymmetric FusedQKV
-                    auto *concrete_ctx = dynamic_cast<ModelContext *>(model_ctx_.get());
-                    if (concrete_ctx)
-                    {
-                        const std::string arch_prefix = model_ctx_->architecture();
-                        ModelLoader &loader = concrete_ctx->concreteLoader();
-                        const int gdn_group_count = loader.getInt(arch_prefix + ".ssm.group_count", 0);
-                        const int gdn_time_step_rank = loader.getInt(arch_prefix + ".ssm.time_step_rank", 0);
-                        const int gdn_state_size = loader.getInt(arch_prefix + ".ssm.state_size", 0);
+                // GDN dimensions from GGUF metadata for asymmetric FusedQKV
+                auto *concrete_ctx = dynamic_cast<ModelContext *>(model_ctx_.get());
+                if (concrete_ctx)
+                {
+                    const std::string arch_prefix = model_ctx_->architecture();
+                    ModelLoader &loader = concrete_ctx->concreteLoader();
+                    const int gdn_group_count = loader.getInt(arch_prefix + ".ssm.group_count", 0);
+                    const int gdn_time_step_rank = loader.getInt(arch_prefix + ".ssm.time_step_rank", 0);
+                    const int gdn_state_size = loader.getInt(arch_prefix + ".ssm.state_size", 0);
 
-                        if (gdn_group_count > 0 && gdn_time_step_rank > 0 && gdn_state_size > 0)
-                        {
-                            weight_mgr->setGDNDimensions(gdn_group_count, gdn_time_step_rank, gdn_state_size);
-                            LOG_INFO("MultiDeviceOrchestrator: Set GDN dimensions for FusedQKV slicing"
-                                     << " (group_count=" << gdn_group_count
-                                     << " time_step_rank=" << gdn_time_step_rank
-                                     << " state_size=" << gdn_state_size << ")");
-                        }
+                    if (gdn_group_count > 0 && gdn_time_step_rank > 0 && gdn_state_size > 0)
+                    {
+                        wm_config.dimensions.gdn_n_k_heads = gdn_group_count;
+                        wm_config.dimensions.gdn_n_v_heads = gdn_time_step_rank;
+                        wm_config.dimensions.gdn_d_state = gdn_state_size;
+                        LOG_INFO("MultiDeviceOrchestrator: GDN dimensions for FusedQKV slicing"
+                                 << " (group_count=" << gdn_group_count
+                                 << " time_step_rank=" << gdn_time_step_rank
+                                 << " state_size=" << gdn_state_size << ")");
                     }
                 }
 
-                // =====================================================================
-                // SET WEIGHT SHARDING CONFIG FOR TP SLICING MODE DETECTION
-                // =====================================================================
-                // WeightManager needs the sharding config to determine which weights
-                // should be column-parallel vs row-parallel vs replicated.
-                // Without this, determineShardingMode() throws an exception.
-                // Use SchemaFactoryRegistry for model-agnostic architecture lookup.
-                // =====================================================================
-                const std::string arch = model_ctx_->architecture();
-                auto sharding_config = SchemaFactoryRegistry::getWeightShardingConfig(arch);
-                weight_mgr->setWeightShardingConfig(sharding_config);
-                LOG_DEBUG("MultiDeviceOrchestrator: Set WeightShardingConfig for TP slicing mode detection"
-                          << " (architecture=" << arch << ")");
+                // Apply all configuration in a single call
+                weight_mgr->configure(wm_config);
 
-                LOG_INFO("MultiDeviceOrchestrator: Set TensorParallelConfig for LOCAL TP ("
+                LOG_INFO("MultiDeviceOrchestrator: Configured WeightManager for LOCAL TP ("
                          << tp_ctx_->degree() << " devices, "
                          << "heads=" << n_heads << ", kv_heads=" << n_kv_heads
                          << ", d_ff=" << d_ff << ", vocab=" << vocab_size << ")");

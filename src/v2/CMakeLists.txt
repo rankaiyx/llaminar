@@ -1346,6 +1346,7 @@ add_library(llaminar2_core STATIC
     loaders/ModelContext.cpp
     loaders/ModelContextConfig.cpp
     loaders/WeightManager.cpp
+    loaders/WeightSlicer.cpp
     loaders/WeightPlacementMap.cpp
     loaders/WeightPreloader.cpp
     loaders/DeviceOrchestrator.cpp

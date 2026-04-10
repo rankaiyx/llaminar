@@ -7,14 +7,31 @@
  * 2. Mock weights for stage unit tests
  * 3. Testing different distribution strategies
  *
+ * ## Interface Design
+ *
+ * Core interface (pure virtual) — the 9 methods that MUST be implemented:
+ * - Weight access: getWeightForDevice, getDecodeWeight
+ * - Sharding info: isWeightSharded, getShardingMode, isGemmWeight
+ * - Strategy: strategy
+ * - Configuration: setWeightShardingConfig, setTensorParallelConfig, setWeightPreprocessor
+ *
+ * Default no-ops — methods with default implementations for backward compatibility:
+ * - setModelDimensions, setGDNDimensions (model dimension hints)
+ * - hasLMHead, hasEmbedding (PP stage info)
+ *
+ * Lifecycle methods (packGemmWeights, uploadNonGemmWeights, preloadForDevices,
+ * releaseAllHostWeightData, preloadStats) have default no-op implementations.
+ * Concrete WeightManager overrides these.
+ *
  * @author David Sanftenberg
  * @date January 2026
  */
 
 #pragma once
 
+#include "WeightTypes.h"
+#include "WeightManagerConfig.h"
 #include "../backends/DeviceId.h"
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,47 +40,15 @@
 namespace llaminar2
 {
 
-    /**
-     * @brief Pre-packing progress callback for weight preloading
-     *
-     * Called during preloading with:
-     * @param current Number of weights packed so far
-     * @param total Total number of weights to pack
-     * @param name Current weight name being packed
-     */
-    using PreloadProgressCallback = std::function<void(size_t current, size_t total, const std::string &name)>;
-
     // Forward declaration for sharding config
     struct WeightShardingConfig;
 
     // Forward declarations
     class TensorBase;
     class TensorParallelConfig;
-    enum class ShardingMode;
-    enum class WeightDistributionStrategy;
-
-    /**
-     * @brief Transforms a weight tensor before GEMM packing.
-     *
-     * Applied once per GEMM weight during packGemmWeights(). The callback
-     * receives the weight name and original tensor, and returns either:
-     *   - A new tensor (e.g., rotated copy) to replace the original
-     *   - The same tensor if no preprocessing is needed
-     *
-     * The returned tensor becomes the cache entry, so subsequent
-     * getWeightForDevice() calls see the preprocessed version.
-     */
-    using WeightPreprocessor = std::function<std::shared_ptr<TensorBase>(
-        const std::string &name, std::shared_ptr<TensorBase> tensor)>;
 
     /**
      * @brief Interface for managing model weights with distribution strategies
-     *
-     * Abstracts weight management to enable:
-     * 1. Testing weight sharding without MPI
-     * 2. Mock weights for stage unit tests
-     * 3. Testing different distribution strategies
-     * 4. Testing allreduce stages with simulated sharded weights
      *
      * Implementations:
      * - WeightManager: Real implementation with GGUF loader integration
@@ -71,20 +56,12 @@ namespace llaminar2
      *
      * Usage:
      * @code
-     * // Production code works with interface
      * void loadProjection(IWeightManager& weights) {
      *     auto wq = weights.getWeightForDevice("blk.0.attn_q.weight");
      *     if (weights.isWeightSharded("blk.0.attn_q.weight")) {
      *         // Need allreduce after matmul
      *     }
      * }
-     *
-     * // Test code uses mock
-     * auto mock = MockWeightManagerBuilder()
-     *     .addWeight("blk.0.attn_q.weight", create_fp32_tensor({896, 896}))
-     *     .setSharded("blk.0.attn_q.weight", ShardingMode::COLUMN_PARALLEL)
-     *     .build();
-     * loadProjection(*mock);
      * @endcode
      */
     class IWeightManager
@@ -93,24 +70,15 @@ namespace llaminar2
         virtual ~IWeightManager() = default;
 
         // =========================================================================
-        // Weight Access
+        // Core: Weight Access (pure virtual)
         // =========================================================================
 
         /**
          * @brief Get weight tensor for a specific device (device-isolated instance)
          *
          * Loads from storage if not cached, applies distribution strategy.
-         * For multi-device scenarios (LOCAL TP), each device needs its own tensor
-         * instance to track coherence state independently. This method:
-         * - Returns the original tensor for the first device that requests it
-         * - Creates and caches a clone for subsequent devices
-         * - Clones are uploaded to GPU independently, avoiding race conditions
-         *
-         * This solves the problem where multiple devices running forward() in parallel
-         * would race to call ensureOnDevice() on a shared tensor.
-         *
-         * For single-device scenarios, passing DeviceId::cpu() (the default) is safe
-         * and equivalent to the former getWeight() behavior.
+         * For multi-device scenarios (LOCAL TP), returns device-specific clones
+         * to enable independent coherence tracking.
          *
          * @param name GGUF tensor name (e.g., "token_embd.weight", "blk.0.attn_q.weight")
          * @param device Target device for this tensor instance (default: CPU)
@@ -122,23 +90,17 @@ namespace llaminar2
             DeviceId device = DeviceId::cpu(),
             int layer_idx = -1) = 0;
 
-        // =========================================================================
-        // Decode Weight Access (Option A: Selective Duplication)
-        // =========================================================================
-
         /**
-         * @brief Get or create decode weight shard for a weight tensor
+         * @brief Get or create decode weight shard for CPU decode participation
          *
-         * For Option A (Selective Duplication) in CPU decode participation:
-         * - Returns a SLICED copy of the weight for decode phase
-         * - The shard is the "tail" portion based on fraction
-         * - Cached separately from the full prefill weight
+         * Returns a sliced copy of the weight (tail portion based on fraction).
+         * Cached separately from the full prefill weight.
          *
-         * @param name Weight tensor name (e.g., "blk.0.attn_q.weight")
+         * @param name Weight tensor name
          * @param decode_device Device for the decode shard (typically CPU)
          * @param fraction Fraction of weight for this shard (e.g., 0.20 = tail 20%)
          * @param layer_idx Layer index for sharding mode lookup
-         * @return Shared pointer to sliced weight tensor, or nullptr on error
+         * @return Sliced weight tensor, or nullptr on error
          */
         virtual std::shared_ptr<TensorBase> getDecodeWeight(
             const std::string &name,
@@ -147,11 +109,11 @@ namespace llaminar2
             int layer_idx = -1) = 0;
 
         // =========================================================================
-        // Sharding Info
+        // Core: Sharding Info (pure virtual)
         // =========================================================================
 
         /**
-         * @brief Check if a weight is sharded (only valid for SHARDED strategy)
+         * @brief Check if a weight is sharded
          * @param name Weight tensor name
          * @return true if weight is column, row, or input parallel sharded
          */
@@ -166,105 +128,73 @@ namespace llaminar2
 
         /**
          * @brief Check if a weight is used for GEMM operations
-         *
-         * Non-GEMM weights (norms, biases, embeddings) need raw data retained.
-         * GEMM weights can have raw data released after packing.
-         *
          * @param name Weight tensor name
          * @return true if weight is a GEMM matrix
          */
         virtual bool isGemmWeight(const std::string &name) const = 0;
 
         // =========================================================================
-        // Strategy
+        // Core: Strategy (pure virtual)
         // =========================================================================
 
         /**
          * @brief Get current distribution strategy
-         * @return Current weight distribution strategy
          */
         virtual WeightDistributionStrategy strategy() const = 0;
 
         // =========================================================================
-        // Layer Range Info (for PP stages)
-        // =========================================================================
-
-        /**
-         * @brief Check if this weight manager owns the LM head
-         *
-         * For pipeline parallelism, only the last PP stage has the LM head.
-         * This is used by MultiDeviceOrchestrator to determine which stage
-         * should return LM_HEAD snapshot data.
-         *
-         * @return true if this stage has the LM head
-         */
-        virtual bool hasLMHead() const = 0;
-
-        /**
-         * @brief Check if this weight manager owns the token embedding
-         *
-         * For pipeline parallelism, only the first PP stage has the embedding.
-         *
-         * @return true if this stage has the token embedding
-         */
-        virtual bool hasEmbedding() const = 0;
-
-        // =========================================================================
-        // Cache Management
-        // =========================================================================
-
-        /**
-         * @brief Get number of cached weights
-         * @return Number of weights in the primary cache
-         */
-        virtual size_t cacheSize() const = 0;
-
-        /**
-         * @brief Clear weight cache (frees memory)
-         */
-        virtual void clearCache() = 0;
-
-        /**
-         * @brief Get number of cached decode weight shards
-         * @return Number of weights in the decode cache
-         */
-        virtual size_t decodeCacheSize() const = 0;
-
-        /**
-         * @brief Clear decode weight cache (frees decode shard memory)
-         */
-        virtual void clearDecodeCache() = 0;
-
-        // =========================================================================
-        // Configuration
+        // Core: Configuration (pure virtual)
         // =========================================================================
 
         /**
          * @brief Set model-specific weight sharding configuration
-         *
-         * This should be called after construction with the config from
-         * the model's schema factory (e.g., Qwen2SchemaFactory).
-         *
          * @param config Weight sharding configuration from model schema
          */
         virtual void setWeightShardingConfig(const WeightShardingConfig &config) = 0;
 
         /**
          * @brief Set tensor parallel configuration for proportional sharding
-         *
-         * Used by LOCAL TP to configure device-aware weight slicing.
-         * When set, getShardedWeightForAssignment() uses this config to
-         * determine slice bounds for each device.
-         *
          * @param config Tensor parallel config from ILocalTPContext
          */
         virtual void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> config) = 0;
 
         /**
+         * @brief Register a preprocessor applied to each GEMM weight before packing
+         * @param preprocessor Callable that transforms (name, tensor) → tensor
+         */
+        virtual void setWeightPreprocessor(WeightPreprocessor preprocessor) = 0;
+
+        /**
+         * @brief Configure weight manager with a unified config struct
+         *
+         * Replaces multi-step setter chain (setWeightShardingConfig + setModelDimensions
+         * + setGDNDimensions + setTensorParallelConfig) with a single call.
+         *
+         * Default implementation calls individual setters for backward compatibility.
+         * WeightManager overrides for more efficient initialization.
+         *
+         * @param config Configuration struct with all sharding/dimension settings
+         */
+        virtual void configure(const WeightManagerConfig &config)
+        {
+            if (config.hasShardingConfig())
+                setWeightShardingConfig(config.sharding);
+            if (config.hasTensorParallelConfig())
+                setTensorParallelConfig(config.tp_config);
+            if (config.hasModelDimensions())
+                setModelDimensions(config.dimensions.n_heads, config.dimensions.n_kv_heads, config.dimensions.head_dim);
+            if (config.hasGDNDimensions())
+                setGDNDimensions(config.dimensions.gdn_n_k_heads, config.dimensions.gdn_n_v_heads, config.dimensions.gdn_d_state);
+            if (config.preprocessor)
+                setWeightPreprocessor(config.preprocessor);
+        }
+
+        // =========================================================================
+        // Optional: Model Dimensions (default no-ops)
+        // =========================================================================
+
+        /**
          * @brief Set model head dimensions for FusedQKV sub-block slicing
-         * @param n_heads Total attention heads
-         * @param n_kv_heads Total KV heads (for GQA)
-         * @param head_dim Per-head dimension
          */
         virtual void setModelDimensions(int n_heads, int n_kv_heads, int head_dim)
         {
@@ -275,10 +205,6 @@ namespace llaminar2
 
         /**
          * @brief Set GDN dimensions for asymmetric FusedQKV sub-block slicing
-         * GDN layers have [Q:n_k*d | K:n_k*d | V:n_v*d] where n_k != n_v
-         * @param n_k_heads Number of key heads (ssm.group_count)
-         * @param n_v_heads Number of value heads (ssm.time_step_rank)
-         * @param d_state State dimension per head (ssm.state_size)
          */
         virtual void setGDNDimensions(int n_k_heads, int n_v_heads, int d_state)
         {
@@ -287,94 +213,36 @@ namespace llaminar2
             (void)d_state;
         }
 
-        /**
-         * @brief Register a preprocessor applied to each GEMM weight before packing.
-         *
-         * Must be called before packGemmWeights(). The preprocessor runs once
-         * per weight inside the packing pipeline: preprocess → pack → reclaim.
-         * The preprocessed tensor replaces the cache entry so that subsequent
-         * getWeightForDevice() calls return it.
-         *
-         * @param preprocessor Callable that transforms (name, tensor) → tensor
-         */
-        virtual void setWeightPreprocessor(WeightPreprocessor preprocessor) = 0;
-
         // =========================================================================
-        // Multi-Device Pre-loading
+        // Optional: PP Stage Info (default implementations)
         // =========================================================================
 
         /**
-         * @brief Pre-load and upload weights for multiple devices
-         *
-         * For LOCAL tensor parallelism scenarios, this method:
-         * 1. Creates device-specific clones of all cached weights
-         * 2. Uploads each clone to its target device
-         * 3. Caches the device-specific tensors for getWeightForDevice()
-         *
-         * This MUST be called BEFORE creating device runners to avoid race conditions
-         * where multiple devices try to upload the same tensor concurrently.
-         *
-         * @param devices List of devices that will use the weights
-         * @return true if all weights were pre-loaded successfully
+         * @brief Check if this weight manager owns the LM head
          */
-        virtual bool preloadForDevices(const std::vector<DeviceId> &devices) = 0;
-
-        // =========================================================================
-        // Weight Packing and Preloading
-        // =========================================================================
+        virtual bool hasLMHead() const { return true; }
 
         /**
-         * @brief Pack all GEMM weights for a target device
-         *
-         * Creates GEMM kernels for all GEMM weights and calls prepareWeights()
-         * on each kernel. For GPU kernels, this uploads weights to device memory.
-         * For CPU kernels, this is typically a no-op (packing is lazy).
-         *
-         * @param target_device Target device for weight packing
-         * @param progress_cb Optional callback for progress reporting
-         * @param release_raw_data If true, release raw tensor data after packing (CPU only)
-         * @return true if all GEMM weights were packed successfully
+         * @brief Check if this weight manager owns the token embedding
          */
+        virtual bool hasEmbedding() const { return true; }
+
+        // =========================================================================
+        // Lifecycle (default no-ops — concrete WeightManager overrides these)
+        // =========================================================================
+
         virtual bool packGemmWeights(
-            DeviceId target_device,
-            PreloadProgressCallback progress_cb = nullptr,
-            bool release_raw_data = false) = 0;
+            DeviceId /*target_device*/,
+            PreloadProgressCallback /*progress_cb*/ = nullptr,
+            bool /*release_raw_data*/ = false) { return true; }
 
-        /**
-         * @brief Upload all non-GEMM weights to GPU
-         *
-         * Non-GEMM weights (norms, embeddings, biases) don't need GEMM packing
-         * but still need to be uploaded to GPU for kernel access.
-         * This eliminates lazy upload overhead during inference.
-         *
-         * @param target_device Target GPU device
-         * @return true if all non-GEMM weights were uploaded successfully
-         */
-        virtual bool uploadNonGemmWeights(DeviceId target_device) = 0;
+        virtual bool uploadNonGemmWeights(DeviceId /*target_device*/) { return true; }
 
-        /**
-         * @brief Release ALL host-side weight data after all GPU uploads are complete.
-         *
-         * Sweeps through all cached weights (GEMM and non-GEMM) and calls
-         * release_host_weight_data() on each. This aggressively frees:
-         *  - raw_data_ (quantized block storage)
-         *  - dequant_cache_ (FP32 decompressed cache)
-         *  - mmap_owner_ references (allows GGUF mmap unmap)
-         *
-         * Call this ONCE after all packGemmWeights() and uploadNonGemmWeights()
-         * calls have completed for all devices. After this call, host-side
-         * tensor data() / fp32_data() will return stale/null results.
-         *
-         * @return Number of tensors whose host data was released
-         */
+        virtual bool preloadForDevices(const std::vector<DeviceId> & /*devices*/) { return true; }
+
         virtual size_t releaseAllHostWeightData() { return 0; }
 
-        /**
-         * @brief Get statistics about preloaded weights
-         *
-         * @return Pair of (num_cpu_packed, num_gpu_packed)
-         */
-        virtual std::pair<size_t, size_t> preloadStats() const = 0;
+        virtual std::pair<size_t, size_t> preloadStats() const { return {0, 0}; }
     };
 
 } // namespace llaminar2

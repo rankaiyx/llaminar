@@ -589,14 +589,8 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Configure weight sharding from architecture-specific schema (model-agnostic)
+        // Configure weight manager from architecture-specific schema
         auto weight_mgr = model_ctx->concreteWeightManager();
-        if (weight_mgr)
-        {
-            auto sharding_config = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
-            weight_mgr->setWeightShardingConfig(sharding_config);
-            LOG_DEBUG("[InferenceRunner] Applied " << architecture << " sharding config to WeightManager");
-        }
 
         // Get model metadata
         ModelLoader &loader = model_ctx->concreteLoader();
@@ -607,22 +601,26 @@ namespace llaminar2
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
 
-        // Pass model head dimensions to WeightManager for FusedQKV sub-block slicing
+        // Apply sharding config + model dimensions in a single call
         // (must be after populateFromModelContext which sets n_heads/n_kv_heads/head_dim)
-        if (weight_mgr && graph_config.n_heads > 0 && graph_config.head_dim > 0)
+        if (weight_mgr)
         {
-            weight_mgr->setModelDimensions(
-                graph_config.n_heads, graph_config.n_kv_heads, graph_config.head_dim);
-        }
-
-        // Pass GDN dimensions for asymmetric FusedQKV sub-block slicing
-        // GDN layers have [Q:n_k*d | K:n_k*d | V:n_v*d] where n_k (group_count) != n_v (time_step_rank)
-        if (weight_mgr && graph_config.gdn.enabled())
-        {
-            weight_mgr->setGDNDimensions(
-                graph_config.gdn.group_count,
-                graph_config.gdn.time_step_rank,
-                graph_config.gdn.state_size);
+            WeightManagerConfig wm_config;
+            wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
+            if (graph_config.n_heads > 0 && graph_config.head_dim > 0)
+            {
+                wm_config.dimensions.n_heads = graph_config.n_heads;
+                wm_config.dimensions.n_kv_heads = graph_config.n_kv_heads;
+                wm_config.dimensions.head_dim = graph_config.head_dim;
+            }
+            if (graph_config.gdn.enabled())
+            {
+                wm_config.dimensions.gdn_n_k_heads = graph_config.gdn.group_count;
+                wm_config.dimensions.gdn_n_v_heads = graph_config.gdn.time_step_rank;
+                wm_config.dimensions.gdn_d_state = graph_config.gdn.state_size;
+            }
+            weight_mgr->configure(wm_config);
+            LOG_DEBUG("[InferenceRunner] Applied " << architecture << " weight config to WeightManager");
         }
 
         // Execution-specific settings
@@ -1616,9 +1614,10 @@ namespace llaminar2
         auto weight_mgr = stage_ctx->concreteWeightManager();
         if (weight_mgr)
         {
-            auto sharding_config = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
-            weight_mgr->setWeightShardingConfig(sharding_config);
-            LOG_DEBUG("[PPStageRunner] Applied " << architecture << " sharding config to WeightManager");
+            WeightManagerConfig wm_config;
+            wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
+            weight_mgr->configure(wm_config);
+            LOG_DEBUG("[PPStageRunner] Applied " << architecture << " weight config to WeightManager");
         }
 
         // =====================================================================

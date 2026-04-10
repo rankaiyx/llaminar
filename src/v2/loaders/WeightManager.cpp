@@ -2598,55 +2598,8 @@ namespace llaminar2
     }
 
     // =============================================================================
-    // Device-aware weight slicing for LOCAL TP (Phase 1)
+    // Device-aware weight slicing for LOCAL TP
     // =============================================================================
-
-    bool WeightManager::isQKVWeight(const std::string &name)
-    {
-        return name.find("attn_q.weight") != std::string::npos ||
-               name.find("attn_k.weight") != std::string::npos ||
-               name.find("attn_v.weight") != std::string::npos ||
-               name.find("attn_qkv.weight") != std::string::npos;
-    }
-
-    bool WeightManager::isQKVBias(const std::string &name)
-    {
-        return name.find("attn_q.bias") != std::string::npos ||
-               name.find("attn_k.bias") != std::string::npos ||
-               name.find("attn_v.bias") != std::string::npos;
-    }
-
-    bool WeightManager::isFFNGateUpWeight(const std::string &name)
-    {
-        return name.find("ffn_gate.weight") != std::string::npos ||
-               name.find("ffn_up.weight") != std::string::npos ||
-               name.find("ffn_gate_up.weight") != std::string::npos;
-    }
-
-    bool WeightManager::isFFNDownWeight(const std::string &name)
-    {
-        return name.find("ffn_down.weight") != std::string::npos;
-    }
-
-    bool WeightManager::isLMHeadWeight(const std::string &name)
-    {
-        return name == "output.weight";
-    }
-
-    bool WeightManager::isWoWeight(const std::string &name)
-    {
-        return name.find("attn_output.weight") != std::string::npos;
-    }
-
-    bool WeightManager::isEmbeddingWeight(const std::string &name)
-    {
-        return name == "token_embd.weight";
-    }
-
-    bool WeightManager::isOutputNormWeight(const std::string &name)
-    {
-        return name == "output_norm.weight";
-    }
 
     std::shared_ptr<TensorBase> WeightManager::sliceRowRange(
         const std::shared_ptr<TensorBase> &tensor,

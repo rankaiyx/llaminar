@@ -80,23 +80,16 @@ namespace
         bool hasLMHead() const override { return true; }
         bool hasEmbedding() const override { return true; }
 
-        size_t cacheSize() const override { return 0; }
-        void clearCache() override {}
-        size_t decodeCacheSize() const override { return 0; }
-        void clearDecodeCache() override {}
+        size_t cacheSize() const { return 0; }
+        void clearCache() {}
+        size_t decodeCacheSize() const { return 0; }
+        void clearDecodeCache() {}
 
         void setWeightShardingConfig(const WeightShardingConfig & /*config*/) override {}
 
         void setTensorParallelConfig(std::shared_ptr<TensorParallelConfig> /*config*/) override {}
 
         void setWeightPreprocessor(WeightPreprocessor /*preprocessor*/) override {}
-
-        // New methods folded from WeightPreloader
-        bool packGemmWeights(DeviceId /*target_device*/,
-                             PreloadProgressCallback /*progress_cb*/,
-                             bool /*release_raw_data*/) override { return true; }
-        bool uploadNonGemmWeights(DeviceId /*target_device*/) override { return true; }
-        std::pair<size_t, size_t> preloadStats() const override { return {0, 0}; }
     };
 
     // Global stub for tests to use

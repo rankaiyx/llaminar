@@ -21,6 +21,7 @@
 
 #include "IModelLoader.h"
 #include "WeightPlacementMap.h"
+#include "WeightManagerConfig.h"
 #include "../backends/DeviceId.h"
 #include "../config/TensorParallelConfig.h"
 #include "../execution/local_execution/graph/GraphSchema.h"
@@ -38,27 +39,8 @@
 namespace llaminar2
 {
 
-    /**
-     * @brief Weight distribution strategy
-     */
-    enum class WeightDistributionStrategy
-    {
-        REPLICATED,       ///< Full copy per rank (2x memory on 2-socket, no communication)
-        SHARDED,          ///< Partition across ranks (1x memory, Allreduce after matmul)
-        INTERLEAVED,      ///< NUMA-aware global (shared memory, remote access penalty)
-        LAYER_PARTITIONED ///< Load only weights for assigned layers (for Pipeline Parallelism)
-    };
-
-    /**
-     * @brief Sharding mode for a weight tensor
-     */
-    enum class ShardingMode
-    {
-        REPLICATE,       ///< Not sharded, full copy on each rank (norms, biases, embeddings)
-        COLUMN_PARALLEL, ///< Split output dimension (rows of weight) - for Gate/Up, QKV
-        ROW_PARALLEL,    ///< Split output dimension (rows of weight) + allreduce - for Wo
-        INPUT_PARALLEL   ///< Split input dimension (columns of weight) + allreduce - for Down
-    };
+    // WeightDistributionStrategy and ShardingMode are now in WeightTypes.h
+    // (included transitively via WeightManagerConfig.h → WeightTypes.h)
 
     /**
      * @brief Weight manager with distribution strategy and caching
@@ -178,12 +160,74 @@ namespace llaminar2
         /**
          * @brief Get number of cached weights
          */
-        size_t cacheSize() const override;
+        size_t cacheSize() const;
 
         /**
          * @brief Clear weight cache (frees memory)
          */
-        void clearCache() override;
+        void clearCache();
+
+        /**
+         * @brief Configure weight manager with unified config struct
+         *
+         * Replaces multi-step setter chain with a single call. Sets all members
+         * directly and performs a single cache invalidation.
+         *
+         * @param config Configuration struct with all sharding/dimension settings
+         */
+        void configure(const WeightManagerConfig &config) override
+        {
+            // Sharding config
+            if (config.hasShardingConfig())
+            {
+                sharding_config_ = config.sharding;
+                has_sharding_config_ = true;
+            }
+
+            // Model dimensions
+            if (config.hasModelDimensions())
+            {
+                model_n_heads_ = config.dimensions.n_heads;
+                model_n_kv_heads_ = config.dimensions.n_kv_heads;
+                model_head_dim_ = config.dimensions.head_dim;
+                has_model_dimensions_ = true;
+            }
+
+            // GDN dimensions
+            if (config.hasGDNDimensions())
+            {
+                gdn_n_k_heads_ = config.dimensions.gdn_n_k_heads;
+                gdn_n_v_heads_ = config.dimensions.gdn_n_v_heads;
+                gdn_d_state_ = config.dimensions.gdn_d_state;
+                has_gdn_dimensions_ = true;
+            }
+
+            // Tensor parallel config
+            if (config.hasTensorParallelConfig())
+            {
+                tp_config_ = config.tp_config;
+            }
+
+            // Preprocessor
+            if (config.preprocessor)
+            {
+                weight_preprocessor_ = config.preprocessor;
+            }
+
+            // Layer range (Pipeline Parallelism)
+            if (config.hasLayerRange())
+            {
+                layer_first_ = config.layer_range->first;
+                layer_last_ = config.layer_range->last;
+                has_embedding_ = config.layer_range->has_embedding;
+                has_lm_head_ = config.layer_range->has_lm_head;
+                has_layer_range_ = true;
+            }
+
+            // Single cache invalidation
+            sharding_mode_cache_.clear();
+            cache_.clear();
+        }
 
         /**
          * @brief Set model-specific weight sharding configuration
@@ -436,12 +480,12 @@ namespace llaminar2
         /**
          * @brief Get number of cached decode weight shards
          */
-        size_t decodeCacheSize() const override;
+        size_t decodeCacheSize() const;
 
         /**
          * @brief Clear decode weight cache (frees decode shard memory)
          */
-        void clearDecodeCache() override;
+        void clearDecodeCache();
 
         // =========================================================================
         // Static utility methods for decode shard slicing
@@ -647,26 +691,6 @@ namespace llaminar2
             DeviceId device,
             const DeviceShardingAssignment &assignment,
             int layer_idx);
-
-        // Weight category detection helpers for LOCAL TP slicing
-        // DEPRECATED: Use WeightShardingConfig::getDimensionType() instead.
-        // These methods hardcode Qwen2 weight name patterns.
-        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
-        static bool isQKVWeight(const std::string &name);
-        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
-        static bool isQKVBias(const std::string &name);
-        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
-        static bool isFFNGateUpWeight(const std::string &name);
-        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
-        static bool isFFNDownWeight(const std::string &name);
-        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
-        static bool isLMHeadWeight(const std::string &name);
-        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
-        static bool isWoWeight(const std::string &name);
-        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
-        static bool isEmbeddingWeight(const std::string &name);
-        [[deprecated("Use WeightShardingConfig::getDimensionType() instead")]]
-        static bool isOutputNormWeight(const std::string &name);
 
         /**
          * @brief Slice a specific row range from tensor

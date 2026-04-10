@@ -114,57 +114,6 @@ namespace llaminar2
         };
 
         // =============================================================================
-        // Weight Category Detection Tests (prerequisite for correct slicing)
-        // =============================================================================
-
-        TEST_F(Test__WeightManagerInputParallelSlicing, CategorizeWeight_AttnOutput_IsAttentionWo)
-        {
-            // Verify that attn_output weights are categorized as ATTENTION_WO
-            EXPECT_TRUE(WeightManager::isWoWeight("blk.0.attn_output.weight"));
-            EXPECT_TRUE(WeightManager::isWoWeight("blk.5.attn_output.weight"));
-            EXPECT_TRUE(WeightManager::isWoWeight("blk.23.attn_output.weight"));
-
-            // Should NOT match FFN patterns
-            EXPECT_FALSE(WeightManager::isFFNDownWeight("blk.0.attn_output.weight"));
-            EXPECT_FALSE(WeightManager::isFFNGateUpWeight("blk.0.attn_output.weight"));
-            EXPECT_FALSE(WeightManager::isQKVWeight("blk.0.attn_output.weight"));
-        }
-
-        TEST_F(Test__WeightManagerInputParallelSlicing, CategorizeWeight_FFNDown_IsFFNDown)
-        {
-            // Verify that ffn_down weights are categorized as FFN_DOWN
-            EXPECT_TRUE(WeightManager::isFFNDownWeight("blk.0.ffn_down.weight"));
-            EXPECT_TRUE(WeightManager::isFFNDownWeight("blk.10.ffn_down.weight"));
-            EXPECT_TRUE(WeightManager::isFFNDownWeight("blk.23.ffn_down.weight"));
-
-            // Should NOT match attention patterns
-            EXPECT_FALSE(WeightManager::isWoWeight("blk.0.ffn_down.weight"));
-            EXPECT_FALSE(WeightManager::isQKVWeight("blk.0.ffn_down.weight"));
-            EXPECT_FALSE(WeightManager::isFFNGateUpWeight("blk.0.ffn_down.weight"));
-        }
-
-        TEST_F(Test__WeightManagerInputParallelSlicing, CategorizeWeight_Disambiguation_AttnOutputVsFFNDown)
-        {
-            // Critical test: These two weight types have same ShardingMode (INPUT_PARALLEL)
-            // but different slicing strategies
-
-            Qwen2SchemaFactory schema_factory;
-            auto config = schema_factory.getWeightShardingConfig();
-
-            // Both should be INPUT_PARALLEL
-            EXPECT_EQ(config.getMode("blk.0.attn_output.weight"), WeightShardingMode::InputParallel);
-            EXPECT_EQ(config.getMode("blk.0.ffn_down.weight"), WeightShardingMode::InputParallel);
-
-            // But they are different weight categories
-            EXPECT_TRUE(WeightManager::isWoWeight("blk.0.attn_output.weight"));
-            EXPECT_TRUE(WeightManager::isFFNDownWeight("blk.0.ffn_down.weight"));
-
-            // Sanity: they don't cross-match
-            EXPECT_FALSE(WeightManager::isWoWeight("blk.0.ffn_down.weight"));
-            EXPECT_FALSE(WeightManager::isFFNDownWeight("blk.0.attn_output.weight"));
-        }
-
-        // =============================================================================
         // Sharding Config Mode Tests
         // =============================================================================
 
@@ -877,46 +826,6 @@ namespace llaminar2
             float expected_last_last = static_cast<float>(last_row * 10000 + 2431);
             EXPECT_FLOAT_EQ(slice[last_row * 1216], expected_last_first);
             EXPECT_FLOAT_EQ(slice[last_row * 1216 + 1215], expected_last_last);
-        }
-
-        // =============================================================================
-        // EXHAUSTIVE LAYER INDEX TESTS
-        // =============================================================================
-
-        TEST_F(Test__WeightManagerInputParallelSlicing, AllLayers_AttnOutputCategorizesCorrectly)
-        {
-            // Test all 24 layers (Qwen2.5-0.5B)
-            for (int layer = 0; layer < 24; ++layer)
-            {
-                std::string name = "blk." + std::to_string(layer) + ".attn_output.weight";
-
-                EXPECT_TRUE(WeightManager::isWoWeight(name))
-                    << "Layer " << layer << " attn_output should be Wo weight";
-
-                EXPECT_FALSE(WeightManager::isFFNDownWeight(name))
-                    << "Layer " << layer << " attn_output should NOT be FFN Down weight";
-
-                EXPECT_FALSE(WeightManager::isQKVWeight(name))
-                    << "Layer " << layer << " attn_output should NOT be QKV weight";
-            }
-        }
-
-        TEST_F(Test__WeightManagerInputParallelSlicing, AllLayers_FFNDownCategorizesCorrectly)
-        {
-            // Test all 24 layers (Qwen2.5-0.5B)
-            for (int layer = 0; layer < 24; ++layer)
-            {
-                std::string name = "blk." + std::to_string(layer) + ".ffn_down.weight";
-
-                EXPECT_TRUE(WeightManager::isFFNDownWeight(name))
-                    << "Layer " << layer << " ffn_down should be FFN Down weight";
-
-                EXPECT_FALSE(WeightManager::isWoWeight(name))
-                    << "Layer " << layer << " ffn_down should NOT be Wo weight";
-
-                EXPECT_FALSE(WeightManager::isFFNGateUpWeight(name))
-                    << "Layer " << layer << " ffn_down should NOT be FFN Gate/Up weight";
-            }
         }
 
         // =============================================================================

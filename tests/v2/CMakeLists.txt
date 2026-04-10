@@ -3768,6 +3768,19 @@ target_include_directories(v2_test_weight_manager_fusedqkv_tied_embeddings PRIVA
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ includes
 )
 target_link_libraries(v2_test_weight_manager_fusedqkv_tied_embeddings llaminar2_core GTest::gtest_main)
+
+# Test: WeightSlicer — stateless slicing math
+# Pure computation tests for weight slicing without I/O or MPI dependencies.
+# Tests column-parallel, row-parallel, FusedQKV sub-block, GDN asymmetric,
+# proportional (TensorParallelConfig), and device-assignment slicing.
+add_executable(v2_unit_weight_slicer unit/loaders/Test__WeightSlicer.cpp)
+target_link_libraries(v2_unit_weight_slicer llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightSlicer
+    COMMAND $<TARGET_FILE:v2_unit_weight_slicer>
+    LABELS "V2;Unit;TensorParallelism;WeightSharding;Slicing"
+    MPI_PROCS 1
+)
+
 add_v2_test(V2_Unit_WeightManagerFusedQKVTiedEmbeddings
     COMMAND $<TARGET_FILE:v2_test_weight_manager_fusedqkv_tied_embeddings>
     LABELS "V2;Unit;TensorParallelism;WeightSharding;FusedQKV;TiedEmbeddings;GatedDeltaNet;Qwen35"

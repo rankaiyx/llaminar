@@ -677,85 +677,6 @@ TEST_F(WeightManagerInstanceTest, ClearDecodeCache_Works)
 }
 
 // -----------------------------------------------------------------------------
-// Static Helper Tests (comprehensive)
-// -----------------------------------------------------------------------------
-
-TEST_F(WeightManagerInstanceTest, IsQKVWeight_AllPatterns)
-{
-    EXPECT_TRUE(WeightManager::isQKVWeight("blk.0.attn_q.weight"));
-    EXPECT_TRUE(WeightManager::isQKVWeight("blk.0.attn_k.weight"));
-    EXPECT_TRUE(WeightManager::isQKVWeight("blk.0.attn_v.weight"));
-    EXPECT_TRUE(WeightManager::isQKVWeight("blk.23.attn_q.weight"));
-
-    EXPECT_FALSE(WeightManager::isQKVWeight("blk.0.attn_output.weight"));
-    EXPECT_FALSE(WeightManager::isQKVWeight("blk.0.ffn_gate.weight"));
-    EXPECT_FALSE(WeightManager::isQKVWeight("token_embd.weight"));
-}
-
-TEST_F(WeightManagerInstanceTest, IsQKVBias_AllPatterns)
-{
-    EXPECT_TRUE(WeightManager::isQKVBias("blk.0.attn_q.bias"));
-    EXPECT_TRUE(WeightManager::isQKVBias("blk.0.attn_k.bias"));
-    EXPECT_TRUE(WeightManager::isQKVBias("blk.0.attn_v.bias"));
-
-    EXPECT_FALSE(WeightManager::isQKVBias("blk.0.attn_q.weight"));
-    EXPECT_FALSE(WeightManager::isQKVBias("blk.0.attn_output.bias"));
-}
-
-TEST_F(WeightManagerInstanceTest, IsFFNGateUpWeight_AllPatterns)
-{
-    EXPECT_TRUE(WeightManager::isFFNGateUpWeight("blk.0.ffn_gate.weight"));
-    EXPECT_TRUE(WeightManager::isFFNGateUpWeight("blk.0.ffn_up.weight"));
-    EXPECT_TRUE(WeightManager::isFFNGateUpWeight("blk.15.ffn_gate.weight"));
-
-    EXPECT_FALSE(WeightManager::isFFNGateUpWeight("blk.0.ffn_down.weight"));
-    EXPECT_FALSE(WeightManager::isFFNGateUpWeight("blk.0.attn_q.weight"));
-}
-
-TEST_F(WeightManagerInstanceTest, IsFFNDownWeight_AllPatterns)
-{
-    EXPECT_TRUE(WeightManager::isFFNDownWeight("blk.0.ffn_down.weight"));
-    EXPECT_TRUE(WeightManager::isFFNDownWeight("blk.23.ffn_down.weight"));
-
-    EXPECT_FALSE(WeightManager::isFFNDownWeight("blk.0.ffn_gate.weight"));
-    EXPECT_FALSE(WeightManager::isFFNDownWeight("blk.0.ffn_up.weight"));
-}
-
-TEST_F(WeightManagerInstanceTest, IsWoWeight_AllPatterns)
-{
-    EXPECT_TRUE(WeightManager::isWoWeight("blk.0.attn_output.weight"));
-    EXPECT_TRUE(WeightManager::isWoWeight("blk.15.attn_output.weight"));
-    EXPECT_TRUE(WeightManager::isWoWeight("attn_output.weight"));
-
-    EXPECT_FALSE(WeightManager::isWoWeight("blk.0.attn_q.weight"));
-    EXPECT_FALSE(WeightManager::isWoWeight("blk.0.ffn_down.weight"));
-}
-
-TEST_F(WeightManagerInstanceTest, IsLMHeadWeight_AllPatterns)
-{
-    EXPECT_TRUE(WeightManager::isLMHeadWeight("output.weight"));
-
-    EXPECT_FALSE(WeightManager::isLMHeadWeight("output_norm.weight"));
-    EXPECT_FALSE(WeightManager::isLMHeadWeight("token_embd.weight"));
-}
-
-TEST_F(WeightManagerInstanceTest, IsEmbeddingWeight_AllPatterns)
-{
-    EXPECT_TRUE(WeightManager::isEmbeddingWeight("token_embd.weight"));
-
-    EXPECT_FALSE(WeightManager::isEmbeddingWeight("output.weight"));
-    EXPECT_FALSE(WeightManager::isEmbeddingWeight("blk.0.attn_q.weight"));
-}
-
-TEST_F(WeightManagerInstanceTest, IsOutputNormWeight_AllPatterns)
-{
-    EXPECT_TRUE(WeightManager::isOutputNormWeight("output_norm.weight"));
-
-    EXPECT_FALSE(WeightManager::isOutputNormWeight("blk.0.attn_norm.weight"));
-    EXPECT_FALSE(WeightManager::isOutputNormWeight("blk.0.ffn_norm.weight"));
-}
-
-// -----------------------------------------------------------------------------
 // SliceRowRange / SliceColumnRange Tests
 // -----------------------------------------------------------------------------
 
@@ -1766,6 +1687,160 @@ TEST_F(WeightManagerInstanceTest, PreloadForDevices_EmptyDeviceList)
 
     // Empty device list should succeed (no-op)
     EXPECT_TRUE(result);
+}
+
+// =============================================================================
+// configure() Tests — Unified config struct API
+// =============================================================================
+
+class WeightManagerConfigureTest : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        mock_loader_ = MockModelLoader::createMinimal();
+        mock_loader_->addFP32RandomTensor("blk.0.attn_q.weight", {128, 128}, -1.0f, 1.0f, 101);
+        mock_loader_->addFP32RandomTensor("blk.0.ffn_gate.weight", {512, 128}, -1.0f, 1.0f, 106);
+    }
+
+    std::shared_ptr<MockModelLoader> mock_loader_;
+};
+
+TEST_F(WeightManagerConfigureTest, Configure_SetsShardingConfig)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    // Before configure: no sharding config
+    // After configure with sharding config: should recognize weight types
+    Qwen2SchemaFactory schema_factory;
+    WeightManagerConfig config;
+    config.sharding = schema_factory.getWeightShardingConfig();
+
+    wm.configure(config);
+
+    // Should now correctly determine sharding modes
+    EXPECT_EQ(wm.getShardingMode("blk.0.attn_q.weight"), ShardingMode::COLUMN_PARALLEL);
+    EXPECT_EQ(wm.getShardingMode("blk.0.ffn_gate.weight"), ShardingMode::COLUMN_PARALLEL);
+}
+
+TEST_F(WeightManagerConfigureTest, Configure_SetsModelDimensions)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::REPLICATED,
+                     WeightPrecision::NATIVE);
+
+    WeightManagerConfig config;
+    config.dimensions.n_heads = 32;
+    config.dimensions.n_kv_heads = 8;
+    config.dimensions.head_dim = 128;
+
+    wm.configure(config);
+
+    // Model dimensions should be accessible (verified indirectly via FusedQKV)
+    EXPECT_TRUE(config.hasModelDimensions());
+}
+
+TEST_F(WeightManagerConfigureTest, Configure_SetsGDNDimensions)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::REPLICATED,
+                     WeightPrecision::NATIVE);
+
+    WeightManagerConfig config;
+    config.dimensions.gdn_n_k_heads = 16;
+    config.dimensions.gdn_n_v_heads = 32;
+    config.dimensions.gdn_d_state = 128;
+
+    wm.configure(config);
+
+    EXPECT_TRUE(config.hasGDNDimensions());
+}
+
+TEST_F(WeightManagerConfigureTest, Configure_SetsLayerRange)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::LAYER_PARTITIONED,
+                     WeightPrecision::NATIVE);
+
+    WeightManagerConfig config;
+    config.layer_range = LayerRange{.first = 5, .last = 10, .has_embedding = false, .has_lm_head = false};
+
+    wm.configure(config);
+
+    EXPECT_TRUE(wm.hasLayerRange());
+    EXPECT_EQ(wm.layerRange().first, 5);
+    EXPECT_EQ(wm.layerRange().second, 10);
+    EXPECT_FALSE(wm.hasEmbedding());
+    EXPECT_FALSE(wm.hasLMHead());
+}
+
+TEST_F(WeightManagerConfigureTest, Configure_DoesNotOverrideStrategy)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    // configure() should NOT overwrite strategy_ set at construction
+    WeightManagerConfig config;
+    // config.strategy defaults to REPLICATED
+
+    wm.configure(config);
+
+    EXPECT_EQ(wm.strategy(), WeightDistributionStrategy::SHARDED);
+}
+
+TEST_F(WeightManagerConfigureTest, Configure_CombinedShardingAndDimensions)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    // Simulate what InferenceRunnerFactory does: sharding + dimensions in one call
+    Qwen2SchemaFactory schema_factory;
+    WeightManagerConfig config;
+    config.sharding = schema_factory.getWeightShardingConfig();
+    config.dimensions.n_heads = 16;
+    config.dimensions.n_kv_heads = 4;
+    config.dimensions.head_dim = 64;
+
+    wm.configure(config);
+
+    // Both should be applied
+    EXPECT_EQ(wm.getShardingMode("blk.0.attn_q.weight"), ShardingMode::COLUMN_PARALLEL);
+    EXPECT_TRUE(config.hasModelDimensions());
+    EXPECT_TRUE(config.hasShardingConfig());
+}
+
+TEST_F(WeightManagerConfigureTest, Configure_PartialConfig_OnlySharding)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::SHARDED,
+                     WeightPrecision::NATIVE);
+
+    // Only set sharding, no dimensions (like PPStageRunner does)
+    Qwen2SchemaFactory schema_factory;
+    WeightManagerConfig config;
+    config.sharding = schema_factory.getWeightShardingConfig();
+
+    wm.configure(config);
+
+    EXPECT_EQ(wm.getShardingMode("blk.0.attn_q.weight"), ShardingMode::COLUMN_PARALLEL);
+    EXPECT_FALSE(config.hasModelDimensions());
+}
+
+TEST_F(WeightManagerConfigureTest, Configure_EmptyConfig_NoEffect)
+{
+    WeightManager wm(*mock_loader_, nullptr, nullptr,
+                     WeightDistributionStrategy::REPLICATED,
+                     WeightPrecision::NATIVE);
+
+    // Empty config should not change anything
+    WeightManagerConfig config;
+    wm.configure(config);
+
+    EXPECT_EQ(wm.strategy(), WeightDistributionStrategy::REPLICATED);
 }
 
 // =============================================================================

@@ -24,7 +24,8 @@ using namespace llaminar2::test;
 // BASIC CONSTRUCTION TESTS
 // =============================================================================
 
-TEST(Test__MockModelContext, DefaultConstruction) {
+TEST(Test__MockModelContext, DefaultConstruction)
+{
     MockModelContext ctx;
 
     // Default values
@@ -40,16 +41,17 @@ TEST(Test__MockModelContext, DefaultConstruction) {
     EXPECT_NE(ctx.weightManager(), nullptr);
 }
 
-TEST(Test__MockModelContext, BuilderBasicConfiguration) {
+TEST(Test__MockModelContext, BuilderBasicConfiguration)
+{
     auto ctx = MockModelContextBuilder()
-        .setArchitecture("llama")
-        .setBlockCount(32)
-        .setEmbeddingLength(4096)
-        .setHeadCount(32)
-        .setHeadCountKV(8)
-        .setVocabSize(128000)
-        .setContextLength(8192)
-        .build();
+                   .setArchitecture("llama")
+                   .setBlockCount(32)
+                   .setEmbeddingLength(4096)
+                   .setHeadCount(32)
+                   .setHeadCountKV(8)
+                   .setVocabSize(128000)
+                   .setContextLength(8192)
+                   .build();
 
     EXPECT_EQ(ctx->architecture(), "llama");
     EXPECT_EQ(ctx->blockCount(), 32);
@@ -60,10 +62,11 @@ TEST(Test__MockModelContext, BuilderBasicConfiguration) {
     EXPECT_EQ(ctx->contextLength(), 8192);
 }
 
-TEST(Test__MockModelContext, SetPath) {
+TEST(Test__MockModelContext, SetPath)
+{
     auto ctx = MockModelContextBuilder()
-        .setPath("/custom/path/model.gguf")
-        .build();
+                   .setPath("/custom/path/model.gguf")
+                   .build();
 
     EXPECT_EQ(ctx->path(), "/custom/path/model.gguf");
 }
@@ -72,7 +75,8 @@ TEST(Test__MockModelContext, SetPath) {
 // PRESET TESTS
 // =============================================================================
 
-TEST(Test__MockModelContext, PresetMinimal) {
+TEST(Test__MockModelContext, PresetMinimal)
+{
     auto ctx = MockModelContext::createMinimal();
 
     // Presets only set metadata - no tensors by default (for fast tests)
@@ -85,14 +89,15 @@ TEST(Test__MockModelContext, PresetMinimal) {
     EXPECT_EQ(ctx->contextLength(), 512);
 }
 
-TEST(Test__MockModelContext, PresetMinimalWithTensors) {
+TEST(Test__MockModelContext, PresetMinimalWithTensors)
+{
     // Use builder pattern when you need actual tensors
     auto ctx = MockModelContextBuilder()
-        .usePreset(ModelPreset::MINIMAL)
-        .addEmbeddingLayer()
-        .addTransformerLayer(0)
-        .addOutputLayer()
-        .build();
+                   .usePreset(ModelPreset::MINIMAL)
+                   .addEmbeddingLayer()
+                   .addTransformerLayer(0)
+                   .addOutputLayer()
+                   .build();
 
     EXPECT_EQ(ctx->architecture(), "qwen2");
     EXPECT_EQ(ctx->blockCount(), 1);
@@ -105,7 +110,8 @@ TEST(Test__MockModelContext, PresetMinimalWithTensors) {
     EXPECT_TRUE(ctx->hasTensor("output.weight"));
 }
 
-TEST(Test__MockModelContext, PresetQwen2_05B) {
+TEST(Test__MockModelContext, PresetQwen2_05B)
+{
     auto ctx = MockModelContext::createQwen2_05B();
 
     EXPECT_EQ(ctx->architecture(), "qwen2");
@@ -117,7 +123,8 @@ TEST(Test__MockModelContext, PresetQwen2_05B) {
     EXPECT_EQ(ctx->contextLength(), 32768);
 }
 
-TEST(Test__MockModelContext, PresetQwen2_7B) {
+TEST(Test__MockModelContext, PresetQwen2_7B)
+{
     auto ctx = MockModelContext::createQwen2_7B();
 
     EXPECT_EQ(ctx->architecture(), "qwen2");
@@ -128,7 +135,8 @@ TEST(Test__MockModelContext, PresetQwen2_7B) {
     EXPECT_EQ(ctx->vocabSize(), 152064);
 }
 
-TEST(Test__MockModelContext, PresetLlama3_8B) {
+TEST(Test__MockModelContext, PresetLlama3_8B)
+{
     auto ctx = MockModelContext::createLlama3_8B();
 
     EXPECT_EQ(ctx->architecture(), "llama");
@@ -139,7 +147,8 @@ TEST(Test__MockModelContext, PresetLlama3_8B) {
     EXPECT_EQ(ctx->vocabSize(), 128256);
 }
 
-TEST(Test__MockModelContext, PresetFromEnum) {
+TEST(Test__MockModelContext, PresetFromEnum)
+{
     auto ctx = MockModelContext::createFromPreset(ModelPreset::QWEN2_05B);
 
     EXPECT_EQ(ctx->architecture(), "qwen2");
@@ -151,7 +160,8 @@ TEST(Test__MockModelContext, PresetFromEnum) {
 // COMPONENT ACCESS TESTS
 // =============================================================================
 
-TEST(Test__MockModelContext, LoaderInterfaceAccess) {
+TEST(Test__MockModelContext, LoaderInterfaceAccess)
+{
     auto ctx = MockModelContext::createMinimal();
 
     auto loader = ctx->loader();
@@ -163,27 +173,32 @@ TEST(Test__MockModelContext, LoaderInterfaceAccess) {
     EXPECT_EQ(loader->blockCount(), 1);
 }
 
-TEST(Test__MockModelContext, WeightManagerInterfaceAccess) {
+TEST(Test__MockModelContext, WeightManagerInterfaceAccess)
+{
     auto ctx = MockModelContextBuilder()
-        .usePreset(ModelPreset::MINIMAL)
-        .setStrategy(WeightDistributionStrategy::SHARDED)
-        .addEmbeddingLayer()
-        .build();
+                   .usePreset(ModelPreset::MINIMAL)
+                   .setStrategy(WeightDistributionStrategy::SHARDED)
+                   .addEmbeddingLayer()
+                   .build();
 
     auto wm = ctx->weightManager();
     ASSERT_NE(wm, nullptr);
 
     // Should be able to use interface methods
     EXPECT_EQ(wm->strategy(), WeightDistributionStrategy::SHARDED);
-    EXPECT_GT(wm->cacheSize(), 0);
+
+    // cacheSize is concrete-only; access through mock
+    auto &mock_wm = ctx->mockWeightManager();
+    EXPECT_GT(mock_wm.cacheSize(), 0);
 }
 
-TEST(Test__MockModelContext, MockComponentAccess) {
+TEST(Test__MockModelContext, MockComponentAccess)
+{
     auto ctx = MockModelContext::createMinimal();
 
     // Access underlying mocks for test configuration
-    MockModelLoader& loader = ctx->mockLoader();
-    MockWeightManager& wm = ctx->mockWeightManager();
+    MockModelLoader &loader = ctx->mockLoader();
+    MockWeightManager &wm = ctx->mockWeightManager();
 
     // Can configure via mock APIs
     loader.setIntParam("custom_param", 42);
@@ -197,10 +212,11 @@ TEST(Test__MockModelContext, MockComponentAccess) {
 // TENSOR/WEIGHT ADDITION TESTS
 // =============================================================================
 
-TEST(Test__MockModelContext, AddFP32RandomTensor) {
+TEST(Test__MockModelContext, AddFP32RandomTensor)
+{
     auto ctx = MockModelContextBuilder()
-        .addFP32RandomTensor("custom_weight", {64, 128}, -1.0f, 1.0f, 42)
-        .build();
+                   .addFP32RandomTensor("custom_weight", {64, 128}, -1.0f, 1.0f, 42)
+                   .build();
 
     // Should exist in loader
     EXPECT_TRUE(ctx->hasTensor("custom_weight"));
@@ -212,84 +228,92 @@ TEST(Test__MockModelContext, AddFP32RandomTensor) {
     EXPECT_EQ(weight->cols(), 128);
 
     // Verify it's FP32
-    auto* fp32 = dynamic_cast<FP32Tensor*>(weight.get());
+    auto *fp32 = dynamic_cast<FP32Tensor *>(weight.get());
     ASSERT_NE(fp32, nullptr);
 }
 
-TEST(Test__MockModelContext, AddFP32ZerosTensor) {
+TEST(Test__MockModelContext, AddFP32ZerosTensor)
+{
     auto ctx = MockModelContextBuilder()
-        .addFP32ZerosTensor("zeros", {32, 64})
-        .build();
+                   .addFP32ZerosTensor("zeros", {32, 64})
+                   .build();
 
     auto weight = ctx->getWeightForDevice("zeros");
     ASSERT_NE(weight, nullptr);
 
-    auto* fp32 = dynamic_cast<FP32Tensor*>(weight.get());
+    auto *fp32 = dynamic_cast<FP32Tensor *>(weight.get());
     ASSERT_NE(fp32, nullptr);
 
     // Verify all zeros
-    const float* data = fp32->data();
-    for (size_t i = 0; i < 32 * 64; ++i) {
+    const float *data = fp32->data();
+    for (size_t i = 0; i < 32 * 64; ++i)
+    {
         EXPECT_EQ(data[i], 0.0f);
     }
 }
 
-TEST(Test__MockModelContext, AddFP32OnesTensor) {
+TEST(Test__MockModelContext, AddFP32OnesTensor)
+{
     auto ctx = MockModelContextBuilder()
-        .addFP32OnesTensor("ones", {16, 32})
-        .build();
+                   .addFP32OnesTensor("ones", {16, 32})
+                   .build();
 
     auto weight = ctx->getWeightForDevice("ones");
     ASSERT_NE(weight, nullptr);
 
-    auto* fp32 = dynamic_cast<FP32Tensor*>(weight.get());
+    auto *fp32 = dynamic_cast<FP32Tensor *>(weight.get());
     ASSERT_NE(fp32, nullptr);
 
     // Verify all ones
-    const float* data = fp32->data();
-    for (size_t i = 0; i < 16 * 32; ++i) {
+    const float *data = fp32->data();
+    for (size_t i = 0; i < 16 * 32; ++i)
+    {
         EXPECT_EQ(data[i], 1.0f);
     }
 }
 
-TEST(Test__MockModelContext, AddQ4_0RandomTensor) {
+TEST(Test__MockModelContext, AddQ4_0RandomTensor)
+{
     auto ctx = MockModelContextBuilder()
-        .addQ4_0RandomTensor("q4_weight", {256, 256})
-        .build();
+                   .addQ4_0RandomTensor("q4_weight", {256, 256})
+                   .build();
 
     EXPECT_TRUE(ctx->hasTensor("q4_weight"));
     auto weight = ctx->getWeightForDevice("q4_weight");
     ASSERT_NE(weight, nullptr);
 
     // Should be Q4_0 tensor
-    auto* q4 = dynamic_cast<Q4_0Tensor*>(weight.get());
+    auto *q4 = dynamic_cast<Q4_0Tensor *>(weight.get());
     ASSERT_NE(q4, nullptr);
 }
 
-TEST(Test__MockModelContext, AddQ8_0RandomTensor) {
+TEST(Test__MockModelContext, AddQ8_0RandomTensor)
+{
     auto ctx = MockModelContextBuilder()
-        .addQ8_0RandomTensor("q8_weight", {128, 128})
-        .build();
+                   .addQ8_0RandomTensor("q8_weight", {128, 128})
+                   .build();
 
     EXPECT_TRUE(ctx->hasTensor("q8_weight"));
     auto weight = ctx->getWeightForDevice("q8_weight");
     ASSERT_NE(weight, nullptr);
 
-    auto* q8 = dynamic_cast<Q8_0Tensor*>(weight.get());
+    auto *q8 = dynamic_cast<Q8_0Tensor *>(weight.get());
     ASSERT_NE(q8, nullptr);
 }
 
-TEST(Test__MockModelContext, AddPrebuiltTensor) {
+TEST(Test__MockModelContext, AddPrebuiltTensor)
+{
     // Create a custom tensor
     auto custom = std::make_shared<FP32Tensor>(std::vector<size_t>{100, 200});
-    float* data = custom->mutable_data();
-    for (size_t i = 0; i < 100 * 200; ++i) {
+    float *data = custom->mutable_data();
+    for (size_t i = 0; i < 100 * 200; ++i)
+    {
         data[i] = static_cast<float>(i) * 0.001f;
     }
 
     auto ctx = MockModelContextBuilder()
-        .addTensor("custom_tensor", custom)
-        .build();
+                   .addTensor("custom_tensor", custom)
+                   .build();
 
     auto weight = ctx->getWeightForDevice("custom_tensor");
     ASSERT_NE(weight, nullptr);
@@ -301,19 +325,20 @@ TEST(Test__MockModelContext, AddPrebuiltTensor) {
 // SHARDING CONFIGURATION TESTS
 // =============================================================================
 
-TEST(Test__MockModelContext, ShardingModeConfiguration) {
+TEST(Test__MockModelContext, ShardingModeConfiguration)
+{
     auto ctx = MockModelContextBuilder()
-        .setStrategy(WeightDistributionStrategy::SHARDED)
-        .addFP32RandomTensor("attn_q", {896, 896})
-        .setColumnParallel("attn_q")
-        .addFP32RandomTensor("attn_output", {896, 896})
-        .setRowParallel("attn_output")
-        .addFP32RandomTensor("ffn_down", {896, 4864})
-        .setInputParallel("ffn_down")
-        .addFP32RandomTensor("norm", {896})
-        .setReplicated("norm")
-        .setNonGemm("norm")
-        .build();
+                   .setStrategy(WeightDistributionStrategy::SHARDED)
+                   .addFP32RandomTensor("attn_q", {896, 896})
+                   .setColumnParallel("attn_q")
+                   .addFP32RandomTensor("attn_output", {896, 896})
+                   .setRowParallel("attn_output")
+                   .addFP32RandomTensor("ffn_down", {896, 4864})
+                   .setInputParallel("ffn_down")
+                   .addFP32RandomTensor("norm", {896})
+                   .setReplicated("norm")
+                   .setNonGemm("norm")
+                   .build();
 
     auto wm = ctx->weightManager();
 
@@ -330,13 +355,14 @@ TEST(Test__MockModelContext, ShardingModeConfiguration) {
     EXPECT_FALSE(wm->isGemmWeight("norm"));
 }
 
-TEST(Test__MockModelContext, AddShardedWeight) {
+TEST(Test__MockModelContext, AddShardedWeight)
+{
     auto tensor = std::make_shared<FP32Tensor>(std::vector<size_t>{64, 64});
 
     auto ctx = MockModelContextBuilder()
-        .setStrategy(WeightDistributionStrategy::SHARDED)
-        .addShardedWeight("sharded_weight", tensor, ShardingMode::COLUMN_PARALLEL)
-        .build();
+                   .setStrategy(WeightDistributionStrategy::SHARDED)
+                   .addShardedWeight("sharded_weight", tensor, ShardingMode::COLUMN_PARALLEL)
+                   .build();
 
     auto wm = ctx->weightManager();
     EXPECT_TRUE(wm->isWeightSharded("sharded_weight"));
@@ -347,11 +373,12 @@ TEST(Test__MockModelContext, AddShardedWeight) {
 // LAYER PRESET TESTS
 // =============================================================================
 
-TEST(Test__MockModelContext, AddEmbeddingLayer) {
+TEST(Test__MockModelContext, AddEmbeddingLayer)
+{
     auto ctx = MockModelContextBuilder()
-        .usePreset(ModelPreset::MINIMAL)
-        .addEmbeddingLayer()
-        .build();
+                   .usePreset(ModelPreset::MINIMAL)
+                   .addEmbeddingLayer()
+                   .build();
 
     EXPECT_TRUE(ctx->hasTensor("token_embd.weight"));
     auto embd = ctx->getWeightForDevice("token_embd.weight");
@@ -367,11 +394,12 @@ TEST(Test__MockModelContext, AddEmbeddingLayer) {
     EXPECT_FALSE(wm->isGemmWeight("token_embd.weight"));
 }
 
-TEST(Test__MockModelContext, AddTransformerLayer) {
+TEST(Test__MockModelContext, AddTransformerLayer)
+{
     auto ctx = MockModelContextBuilder()
-        .usePreset(ModelPreset::MINIMAL)
-        .addTransformerLayer(0)
-        .build();
+                   .usePreset(ModelPreset::MINIMAL)
+                   .addTransformerLayer(0)
+                   .build();
 
     // Check attention weights
     EXPECT_TRUE(ctx->hasTensor("blk.0.attn_norm.weight"));
@@ -394,11 +422,12 @@ TEST(Test__MockModelContext, AddTransformerLayer) {
     EXPECT_FALSE(wm->isGemmWeight("blk.0.attn_norm.weight"));
 }
 
-TEST(Test__MockModelContext, AddOutputLayer) {
+TEST(Test__MockModelContext, AddOutputLayer)
+{
     auto ctx = MockModelContextBuilder()
-        .usePreset(ModelPreset::MINIMAL)
-        .addOutputLayer()
-        .build();
+                   .usePreset(ModelPreset::MINIMAL)
+                   .addOutputLayer()
+                   .build();
 
     EXPECT_TRUE(ctx->hasTensor("output_norm.weight"));
     EXPECT_TRUE(ctx->hasTensor("output.weight"));
@@ -408,21 +437,23 @@ TEST(Test__MockModelContext, AddOutputLayer) {
     EXPECT_EQ(wm->getShardingMode("output.weight"), ShardingMode::COLUMN_PARALLEL);
 }
 
-TEST(Test__MockModelContext, AddAllLayers) {
+TEST(Test__MockModelContext, AddAllLayers)
+{
     auto ctx = MockModelContextBuilder()
-        .setBlockCount(3)
-        .setEmbeddingLength(256)
-        .setHeadCount(4)
-        .setHeadCountKV(2)
-        .setVocabSize(1000)
-        .addAllLayers()
-        .build();
+                   .setBlockCount(3)
+                   .setEmbeddingLength(256)
+                   .setHeadCount(4)
+                   .setHeadCountKV(2)
+                   .setVocabSize(1000)
+                   .addAllLayers()
+                   .build();
 
     // Embedding layer
     EXPECT_TRUE(ctx->hasTensor("token_embd.weight"));
 
     // All 3 transformer layers
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 3; ++i)
+    {
         std::string prefix = "blk." + std::to_string(i) + ".";
         EXPECT_TRUE(ctx->hasTensor(prefix + "attn_norm.weight"));
         EXPECT_TRUE(ctx->hasTensor(prefix + "attn_q.weight"));
@@ -438,7 +469,8 @@ TEST(Test__MockModelContext, AddAllLayers) {
 // CALL TRACKING TESTS
 // =============================================================================
 
-TEST(Test__MockModelContext, TrackGetWeightCalls) {
+TEST(Test__MockModelContext, TrackGetWeightCalls)
+{
     auto ctx = MockModelContext::createMinimal();
 
     EXPECT_EQ(ctx->getWeightCallCount(), 0);
@@ -454,7 +486,8 @@ TEST(Test__MockModelContext, TrackGetWeightCalls) {
     EXPECT_EQ(ctx->getWeightCallCount(), 0);
 }
 
-TEST(Test__MockModelContext, TrackLoadTensorCalls) {
+TEST(Test__MockModelContext, TrackLoadTensorCalls)
+{
     auto ctx = MockModelContext::createMinimal();
 
     EXPECT_EQ(ctx->loadTensorCallCount(), 0);
@@ -471,16 +504,17 @@ TEST(Test__MockModelContext, TrackLoadTensorCalls) {
 // INTEGRATION TESTS
 // =============================================================================
 
-TEST(Test__MockModelContext, FullPipelineSetup) {
+TEST(Test__MockModelContext, FullPipelineSetup)
+{
     // Simulate setting up a complete inference context
     // Use MINIMAL preset to avoid allocating huge vocab-sized tensors
     auto ctx = MockModelContextBuilder()
-        .usePreset(ModelPreset::MINIMAL)  // vocab=1000, dim=128 - fast
-        .setStrategy(WeightDistributionStrategy::SHARDED)
-        .addEmbeddingLayer()
-        .addTransformerLayer(0)
-        .addOutputLayer()
-        .build();
+                   .usePreset(ModelPreset::MINIMAL) // vocab=1000, dim=128 - fast
+                   .setStrategy(WeightDistributionStrategy::SHARDED)
+                   .addEmbeddingLayer()
+                   .addTransformerLayer(0)
+                   .addOutputLayer()
+                   .build();
 
     // Verify configuration
     EXPECT_EQ(ctx->architecture(), "qwen2");
@@ -490,8 +524,8 @@ TEST(Test__MockModelContext, FullPipelineSetup) {
     // Verify weight dimensions
     auto embd = ctx->getWeightForDevice("token_embd.weight");
     ASSERT_NE(embd, nullptr);
-    EXPECT_EQ(embd->rows(), 1000);   // vocab_size (MINIMAL)
-    EXPECT_EQ(embd->cols(), 128);    // embedding_length (MINIMAL)
+    EXPECT_EQ(embd->rows(), 1000); // vocab_size (MINIMAL)
+    EXPECT_EQ(embd->cols(), 128);  // embedding_length (MINIMAL)
 
     auto attn_q = ctx->getWeightForDevice("blk.0.attn_q.weight");
     ASSERT_NE(attn_q, nullptr);
@@ -503,12 +537,13 @@ TEST(Test__MockModelContext, FullPipelineSetup) {
     EXPECT_TRUE(wm->isWeightSharded("blk.0.attn_q.weight"));
 }
 
-TEST(Test__MockModelContext, ComposedMocksAreConsistent) {
+TEST(Test__MockModelContext, ComposedMocksAreConsistent)
+{
     auto ctx = MockModelContextBuilder()
-        .setBlockCount(8)
-        .setEmbeddingLength(512)
-        .addFP32RandomTensor("test_weight", {512, 512})
-        .build();
+                   .setBlockCount(8)
+                   .setEmbeddingLength(512)
+                   .addFP32RandomTensor("test_weight", {512, 512})
+                   .build();
 
     // Both loader and weight manager should have the same tensor
     EXPECT_TRUE(ctx->loader()->hasTensor("test_weight"));
@@ -522,10 +557,11 @@ TEST(Test__MockModelContext, ComposedMocksAreConsistent) {
     EXPECT_EQ(from_loader->cols(), from_wm->cols());
 }
 
-TEST(Test__MockModelContext, CanModifyAfterBuild) {
+TEST(Test__MockModelContext, CanModifyAfterBuild)
+{
     auto ctx = MockModelContextBuilder()
-        .usePreset(ModelPreset::MINIMAL)
-        .build();
+                   .usePreset(ModelPreset::MINIMAL)
+                   .build();
 
     // Initial state
     EXPECT_EQ(ctx->blockCount(), 1);
@@ -546,11 +582,12 @@ TEST(Test__MockModelContext, CanModifyAfterBuild) {
 // HYPERPARAMETER TESTS (RoPE, RMSNorm)
 // =============================================================================
 
-TEST(Test__MockModelContext, RopeAndNormConfig) {
+TEST(Test__MockModelContext, RopeAndNormConfig)
+{
     auto ctx = MockModelContextBuilder()
-        .setRopeTheta(500000.0f)
-        .setRmsNormEps(1e-5f)
-        .build();
+                   .setRopeTheta(500000.0f)
+                   .setRmsNormEps(1e-5f)
+                   .build();
 
     // Access via loader interface
     auto loader = ctx->loader();
@@ -558,7 +595,8 @@ TEST(Test__MockModelContext, RopeAndNormConfig) {
     EXPECT_FLOAT_EQ(loader->rmsNormEps(), 1e-5f);
 }
 
-TEST(Test__MockModelContext, PresetRopeConfig) {
+TEST(Test__MockModelContext, PresetRopeConfig)
+{
     // Qwen2 uses rope_theta = 1000000
     auto qwen2 = MockModelContext::createQwen2_05B();
     EXPECT_FLOAT_EQ(qwen2->loader()->ropeTheta(), 1000000.0f);
