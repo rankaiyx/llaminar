@@ -96,11 +96,12 @@ namespace llaminar2
          * - Down projection: INPUT_PARALLEL (allreduce after)
          *   - Weight: [d_model, d_ff] → [d_model, d_ff_local]
          *
-         * LM Head:
+         * LM Head / Embedding:
          * - output.weight: COLUMN_PARALLEL (split vocab, allgather logits)
+         * - token_embd.weight: COLUMN_PARALLEL (split vocab, allreduce after embedding)
          *
          * Replicated (full copy on each rank):
-         * - Norms, biases, embeddings
+         * - Norms, biases
          */
         WeightShardingConfig getWeightShardingConfig() const override
         {
@@ -109,6 +110,10 @@ namespace llaminar2
             // Exact match for LM head (no blk prefix)
             config.exact_matches["output.weight"] = WeightShardingMode::ColumnParallel;
             config.exact_dimension_matches["output.weight"] = WeightDimensionType::Vocab;
+
+            // Exact match for embedding table — vocab-parallel sharding
+            config.exact_matches["token_embd.weight"] = WeightShardingMode::ColumnParallel;
+            config.exact_dimension_matches["token_embd.weight"] = WeightDimensionType::Vocab;
 
             // Pattern rules (evaluated in order, first match wins)
             // Format: {pattern, mode, dimension_type, description}
@@ -197,6 +202,7 @@ namespace llaminar2
                     {"token_ids", BufferSemantic::Input},
                     {"weights.embedding_table", BufferSemantic::Input}},
                 .outputs = {{"hidden", BufferSemantic::Output}},
+                .tp_mode = TPMode::RowParallel,
                 .is_optional = true,
                 .exec_policy_key = "exec_embedding"};
 

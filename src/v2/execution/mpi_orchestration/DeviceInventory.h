@@ -24,6 +24,7 @@
 #pragma once
 
 #include "../../backends/DeviceType.h"
+#include "../../backends/CPUSocketInfo.h"
 #include <cstddef>
 #include <string>
 #include <sstream>
@@ -86,6 +87,14 @@ namespace llaminar2
         int pcie_bus_id = 0;       ///< PCIe bus ID (for locality)
         int numa_node = -1;        ///< Associated NUMA node (-1 if unknown)
 
+        // PCIe link info
+        int pcie_gen = 0;              ///< PCIe generation (3/4/5/6)
+        int pcie_width = 0;            ///< Current link width (x8, x16)
+        double pcie_speed_gts = 0.0;   ///< Current speed in GT/s
+        int pcie_max_width = 0;        ///< Max capable width
+        double pcie_max_speed_gts = 0; ///< Max capable speed in GT/s
+        bool pcie_degraded = false;    ///< True if running below max capability
+
         /// Check if this is a GPU (any type)
         bool isGPU() const
         {
@@ -128,6 +137,16 @@ namespace llaminar2
 
         // GPU/accelerator info
         std::vector<DeviceInfo> gpus; ///< GPU devices accessible to this rank
+
+        // Per-socket CPU detail (detected from sysfs)
+        std::vector<CPUSocketInfo> cpu_socket_info; ///< Per-socket CPU topology
+
+        // P2P access matrices (per GPU backend, populated if >=2 devices)
+        // Stored as flat bool vectors: p2p_cuda[i * cuda_count + j] = can_access
+        std::vector<bool> p2p_cuda; ///< CUDA P2P matrix (cuda_count x cuda_count)
+        std::vector<bool> p2p_rocm; ///< ROCm P2P matrix (rocm_count x rocm_count)
+        int p2p_cuda_count = 0;     ///< Number of CUDA devices in P2P matrix
+        int p2p_rocm_count = 0;     ///< Number of ROCm devices in P2P matrix
 
         /// Total GPU count for this rank
         int gpuCount() const { return static_cast<int>(gpus.size()); }

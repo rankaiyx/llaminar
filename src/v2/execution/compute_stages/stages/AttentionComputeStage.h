@@ -57,6 +57,10 @@ namespace llaminar2
             int n_kv_heads = 0;
             int head_dim = 0;
 
+            // Tensor-parallel GQA mapping (replicated KV heads)
+            int head_start = 0; ///< Global Q head offset for this device
+            int gqa_n_rep = 0;  ///< Global GQA repetition factor (n_heads_global / n_kv_heads_global, 0 = auto)
+
             // Attention configuration
             bool causal = true;
             int window_size = -1;

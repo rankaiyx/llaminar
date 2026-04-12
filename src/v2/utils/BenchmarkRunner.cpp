@@ -113,7 +113,7 @@ namespace llaminar2
         return {success, time_ms};
     }
 
-    std::tuple<bool, double, int, std::string> BenchmarkRunner::runDecode(int n_tokens, int eos_token_id)
+    std::tuple<bool, double, int, std::string> BenchmarkRunner::runDecode(int n_tokens, int eos_token_id, bool ignore_stop_tokens)
     {
         Sampler sampler(42); // Fixed seed for reproducibility
         std::string generated_text;
@@ -167,8 +167,8 @@ namespace llaminar2
             if (mpi_ctx_->world_size() > 1)
                 mpi_ctx_->broadcast_int32(&next_token, 1, 0);
 
-            // Check for stop token
-            if (tokenizer_->is_stop_token(next_token))
+            // Check for stop token (unless benchmarking throughput)
+            if (!ignore_stop_tokens && tokenizer_->is_stop_token(next_token))
             {
                 break;
             }
@@ -319,7 +319,7 @@ namespace llaminar2
         {
             int eos_token = tokenizer_->eos_token();
             auto [warmup_decode_success, warmup_decode_time, warmup_tokens, warmup_text] =
-                runDecode(n_decode, eos_token);
+                runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
             if (!warmup_decode_success)
             {
                 if (mpi_ctx_->rank() == 0)
@@ -401,7 +401,7 @@ namespace llaminar2
                 GraphExecutorStats::setCurrentPhase(ExecutionPhase::DECODE);
                 int eos_token = tokenizer_->eos_token();
                 auto [decode_success, decode_time, tokens_generated, generated_text] =
-                    runDecode(n_decode, eos_token);
+                    runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
                 if (!decode_success)
                 {
                     if (mpi_ctx_->rank() == 0)

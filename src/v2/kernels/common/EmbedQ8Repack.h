@@ -33,11 +33,11 @@ namespace llaminar2
      */
     struct EmbedQ8RepackResult
     {
-        std::vector<uint8_t> data;  ///< Raw bytes of EmbedQ8Block array
-        size_t blocks_per_row;      ///< Number of 32-element blocks per vocabulary entry
-        size_t vocab_size;          ///< Number of vocabulary entries (rows)
-        size_t total_blocks;        ///< Total blocks = vocab_size × blocks_per_row
-        size_t byte_size;           ///< Total bytes = total_blocks × sizeof(EmbedQ8Block)
+        std::vector<uint8_t> data; ///< Raw bytes of EmbedQ8Block array
+        size_t blocks_per_row;     ///< Number of 32-element blocks per vocabulary entry
+        size_t vocab_size;         ///< Number of vocabulary entries (rows)
+        size_t total_blocks;       ///< Total blocks = vocab_size × blocks_per_row
+        size_t byte_size;          ///< Total bytes = total_blocks × sizeof(EmbedQ8Block)
     };
 
     /**
@@ -65,7 +65,8 @@ namespace llaminar2
         {
             throw std::runtime_error(
                 "[repackEmbeddingToQ8] Tensor does not implement IINT8Unpackable. "
-                "Type: " + std::string(tensorTypeName(embed_table->native_type())));
+                "Type: " +
+                std::string(tensorTypeName(embed_table->native_type())));
         }
 
         const size_t vocab_size = embed_table->rows();
@@ -156,5 +157,121 @@ namespace llaminar2
         return result;
     }
 
-} // namespace llaminar2
+    /**
+     * @brief Repack a vocab-range slice of a quantized embedding tensor into EmbedQ8Block format
+     *
+     * Repacks rows [vocab_start, vocab_start + vocab_count) from the original tensor.
+     * Used for vocabulary-parallel embedding sharding where each device holds a
+     * contiguous slice of the vocabulary.
+     *
+     * @param embed_table  The quantized embedding tensor (must implement IINT8Unpackable)
+     * @param d_model      Embedding dimension (number of columns)
+     * @param vocab_start  First vocabulary row to include
+     * @param vocab_count  Number of vocabulary rows to include
+     * @return EmbedQ8RepackResult containing the repacked slice
+     */
+    inline EmbedQ8RepackResult repackEmbeddingToQ8(
+        const TensorBase *embed_table,
+        int d_model,
+        size_t vocab_start,
+        size_t vocab_count)
+    {
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(embed_table);
+        if (!unpackable)
+        {
+            throw std::runtime_error(
+                "[repackEmbeddingToQ8] Tensor does not implement IINT8Unpackable. "
+                "Type: " +
+                std::string(tensorTypeName(embed_table->native_type())));
+        }
 
+        const size_t total_vocab = embed_table->rows();
+        if (vocab_start + vocab_count > total_vocab)
+        {
+            throw std::runtime_error(
+                "[repackEmbeddingToQ8] Vocab range [" + std::to_string(vocab_start) +
+                ", " + std::to_string(vocab_start + vocab_count) +
+                ") exceeds total vocab " + std::to_string(total_vocab));
+        }
+
+        const size_t blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
+        const size_t total_blocks = vocab_count * blocks_per_row;
+        const size_t byte_size = total_blocks * sizeof(EmbedQ8Block);
+        const size_t sb_size = unpackable->superblock_size();
+
+        auto t0 = std::chrono::steady_clock::now();
+
+        EmbedQ8RepackResult result;
+        result.blocks_per_row = blocks_per_row;
+        result.vocab_size = vocab_count;
+        result.total_blocks = total_blocks;
+        result.byte_size = byte_size;
+        result.data.resize(byte_size);
+
+        EmbedQ8Block *out_blocks = reinterpret_cast<EmbedQ8Block *>(result.data.data());
+
+        if (sb_size == 256)
+        {
+            const size_t superblocks_per_row = (static_cast<size_t>(d_model) + 255) / 256;
+            const size_t sub_blocks_per_superblock = 8;
+
+#pragma omp parallel for schedule(dynamic, 256)
+            for (size_t i = 0; i < vocab_count; ++i)
+            {
+                const size_t src_row = vocab_start + i;
+                alignas(64) int8_t sb_int8[256];
+                float sb_scales[8];
+                float sb_mins[8];
+
+                for (size_t sb = 0; sb < superblocks_per_row; ++sb)
+                {
+                    unpackable->unpack_superblock_to_int8(src_row, sb, sb_int8, sb_scales, sb_mins);
+
+                    for (size_t sub = 0; sub < sub_blocks_per_superblock; ++sub)
+                    {
+                        size_t block_idx_in_row = sb * sub_blocks_per_superblock + sub;
+                        if (block_idx_in_row >= blocks_per_row)
+                            break;
+
+                        EmbedQ8Block &out = out_blocks[i * blocks_per_row + block_idx_in_row];
+                        out.d = fp32_to_fp16(sb_scales[sub]);
+                        out.m = fp32_to_fp16(sb_mins[sub]);
+                        std::memcpy(out.qs, &sb_int8[sub * 32], 32);
+                    }
+                }
+            }
+        }
+        else
+        {
+#pragma omp parallel for schedule(dynamic, 256)
+            for (size_t i = 0; i < vocab_count; ++i)
+            {
+                const size_t src_row = vocab_start + i;
+                alignas(64) int8_t block_int8[32];
+
+                for (size_t b = 0; b < blocks_per_row; ++b)
+                {
+                    unpackable->unpack_block_to_int8(src_row, b, block_int8);
+
+                    EmbedQ8Block &out = out_blocks[i * blocks_per_row + b];
+                    out.d = fp32_to_fp16(unpackable->get_block_scale(src_row, b));
+                    out.m = fp32_to_fp16(unpackable->get_block_min(src_row, b));
+                    std::memcpy(out.qs, block_int8, 32);
+                }
+            }
+        }
+
+        auto t1 = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+        LOG_INFO("[repackEmbeddingToQ8] Repacked "
+                 << tensorTypeName(embed_table->native_type()) << " embedding "
+                 << "rows [" << vocab_start << ", " << (vocab_start + vocab_count) << ") of "
+                 << total_vocab << "×" << d_model << " → EmbedQ8 "
+                 << (byte_size / (1024 * 1024)) << " MB (" << total_blocks << " blocks) in "
+                 << ms << " ms");
+
+        return result;
+    }
+
+} // namespace llaminar2

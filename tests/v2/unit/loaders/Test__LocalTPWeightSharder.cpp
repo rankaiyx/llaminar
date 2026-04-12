@@ -18,13 +18,15 @@
 #include <vector>
 
 #include "loaders/ILocalTPWeightSharder.h"
-#include "collective/LocalTPContext.h"
+#include "collective/ILocalTPContext.h"
+#include "mocks/MockLocalTPContext.h"
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "utils/MPIContext.h"
 
 using namespace llaminar2;
+using namespace llaminar2::test;
 
 // =============================================================================
 // Test Fixture
@@ -45,6 +47,20 @@ protected:
 
         // Create MPI context for TensorFactory (single rank for unit tests)
         mpi_ctx_ = std::make_shared<MPIContext>(0, 1, MPI_COMM_NULL);
+    }
+
+    /**
+     * @brief Create a MockLocalTPContext with the given devices and weights
+     */
+    std::unique_ptr<MockLocalTPContext> createMockTPContext(
+        std::vector<GlobalDeviceAddress> devices,
+        std::vector<float> weights = {})
+    {
+        auto mock = std::make_unique<MockLocalTPContext>();
+        mock->setDevices(std::move(devices));
+        if (!weights.empty())
+            mock->setWeights(std::move(weights));
+        return mock;
     }
 
     /**
@@ -97,7 +113,7 @@ TEST_F(Test__LocalTPWeightSharder, FactoryCreatesValidSharder)
  */
 TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelCreatesCorrectCount)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
     auto weight = createTestWeight(64, 128);
 
     auto shards = sharder_->shardColumnParallel(weight.get(), *ctx);
@@ -110,7 +126,7 @@ TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelCreatesCorrectCount)
  */
 TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelEqualWeights)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
     auto weight = createTestWeight(64, 128);
 
     auto shards = sharder_->shardColumnParallel(weight.get(), *ctx);
@@ -129,7 +145,7 @@ TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelEqualWeights)
 TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelProportional)
 {
     // 75%/25% split
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {0.75f, 0.25f}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {0.75f, 0.25f});
     auto weight = createTestWeight(64, 128);
 
     auto shards = sharder_->shardColumnParallel(weight.get(), *ctx);
@@ -155,7 +171,7 @@ TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelProportional)
  */
 TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelDataCorrect)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
     auto weight = createTestWeight(4, 8);
 
     auto shards = sharder_->shardColumnParallel(weight.get(), *ctx);
@@ -191,7 +207,7 @@ TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelDataCorrect)
 TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelThreeDevices)
 {
     auto rocm1 = GlobalDeviceAddress::rocm(1, 0);
-    auto ctx = createLocalTPContext({cuda0_, rocm0_, rocm1}, {}, CollectiveBackendType::PCIE_BAR);
+    auto ctx = createMockTPContext({cuda0_, rocm0_, rocm1}, {});
     auto weight = createTestWeight(64, 99); // Not evenly divisible by 3
 
     auto shards = sharder_->shardColumnParallel(weight.get(), *ctx);
@@ -220,7 +236,7 @@ TEST_F(Test__LocalTPWeightSharder, ShardColumnParallelThreeDevices)
  */
 TEST_F(Test__LocalTPWeightSharder, ShardRowParallelCreatesCorrectCount)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
     auto weight = createTestWeight(128, 64);
 
     auto shards = sharder_->shardRowParallel(weight.get(), *ctx);
@@ -233,7 +249,7 @@ TEST_F(Test__LocalTPWeightSharder, ShardRowParallelCreatesCorrectCount)
  */
 TEST_F(Test__LocalTPWeightSharder, ShardRowParallelEqualWeights)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
     auto weight = createTestWeight(128, 64);
 
     auto shards = sharder_->shardRowParallel(weight.get(), *ctx);
@@ -252,7 +268,7 @@ TEST_F(Test__LocalTPWeightSharder, ShardRowParallelEqualWeights)
 TEST_F(Test__LocalTPWeightSharder, ShardRowParallelProportional)
 {
     // 60%/40% split
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {0.6f, 0.4f}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {0.6f, 0.4f});
     auto weight = createTestWeight(100, 64);
 
     auto shards = sharder_->shardRowParallel(weight.get(), *ctx);
@@ -278,7 +294,7 @@ TEST_F(Test__LocalTPWeightSharder, ShardRowParallelProportional)
  */
 TEST_F(Test__LocalTPWeightSharder, ShardRowParallelDataCorrect)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
     auto weight = createTestWeight(8, 4);
 
     auto shards = sharder_->shardRowParallel(weight.get(), *ctx);
@@ -317,7 +333,7 @@ TEST_F(Test__LocalTPWeightSharder, ShardRowParallelDataCorrect)
  */
 TEST_F(Test__LocalTPWeightSharder, GetColumnShardForDevice)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
     auto weight = createTestWeight(64, 128);
 
     auto shard0 = sharder_->getColumnShard(weight.get(), *ctx, cuda0_);
@@ -335,7 +351,7 @@ TEST_F(Test__LocalTPWeightSharder, GetColumnShardForDevice)
  */
 TEST_F(Test__LocalTPWeightSharder, GetRowShardForDevice)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
     auto weight = createTestWeight(128, 64);
 
     auto shard0 = sharder_->getRowShard(weight.get(), *ctx, cuda0_);
@@ -355,7 +371,7 @@ TEST_F(Test__LocalTPWeightSharder, GetRowShardForDevice)
  */
 TEST_F(Test__LocalTPWeightSharder, GetColumnShardUnknownDeviceThrows)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
     auto weight = createTestWeight(64, 128);
 
     EXPECT_THROW(
@@ -368,7 +384,7 @@ TEST_F(Test__LocalTPWeightSharder, GetColumnShardUnknownDeviceThrows)
  */
 TEST_F(Test__LocalTPWeightSharder, GetRowShardNullWeightThrows)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
 
     EXPECT_THROW(
         sharder_->getRowShard(nullptr, *ctx, cuda0_),
@@ -384,7 +400,7 @@ TEST_F(Test__LocalTPWeightSharder, GetRowShardNullWeightThrows)
  */
 TEST_F(Test__LocalTPWeightSharder, ColumnCountForDevice)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {});
 
     EXPECT_EQ(sharder_->columnCountForDevice(128, *ctx, cuda0_), 64);
     EXPECT_EQ(sharder_->columnCountForDevice(128, *ctx, cuda1_), 64);
@@ -396,7 +412,7 @@ TEST_F(Test__LocalTPWeightSharder, ColumnCountForDevice)
  */
 TEST_F(Test__LocalTPWeightSharder, RowCountForDevice)
 {
-    auto ctx = createLocalTPContext({cuda0_, cuda1_}, {0.7f, 0.3f}, CollectiveBackendType::NCCL);
+    auto ctx = createMockTPContext({cuda0_, cuda1_}, {0.7f, 0.3f});
 
     int r0 = sharder_->rowCountForDevice(100, *ctx, cuda0_);
     int r1 = sharder_->rowCountForDevice(100, *ctx, cuda1_);

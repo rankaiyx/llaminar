@@ -19,7 +19,6 @@
 #include "../collective/backends/PCIeBARBackend.h" // For BAR-backed tensor support
 
 #include "../kernels/cpu/ops/CPUEmbeddingKernelT.h"
-#include "../kernels/cpu/attention/CPUAttentionKernelT.h"
 #include <cstring>
 #include <stdexcept>
 #include <iostream>

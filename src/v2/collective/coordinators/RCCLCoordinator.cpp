@@ -572,63 +572,24 @@ namespace llaminar2
             LOG_TRACE("[RCCLCoordinator] Created stream and event for device " << device_ordinals_[i]);
         }
 
-        // Step 2: Generate RCCL unique ID
-        rccl::ncclUniqueId unique_id;
-        rccl::ncclResult_t r = rccl::ncclGetUniqueId(&unique_id);
+        // Step 2: Initialize RCCL communicators using rcclCommInitAll.
+        // This is the correct API for single-process multi-GPU initialization.
+        // The GroupStart/CommInitRank/GroupEnd pattern has a shared memory race
+        // condition in RCCL's topology exchange layer that causes failures with
+        // >=4 GPUs (threads race to attach to /dev/shm segments before they exist).
+        std::vector<rccl::ncclComm_t> rccl_comms(num_devices_);
+        rccl::ncclResult_t r = rccl::ncclCommInitAll(rccl_comms.data(), num_devices_, device_ordinals_.data());
         if (r != rccl::ncclSuccess)
         {
-            last_error_ = std::string("rcclGetUniqueId failed: ") + rccl::ncclGetErrorString(r);
+            last_error_ = std::string("rcclCommInitAll failed: ") + rccl::ncclGetErrorString(r);
             LOG_ERROR("[RCCLCoordinator] " << last_error_);
             cleanupOnThread();
             return;
         }
-
-        // Step 3: Initialize RCCL communicators using rcclGroupStart/End
-        // This is the proper way to initialize multiple communicators from a single thread
-        r = rccl::ncclGroupStart();
-        if (r != rccl::ncclSuccess)
-        {
-            last_error_ = std::string("rcclGroupStart failed: ") + rccl::ncclGetErrorString(r);
-            LOG_ERROR("[RCCLCoordinator] " << last_error_);
-            cleanupOnThread();
-            return;
-        }
-
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t hip_err = hipSetDevice(device_ordinals_[i]);
-            if (hip_err != hipSuccess)
-            {
-                last_error_ = std::string("hipSetDevice in rcclCommInitRank failed: ") +
-                              hipGetErrorString(hip_err);
-                LOG_ERROR("[RCCLCoordinator] " << last_error_);
-                rccl::ncclGroupEnd();
-                cleanupOnThread();
-                return;
-            }
-
-            rccl::ncclComm_t comm;
-            r = rccl::ncclCommInitRank(&comm, num_devices_, unique_id, i);
-            if (r != rccl::ncclSuccess)
-            {
-                last_error_ = std::string("rcclCommInitRank failed for rank ") +
-                              std::to_string(i) + ": " + rccl::ncclGetErrorString(r);
-                LOG_ERROR("[RCCLCoordinator] " << last_error_);
-                rccl::ncclGroupEnd();
-                cleanupOnThread();
-                return;
-            }
-            comms_[i] = static_cast<void *>(comm);
+            comms_[i] = static_cast<void *>(rccl_comms[i]);
             LOG_TRACE("[RCCLCoordinator] Initialized RCCL comm for device " << device_ordinals_[i]);
-        }
-
-        r = rccl::ncclGroupEnd();
-        if (r != rccl::ncclSuccess)
-        {
-            last_error_ = std::string("rcclGroupEnd failed: ") + rccl::ncclGetErrorString(r);
-            LOG_ERROR("[RCCLCoordinator] " << last_error_);
-            cleanupOnThread();
-            return;
         }
 
         init_success_.store(true);
@@ -737,36 +698,83 @@ namespace llaminar2
             }
         }
 
-        // Step 3: Destroy RCCL communicators.
-        // After priming (Step 2), all communicators have initialized internal
-        // buffers. We use ncclCommDestroy (graceful) rather than ncclCommAbort
-        // (aggressive) because ncclCommAbort tears down internal RCCL/ROCm CLR
-        // tracking structures in a way that leaves the HIP runtime in an
-        // inconsistent state, causing "Memobj map does not have ptr" errors
-        // on subsequent communicator creation.
+        // Step 3: Release RCCL communicators.
         //
-        // NOTE: Even ncclCommDestroy causes slight ROCm CLR state accumulation
-        // over many repeated init/destroy cycles (a known ROCm CLR bug). In
-        // production inference this is not an issue (single lifecycle). In tests,
-        // this can cause crashes after ~14+ cycles. See test fixture caching for
-        // the test-side mitigation.
-        if (collective_performed_.load())
+        // RCCL/ROCm CLR has bugs with communicator cleanup on MI60 GPUs:
+        // - ncclCommDestroy alone: segfaults inside librccl.so with 4 communicators
+        //   created via ncclCommInitAll (null deref at internal struct offset)
+        // - ncclCommAbort: corrupts glibc heap metadata, causing SIGABRT during
+        //   subsequent cleanup
+        //
+        // Solution: Use the proper NCCL 2.14+ shutdown sequence:
+        //   ncclCommFinalize → hipStreamSynchronize → ncclCommDestroy
+        // ncclCommFinalize tells RCCL to flush async operations and prepare
+        // internal state for clean destruction.
+        if (!comms_.empty())
         {
-            for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+            bool has_finalize = rccl::isCommFinalizeAvailable();
+
+            if (has_finalize)
             {
-                if (comms_[i] != nullptr)
+                // Step 3a: Finalize all communicators first
+                for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
                 {
-                    if (i < static_cast<int>(device_ordinals_.size()))
+                    if (comms_[i] != nullptr)
                     {
-                        hipSetDevice(device_ordinals_[i]);
+                        if (i < static_cast<int>(device_ordinals_.size()))
+                        {
+                            hipSetDevice(device_ordinals_[i]);
+                        }
+                        rccl::ncclResult_t r = rccl::ncclCommFinalize(static_cast<rccl::ncclComm_t>(comms_[i]));
+                        if (r != rccl::ncclSuccess)
+                        {
+                            LOG_WARN("[RCCLCoordinator] ncclCommFinalize failed for device "
+                                     << (i < static_cast<int>(device_ordinals_.size()) ? device_ordinals_[i] : -1)
+                                     << ": " << rccl::ncclGetErrorString(r));
+                        }
                     }
-                    rccl::ncclResult_t r = rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comms_[i]));
-                    if (r != rccl::ncclSuccess)
+                }
+
+                // Step 3b: Synchronize all streams after finalize
+                for (int i = 0; i < static_cast<int>(streams_.size()); ++i)
+                {
+                    if (streams_[i] != nullptr)
                     {
-                        LOG_WARN("[RCCLCoordinator] ncclCommDestroy failed for device "
-                                 << (i < static_cast<int>(device_ordinals_.size()) ? device_ordinals_[i] : -1)
-                                 << ": " << rccl::ncclGetErrorString(r));
+                        if (i < static_cast<int>(device_ordinals_.size()))
+                        {
+                            hipSetDevice(device_ordinals_[i]);
+                        }
+                        hipStreamSynchronize(static_cast<hipStream_t>(streams_[i]));
                     }
+                }
+
+                // Step 3c: Now destroy communicators (safe after finalize+sync)
+                for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+                {
+                    if (comms_[i] != nullptr)
+                    {
+                        if (i < static_cast<int>(device_ordinals_.size()))
+                        {
+                            hipSetDevice(device_ordinals_[i]);
+                        }
+                        rccl::ncclResult_t r = rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comms_[i]));
+                        if (r != rccl::ncclSuccess)
+                        {
+                            LOG_WARN("[RCCLCoordinator] ncclCommDestroy failed for device "
+                                     << (i < static_cast<int>(device_ordinals_.size()) ? device_ordinals_[i] : -1)
+                                     << ": " << rccl::ncclGetErrorString(r));
+                        }
+                        comms_[i] = nullptr;
+                    }
+                }
+            }
+            else
+            {
+                // Fallback: ncclCommFinalize not available — skip cleanup to avoid crash
+                LOG_DEBUG("[RCCLCoordinator] ncclCommFinalize not available, skipping comm cleanup "
+                          "(OS will reclaim resources at exit)");
+                for (int i = 0; i < static_cast<int>(comms_.size()); ++i)
+                {
                     comms_[i] = nullptr;
                 }
             }

@@ -5,6 +5,7 @@
  */
 
 #include "KernelFactory.h"
+#include "../backends/BackendManager.h"
 #include "cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "cpu/gemm/FloatingPointGemmKernel.h"
 #include "../tensors/TensorSlice.h"
@@ -14,7 +15,6 @@
 #include "cpu/ops/CPURMSNormKernelT.h"
 #include "cpu/ops/CPUResidualAddKernelT.h"
 #include "cpu/ops/CPUEmbeddingKernelT.h"
-#include "cpu/attention/CPUAttentionKernelT.h"
 #include "cpu/attention/CPUFlashAttentionKernelT.h"
 #include "cpu/gdn/CPUShortConvolution.h"
 #include "cpu/gdn/CPUGatedDeltaNet.h"
@@ -35,6 +35,7 @@
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../backends/ComputeBackend.h"
 #include "../utils/Logger.h"
+#include "common/EmbedQ8Repack.h"
 
 // CUDA kernel classes
 #ifdef HAVE_CUDA
@@ -2619,8 +2620,6 @@ namespace llaminar
                     return createAttention(static_cast<const llaminar2::BF16Tensor *>(tensor), dev_type, device_ordinal);
                 case llaminar2::TensorType::FP16:
                     return createAttention(static_cast<const llaminar2::FP16Tensor *>(tensor), dev_type, device_ordinal);
-                case llaminar2::TensorType::Q8_1:
-                    return createAttention(static_cast<const llaminar2::Q8_1Tensor *>(tensor), dev_type, device_ordinal);
                 default:
                     throw std::runtime_error(
                         "KernelFactory::createAttention: unsupported tensor type " +
@@ -2769,30 +2768,6 @@ namespace llaminar
                 }
             }
 
-            std::unique_ptr<llaminar2::ITensorAttention> KernelFactory::createAttention(
-                const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal)
-            {
-                (void)tensor;
-                switch (dev_type)
-                {
-                case DeviceType::CPU:
-                    return std::make_unique<llaminar2::CPUAttentionKernelT<llaminar2::ActivationPrecision::Q8_1>>();
-
-#ifdef HAVE_CUDA
-                case DeviceType::CUDA:
-                    throwUnsupportedKernel(dev_type, "Attention", "Q8_1");
-#endif
-
-#ifdef HAVE_ROCM
-                case DeviceType::ROCm:
-                    throwUnsupportedKernel(dev_type, "Attention", "Q8_1");
-#endif
-
-                default:
-                    throwUnsupportedKernel(dev_type, "Attention", "Q8_1");
-                }
-            }
-
             // ==========================================================================
             // Embedding Kernel Creation - Device-aware dispatch
             // NO CPU FALLBACK: If GPU requested but not implemented, throws
@@ -2912,6 +2887,7 @@ namespace llaminar
             std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> KernelFactory::device_kernel_registry_;
             std::unordered_map<KernelFactory::PreparedGemmKey, std::shared_ptr<KernelFactory::PreparedGemmHandle>, KernelFactory::PreparedGemmKeyHash> KernelFactory::prepared_gemm_registry_;
             std::unordered_map<DeviceKernelKey, std::shared_ptr<KernelFactory::IGemmEngine>, DeviceKernelKeyHash> KernelFactory::device_gemm_engine_registry_;
+            std::unordered_map<KernelFactory::PreparedEmbeddingKey, std::shared_ptr<llaminar2::PreparedEmbeddingHandle>, KernelFactory::PreparedEmbeddingKeyHash> KernelFactory::prepared_embedding_registry_;
 
             // NOTE: Device-level kernel caching (hipBLAS, cuBLAS handles, etc.)
             // has moved to DeviceKernelCache. See kernels/DeviceKernelCache.h
@@ -3327,6 +3303,7 @@ namespace llaminar
                 device_kernel_registry_.clear();
                 prepared_gemm_registry_.clear();
                 device_gemm_engine_registry_.clear();
+                prepared_embedding_registry_.clear();
 
 #ifdef HAVE_CUDA
                 // Clear CUDA GEMV static caches (row-major weight transpose, sweep
@@ -3731,6 +3708,118 @@ namespace llaminar
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 return device_gemm_engine_registry_.size();
+            }
+
+            // ==========================================================================
+            // Prepared Embedding Weights
+            // ==========================================================================
+
+            const llaminar2::PreparedEmbeddingHandle *KernelFactory::getOrCreatePreparedEmbeddingWeights(
+                const llaminar2::TensorBase *tensor,
+                int d_model,
+                llaminar2::DeviceId target_device,
+                size_t vocab_offset,
+                size_t total_vocab)
+            {
+                if (!tensor)
+                    throw std::runtime_error("getOrCreatePreparedEmbeddingWeights: null tensor");
+
+                // Only quantized tensors need EmbedQ8 repack
+                const auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
+                if (!unpackable)
+                    return nullptr; // FP32 embedding tables are used directly, no prep needed
+
+                const PreparedEmbeddingKey key{tensor, target_device};
+
+                // Cache lookup
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto it = prepared_embedding_registry_.find(key);
+                    if (it != prepared_embedding_registry_.end())
+                        return it->second.get();
+                }
+
+                // Resolve vocab metadata
+                const size_t shard_rows = tensor->rows();
+                const size_t effective_total = (total_vocab > 0) ? total_vocab : shard_rows;
+                const bool is_sharded = (shard_rows < effective_total);
+
+                // CPU-side repack: Q8_0/Q4_0/etc. → EmbedQ8Block array
+                // The tensor is already sliced to the correct rows— repack all of them
+                auto repacked = llaminar2::repackEmbeddingToQ8(tensor, d_model);
+
+                // Allocate GPU memory and upload
+                auto weights = std::make_shared<llaminar2::PreparedEmbeddingWeights>();
+                weights->byte_size = repacked.byte_size;
+                weights->blocks_per_row = repacked.blocks_per_row;
+                weights->vocab_size = repacked.vocab_size;
+                weights->vocab_offset = vocab_offset;
+                weights->total_vocab = effective_total;
+                weights->d_model = d_model;
+                weights->device_id = target_device;
+
+                bool upload_ok = false;
+                llaminar2::IBackend *backend = llaminar2::getBackendFor(target_device);
+                if (!backend)
+                {
+                    LOG_ERROR("[PreparedEmbeddingWeights] No backend for device " << target_device.to_string());
+                    return nullptr;
+                }
+
+                weights->device_data = backend->allocate(repacked.byte_size, target_device.ordinal);
+                if (!weights->device_data)
+                {
+                    LOG_ERROR("[PreparedEmbeddingWeights] GPU allocation failed for "
+                              << target_device.to_string() << " (" << (repacked.byte_size / (1024 * 1024)) << " MB)");
+                    return nullptr;
+                }
+
+                upload_ok = backend->hostToDevice(weights->device_data, repacked.data.data(),
+                                                  repacked.byte_size, target_device.ordinal);
+                if (!upload_ok)
+                {
+                    LOG_ERROR("[PreparedEmbeddingWeights] H2D upload failed for " << target_device.to_string());
+                    backend->free(weights->device_data, target_device.ordinal);
+                    weights->device_data = nullptr;
+                    return nullptr;
+                }
+
+                LOG_INFO("[PreparedEmbeddingWeights] Prepared embedding for "
+                         << target_device.to_string() << ": "
+                         << llaminar2::tensorTypeName(tensor->native_type()) << " "
+                         << repacked.vocab_size << "x" << d_model
+                         << (is_sharded ? (" (vocab_offset=" + std::to_string(vocab_offset) +
+                                           " of " + std::to_string(effective_total) + ")")
+                                        : "")
+                         << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
+                         << " (" << repacked.blocks_per_row << " blocks/row)");
+
+                auto handle = std::make_shared<llaminar2::PreparedEmbeddingHandle>();
+                handle->tensor = tensor;
+                handle->device_id = target_device;
+                handle->weights = std::move(weights);
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto [it, inserted] = prepared_embedding_registry_.emplace(key, std::move(handle));
+                return it->second.get();
+            }
+
+            const llaminar2::PreparedEmbeddingHandle *KernelFactory::getPreparedEmbeddingWeights(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device)
+            {
+                const PreparedEmbeddingKey key{tensor, target_device};
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto it = prepared_embedding_registry_.find(key);
+                if (it != prepared_embedding_registry_.end())
+                    return it->second.get();
+                return nullptr;
+            }
+
+            size_t KernelFactory::preparedEmbeddingRegistrySize()
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                return prepared_embedding_registry_.size();
             }
 
             // ==========================================================================

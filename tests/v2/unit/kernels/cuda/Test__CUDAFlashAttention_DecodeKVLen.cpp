@@ -30,7 +30,7 @@
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
-#include "kernels/cpu/attention/CPUAttentionKernelT.h"
+#include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -138,7 +138,7 @@ TEST_F(Test__CUDAFlashAttention_DecodeKVLen, DecodeMode_SeqLen1_KVLen7)
     std::vector<float> cuda_output(out_size, 0.0f);
 
     // CPU reference - uses seq_len=1, kv_len=7 correctly
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
 
     // For CPU decode, we need to set up the proper attention computation
     // The CPU kernel in decode mode should attend from Q[1 token] to K/V[7 tokens]

@@ -465,6 +465,15 @@ namespace llaminar2
          */
         virtual void prepareWeights() {}
 
+        /**
+         * @brief Check whether weights have been successfully converted and uploaded.
+         *
+         * Returns true once prepareWeights() has completed everything it needs to do
+         * (e.g. hipMemcpy/cudaMemcpy of VNNI data to device).  Callers can use this
+         * to detect silent upload failures (prepareWeights() is void).
+         */
+        virtual bool weights_converted() const { return true; }
+
         // =====================================================================
         // Tensor-aware fused projection API (preferred for GPU execution)
         // =====================================================================
@@ -1304,7 +1313,8 @@ namespace llaminar2
             int device_idx = -1,
             int head_start = 0,        ///< First query head (TP slice start)
             int local_n_heads = -1,    ///< Number of query heads (-1 = all)
-            int local_n_kv_heads = -1) ///< Number of KV heads (-1 = all)
+            int local_n_kv_heads = -1, ///< Number of KV heads (-1 = all)
+            int gqa_n_rep = 0)         ///< Global GQA repetition factor (0 = auto from n_heads/n_kv_heads)
             = 0;
 
         /**

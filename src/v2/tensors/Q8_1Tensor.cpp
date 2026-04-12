@@ -9,7 +9,6 @@
 #include "../kernels/cpu/ops/CPURMSNormKernelT.h"
 
 #include "../kernels/cpu/ops/CPUEmbeddingKernelT.h"
-#include "../kernels/cpu/attention/CPUAttentionKernelT.h"
 #include "../utils/Logger.h"
 #include "../utils/CPUFeatures.h"
 #include "SIMDHelpers.h"
@@ -456,9 +455,7 @@ namespace llaminar2
 
     std::unique_ptr<ITensorAttention> Q8_1Tensor::createAttention()
     {
-        // Use centralized KernelFactory for device-aware dispatch
-        auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(device_);
-        return llaminar::v2::kernels::KernelFactory::createAttention(this, dev_type);
+        throw std::runtime_error("Q8_1 activation precision attention is not supported. Use FP32 activations.");
     }
 
     std::unique_ptr<ITensorEmbedding> Q8_1Tensor::createEmbedding()

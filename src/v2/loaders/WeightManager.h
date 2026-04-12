@@ -107,6 +107,36 @@ namespace llaminar2
         bool preloadForDevices(const std::vector<DeviceId> &devices) override;
 
         // =========================================================================
+        // Weight Lifecycle (single entry points)
+        // =========================================================================
+
+        /**
+         * @brief Complete weight lifecycle for a single device
+         *
+         * Runs the full pack → upload → release sequence:
+         * 1. Pack GEMM weights (async on GPU, sync on CPU)
+         * 2. Upload non-GEMM weights (norms, embeddings)
+         * 3. Release host weight data (GPU only, after successful pack+upload)
+         *
+         * @param device Target device
+         * @return true on success
+         */
+        bool finalizeForDevice(DeviceId device) override;
+
+        /**
+         * @brief Complete weight lifecycle for multiple LOCAL TP devices
+         *
+         * Runs the full multi-device sequence:
+         * 1. Clone and upload weights to all devices (preloadForDevices)
+         * 2. Pack GEMM weights per device
+         * 3. Release all host weight data (cache_ + per_device_cache_)
+         *
+         * @param devices List of devices
+         * @return true on success
+         */
+        bool finalizeForDevices(const std::vector<DeviceId> &devices) override;
+
+        // =========================================================================
         // Weight Packing and Preloading (folded from WeightPreloader)
         // =========================================================================
 
@@ -144,6 +174,20 @@ namespace llaminar2
          * @return Number of tensors whose host data was released
          */
         size_t releaseAllHostWeightData() override;
+
+        /**
+         * @brief Release host data for host-resident tensors after GPU kernels
+         * have uploaded their own device copies (e.g., embedding repack+upload).
+         *
+         * Called after the first forward pass completes. Unlike releaseAllHostWeightData()
+         * which retains host-resident tensors because they haven't been uploaded yet,
+         * this method releases them because the GPU kernels have now created their own copies.
+         *
+         * @return Number of tensors whose host data was released
+         */
+        size_t releaseHostResidentWeightData() override;
+
+        size_t getPreparedEmbeddingCount() const override;
 
         /**
          * @brief Get statistics about preloaded weights
@@ -556,20 +600,8 @@ namespace llaminar2
          */
         static ShardingMode toShardingMode(WeightShardingMode mode);
 
-        /**
-         * @brief Pack a single weight tensor for a target device
-         *
-         * Creates a GEMM kernel and calls prepareWeights() on it.
-         *
-         * @param tensor Weight tensor to pack
-         * @param target_device Target device
-         * @param release_raw_data If true, release raw tensor data after packing
-         * @return true on success
-         */
-        bool packWeight(TensorBase *tensor, DeviceId target_device, bool release_raw_data);
-
         IModelLoader &loader_;                                                      ///< Model loader (GGUF, mock, etc.)
-        std::shared_ptr<IMPIContext> mpi_ctx_;                                       ///< MPI context (nullptr = single rank)
+        std::shared_ptr<IMPIContext> mpi_ctx_;                                      ///< MPI context (nullptr = single rank)
         std::shared_ptr<WeightPlacementMap> placement_map_;                         ///< Fine-grained placement decisions
         std::shared_ptr<TensorParallelConfig> tp_config_;                           ///< Tensor parallelism configuration (optional)
         WeightDistributionStrategy strategy_;                                       ///< Distribution strategy
@@ -910,11 +942,6 @@ namespace llaminar2
         void evaluateReclaimEligibility(const std::string &name, bool is_gemm);
         bool tryReleaseReclaimHostRawData(const std::string &name);
         static const char *weightPrepStateName(WeightPrepState state);
-
-    public:
-        // Friend class for WeightPreloader (deprecated, will be removed)
-        // WeightPreloader needs access to cache_ and private members until fully removed
-        friend class WeightPreloader;
     };
 
 } // namespace llaminar2

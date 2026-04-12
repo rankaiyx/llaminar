@@ -25,12 +25,12 @@
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/Logger.h"
 #include "../../utils/MPITopology.h"
+#include "../../utils/NodeDetection.h"
 #include "../../utils/NUMATopology.h"
 #include "../../utils/WeightLoadingProfiler.h"
 
 #include <algorithm>
 #include <cctype>
-#include <map>
 
 namespace llaminar2
 {
@@ -280,7 +280,7 @@ namespace llaminar2
             mpi_ctx_->broadcast_int32(&n_tokens, 1, 0);
             // const_cast is safe: rank 0 is the sender, buffer is not modified
             mpi_ctx_->broadcast_int32(const_cast<int32_t *>(prompt_tokens.data()),
-                                     static_cast<size_t>(n_tokens), 0);
+                                      static_cast<size_t>(n_tokens), 0);
         }
 
         // For PP: head stage receives activations from external source
@@ -704,7 +704,7 @@ namespace llaminar2
             {
                 target_numa_node = numa_info.local_numa_node;
             }
-            dm.initialize(target_numa_node);
+            dm.initialize(target_numa_node, false); // Tables already printed pre-MPI
         }
         const auto &devices = dm.devices();
 
@@ -912,20 +912,30 @@ namespace llaminar2
             }
         }
 
-        // Build deterministic node_id mapping from hostname.
-        std::map<std::string, int> host_to_node_id;
-        int next_node_id = 0;
-        for (auto &rank_inv : inventory.ranks)
+        // Build deterministic node_id mapping from hostname (single source of truth).
+        // If a hostfile is configured, use it to determine node ordering.
+        std::vector<std::string> hostnames;
+        hostnames.reserve(static_cast<size_t>(world_size));
+        for (const auto &rank_inv : inventory.ranks)
         {
-            auto it = host_to_node_id.find(rank_inv.hostname);
-            if (it == host_to_node_id.end())
-            {
-                it = host_to_node_id.emplace(rank_inv.hostname, next_node_id++).first;
-            }
-            rank_inv.node_id = it->second;
+            hostnames.push_back(rank_inv.hostname);
         }
 
-        inventory.node_count = next_node_id;
+        NodeDetectionResult detection;
+        if (!config_.hostfile.empty())
+        {
+            detection = NodeDetection::fromHostnames(hostnames, config_.hostfile);
+        }
+        else
+        {
+            detection = NodeDetection::fromHostnames(hostnames);
+        }
+        for (int r = 0; r < world_size; ++r)
+        {
+            inventory.ranks[r].node_id = detection.node_ids[r];
+        }
+
+        inventory.node_count = detection.node_count;
         inventory.buildNodeAggregations();
 
         LOG_INFO("[gatherClusterInventory] Discovered " << inventory.total_gpus
@@ -1332,6 +1342,7 @@ namespace llaminar2
 
         // Build config from execution plan via canonical factory
         auto runner_config = InferenceRunnerConfig::fromPlan(plan_);
+        runner_config.hostfile = config_.hostfile;
 
         LOG_INFO("[OrchestrationRunner] Single-device precision config: activation="
                  << activationPrecisionToString(runner_config.activation_precision)

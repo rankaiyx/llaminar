@@ -364,13 +364,17 @@ namespace llaminar2
      */
     enum class WeightDimensionType
     {
-        None,         ///< Not sharded (replicated weights)
-        Heads,        ///< Attention heads (Q projection) - uses head_start/head_count
-        KVHeads,      ///< KV attention heads (K/V projections) - uses kv_head_start/kv_head_count
-        FFNHidden,    ///< FFN hidden dimension (Gate/Up/Down) - uses d_ff_start/d_ff_count
-        Vocab,        ///< Vocabulary dimension (LM head) - uses vocab_start/vocab_count
-        Bias1D,       ///< 1D bias that follows its weight's dimension type
-        FusedQKVHeads ///< Fused QKV: 3 equal sub-blocks [Q|K|V] each split by heads
+        None,             ///< Not sharded (replicated weights)
+        Heads,            ///< Attention heads (Q projection) - uses head_start/head_count
+        KVHeads,          ///< KV attention heads (K/V projections) - uses kv_head_start/kv_head_count
+        FFNHidden,        ///< FFN hidden dimension (Gate/Up/Down) - uses d_ff_start/d_ff_count
+        Vocab,            ///< Vocabulary dimension (LM head) - uses vocab_start/vocab_count
+        Bias1D,           ///< 1D bias that follows its weight's dimension type
+        FusedQKVHeads,    ///< Fused QKV: 3 equal sub-blocks [Q|K|V] each split by heads
+        ProportionalHeads ///< Proportional slice using head_start/head_count ratio against totalHeads.
+                          ///< For weights whose output dim != n_heads (e.g. GDN ssm_alpha/beta with
+                          ///< n_v_heads != n_heads). Computes: start = total_size * head_start / totalHeads,
+                          ///< count = total_size * head_count / totalHeads.
     };
 
     /**

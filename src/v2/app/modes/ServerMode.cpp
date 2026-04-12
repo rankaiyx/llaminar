@@ -22,6 +22,10 @@
 #include <iostream>
 #include <mutex>
 #include <atomic>
+#ifdef __linux__
+#include <malloc.h>
+#include <fstream>
+#endif
 #include <csignal>
 #include <filesystem>
 
@@ -167,6 +171,23 @@ namespace llaminar2
 
         // Start listening
         LOG_INFO("Llaminar server starting on " << config.serve_host << ":" << config.serve_port);
+
+        // Report RSS at server-ready point (after arena + KV cache init)
+#ifdef __linux__
+        {
+            ::malloc_trim(0); // Return freed init memory to OS
+            std::ifstream proc_status("/proc/self/status");
+            std::string line;
+            while (std::getline(proc_status, line))
+            {
+                if (line.compare(0, 6, "VmRSS:") == 0 ||
+                    line.compare(0, 8, "RssAnon:") == 0)
+                {
+                    LOG_INFO("[ServerReady] " << line);
+                }
+            }
+        }
+#endif
 
         if (!svr.listen(config.serve_host, config.serve_port))
         {

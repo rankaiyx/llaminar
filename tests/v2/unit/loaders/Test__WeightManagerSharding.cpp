@@ -153,11 +153,11 @@ TEST_F(WeightManagerShardingTest, DeterminesReplicateForNorms)
               ShardingMode::REPLICATE);
 }
 
-TEST_F(WeightManagerShardingTest, DeterminesReplicateForEmbeddings)
+TEST_F(WeightManagerShardingTest, DeterminesColumnParallelForEmbeddings)
 {
-    // Token embeddings should always be replicated
+    // Token embeddings are column-parallel (vocab-parallel sharding)
     EXPECT_EQ(getShardingMode("token_embd.weight"),
-              ShardingMode::REPLICATE);
+              ShardingMode::COLUMN_PARALLEL);
 }
 
 TEST_F(WeightManagerShardingTest, DeterminesColumnParallelForLMHead)
@@ -802,7 +802,7 @@ TEST_F(WeightManagerInstanceTest, GetShardingMode_WithConfig)
     EXPECT_EQ(wm.getShardingMode("blk.0.ffn_up.weight"), ShardingMode::COLUMN_PARALLEL);
     EXPECT_EQ(wm.getShardingMode("blk.0.ffn_down.weight"), ShardingMode::INPUT_PARALLEL);
     EXPECT_EQ(wm.getShardingMode("blk.0.attn_norm.weight"), ShardingMode::REPLICATE);
-    EXPECT_EQ(wm.getShardingMode("token_embd.weight"), ShardingMode::REPLICATE);
+    EXPECT_EQ(wm.getShardingMode("token_embd.weight"), ShardingMode::COLUMN_PARALLEL);
 }
 
 // -----------------------------------------------------------------------------
@@ -851,10 +851,10 @@ TEST_F(WeightManagerInstanceTest, IsWeightSharded_ShardedStrategy_ReplicatedWeig
     Qwen2SchemaFactory schema_factory;
     wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
 
-    // Norms and embeddings should NOT be sharded
+    // Norms should NOT be sharded; embeddings ARE sharded (column-parallel)
     EXPECT_FALSE(wm.isWeightSharded("blk.0.attn_norm.weight"));
     EXPECT_FALSE(wm.isWeightSharded("blk.0.ffn_norm.weight"));
-    EXPECT_FALSE(wm.isWeightSharded("token_embd.weight"));
+    EXPECT_TRUE(wm.isWeightSharded("token_embd.weight"));
     EXPECT_FALSE(wm.isWeightSharded("output_norm.weight"));
 }
 

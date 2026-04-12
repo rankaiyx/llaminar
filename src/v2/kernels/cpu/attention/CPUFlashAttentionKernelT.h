@@ -18,8 +18,8 @@
  * ## Template parameter
  *
  * The kernel is templated on `ActivationPrecision` so the same code serves
- * FP32, BF16, and FP16 builds.  When `Precision ≠ FP32`, the kernel delegates
- * to a `CPUAttentionKernelT<Precision>` fallback that handles non-float paths.
+ * FP32, BF16, and FP16 builds.  Only FP32 precision is currently supported;
+ * non-FP32 instantiations will return false.
  *
  * ## Integer quantised prefill path (I16/I12)
  *
@@ -44,14 +44,13 @@
  *    - Private helpers: SIMD dot-products, quantisation routines, and the
  *      core `compute_flash_fp32()` tiled-softmax implementation.
  *
- * @see CPUAttentionKernelT  The non-flash fallback kernel used for non-FP32
- *                           precisions and for sharded (tensor-parallel) heads.
  * @see ITensorAttention     The polymorphic interface this class implements.
  * @see AttentionCacheConfig  Cache-hierarchy model used by the tile policy.
  */
 
 #pragma once
 
+#include "../../../execution/config/RuntimeConfig.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TQ8Tensor.h"
@@ -63,7 +62,6 @@
 #include "../primitives/ActivationTraits.h"
 #include "../turboquant/TurboQuantRotation.h"
 #include "../turboquant/TurboQuantContext.h"
-#include "CPUAttentionKernelT.h"
 #include "TQFusedAttentionPrimitives.h"
 
 #include <algorithm>
@@ -335,9 +333,8 @@ namespace llaminar2
      * ## Precision handling
      *
      * When `Precision == FP32`, all work is done directly in this kernel.
-     * For BF16 and FP16, the kernel delegates to the `CPUAttentionKernelT`
-     * fallback which handles mixed-precision conversions.  This delegation
-     * is resolved entirely at compile time via `if constexpr`.
+     * Non-FP32 precisions are not supported and will return false.
+     * Precision dispatch is resolved entirely at compile time via `if constexpr`.
      *
      * ## Thread safety
      *
@@ -346,10 +343,8 @@ namespace llaminar2
      * fork/join overhead (see copilot-instructions.md § OpenMP).
      *
      * @tparam Precision  The activation storage format.  Currently FP32 is
-     *                    fully optimised; BF16/FP16 fall back to the non-flash
-     *                    implementation.
+     *                    fully optimised; non-FP32 precisions are unsupported.
      *
-     * @see CPUAttentionKernelT  The fallback kernel for non-FP32 precisions.
      * @see CacheAwareFlashKVTilePolicy  Tile-size selection logic.
      */
     template <ActivationPrecision Precision>
@@ -386,8 +381,7 @@ namespace llaminar2
          *   - Q, K, V: `[seq_len, n_heads/n_kv_heads * head_dim]`
          *   - output:   `[seq_len, n_heads * head_dim]`
          *
-         * If the precision is not FP32, the call is forwarded to the
-         * `CPUAttentionKernelT` fallback.
+         * If the precision is not FP32, the call returns false.
          *
          * @param Q               Query matrix, shape [seq_len, n_heads * head_dim].
          * @param K               Key matrix,   shape [seq_len, n_kv_heads * head_dim].
@@ -430,12 +424,8 @@ namespace llaminar2
 
             if constexpr (!std::is_same_v<ElementType, float>)
             {
-                return fallback_.compute(Q, K, V, output,
-                                         seq_len, n_heads, n_kv_heads, head_dim,
-                                         causal, window_size,
-                                         workspace_scores, workspace_buffer,
-                                         workspace_context, workspace_mask,
-                                         use_bf16, mpi_ctx, device_idx);
+                LOG_ERROR("[CPUFlashAttentionKernelT] compute() not supported for non-FP32 precision");
+                return false;
             }
 
             const float *mask = workspace_mask ? workspace_mask->data() : nullptr;
@@ -477,19 +467,17 @@ namespace llaminar2
             TensorBase *workspace_mask = nullptr,
             bool use_bf16 = false,
             const IMPIContext *mpi_ctx = nullptr,
-            int device_idx = -1)
+            int device_idx = -1,
+            int head_start = 0,
+            int gqa_n_rep = 0)
         {
             (void)workspace_buffer;
             (void)workspace_context;
 
             if constexpr (!std::is_same_v<ElementType, float>)
             {
-                return fallback_.compute_batch(Q, K, V, output,
-                                               batch_size, seq_len, n_heads, n_kv_heads, head_dim,
-                                               causal, window_size,
-                                               workspace_scores, workspace_buffer,
-                                               workspace_context, workspace_mask,
-                                               use_bf16, mpi_ctx, device_idx);
+                LOG_ERROR("[CPUFlashAttentionKernelT] compute_batch() not supported for non-FP32 precision");
+                return false;
             }
 
             const size_t q_stride = static_cast<size_t>(seq_len) * static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
@@ -506,7 +494,8 @@ namespace llaminar2
                                         seq_len, seq_len,
                                         n_heads, n_kv_heads, head_dim,
                                         causal, window_size, 0,
-                                        mask))
+                                        mask,
+                                        head_start, gqa_n_rep))
                 {
                     return false;
                 }
@@ -544,9 +533,8 @@ namespace llaminar2
         {
             if constexpr (!std::is_same_v<ElementType, float>)
             {
-                return fallback_.compute_decode(Q, K, V, output,
-                                                seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-                                                causal, position_offset);
+                LOG_ERROR("[CPUFlashAttentionKernelT] compute_decode() not supported for non-FP32 precision");
+                return false;
             }
 
             return compute_flash_fp32(Q, K, V, output,
@@ -571,9 +559,7 @@ namespace llaminar2
          * - Q and output are FP32 tensors.
          * - Raw `fp32_data()` pointers are obtainable.
          *
-         * Otherwise, the call is delegated to the `CPUAttentionKernelT`
-         * fallback which handles mixed precision, sharded heads, and
-         * quantised KV caches.
+         * Otherwise, the call returns false.
          *
          * @param Q                 Query tensor.
          * @param K                 Key tensor.
@@ -615,40 +601,20 @@ namespace llaminar2
             int device_idx = -1,
             int head_start = 0,
             int local_n_heads = -1,
-            int local_n_kv_heads = -1) override
+            int local_n_kv_heads = -1,
+            int gqa_n_rep = 0) override
         {
             if constexpr (!std::is_same_v<ElementType, float>)
             {
-                return fallback_.compute_tensor(Q, K, V, output,
-                                                batch_size, seq_len, kv_len,
-                                                n_heads, n_kv_heads, head_dim,
-                                                causal, window_size,
-                                                workspace_scores, workspace_mask,
-                                                mpi_ctx, device_idx,
-                                                head_start, local_n_heads, local_n_kv_heads);
-            }
-
-            if (head_start != 0 || local_n_heads != -1 || local_n_kv_heads != -1)
-            {
-                return fallback_.compute_tensor(Q, K, V, output,
-                                                batch_size, seq_len, kv_len,
-                                                n_heads, n_kv_heads, head_dim,
-                                                causal, window_size,
-                                                workspace_scores, workspace_mask,
-                                                mpi_ctx, device_idx,
-                                                head_start, local_n_heads, local_n_kv_heads);
+                LOG_ERROR("[CPUFlashAttentionKernelT] compute_tensor() not supported for non-FP32 precision");
+                return false;
             }
 
             if (Q->native_type() != TensorType::FP32 ||
                 output->native_type() != TensorType::FP32)
             {
-                return fallback_.compute_tensor(Q, K, V, output,
-                                                batch_size, seq_len, kv_len,
-                                                n_heads, n_kv_heads, head_dim,
-                                                causal, window_size,
-                                                workspace_scores, workspace_mask,
-                                                mpi_ctx, device_idx,
-                                                head_start, local_n_heads, local_n_kv_heads);
+                LOG_ERROR("[CPUFlashAttentionKernelT] compute_tensor() requires FP32 Q and output tensors");
+                return false;
             }
 
             const auto *Q_base = dynamic_cast<const TensorBase *>(Q);
@@ -690,7 +656,8 @@ namespace llaminar2
                             V_fp16->typed_data(),
                             O_ptr,
                             kv_len, n_heads, n_kv_heads, head_dim,
-                            causal, position_offset);
+                            causal, position_offset,
+                            head_start, gqa_n_rep);
                     }
                 }
             }
@@ -722,14 +689,16 @@ namespace llaminar2
                             return compute_decode_q16kv(
                                 Q_ptr, K_q16, V_q16, O_ptr,
                                 kv_len, n_heads, n_kv_heads, head_dim,
-                                causal, position_offset);
+                                causal, position_offset,
+                                head_start, gqa_n_rep);
                         }
                         else
                         {
                             return compute_prefill_q16kv(
                                 Q_ptr, K_q16, V_q16, O_ptr,
                                 seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-                                causal, window_size, position_offset);
+                                causal, window_size, position_offset,
+                                head_start, gqa_n_rep);
                         }
                     }
                 }
@@ -760,7 +729,8 @@ namespace llaminar2
                         return compute_decode_tqkv(
                             Q_ptr, K_tq8, V_tq4, O_ptr,
                             kv_len, n_heads, n_kv_heads, head_dim,
-                            causal, position_offset);
+                            causal, position_offset,
+                            head_start, gqa_n_rep);
                     }
                 }
             }
@@ -792,7 +762,8 @@ namespace llaminar2
                             return compute_decode_q8kv(
                                 Q_ptr, K_q8, V_q8, O_ptr,
                                 kv_len, n_heads, n_kv_heads, head_dim,
-                                causal, position_offset);
+                                causal, position_offset,
+                                head_start, gqa_n_rep);
                         }
                     }
                 }
@@ -806,13 +777,8 @@ namespace llaminar2
 
             if (!Q_ptr || !K_ptr || !V_ptr || !O_ptr)
             {
-                return fallback_.compute_tensor(Q, K, V, output,
-                                                batch_size, seq_len, kv_len,
-                                                n_heads, n_kv_heads, head_dim,
-                                                causal, window_size,
-                                                workspace_scores, workspace_mask,
-                                                mpi_ctx, device_idx,
-                                                head_start, local_n_heads, local_n_kv_heads);
+                LOG_ERROR("[CPUFlashAttentionKernelT] compute_tensor() null data pointer");
+                return false;
             }
 
             if (batch_size > 1)
@@ -821,22 +787,27 @@ namespace llaminar2
                                      batch_size, seq_len, n_heads, n_kv_heads, head_dim,
                                      causal, window_size,
                                      scores_base, nullptr, nullptr, mask_base,
-                                     false, mpi_ctx, device_idx);
+                                     false, mpi_ctx, device_idx,
+                                     head_start, gqa_n_rep);
             }
 
             if (kv_len != seq_len)
             {
                 const int position_offset = (kv_len > seq_len) ? (kv_len - seq_len) : 0;
-                return compute_decode(Q_ptr, K_ptr, V_ptr, O_ptr,
-                                      seq_len, kv_len, n_heads, n_kv_heads, head_dim,
-                                      causal, position_offset);
+                const float *mask = mask_base ? mask_base->data() : nullptr;
+                return compute_flash_fp32(Q_ptr, K_ptr, V_ptr, O_ptr,
+                                          seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+                                          causal, window_size, position_offset, mask,
+                                          head_start, gqa_n_rep);
             }
 
-            return compute(Q_ptr, K_ptr, V_ptr, O_ptr,
-                           seq_len, n_heads, n_kv_heads, head_dim,
-                           causal, window_size,
-                           scores_base, nullptr, nullptr, mask_base,
-                           false, mpi_ctx, device_idx);
+            {
+                const float *mask = mask_base ? mask_base->data() : nullptr;
+                return compute_flash_fp32(Q_ptr, K_ptr, V_ptr, O_ptr,
+                                          seq_len, seq_len, n_heads, n_kv_heads, head_dim,
+                                          causal, window_size, 0, mask,
+                                          head_start, gqa_n_rep);
+            }
         }
 
         /**
@@ -865,14 +836,6 @@ namespace llaminar2
         friend class ::AVX2Q16DotParityTest;
 
     private:
-        /**
-         * @brief Non-flash fallback kernel.
-         *
-         * Used for non-FP32 precisions and for sharded-head (tensor parallel)
-         * configurations that the flash path does not yet handle.
-         */
-        CPUAttentionKernelT<Precision> fallback_;
-
         // -----------------------------------------------------------------
         // Dot-product helpers
         // -----------------------------------------------------------------
@@ -3109,7 +3072,9 @@ namespace llaminar2
             int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset,
-            const float *mask)
+            const float *mask,
+            int head_start = 0,
+            int gqa_n_rep = 0)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -3123,7 +3088,9 @@ namespace llaminar2
                 return false;
             }
             // GQA requires n_heads to be a multiple of n_kv_heads (e.g. 32 Q heads / 8 KV heads = 4 Q heads per KV head).
-            if (n_heads % n_kv_heads != 0)
+            // In TP with replicated KV, gqa_n_rep carries the global ratio so
+            // local n_heads need not divide n_kv_heads evenly (e.g. 7 / 2).
+            if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
             {
                 return false;
             }
@@ -3136,7 +3103,8 @@ namespace llaminar2
             const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(head_dim, n_kv_heads, kv_len, is_decode);
 
             // For Grouped Query Attention: how many Q heads share one KV head.
-            const int heads_per_kv = n_heads / n_kv_heads;
+            // TP-aware: use global GQA ratio when gqa_n_rep is provided.
+            const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
 
             // Attention score scaling factor:  1/√d
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
@@ -3280,7 +3248,13 @@ namespace llaminar2
                 for (int h = 0; h < n_heads; ++h)
                 {
                     // GQA mapping: which KV head does this Q head read from?
-                    const int kv_h = h / heads_per_kv;
+                    // When gqa_n_rep > 0, KV heads are REPLICATED (each rank has all KV heads),
+                    // so we need the global head position (head_start + h) to index into the
+                    // full KV tensor. When gqa_n_rep == 0, KV heads are SHARDED (each rank
+                    // has only local_n_kv_heads), so we use local indexing (h only).
+                    const int kv_h = (gqa_n_rep > 0)
+                                         ? (head_start + h) / heads_per_kv
+                                         : h / heads_per_kv;
 
                     // Pointer to the pre-quantised packed-pair K data for this KV head
                     // (nullptr when using the FP32 dot-product path).
@@ -3674,7 +3648,9 @@ namespace llaminar2
             float *output,
             int seq_len, int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int window_size, int position_offset)
+            bool causal, int window_size, int position_offset,
+            int head_start = 0,
+            int gqa_n_rep = 0)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -3682,10 +3658,10 @@ namespace llaminar2
                 return false;
             if (seq_len <= 0 || kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
                 return false;
-            if (n_heads % n_kv_heads != 0)
+            if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
 
-            const int heads_per_kv = n_heads / n_kv_heads;
+            const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
             // Q16_1 block layout
@@ -3724,7 +3700,11 @@ namespace llaminar2
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
                 for (int h = 0; h < n_heads; ++h)
                 {
-                    const int kv_h = h / heads_per_kv;
+                    // GQA mapping: replicated KV uses global head position;
+                    // sharded KV uses local indexing (see compute_flash_fp32 comment).
+                    const int kv_h = (gqa_n_rep > 0)
+                                         ? (head_start + h) / heads_per_kv
+                                         : h / heads_per_kv;
 
                     // Hoist per-head block layout invariants
                     const size_t blocks_per_head = (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
@@ -4071,7 +4051,9 @@ namespace llaminar2
             float *output,
             int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset)
+            bool causal, int position_offset,
+            int head_start = 0,
+            int gqa_n_rep = 0)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -4079,10 +4061,10 @@ namespace llaminar2
                 return false;
             if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
                 return false;
-            if (n_heads % n_kv_heads != 0)
+            if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
 
-            const int heads_per_kv = n_heads / n_kv_heads;
+            const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
             // Q16_1 block layout: all blocks have {float d, int32_t sum_qs, int16_t qs[block_elems]}
@@ -4133,7 +4115,11 @@ namespace llaminar2
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
                 for (int h = 0; h < n_heads; ++h)
                 {
-                    const int kv_h = h / heads_per_kv;
+                    // GQA mapping: replicated KV uses global head position;
+                    // sharded KV uses local indexing (see compute_flash_fp32 comment).
+                    const int kv_h = (gqa_n_rep > 0)
+                                         ? (head_start + h) / heads_per_kv
+                                         : h / heads_per_kv;
                     float *out = output + static_cast<size_t>(h) * head_dim;
                     std::fill(out, out + head_dim, 0.0f);
 
@@ -4599,7 +4585,9 @@ namespace llaminar2
             float *output,
             int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset)
+            bool causal, int position_offset,
+            int head_start = 0,
+            int gqa_n_rep = 0)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -4607,10 +4595,10 @@ namespace llaminar2
                 return false;
             if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
                 return false;
-            if (n_heads % n_kv_heads != 0)
+            if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
 
-            const int heads_per_kv = n_heads / n_kv_heads;
+            const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
 
             constexpr size_t BLOCK_SIZE = Q8_1Block::BLOCK_SIZE; // 32
@@ -4650,7 +4638,11 @@ namespace llaminar2
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
                 for (int h = 0; h < n_heads; ++h)
                 {
-                    const int kv_h = h / heads_per_kv;
+                    // GQA mapping: replicated KV uses global head position;
+                    // sharded KV uses local indexing (see compute_flash_fp32 comment).
+                    const int kv_h = (gqa_n_rep > 0)
+                                         ? (head_start + h) / heads_per_kv
+                                         : h / heads_per_kv;
                     float *out = output + static_cast<size_t>(h) * head_dim;
                     std::fill(out, out + head_dim, 0.0f);
 
@@ -4829,7 +4821,9 @@ namespace llaminar2
             float *output,
             int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset)
+            bool causal, int position_offset,
+            int head_start = 0,
+            int gqa_n_rep = 0)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -4837,10 +4831,10 @@ namespace llaminar2
                 return false;
             if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
                 return false;
-            if (n_heads % n_kv_heads != 0)
+            if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
 
-            const int heads_per_kv = n_heads / n_kv_heads;
+            const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
             const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
             const int q_stride = n_heads * head_dim;
             const int kv_stride = n_kv_heads * head_dim;
@@ -4862,7 +4856,11 @@ namespace llaminar2
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
                 for (int h = 0; h < n_heads; ++h)
                 {
-                    const int kv_h = h / heads_per_kv;
+                    // GQA mapping: replicated KV uses global head position;
+                    // sharded KV uses local indexing (see compute_flash_fp32 comment).
+                    const int kv_h = (gqa_n_rep > 0)
+                                         ? (head_start + h) / heads_per_kv
+                                         : h / heads_per_kv;
                     float *out = output + static_cast<size_t>(h) * head_dim;
                     std::fill(out, out + head_dim, 0.0f);
 
@@ -5069,7 +5067,9 @@ namespace llaminar2
             float *output,
             int kv_len,
             int n_heads, int n_kv_heads, int head_dim,
-            bool causal, int position_offset)
+            bool causal, int position_offset,
+            int head_start = 0,
+            int gqa_n_rep = 0)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -5077,7 +5077,7 @@ namespace llaminar2
                 return false;
             if (kv_len <= 0 || n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0)
                 return false;
-            if (n_heads % n_kv_heads != 0)
+            if (gqa_n_rep <= 0 && n_heads % n_kv_heads != 0)
                 return false;
 
             // Get TQ context (per-layer, set by the stage).
@@ -5086,7 +5086,7 @@ namespace llaminar2
             if (!tq_ctx)
                 return false;
 
-            const int heads_per_kv = n_heads / n_kv_heads;
+            const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
             // Combined scale: (1/√D) from TQ dequant descale × (1/√D) from attention = 1/D
             const float combined_scale = 1.0f / static_cast<float>(head_dim);
 
@@ -5127,7 +5127,11 @@ namespace llaminar2
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
                 for (int h = 0; h < n_heads; ++h)
                 {
-                    const int kv_h = h / heads_per_kv;
+                    // GQA mapping: replicated KV uses global head position;
+                    // sharded KV uses local indexing (see compute_flash_fp32 comment).
+                    const int kv_h = (gqa_n_rep > 0)
+                                         ? (head_start + h) / heads_per_kv
+                                         : h / heads_per_kv;
                     float *out = output + static_cast<size_t>(h) * head_dim;
 
                     const float *q_ptr = Q + static_cast<size_t>(h) * head_dim;

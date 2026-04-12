@@ -33,7 +33,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     // Flash Attention 2 prefill with native FP16 KV cache (avoids FP32 conversion)
     int hipFlashAttn_prefill_fa2_fp16(
@@ -43,7 +44,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     // Flash Attention 2 prefill with native Q8_1 KV cache (inline dequant)
     int hipFlashAttn_prefill_fa2_q8_1(
@@ -53,7 +55,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     // Flash Decoding for single-token decode with split-K parallelism
     int hipFlashAttn_decode_fp32(
@@ -63,7 +66,8 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     // Flash Decoding with native FP16 KV cache (avoids FP32 conversion)
     int hipFlashAttn_decode_fp16(
@@ -73,7 +77,8 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     // Flash Decoding with native Q8_1 KV cache (inline dequant)
     int hipFlashAttn_decode_q8_1(
@@ -83,7 +88,8 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
-        void *stream);
+        void *stream,
+        int head_start, int gqa_n_rep);
 
     int hipFlashAttn_allocWorkspace(
         void **partial_output, void **partial_m, void **partial_l,
@@ -338,7 +344,9 @@ namespace llaminar2
             bool causal, int window_size, int position_offset,
             int device_idx,
             const attention::AttentionDeviceParams *device_params,
-            const float *mask)
+            const float *mask,
+            int head_start,
+            int gqa_n_rep)
         {
 
             if (!Q || !K || !V || !output)
@@ -419,7 +427,8 @@ namespace llaminar2
                         static_cast<float *>(partial_l_buf_),
                         batch_size, kv_len,
                         n_heads, n_kv_heads, head_dim,
-                        num_splits, device_params, stream_);
+                        num_splits, device_params, stream_,
+                        head_start, gqa_n_rep);
                 }
             }
             else
@@ -436,7 +445,8 @@ namespace llaminar2
                         n_heads, n_kv_heads, head_dim,
                         causal, window_size, position_offset,
                         device_params, mask,
-                        stream_);
+                        stream_,
+                        head_start, gqa_n_rep);
                 }
             }
 
@@ -488,11 +498,11 @@ namespace llaminar2
             int device_idx,
             int head_start,
             int local_n_heads,
-            int local_n_kv_heads)
+            int local_n_kv_heads,
+            int gqa_n_rep)
         {
             (void)workspace_scores;
             (void)mpi_ctx;
-            (void)head_start;
             (void)local_n_heads;
             (void)local_n_kv_heads;
 
@@ -693,7 +703,8 @@ namespace llaminar2
                                 static_cast<float *>(partial_l_buf_),
                                 batch_size, kv_len,
                                 n_heads, n_kv_heads, head_dim,
-                                num_splits, d_attn_params, stream_);
+                                num_splits, d_attn_params, stream_,
+                                head_start, gqa_n_rep);
                         }
                         else
                         {
@@ -704,7 +715,8 @@ namespace llaminar2
                                 static_cast<float *>(partial_l_buf_),
                                 batch_size, kv_len,
                                 n_heads, n_kv_heads, head_dim,
-                                num_splits, d_attn_params, stream_);
+                                num_splits, d_attn_params, stream_,
+                                head_start, gqa_n_rep);
                         }
                     }
                 }
@@ -720,7 +732,8 @@ namespace llaminar2
                             batch_size, seq_len, kv_len,
                             n_heads, n_kv_heads, head_dim,
                             causal, window_size, 0,
-                            d_attn_params, mask_ptr, stream_);
+                            d_attn_params, mask_ptr, stream_,
+                            head_start, gqa_n_rep);
                     }
                     else
                     {
@@ -729,7 +742,8 @@ namespace llaminar2
                             batch_size, seq_len, kv_len,
                             n_heads, n_kv_heads, head_dim,
                             causal, window_size, 0,
-                            d_attn_params, mask_ptr, stream_);
+                            d_attn_params, mask_ptr, stream_,
+                            head_start, gqa_n_rep);
                     }
                 }
                 if (result != 0)
@@ -745,7 +759,8 @@ namespace llaminar2
                                batch_size, seq_len, kv_len,
                                n_heads, n_kv_heads, head_dim,
                                causal, window_size, 0, dev,
-                               d_attn_params, mask_ptr);
+                               d_attn_params, mask_ptr,
+                               head_start, gqa_n_rep);
         }
         WorkspaceRequirements ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::getWorkspaceRequirements(
             int m, int n, int k) const
@@ -989,7 +1004,7 @@ namespace llaminar2
                        n_heads, n_kv_heads, head_dim,
                        causal, window_size, 0,
                        nullptr, mask_ptr,
-                       stream_) == 0;
+                       stream_, 0, 0) == 0;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::compute_batch(
@@ -1023,7 +1038,7 @@ namespace llaminar2
                        n_heads, n_kv_heads, head_dim,
                        causal, window_size, 0,
                        nullptr, mask_ptr,
-                       stream_) == 0;
+                       stream_, 0, 0) == 0;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::compute_decode(
@@ -1058,7 +1073,7 @@ namespace llaminar2
                        static_cast<float *>(partial_l_buf_),
                        1, kv_len,
                        n_heads, n_kv_heads, head_dim,
-                       num_splits, nullptr, stream_) == 0;
+                       num_splits, nullptr, stream_, 0, 0) == 0;
         }
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP16>::apply_typed(
             const uint16_t *Q, const uint16_t *K, const uint16_t *V, uint16_t *output,
@@ -1110,7 +1125,8 @@ namespace llaminar2
             int device_idx,
             int head_start,
             int local_n_heads,
-            int local_n_kv_heads)
+            int local_n_kv_heads,
+            int gqa_n_rep)
         {
             // TODO: Implement FP16 tensor path
             LOG_ERROR("[ROCmFlashAttentionKernelT<FP16>::compute_tensor] Not implemented");
@@ -1133,6 +1149,7 @@ namespace llaminar2
             (void)head_start;
             (void)local_n_heads;
             (void)local_n_kv_heads;
+            (void)gqa_n_rep;
             return false;
         }
 
@@ -1347,7 +1364,7 @@ namespace llaminar2
                        n_heads, n_kv_heads, head_dim,
                        causal, window_size, 0,
                        nullptr, mask_ptr,
-                       stream_) == 0;
+                       stream_, 0, 0) == 0;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::compute_batch(
@@ -1381,7 +1398,7 @@ namespace llaminar2
                        n_heads, n_kv_heads, head_dim,
                        causal, window_size, 0,
                        nullptr, mask_ptr,
-                       stream_) == 0;
+                       stream_, 0, 0) == 0;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::compute_decode(
@@ -1416,7 +1433,7 @@ namespace llaminar2
                        static_cast<float *>(partial_l_buf_),
                        1, kv_len,
                        n_heads, n_kv_heads, head_dim,
-                       num_splits, nullptr, stream_) == 0;
+                       num_splits, nullptr, stream_, 0, 0) == 0;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::BF16>::apply_typed(
@@ -1467,7 +1484,8 @@ namespace llaminar2
             int device_idx,
             int head_start,
             int local_n_heads,
-            int local_n_kv_heads)
+            int local_n_kv_heads,
+            int gqa_n_rep)
         {
             LOG_ERROR("[ROCmFlashAttentionKernelT<BF16>::compute_tensor] Not implemented for MI50");
             (void)Q;
@@ -1489,6 +1507,7 @@ namespace llaminar2
             (void)head_start;
             (void)local_n_heads;
             (void)local_n_kv_heads;
+            (void)gqa_n_rep;
             return false;
         }
 

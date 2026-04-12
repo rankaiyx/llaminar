@@ -20,7 +20,7 @@
 #include "kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "kernels/cpu/ops/CPUSoftmaxKernelT.h"
 #include "kernels/cpu/ops/CPUEmbeddingKernelT.h"
-#include "kernels/cpu/attention/CPUAttentionKernelT.h"
+#include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
 #include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 
@@ -212,11 +212,11 @@ namespace llaminar2
         // Attention Kernel Tests
         // =============================================================================
 
-        TEST_F(KernelSnapshotInfoTest, CPUAttentionKernelT_FP32_SnapshotInfo)
+        TEST_F(KernelSnapshotInfoTest, CPUFlashAttentionKernelT_FP32_SnapshotInfo)
         {
-            CPUAttentionKernelT<ActivationPrecision::FP32> kernel;
+            CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel;
             auto info = kernel.getKernelSnapshotInfo();
-            verifySnapshotInfo(info, "CPUAttentionKernelT<FP32>");
+            verifySnapshotInfo(info, "CPUFlashAttentionKernelT<FP32>");
 
             EXPECT_STREQ(info.kernel_name, "Attention");
             EXPECT_GE(info.inputs.size(), 3);  // Q, K, V

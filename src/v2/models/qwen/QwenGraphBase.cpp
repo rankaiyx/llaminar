@@ -278,15 +278,41 @@ namespace llaminar2
         embed_params.vocab_size = config_.vocab_size;
         embed_params.device_id = config_.default_device;
         embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
+        embed_params.mpi_ctx = mpi_ctx_.get();
 
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(embed_params),
                       device);
 
         // -------------------------------------------------------------------------
+        // Stage 1b: Embedding AllReduce (vocab-parallel embedding sharding)
+        // -------------------------------------------------------------------------
+        // When embedding is column-parallel sharded, each device holds
+        // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
+        // AllReduce(sum) combines the partial results.
+        const bool embedding_is_sharded =
+            weights_.embedding_table &&
+            static_cast<int>(weights_.embedding_table->rows()) < config_.vocab_size;
+        if (embedding_is_sharded && needsTPAllreduce())
+        {
+            size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
+            auto allreduce_stage = createTPAllreduceStage(
+                embed_output, allreduce_count, device, -1,
+                /*is_attention=*/false, "embedding_allreduce",
+                BufferId::HIDDEN_STATE);
+            if (allreduce_stage)
+            {
+                graph.addNode("embedding_allreduce", std::move(allreduce_stage), device);
+                graph.addDependency("embedding_allreduce", "embedding");
+            }
+        }
+
+        // -------------------------------------------------------------------------
         // Stage 2: Transformer Layers (complete graphs, not placeholders)
         // -------------------------------------------------------------------------
-        std::string prev_node = "embedding";
+        std::string prev_node = embedding_is_sharded && needsTPAllreduce()
+                                    ? "embedding_allreduce"
+                                    : "embedding";
 
         // Position IDs must be provided externally (or use fallback for backward compat)
         const int *position_ids = input.position_ids;
@@ -514,6 +540,7 @@ namespace llaminar2
             embed_params.vocab_size = config_.vocab_size;
             embed_params.device_id = config_.default_device;
             embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
+            embed_params.mpi_ctx = mpi_ctx_.get();
 
             graph.addNode("embedding",
                           ComputeStageFactory::createEmbedding(embed_params),
@@ -850,6 +877,7 @@ namespace llaminar2
                 embed_params.d_model = config_.d_model;
                 embed_params.vocab_size = config_.vocab_size;
                 embed_params.device_id = stage_device;
+                embed_params.mpi_ctx = mpi_ctx_.get();
 
                 graph.addNode("embedding",
                               ComputeStageFactory::createEmbedding(embed_params),

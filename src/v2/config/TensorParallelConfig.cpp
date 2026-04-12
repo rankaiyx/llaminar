@@ -100,6 +100,27 @@ namespace llaminar2
             total_d_ff_ += a.d_ff_count;
             total_vocab_ += a.vocab_count;
         }
+
+        // GQA replication fix: when KV heads are replicated across all devices
+        // (all have kv_head_start=0 with same kv_head_count), the sum overcounts.
+        // Use one device's count as the actual total.
+        if (assignments_.size() > 1 && assignments_[0].kv_head_count > 0)
+        {
+            bool all_replicated = true;
+            for (size_t i = 1; i < assignments_.size(); ++i)
+            {
+                if (assignments_[i].kv_head_start != 0 ||
+                    assignments_[i].kv_head_count != assignments_[0].kv_head_count)
+                {
+                    all_replicated = false;
+                    break;
+                }
+            }
+            if (all_replicated && assignments_[0].kv_head_start == 0)
+            {
+                total_kv_heads_ = assignments_[0].kv_head_count;
+            }
+        }
     }
 
     bool TensorParallelConfig::validate() const
@@ -136,6 +157,21 @@ namespace llaminar2
         }
 
         // Check for overlapping head ranges
+        // Detect GQA KV replication: all devices have same kv_head_start=0 and same count
+        bool kv_replicated = assignments_.size() > 1;
+        if (kv_replicated)
+        {
+            for (size_t i = 1; i < assignments_.size(); ++i)
+            {
+                if (assignments_[i].kv_head_start != assignments_[0].kv_head_start ||
+                    assignments_[i].kv_head_count != assignments_[0].kv_head_count)
+                {
+                    kv_replicated = false;
+                    break;
+                }
+            }
+        }
+
         for (size_t i = 0; i < assignments_.size(); ++i)
         {
             for (size_t j = i + 1; j < assignments_.size(); ++j)
@@ -150,8 +186,8 @@ namespace llaminar2
                            std::to_string(i) + " and " + std::to_string(j);
                 }
 
-                // Check KV head overlap
-                if (a.kv_head_start < b.kvHeadEnd() && b.kv_head_start < a.kvHeadEnd())
+                // Check KV head overlap (skip when GQA-replicated — all devices have same KV range)
+                if (!kv_replicated && a.kv_head_start < b.kvHeadEnd() && b.kv_head_start < a.kvHeadEnd())
                 {
                     return "Overlapping KV head ranges between rank " +
                            std::to_string(i) + " and " + std::to_string(j);
@@ -308,8 +344,29 @@ namespace llaminar2
         }
 
         // Distribute heads, KV heads, d_ff, and vocab proportionally
-        std::vector<int> head_counts = distributeProportionally(n_heads, normalized, 1);
-        std::vector<int> kv_head_counts = distributeProportionally(n_kv_heads, normalized, 1);
+
+        // GQA-aware KV head distribution: when n_kv_heads < tp_degree,
+        // replicate KV heads on all devices instead of column-parallel sharding.
+        // This is the standard Megatron-LM approach for GQA models where
+        // KV head count is less than the tensor parallelism degree.
+        const bool kv_replicated = n_kv_heads < static_cast<int>(devices.size());
+        std::vector<int> kv_head_counts;
+        if (kv_replicated)
+        {
+            kv_head_counts.assign(devices.size(), n_kv_heads);
+            LOG_INFO("[TensorParallelConfig] GQA replication: n_kv_heads=" << n_kv_heads
+                                                                           << " < tp_degree=" << devices.size()
+                                                                           << ", replicating K/V on all devices");
+        }
+        else
+        {
+            kv_head_counts = distributeProportionally(n_kv_heads, normalized, 1);
+        }
+
+        // When KV is replicated, Q heads must be distributed in multiples of
+        // n_kv_heads so the GQA ratio (n_heads/n_kv_heads) stays integral per device.
+        const int head_alignment = (kv_replicated && n_kv_heads > 1) ? n_kv_heads : 1;
+        std::vector<int> head_counts = distributeProportionally(n_heads, normalized, head_alignment);
         std::vector<int> d_ff_counts = distributeProportionally(d_ff, normalized, 32); // 32-aligned
         std::vector<int> vocab_counts = distributeProportionally(vocab_size, normalized, 1);
 
@@ -331,9 +388,11 @@ namespace llaminar2
             a.head_count = head_counts[i];
             head_offset += head_counts[i];
 
-            a.kv_head_start = kv_offset;
+            // When KV is replicated, all devices start at 0 and have all heads
+            a.kv_head_start = kv_replicated ? 0 : kv_offset;
             a.kv_head_count = kv_head_counts[i];
-            kv_offset += kv_head_counts[i];
+            if (!kv_replicated)
+                kv_offset += kv_head_counts[i];
 
             a.d_ff_start = d_ff_offset;
             a.d_ff_count = d_ff_counts[i];

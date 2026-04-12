@@ -1880,7 +1880,10 @@ add_v2_test(V2_Unit_KernelFactory
     MPI_PROCS 1  # Kernel factory tests, single rank
 )
 
-# Test: CPU Quantized GEMM/GEMV Parity (all formats, M=1 + M=64)
+# Test: CPU Quantized GEMM/GEMV Parity — all formats × thread counts 1-56
+# Covers GEMV (M=1), GEMM (M=9 odd, M=64), standard N=512, and small-N
+# (N=16, N=32) for ldc<64 overflow regression. Checks relative L2 error,
+# cosine similarity, NaN/Inf, and all-zero-row detection.
 add_executable(v2_test_cpu_quantized_gemm_parity unit/kernels/Test__CPUQuantizedGemmParity.cpp)
 target_link_libraries(v2_test_cpu_quantized_gemm_parity
     llaminar2_core
@@ -1889,7 +1892,7 @@ target_link_libraries(v2_test_cpu_quantized_gemm_parity
 )
 add_v2_test(V2_Unit_CPUQuantizedGemmParity
     COMMAND $<TARGET_FILE:v2_test_cpu_quantized_gemm_parity>
-    LABELS "V2;Unit;Kernels;GEMM;GEMV;Quantization;Parity;DeferredPacking;VNNI"
+    LABELS "V2;Unit;Kernels;GEMM;GEMV;Quantization;Parity;DeferredPacking;VNNI;LowThreadCount;Regression"
     MPI_PROCS 1
 )
 
@@ -2230,19 +2233,6 @@ add_v2_test(V2_Unit_Q16VNNISafeNormalization
     MPI_PROCS 1
 )
 
-# Test: CPUAttentionKernelT (Enum-based attention kernel via Factory)
-add_executable(v2_test_cpu_attention_kernel_t unit/kernels/cpu/attention/Test__CPUAttentionKernelT.cpp)
-target_link_libraries(v2_test_cpu_attention_kernel_t
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_CPUAttentionKernelT
-    COMMAND $<TARGET_FILE:v2_test_cpu_attention_kernel_t>
-    LABELS "V2;Unit;Kernels;Attention;FP32;BF16;FP16;TypedKernel;CPU;FactoryWiring"
-    MPI_PROCS 1
-)
-
 # Test: CPUFlashAttentionKernelT (Flash attention accuracy: FP32, VNNI i16/i12, causal, GQA, window)
 add_executable(v2_test_cpu_flash_attention_kernel_t unit/kernels/cpu/attention/Test__CPUFlashAttentionKernelT.cpp)
 target_link_libraries(v2_test_cpu_flash_attention_kernel_t
@@ -2252,7 +2242,7 @@ target_link_libraries(v2_test_cpu_flash_attention_kernel_t
 )
 add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_kernel_t>
-    LABELS "V2;Unit;Kernels;Attention;FlashAttention;FP32;VNNI;CPU;Accuracy"
+    LABELS "V2;Unit;Kernels;Attention;FlashAttention;FP32;VNNI;CPU;Accuracy;GQA;TensorParallel"
     MPI_PROCS 1
 )
 
@@ -2644,18 +2634,7 @@ add_v2_test(V2_Unit_SwiGLUParity
 
 # Test: Batch attention correctness - mask generation and batched processing
 
-# Test: Attention mask application - verify masks are applied before softmax
-add_executable(v2_test_attention_mask_application unit/kernels/cpu/attention/Test__AttentionMaskApplication.cpp)
-target_link_libraries(v2_test_attention_mask_application 
-    llaminar2_core 
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_AttentionMaskApplication 
-    COMMAND $<TARGET_FILE:v2_test_attention_mask_application>
-    LABELS "V2;Unit;Attention;MaskApplication;Softmax;PaddingMask;AttentionWeights"
-    MPI_PROCS 1  # Unit test for mask application in attention, single rank
-)
+# Test: Attention mask application - REMOVED (used deleted CPUAttentionKernelT compute/compute_batch)
 
 # Test: Sequential vs Batched Attention Comparison
 add_executable(v2_test_attention_sequential_vs_batched unit/kernels/cpu/attention/Test__AttentionSequentialVsBatched.cpp)
@@ -4561,6 +4540,27 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
     )
 
+    # ---- NodeLocalTP Parity (Multi-Socket CPU TP) ----
+    add_executable(v2_integration_parity_qwen3_node_local_tp
+        integration/parity/qwen3/Test__Qwen3_NodeLocalTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen3_node_local_tp
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen3_node_local_tp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_v2_test(V2_Integration_Parity_Qwen3_NodeLocalTP
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen3_node_local_tp>
+        LABELS "V2;Integration;Parity;Qwen3;NodeLocalTP;MPI;TensorParallel;UPI;CrossRank;CPU"
+        MPI_PROCS 2
+        TIMEOUT 300
+    )
+
+    message(STATUS "V2: Qwen3 NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
+
     # =========================================================================
     # Qwen3.5 Parity Test Matrix (integration/parity/qwen35/)
     # =========================================================================
@@ -5897,6 +5897,9 @@ add_v2_test(V2_Integration_LocalTPContext
 # Validates proportional weight distribution, equal weight handling, single-device
 # extraction, and correct shard sizing based on device weights.
 add_executable(v2_test_local_tp_weight_sharder unit/loaders/Test__LocalTPWeightSharder.cpp)
+target_include_directories(v2_test_local_tp_weight_sharder PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
 target_link_libraries(v2_test_local_tp_weight_sharder llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_LocalTPWeightSharder
     COMMAND $<TARGET_FILE:v2_test_local_tp_weight_sharder>
@@ -6531,6 +6534,22 @@ add_v2_test(V2_Unit_MPITopologyCapabilityExchange
     COMMAND $<TARGET_FILE:v2_test_mpi_topology_capability_exchange>
     MPI_PROCS 1
     LABELS "V2;Unit;MPI;Topology;Serialization;DeviceInventory;Heterogeneous"
+)
+
+# Test: NodeDetection (canonical hostname-based node detection)
+# Note: Uses mpi_gtest_main.cpp for MPI initialization (needed for detect() with MPI_COMM_SELF)
+add_executable(v2_test_node_detection
+    unit/utils/Test__NodeDetection.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_link_libraries(v2_test_node_detection
+    llaminar2_core
+    GTest::gtest
+)
+add_v2_test(V2_Unit_NodeDetection
+    COMMAND $<TARGET_FILE:v2_test_node_detection>
+    MPI_PROCS 1
+    LABELS "V2;Unit;MPI;Topology;NodeDetection"
 )
 
 # Test: HeterogeneousMultiDomainStrategy (multi-domain TP + PP for heterogeneous clusters)
@@ -9670,6 +9689,61 @@ target_link_libraries(v2_test_executor_weight_coherence
 add_v2_test(V2_Unit_ExecutorWeightCoherence
     COMMAND $<TARGET_FILE:v2_test_executor_weight_coherence>
     LABELS "V2;Unit;DeviceGraphExecutor;Execution;WeightCoherence;BufferContracts"
+    MPI_PROCS 1
+)
+
+# Test: PreparedEmbeddingWeightsLifecycle — KernelFactory prepared embedding registry
+# lifecycle: creation, cache hits, move semantics, lookup, device separation, clear.
+add_executable(v2_test_prepared_embedding_lifecycle unit/kernels/Test__PreparedEmbeddingWeightsLifecycle.cpp)
+target_link_libraries(v2_test_prepared_embedding_lifecycle llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_prepared_embedding_lifecycle PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ include path
+)
+add_v2_test(V2_Unit_PreparedEmbeddingWeightsLifecycle
+    COMMAND $<TARGET_FILE:v2_test_prepared_embedding_lifecycle>
+    LABELS "V2;Unit;Kernels;Embedding;PreparedWeights;Lifecycle"
+    MPI_PROCS 1
+)
+
+# Test: WeightManagerHostRelease — WeightManager host memory release decision logic:
+# releaseAllHostWeightData and releaseHostResidentWeightData with controllable
+# getPreparedEmbeddingCount() override.
+add_executable(v2_test_weight_manager_host_release unit/loaders/Test__WeightManagerHostRelease.cpp)
+target_link_libraries(v2_test_weight_manager_host_release llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_weight_manager_host_release PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+add_v2_test(V2_Unit_WeightManagerHostRelease
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_host_release>
+    LABELS "V2;Unit;WeightManager;HostRelease;Memory;Lifecycle"
+    MPI_PROCS 1
+)
+
+# Test: EmbeddingKernelPreparedPath — Embedding kernel workspace requirements and
+# prepared vs fallback path selection. GPU tests skip if no CUDA/ROCm available.
+add_executable(v2_test_embedding_kernel_prepared_path unit/kernels/Test__EmbeddingKernelPreparedPath.cpp)
+target_link_libraries(v2_test_embedding_kernel_prepared_path llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_embedding_kernel_prepared_path PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ include path
+)
+add_v2_test(V2_Unit_EmbeddingKernelPreparedPath
+    COMMAND $<TARGET_FILE:v2_test_embedding_kernel_prepared_path>
+    LABELS "V2;Unit;Kernels;Embedding;Workspace;PreparedWeights"
+    MPI_PROCS 1
+)
+
+# Test: VocabParallelEmbeddingSharding — Non-GPU logic for Megatron-style
+# vocab-parallel embedding sharding: WeightShardingConfig for token_embd.weight,
+# TensorParallelConfig vocab splits, WeightSlicer boundaries, EmbedQ8Repack
+# vocab-range overload, PreparedEmbeddingWeights metadata, schema TPMode.
+add_executable(v2_test_vocab_parallel_embedding_sharding unit/loaders/Test__VocabParallelEmbeddingSharding.cpp)
+target_link_libraries(v2_test_vocab_parallel_embedding_sharding llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_vocab_parallel_embedding_sharding PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/utils/ include path
+)
+add_v2_test(V2_Unit_VocabParallelEmbeddingSharding
+    COMMAND $<TARGET_FILE:v2_test_vocab_parallel_embedding_sharding>
+    LABELS "V2;Unit;Loaders;WeightSharding;Embedding;VocabParallel;TensorParallelism"
     MPI_PROCS 1
 )
 

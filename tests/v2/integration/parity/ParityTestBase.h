@@ -1770,13 +1770,27 @@ namespace llaminar2::test::parity
 
             // Regenerate snapshots only on rank 0 to avoid race conditions
             // and redundant work. All ranks wait at barrier before proceeding.
-            // OPTIMIZATION: Only regenerate if this snapshot_dir hasn't been done yet.
+            // OPTIMIZATION: Skip regeneration if snapshots already exist on disk
+            // (metadata.txt is the marker file written by all Python generators).
+            // This is critical for MPI_PROCS>1 tests where popen()/fork() inside
+            // an MPI-managed process can crash the HNP event loop.
             if (isRank0())
             {
                 bool need_regen = false;
                 {
                     std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
                     need_regen = (s_generated_snapshots_.find(snapshotCacheKey()) == s_generated_snapshots_.end());
+                }
+
+                if (need_regen)
+                {
+                    // Check disk first — snapshots may exist from a prior test run
+                    auto metadata_path = std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
+                    if (std::filesystem::exists(metadata_path))
+                    {
+                        LOG_INFO("[" << getBackendName() << " Parity] Found existing snapshots on disk: " << config_.snapshot_dir);
+                        need_regen = false;
+                    }
                 }
 
                 if (need_regen)
@@ -1791,6 +1805,9 @@ namespace llaminar2::test::parity
                 }
                 else
                 {
+                    // Mark in cache so subsequent parameterized cases skip the disk check too
+                    std::lock_guard<std::mutex> lock(s_snapshot_mutex_);
+                    s_generated_snapshots_.insert(snapshotCacheKey());
                     LOG_DEBUG("[" << getBackendName() << " Parity] Reusing cached snapshots from: " << config_.snapshot_dir);
                 }
             }

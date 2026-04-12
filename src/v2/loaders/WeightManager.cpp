@@ -24,6 +24,9 @@
 #include <future>
 #include <unordered_map>
 #include <vector>
+#ifdef __linux__
+#include <malloc.h> // malloc_trim
+#endif
 
 namespace llaminar2
 {
@@ -1518,10 +1521,59 @@ namespace llaminar2
         }
 
         default:
-            // Shouldn't reach here for column-parallel weights
+        {
+            // Check schema-based dimension type for weights not covered by WeightCategory
+            // (e.g. GDN ssm_alpha/beta/dt.bias/ssm_a which are ProportionalHeads)
+            if (has_sharding_config_)
+            {
+                WeightDimensionType dim_type = sharding_config_.getDimensionType(name);
+                if (dim_type == WeightDimensionType::ProportionalHeads)
+                {
+                    const int total_heads = tp_config_->totalHeads();
+                    if (total_heads > 0)
+                    {
+                        size_t start = total_rows * static_cast<size_t>(assignment.head_start) / static_cast<size_t>(total_heads);
+                        size_t end = total_rows * static_cast<size_t>(assignment.head_start + assignment.head_count) / static_cast<size_t>(total_heads);
+                        LOG_TRACE("[WeightManager] Proportional heads slice for " << name
+                                                                                  << ": total_heads=" << total_heads
+                                                                                  << " weight_rows=" << total_rows
+                                                                                  << " -> [" << start << ", " << end << ")");
+                        return {start, end - start};
+                    }
+                }
+                else if (dim_type == WeightDimensionType::Heads)
+                {
+                    const int total_heads = tp_config_->totalHeads();
+                    if (total_heads > 0)
+                    {
+                        const size_t head_dim = total_rows / static_cast<size_t>(total_heads);
+                        size_t start = static_cast<size_t>(assignment.head_start) * head_dim;
+                        size_t count = static_cast<size_t>(assignment.head_count) * head_dim;
+                        LOG_TRACE("[WeightManager] Schema heads slice for " << name
+                                                                            << ": total_heads=" << total_heads
+                                                                            << " head_dim=" << head_dim
+                                                                            << " -> [" << start << ", " << (start + count) << ")");
+                        return {start, count};
+                    }
+                }
+                else if (dim_type == WeightDimensionType::KVHeads)
+                {
+                    const int total_kv_heads = tp_config_->totalKVHeads();
+                    if (total_kv_heads > 0)
+                    {
+                        const size_t head_dim = total_rows / static_cast<size_t>(total_kv_heads);
+                        size_t start = static_cast<size_t>(assignment.kv_head_start) * head_dim;
+                        size_t count = static_cast<size_t>(assignment.kv_head_count) * head_dim;
+                        LOG_TRACE("[WeightManager] Schema KV heads slice for " << name
+                                                                               << " -> [" << start << ", " << (start + count) << ")");
+                        return {start, count};
+                    }
+                }
+            }
             LOG_WARN("[WeightManager] calculateProportionalColumnSlice called for non-column weight: " << name);
             return {0, total_rows};
         }
+        } // end switch
         return {0, total_rows}; // unreachable but silences -Wreturn-type
     }
 
@@ -1577,10 +1629,57 @@ namespace llaminar2
         }
 
         default:
-            // Shouldn't reach here for row-parallel weights
+        {
+            // Check schema-based dimension type for weights not covered by WeightCategory
+            // (e.g. GDN ssm_out which is InputParallel with ProportionalHeads or Heads)
+            if (has_sharding_config_)
+            {
+                WeightDimensionType dim_type = sharding_config_.getDimensionType(name);
+                if (dim_type == WeightDimensionType::ProportionalHeads)
+                {
+                    const int total_heads = tp_config_->totalHeads();
+                    if (total_heads > 0)
+                    {
+                        size_t start = total_cols * static_cast<size_t>(assignment.head_start) / static_cast<size_t>(total_heads);
+                        size_t end = total_cols * static_cast<size_t>(assignment.head_start + assignment.head_count) / static_cast<size_t>(total_heads);
+                        LOG_TRACE("[WeightManager] Proportional heads row-slice for " << name
+                                                                                      << ": total_heads=" << total_heads
+                                                                                      << " weight_cols=" << total_cols
+                                                                                      << " -> [" << start << ", " << end << ")");
+                        return {start, end - start};
+                    }
+                }
+                else if (dim_type == WeightDimensionType::Heads)
+                {
+                    const int total_heads = tp_config_->totalHeads();
+                    if (total_heads > 0)
+                    {
+                        const size_t head_dim = total_cols / static_cast<size_t>(total_heads);
+                        size_t start = static_cast<size_t>(assignment.head_start) * head_dim;
+                        size_t count = static_cast<size_t>(assignment.head_count) * head_dim;
+                        LOG_TRACE("[WeightManager] Schema heads row-slice for " << name
+                                                                                << " -> [" << start << ", " << (start + count) << ")");
+                        return {start, count};
+                    }
+                }
+                else if (dim_type == WeightDimensionType::KVHeads)
+                {
+                    const int total_kv_heads = tp_config_->totalKVHeads();
+                    if (total_kv_heads > 0)
+                    {
+                        const size_t head_dim = total_cols / static_cast<size_t>(total_kv_heads);
+                        size_t start = static_cast<size_t>(assignment.kv_head_start) * head_dim;
+                        size_t count = static_cast<size_t>(assignment.kv_head_count) * head_dim;
+                        LOG_TRACE("[WeightManager] Schema KV heads row-slice for " << name
+                                                                                   << " -> [" << start << ", " << (start + count) << ")");
+                        return {start, count};
+                    }
+                }
+            }
             LOG_WARN("[WeightManager] calculateProportionalRowSlice called for non-row weight: " << name);
             return {0, total_cols};
         }
+        } // end switch
         return {0, total_cols}; // unreachable but silences -Wreturn-type
     }
 
@@ -1927,6 +2026,22 @@ namespace llaminar2
 
                 markPrepState(name, device, WeightPrepState::LOADED_HOST, is_gemm_weight, "weight loaded for device");
 
+                // On GPU, mark tensors HOST_RESIDENT when the TransferEngine
+                // upload would produce a dead copy:
+                //
+                // - token_embd.weight: The embedding kernel reads host data
+                //   to repack into a device workspace; never read on GPU.
+                //
+                // - GEMM weights (attn_q/k/v/output, ffn_gate/up/down, etc.):
+                //   ROCmQuantisedGemmKernel uploads its own VNNI-repacked copy
+                //   and never reads the raw Q8_0 gpu_data_ptr_. Without this,
+                //   both the raw Q8_0 AND the VNNI copy sit on GPU — ~1.9 GB
+                //   wasted per device.
+                if (device.is_gpu() && (name == "token_embd.weight" || is_gemm_weight))
+                {
+                    tensor->setHostResident();
+                }
+
                 ++loaded_tensors;
 
                 if (device.type != DeviceType::CPU)
@@ -1956,6 +2071,188 @@ namespace llaminar2
                                                              << ", failures=" << load_failures
                                                              << (seeded_from_loader ? " (seeded from loader names)" : ""));
         return true;
+    }
+
+    // =========================================================================
+    // Weight Lifecycle (single entry points)
+    // =========================================================================
+
+    bool WeightManager::finalizeForDevice(DeviceId device)
+    {
+        const bool is_gpu = device.is_gpu();
+        const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
+
+        // Step 1: Pack GEMM weights (async on GPU for overlap with step 2)
+        std::future<bool> gemm_future;
+        if (is_gpu)
+        {
+            gemm_future = std::async(std::launch::async, [this, device]()
+                                     { return packGemmWeights(device, nullptr, /*release_raw_data=*/true); });
+        }
+
+        // Step 2: Upload non-GEMM weights (norms, embeddings) to device
+        bool non_gemm_ok = uploadNonGemmWeights(device);
+        if (!non_gemm_ok)
+        {
+            LOG_WARN("[WeightManager] Non-GEMM weight upload failed for " << device_name);
+        }
+
+        // Step 3: Wait for GEMM pack (or do sync pack for CPU)
+        bool gemm_ok = true;
+        if (is_gpu)
+        {
+            gemm_ok = gemm_future.get();
+        }
+        else
+        {
+            gemm_ok = packGemmWeights(device, nullptr, /*release_raw_data=*/true);
+        }
+
+        if (!gemm_ok)
+        {
+            LOG_WARN("[WeightManager] GEMM weight packing failed for " << device_name
+                                                                       << ", will use lazy kernel creation");
+        }
+
+        // Step 4: Release host copies now that everything is on GPU
+        if (is_gpu && gemm_ok && non_gemm_ok)
+        {
+            size_t released = releaseAllHostWeightData();
+            LOG_INFO("[WeightManager] finalizeForDevice(" << device_name
+                                                          << "): released " << released << " host tensors");
+        }
+
+        return gemm_ok && non_gemm_ok;
+    }
+
+    bool WeightManager::finalizeForDevices(const std::vector<DeviceId> &devices)
+    {
+        if (devices.empty())
+        {
+            LOG_WARN("[WeightManager] finalizeForDevices called with empty device list");
+            return true;
+        }
+
+        // Step 1: Clone and upload all weights to all devices
+        LOG_INFO("[WeightManager] finalizeForDevices: pre-loading weights for "
+                 << devices.size() << " devices");
+        if (!preloadForDevices(devices))
+        {
+            LOG_ERROR("[WeightManager] finalizeForDevices: preloadForDevices failed");
+            return false;
+        }
+
+        // Step 2: Pack GEMM weights per device (sequential across devices to
+        // avoid HIP/CUDA runtime races from concurrent multi-device hipMemcpy).
+        // Each packGemmWeights call has internal producer/consumer parallelism
+        // for the single target device's weights.
+        bool all_ok = true;
+        for (const auto &dev : devices)
+        {
+            if (!packGemmWeights(dev, nullptr, /*release_raw_data=*/false))
+            {
+                LOG_WARN("[WeightManager] GEMM packing failed for device " << dev.toString());
+                all_ok = false;
+            }
+        }
+
+        // Step 2b: Prepare embedding weights for each device.
+        // Repacks from native quantized format (Q8_0, etc.) → EmbedQ8Block
+        // and uploads to GPU memory, following the PreparedGemmWeights pattern.
+        // With TP, each device gets only its vocab shard (vocab-parallel embedding).
+        {
+            using namespace llaminar::v2::kernels;
+            const int d_model = static_cast<int>(loader_.embeddingLength());
+
+            for (const auto &dev : devices)
+            {
+                if (!dev.is_gpu())
+                    continue;
+
+                // Find the embedding tensor for this device
+                const TensorBase *embed_tensor = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                    // Check per-device cache first (LOCAL TP — may hold a vocab slice)
+                    const std::string device_key = dev.to_string() + ":token_embd.weight";
+                    auto pdit = per_device_cache_.find(device_key);
+                    if (pdit != per_device_cache_.end() && pdit->second)
+                    {
+                        embed_tensor = pdit->second.get();
+                    }
+                    else
+                    {
+                        // Fall back to global cache
+                        auto it = cache_.find("token_embd.weight");
+                        if (it != cache_.end() && it->second)
+                        {
+                            embed_tensor = it->second.get();
+                        }
+                    }
+                }
+
+                if (embed_tensor && d_model > 0)
+                {
+                    // Determine vocab sharding metadata for this device
+                    size_t vocab_offset = 0;
+                    size_t total_vocab = 0;
+                    if (tp_config_)
+                    {
+                        // Find the assignment for this device
+                        for (const auto &a : tp_config_->assignments())
+                        {
+                            if (a.device == dev)
+                            {
+                                vocab_offset = static_cast<size_t>(a.vocab_start);
+                                total_vocab = static_cast<size_t>(tp_config_->totalVocab());
+                                break;
+                            }
+                        }
+                    }
+
+                    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
+                        embed_tensor, d_model, dev, vocab_offset, total_vocab);
+                    if (!handle)
+                    {
+                        LOG_WARN("[WeightManager] Embedding preparation failed for " << dev.toString());
+                    }
+                }
+            }
+        }
+
+        // Step 3: Release all host weight data
+        size_t released = releaseAllHostWeightData();
+        LOG_INFO("[WeightManager] finalizeForDevices: released " << released
+                                                                 << " host tensors across " << devices.size() << " devices");
+
+        // Step 4: Return freed memory to the OS.
+        // glibc malloc keeps freed blocks in its arena and only returns memory
+        // above the brk/mmap threshold.  After releasing hundreds of weight
+        // tensors (several GB), the arena is heavily fragmented.  malloc_trim
+        // forces glibc to release free pages back to the kernel via madvise.
+#ifdef __linux__
+        {
+            auto report_rss = [](const char *label)
+            {
+                std::ifstream status("/proc/self/status");
+                std::string line;
+                while (std::getline(status, line))
+                {
+                    if (line.compare(0, 6, "VmRSS:") == 0 ||
+                        line.compare(0, 8, "RssAnon:") == 0)
+                    {
+                        LOG_INFO("[WeightManager] " << label << " " << line);
+                    }
+                }
+            };
+            report_rss("Pre-trim");
+            ::malloc_trim(0);
+            report_rss("Post-trim");
+        }
+#endif
+
+        return all_ok;
     }
 
     // =========================================================================
@@ -2001,15 +2298,50 @@ namespace llaminar2
 
         // Collect GEMM tensors under lock, then pack outside lock.
         // This allows overlap with other preload operations (e.g., non-GEMM uploads).
+        //
+        // For multi-device LOCAL TP: check per_device_cache_ first for device-specific
+        // sharded tensors. Fall back to cache_ for single-device scenarios.
         std::vector<std::pair<std::string, std::shared_ptr<TensorBase>>> gemm_weights;
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
-            gemm_weights.reserve(cache_.size());
-            for (const auto &[name, tensor] : cache_)
+            const std::string device_prefix = target_device.to_string() + ":";
+            bool has_per_device_entries = false;
+
+            // Check if we have device-specific entries in per_device_cache_
+            for (const auto &[key, tensor] : per_device_cache_)
             {
-                if (isGemmWeight(name) && tensor)
+                if (key.compare(0, device_prefix.size(), device_prefix) == 0)
                 {
-                    gemm_weights.emplace_back(name, tensor);
+                    has_per_device_entries = true;
+                    break;
+                }
+            }
+
+            if (has_per_device_entries)
+            {
+                // LOCAL TP: iterate per_device_cache_ entries for this device
+                for (const auto &[key, tensor] : per_device_cache_)
+                {
+                    if (key.compare(0, device_prefix.size(), device_prefix) != 0)
+                        continue;
+                    // Extract original weight name from key (strip "rocm:0:" prefix)
+                    const std::string name = key.substr(device_prefix.size());
+                    if (isGemmWeight(name) && tensor)
+                    {
+                        gemm_weights.emplace_back(name, tensor);
+                    }
+                }
+            }
+            else
+            {
+                // Single-device: iterate cache_ as before
+                gemm_weights.reserve(cache_.size());
+                for (const auto &[name, tensor] : cache_)
+                {
+                    if (isGemmWeight(name) && tensor)
+                    {
+                        gemm_weights.emplace_back(name, tensor);
+                    }
                 }
             }
         }
@@ -2159,6 +2491,12 @@ namespace llaminar2
                     return false;
                 }
                 kernel->prepareWeights();
+                if (!kernel->weights_converted())
+                {
+                    LOG_ERROR("[WeightManager] prepareWeights() did not complete upload for: "
+                              << job.name << " on " << target_device.to_string());
+                    return false;
+                }
                 return true;
             };
 
@@ -2281,6 +2619,12 @@ namespace llaminar2
                     {
                         markPrepState(job.name, target_device, WeightPrepState::UPLOADED_DEVICE, true, "GEMM packed + uploaded");
                         local_gpu_packed.fetch_add(1, std::memory_order_relaxed);
+                        // Release heap-allocated row-slice data now that weights are on GPU.
+                        // Mmap-backed tensors (is_view()==true) are zero-copy and cost nothing.
+                        if (release_raw_data && job.tensor && !job.tensor->is_view())
+                        {
+                            job.tensor->release_raw_data();
+                        }
                     }
                     else
                     {
@@ -2363,57 +2707,6 @@ namespace llaminar2
         }
 
         return all_success.load(std::memory_order_relaxed);
-    }
-
-    bool WeightManager::packWeight(
-        TensorBase *tensor,
-        DeviceId target_device,
-        bool release_raw_data)
-    {
-        if (!tensor)
-        {
-            return false;
-        }
-
-        using namespace llaminar::v2::kernels;
-
-        // Create kernel for target device (this creates the kernel with packed weights)
-        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, target_device);
-        auto *kernel = KernelFactory::getOrCreateGemmEngine(prepared);
-        if (!kernel)
-        {
-            LOG_ERROR("[WeightManager] Failed to create GEMM kernel for weight packing");
-            return false;
-        }
-
-        // Call prepareWeights() to upload to GPU if needed
-        // For CPU: this is a no-op
-        // For GPU: this calls ensureWeightsConverted() which uploads INT8 data
-        kernel->prepareWeights();
-
-        if (target_device.is_cpu())
-        {
-            num_cpu_packed_++;
-
-            // For CPU, we can release raw data since packed weights are in cache
-            if (release_raw_data)
-            {
-                tensor->release_raw_data();
-                LOG_TRACE("[WeightManager] Released raw data for: " << tensor->shape()[0]
-                                                                    << "x" << tensor->shape()[1]);
-            }
-        }
-        else
-        {
-            num_gpu_packed_++;
-            // For GPU, do NOT release raw data!
-            // The tensor coherence system (ensureOnDevice) still needs the host data
-            // to upload to GPU buffers during stage execution.
-            LOG_TRACE("[WeightManager] GPU weight packed (keeping raw data): "
-                      << tensor->shape()[0] << "x" << tensor->shape()[1]);
-        }
-
-        return true;
     }
 
     bool WeightManager::uploadNonGemmWeights(DeviceId target_device)
@@ -2534,12 +2827,17 @@ namespace llaminar2
         size_t released_count = 0;
         size_t skipped_count = 0;
         size_t error_count = 0;
+        size_t released_bytes = 0;
+        size_t retained_bytes = 0;
+        size_t retained_count = 0;
         std::unordered_set<TensorBase *> visited_ptrs;
 
-        auto try_release = [&](TensorBase *ptr)
+        auto try_release = [&](TensorBase *ptr, const std::string &key)
         {
             if (!ptr || !visited_ptrs.insert(ptr).second)
                 return; // null or already visited
+
+            const size_t tensor_bytes = ptr->is_raw_data_released() ? 0 : ptr->size_bytes();
 
             // Skip tensors that are already released
             if (ptr->is_raw_data_released())
@@ -2549,24 +2847,44 @@ namespace llaminar2
             }
 
             // Release host data for tensors that have valid GPU data OR
-            // kernel-managed device data (GEMM packed weights). GEMM kernels
-            // upload pre-packed representations to their own device buffers and
-            // never read the raw TensorBase data, so the host copy can be freed.
+            // kernel-managed device data (GEMM packed weights, prepared embedding).
+            // GEMM kernels upload pre-packed representations to their own device
+            // buffers and never read the raw TensorBase data, so the host copy can
+            // be freed. Similarly, PreparedEmbeddingWeights hold their own GPU copy.
             if (!ptr->deviceValid())
             {
                 // Check if kernel has its own device copy (CUDA/ROCm packed weights)
                 bool has_kernel_device_data =
                     ptr->hasCachedDeviceData(DeviceType::CUDA) ||
                     ptr->hasCachedDeviceData(DeviceType::ROCm);
+
+                // Check if tensor has PreparedEmbeddingWeights (embedding table).
+                // Since we don't know which device the weights are prepared for,
+                // check if it's a host-resident tensor with prepared embeddings
+                // existing in the registry.
+                if (!has_kernel_device_data && ptr->isHostResident())
+                {
+                    has_kernel_device_data = getPreparedEmbeddingCount() > 0;
+                }
                 if (!has_kernel_device_data)
                 {
                     skipped_count++;
+                    retained_bytes += tensor_bytes;
+                    retained_count++;
+                    LOG_DEBUG("[WeightManager] RETAINED host data for " << key
+                                                                        << " (" << (tensor_bytes / 1024) << " KB)"
+                                                                        << " deviceValid=" << ptr->deviceValid()
+                                                                        << " hasCUDA=" << ptr->hasCachedDeviceData(DeviceType::CUDA)
+                                                                        << " hasROCm=" << ptr->hasCachedDeviceData(DeviceType::ROCm)
+                                                                        << " hostResident=" << ptr->isHostResident()
+                                                                        << " type=" << static_cast<int>(ptr->native_type()));
                     return;
                 }
             }
 
             try
             {
+                released_bytes += tensor_bytes;
                 ptr->release_host_weight_data();
                 released_count++;
             }
@@ -2582,18 +2900,75 @@ namespace llaminar2
         // Sweep main cache
         for (auto &[name, tensor] : cache_)
         {
-            try_release(tensor.get());
+            try_release(tensor.get(), name);
         }
 
         // Sweep per-device cache (clones for multi-GPU)
         for (auto &[key, tensor] : per_device_cache_)
         {
-            try_release(tensor.get());
+            try_release(tensor.get(), key);
         }
 
         LOG_INFO("[WeightManager] Released host weight data: " << released_count
-                                                               << " tensors released, " << skipped_count
-                                                               << " already released, " << error_count << " errors");
+                                                               << " tensors (" << (released_bytes / (1024 * 1024)) << " MB) released, "
+                                                               << retained_count << " tensors (" << (retained_bytes / (1024 * 1024)) << " MB) retained, "
+                                                               << skipped_count << " already released, " << error_count << " errors"
+                                                               << " | cache=" << cache_.size()
+                                                               << " per_device=" << per_device_cache_.size()
+                                                               << " decode=" << decode_cache_.size());
+        return released_count;
+    }
+
+    size_t WeightManager::getPreparedEmbeddingCount() const
+    {
+        using namespace llaminar::v2::kernels;
+        return KernelFactory::preparedEmbeddingRegistrySize();
+    }
+
+    size_t WeightManager::releaseHostResidentWeightData()
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        size_t released_count = 0;
+        size_t released_bytes = 0;
+        std::unordered_set<TensorBase *> visited_ptrs;
+
+        auto try_release = [&](TensorBase *ptr, const std::string &key)
+        {
+            if (!ptr || !visited_ptrs.insert(ptr).second)
+                return;
+            if (ptr->is_raw_data_released())
+                return;
+            if (!ptr->isHostResident())
+                return;
+
+            size_t tensor_bytes = ptr->size_bytes();
+            ptr->release_host_weight_data();
+            released_bytes += tensor_bytes;
+            released_count++;
+            LOG_INFO("[WeightManager] Released host-resident weight: " << key
+                                                                       << " (" << (tensor_bytes / (1024 * 1024)) << " MB)");
+        };
+
+        for (auto &[name, tensor] : cache_)
+        {
+            try_release(tensor.get(), name);
+        }
+
+        for (auto &[key, tensor] : per_device_cache_)
+        {
+            try_release(tensor.get(), key);
+        }
+
+        if (released_count > 0)
+        {
+            LOG_INFO("[WeightManager] Post-upload host-resident release: "
+                     << released_count << " tensors (" << (released_bytes / (1024 * 1024)) << " MB) freed");
+#if defined(__GLIBC__)
+            ::malloc_trim(0);
+#endif
+        }
+
         return released_count;
     }
 
@@ -2790,6 +3165,23 @@ namespace llaminar2
             out_count = assignment.vocab_count;
             LOG_TRACE("[WeightManager] " << name << " (Vocab): vocab=["
                                          << out_start << ", " << (out_start + out_count) << ")");
+            return true;
+        }
+
+        case WeightDimensionType::ProportionalHeads:
+        {
+            const int total_heads = tp_config_->totalHeads();
+            if (total_heads <= 0)
+            {
+                LOG_ERROR("[WeightManager] Invalid total_heads for ProportionalHeads slicing");
+                return false;
+            }
+            out_start = total_size * static_cast<size_t>(assignment.head_start) / static_cast<size_t>(total_heads);
+            const size_t end = total_size * static_cast<size_t>(assignment.head_start + assignment.head_count) / static_cast<size_t>(total_heads);
+            out_count = end - out_start;
+            LOG_TRACE("[WeightManager] " << name << " (ProportionalHeads): total_heads=" << total_heads
+                                         << " weight_size=" << total_size
+                                         << " -> [" << out_start << ", " << (out_start + out_count) << ")");
             return true;
         }
 
@@ -3206,13 +3598,39 @@ namespace llaminar2
         switch (mode)
         {
         case ShardingMode::REPLICATE:
-            result = getReplicatedWeight(name, device);
+        {
+            // For host-resident REPLICATE weights (e.g., token_embd.weight),
+            // all devices share identical host data — no clone needed.
+            // Non-host-resident REPLICATE weights (norms, biases) need per-device
+            // clones because each device calls ensureOnDevice() which allocates
+            // separate GPU memory and releaseAllHostWeightData() may free host data
+            // after the first device uploads (breaking the second device's upload).
+            auto cached_it = cache_.find(name);
+            if (cached_it != cache_.end() && cached_it->second &&
+                cached_it->second->isHostResident())
+            {
+                result = cached_it->second;
+                LOG_DEBUG("[WeightManager] Sharing host-resident REPLICATE weight: " << name
+                                                                                     << " for " << device.to_string()
+                                                                                     << " (" << (result->size_bytes() / (1024 * 1024)) << " MB)");
+            }
+            else
+            {
+                result = getReplicatedWeight(name, device);
+                // Cache in cache_ so subsequent devices can find and share
+                // host-resident tensors (e.g., token_embd.weight).
+                if (result)
+                {
+                    cache_[name] = result;
+                }
+            }
             if (result)
             {
                 LOG_TRACE("[WeightManager] Device " << device.to_string()
                                                     << " gets REPLICATED weight: " << name);
             }
             break;
+        }
 
         case ShardingMode::COLUMN_PARALLEL:
         {

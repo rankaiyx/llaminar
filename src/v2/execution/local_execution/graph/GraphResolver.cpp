@@ -156,6 +156,15 @@ namespace llaminar2
         {
             result.stages.push_back(std::move(*embedding_stage));
             result.stats.stages_emitted++;
+
+            // Vocab-parallel embedding needs AllReduce (each device contributes
+            // its vocab slice; out-of-range tokens produce zeros)
+            auto collective = resolveTPCollective(schema.embedding, result.stages.back(), runtime);
+            if (collective)
+            {
+                result.stages.push_back(std::move(*collective));
+                result.stats.stages_emitted++;
+            }
         }
         else
         {

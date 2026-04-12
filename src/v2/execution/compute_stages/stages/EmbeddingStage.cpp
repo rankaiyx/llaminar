@@ -476,8 +476,11 @@ namespace llaminar2
             return {};
 
         auto contract = StageBufferContract::build()
-            .addOutput(*params_.output_buffer_id);
-        // Embedding table is a model weight, not arena-managed
+                            .addOutput(*params_.output_buffer_id);
+        // Embedding table is a model weight, not arena-managed.
+        // On GPU, it is marked HOST_RESIDENT (MemoryResidency::HOST_RESIDENT)
+        // so ensureOnDevice() is a no-op — the kernel reads host data once
+        // to repack into a device workspace (EmbedQ8).
         if (params_.embed_table)
             contract.addWeight(const_cast<ITensor *>(params_.embed_table));
         return contract;

@@ -42,6 +42,152 @@ namespace llaminar2
     namespace detail
     {
         /**
+         * @brief Internal: Get maximum supported basic CPUID leaf
+         */
+        inline uint32_t max_basic_cpuid_leaf()
+        {
+            uint32_t regs[4];
+            cpuid(0, 0, regs);
+            return regs[0]; // EAX = max basic leaf
+        }
+
+        /**
+         * @brief Internal: Get maximum supported extended CPUID leaf
+         */
+        inline uint32_t max_extended_cpuid_leaf()
+        {
+            uint32_t regs[4];
+            cpuid(0x80000000, 0, regs);
+            return regs[0]; // EAX = max extended leaf
+        }
+
+        /**
+         * @brief Internal: Detect cache size for a given cache level using
+         *        Intel leaf 0x04 or AMD extended leaf 0x8000001D.
+         *
+         * Both leaves use the same register format:
+         *   EAX[4:0]  = Cache Type (1=Data, 2=Instruction, 3=Unified, 0=Null)
+         *   EAX[7:5]  = Cache Level (1=L1, 2=L2, 3=L3)
+         *   EBX[11:0] = Line Size - 1
+         *   EBX[21:12]= Partitions - 1
+         *   EBX[31:22]= Associativity (Ways) - 1
+         *   ECX       = Number of Sets - 1
+         *   EAX[31:26]= Max cores in package - 1 (Intel leaf 0x04 only)
+         *
+         * @param target_level Cache level to find (1=L1, 2=L2, 3=L3)
+         * @param data_only If true, match only Data caches (type 1); if false,
+         *        match Data or Unified (types 1 and 3)
+         * @param[out] out_size Cache size in bytes
+         * @param[out] out_max_cores_in_pkg If non-null and Intel leaf 0x04 was used,
+         *        set to EAX[31:26]+1 (max addressable core IDs in package)
+         * @return true if cache level was found, false if not detected
+         */
+        inline bool detect_cache_by_level(int target_level, bool data_only,
+                                          uint32_t &out_size,
+                                          uint32_t *out_max_cores_in_pkg = nullptr)
+        {
+            // Ordered: try Intel 0x04 first (more fields), then AMD 0x8000001D
+            struct LeafInfo { uint32_t leaf; uint32_t min_supported; bool is_extended; };
+            const LeafInfo leaves[] = {
+                {0x04, 4, false},            // Intel Deterministic Cache Parameters
+                {0x8000001D, 0x8000001D, true} // AMD Cache Topology
+            };
+
+            uint32_t max_basic = max_basic_cpuid_leaf();
+            uint32_t max_ext = max_extended_cpuid_leaf();
+
+            for (const auto &li : leaves)
+            {
+                // Check if this leaf is supported
+                if (li.is_extended)
+                {
+                    if (max_ext < li.min_supported)
+                        continue;
+                }
+                else
+                {
+                    if (max_basic < li.min_supported)
+                        continue;
+                }
+
+                for (uint32_t subleaf = 0; subleaf < 16; ++subleaf)
+                {
+                    uint32_t regs[4];
+                    cpuid(li.leaf, subleaf, regs);
+
+                    uint32_t cache_type = regs[0] & 0x1F;
+                    if (cache_type == 0)
+                        break; // No more cache levels at this leaf
+
+                    uint32_t cache_level = (regs[0] >> 5) & 0x7;
+
+                    bool type_match = data_only
+                                         ? (cache_type == 1)
+                                         : (cache_type == 1 || cache_type == 3);
+
+                    if (cache_level == static_cast<uint32_t>(target_level) && type_match)
+                    {
+                        uint32_t ways = ((regs[1] >> 22) & 0x3FF) + 1;
+                        uint32_t partitions = ((regs[1] >> 12) & 0x3FF) + 1;
+                        uint32_t line_size = (regs[1] & 0xFFF) + 1;
+                        uint32_t sets = regs[2] + 1;
+
+                        out_size = ways * partitions * line_size * sets;
+
+                        // EAX[31:26] = max cores in package (Intel leaf 0x04 only)
+                        if (out_max_cores_in_pkg && !li.is_extended)
+                            *out_max_cores_in_pkg = ((regs[0] >> 26) & 0x3F) + 1;
+
+                        return true;
+                    }
+                }
+            }
+
+            return false; // Not detected by any leaf
+        }
+
+        /**
+         * @brief Internal: Get physical core count per package
+         *
+         * Tries, in order:
+         *   1. Intel CPUID leaf 0x04 EAX[31:26]+1 (from any cache subleaf)
+         *   2. AMD CPUID leaf 0x80000008 ECX[7:0]+1
+         *   3. CPUID leaf 0x01 EBX[23:16] / 2 (fallback, assumes SMT-2)
+         */
+        inline uint32_t detect_physical_cores_per_package()
+        {
+            uint32_t regs[4];
+
+            // Method 1: Intel leaf 0x04 — EAX[31:26]+1 from any valid subleaf
+            if (max_basic_cpuid_leaf() >= 4)
+            {
+                cpuid(0x04, 0, regs);
+                uint32_t cache_type = regs[0] & 0x1F;
+                if (cache_type != 0)
+                {
+                    uint32_t cores = ((regs[0] >> 26) & 0x3F) + 1;
+                    if (cores > 0)
+                        return cores;
+                }
+            }
+
+            // Method 2: AMD leaf 0x80000008 — ECX[7:0]+1
+            if (max_extended_cpuid_leaf() >= 0x80000008)
+            {
+                cpuid(0x80000008, 0, regs);
+                uint32_t cores = (regs[2] & 0xFF) + 1;
+                if (cores > 1) // Sanity check: 0 means "use leaf 1"
+                    return cores;
+            }
+
+            // Method 3: Fallback — CPUID.1 EBX[23:16] / 2
+            cpuid(0x01, 0, regs);
+            uint32_t logical = (regs[1] >> 16) & 0xFF;
+            uint32_t physical = logical / 2;
+            return (physical > 0) ? physical : 1;
+        }
+
+        /**
          * @brief Internal: Perform actual AVX512 detection (called once)
          */
         inline bool detect_avx512()
@@ -282,12 +428,17 @@ namespace llaminar2
 
     /**
      * @brief Check if CPU supports SSE4.1
+     * @note Result is cached on first call - no cpuid overhead on subsequent calls
      */
     inline bool cpu_supports_sse41()
     {
-        uint32_t regs[4];
-        cpuid(1, 0, regs);
-        return (regs[2] & (1 << 19)) != 0; // ECX bit 19 = SSE4.1
+        static const bool result = []
+        {
+            uint32_t regs[4];
+            cpuid(1, 0, regs);
+            return (regs[2] & (1 << 19)) != 0; // ECX bit 19 = SSE4.1
+        }();
+        return result;
     }
 
     /**
@@ -334,48 +485,104 @@ namespace llaminar2
 
     /**
      * @brief Check if CPU supports AMX-BF16
-     * @note AMX-BF16 is supported on Intel Sapphire Rapids (4th gen Xeon) and later
+     * @note AMX-BF16 is supported on Intel Sapphire Rapids (4th gen Xeon) and later.
+     *       Checks both CPUID feature bit AND OS support via XCR0 bits 17-18.
      */
     inline bool cpu_supports_amx_bf16()
     {
-        uint32_t regs[4];
-        cpuid(7, 0, regs);
-        return (regs[3] & (1 << 22)) != 0; // EDX bit 22 = AMX_BF16
+        static const bool result = []
+        {
+            // Check OSXSAVE first
+            uint32_t regs[4];
+            cpuid(1, 0, regs);
+            bool osxsave = (regs[2] & (1 << 27)) != 0;
+            if (!osxsave)
+                return false;
+
+            // Check XCR0 for AMX tile state (bits 17=XTILECFG, 18=XTILEDATA)
+            uint32_t xcr0_lo, xcr0_hi;
+#if defined(_MSC_VER)
+            uint64_t xcr0_full = _xgetbv(0);
+            xcr0_lo = static_cast<uint32_t>(xcr0_full);
+            xcr0_hi = static_cast<uint32_t>(xcr0_full >> 32);
+#elif defined(__GNUC__) || defined(__clang__)
+            __asm__ __volatile__("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+#else
+            return false;
+#endif
+            // AMX requires bits 17 (XTILECFG) and 18 (XTILEDATA)
+            constexpr uint32_t AMX_MASK = (1u << 17) | (1u << 18);
+            if ((xcr0_lo & AMX_MASK) != AMX_MASK)
+                return false;
+
+            // Check CPUID for AMX-BF16
+            cpuid(7, 0, regs);
+            return (regs[3] & (1 << 22)) != 0; // EDX bit 22 = AMX_BF16
+        }();
+        return result;
     }
 
     /**
      * @brief Check if CPU supports AMX-INT8
-     * @note AMX-INT8 is supported on Intel Sapphire Rapids (4th gen Xeon) and later
+     * @note AMX-INT8 is supported on Intel Sapphire Rapids (4th gen Xeon) and later.
+     *       Checks both CPUID feature bit AND OS support via XCR0 bits 17-18.
      */
     inline bool cpu_supports_amx_int8()
     {
-        uint32_t regs[4];
-        cpuid(7, 0, regs);
-        return (regs[3] & (1 << 25)) != 0; // EDX bit 25 = AMX_INT8
+        static const bool result = []
+        {
+            // Check OSXSAVE first
+            uint32_t regs[4];
+            cpuid(1, 0, regs);
+            bool osxsave = (regs[2] & (1 << 27)) != 0;
+            if (!osxsave)
+                return false;
+
+            // Check XCR0 for AMX tile state (bits 17=XTILECFG, 18=XTILEDATA)
+            uint32_t xcr0_lo, xcr0_hi;
+#if defined(_MSC_VER)
+            uint64_t xcr0_full = _xgetbv(0);
+            xcr0_lo = static_cast<uint32_t>(xcr0_full);
+            xcr0_hi = static_cast<uint32_t>(xcr0_full >> 32);
+#elif defined(__GNUC__) || defined(__clang__)
+            __asm__ __volatile__("xgetbv" : "=a"(xcr0_lo), "=d"(xcr0_hi) : "c"(0));
+#else
+            return false;
+#endif
+            constexpr uint32_t AMX_MASK = (1u << 17) | (1u << 18);
+            if ((xcr0_lo & AMX_MASK) != AMX_MASK)
+                return false;
+
+            // Check CPUID for AMX-INT8
+            cpuid(7, 0, regs);
+            return (regs[3] & (1 << 25)) != 0; // EDX bit 25 = AMX_INT8
+        }();
+        return result;
     }
 
     /**
      * @brief Detect CPU vendor
      * @return "GenuineIntel" for Intel, "AuthenticAMD" for AMD, or other vendor string
+     * @note Thread-safe via C++11 static local initialization guarantee
      */
     inline const char *cpu_vendor()
     {
-        static char vendor[13] = {0};
-        static bool detected = false;
-
-        if (!detected)
+        struct VendorString
         {
-            uint32_t regs[4];
-            cpuid(0, 0, regs);
-            // EBX, EDX, ECX contain 12-character vendor string
-            *reinterpret_cast<uint32_t *>(vendor + 0) = regs[1]; // EBX
-            *reinterpret_cast<uint32_t *>(vendor + 4) = regs[3]; // EDX
-            *reinterpret_cast<uint32_t *>(vendor + 8) = regs[2]; // ECX
-            vendor[12] = '\0';
-            detected = true;
-        }
-
-        return vendor;
+            char str[13];
+            VendorString()
+            {
+                uint32_t regs[4];
+                cpuid(0, 0, regs);
+                // EBX, EDX, ECX contain 12-character vendor string
+                *reinterpret_cast<uint32_t *>(str + 0) = regs[1]; // EBX
+                *reinterpret_cast<uint32_t *>(str + 4) = regs[3]; // EDX
+                *reinterpret_cast<uint32_t *>(str + 8) = regs[2]; // ECX
+                str[12] = '\0';
+            }
+        };
+        static const VendorString vendor;
+        return vendor.str;
     }
 
     /**
@@ -391,191 +598,107 @@ namespace llaminar2
     }
 
     /**
+     * @brief Check if CPU is AMD
+     */
+    inline bool cpu_is_amd()
+    {
+        const char *vendor = cpu_vendor();
+        return vendor[0] == 'A' && vendor[1] == 'u' && vendor[2] == 't' &&
+               vendor[3] == 'h' && vendor[4] == 'e' && vendor[5] == 'n' &&
+               vendor[6] == 't' && vendor[7] == 'i' && vendor[8] == 'c' &&
+               vendor[9] == 'A' && vendor[10] == 'M' && vendor[11] == 'D';
+    }
+
+    /**
      * @brief Get L1 data cache size in bytes (per core)
      * @return L1 data cache size in bytes, or 32KB if unknown
      *
-     * Uses CPUID leaf 0x04 (Intel Deterministic Cache Parameters)
-     * Iterates through cache levels to find L1 data cache.
+     * Uses CPUID leaf 0x04 (Intel) or 0x8000001D (AMD) for detection.
      *
      * Typical values:
      *   - Intel Xeon: 32KB per core
-     *   - AMD EPYC: 32KB per core
+     *   - AMD EPYC: 32KB per core (Zen 3/4), 48KB per core (Zen 5)
      */
     inline uint32_t cpu_l1_cache_size()
     {
-        static uint32_t cached_size = 0;
-        static bool detected = false;
-
-        if (detected)
-            return cached_size;
-
-        // CPUID leaf 0x04: Deterministic Cache Parameters (Intel)
-        for (uint32_t subleaf = 0; subleaf < 16; ++subleaf)
+        static const uint32_t cached_size = []
         {
-            uint32_t regs[4];
-            cpuid(0x04, subleaf, regs);
-
-            // EAX[4:0] = Cache Type (1=Data, 2=Instruction, 3=Unified)
-            uint32_t cache_type = regs[0] & 0x1F;
-            if (cache_type == 0)
-                break; // No more cache levels
-
-            // EAX[7:5] = Cache Level (1=L1, 2=L2, 3=L3)
-            uint32_t cache_level = (regs[0] >> 5) & 0x7;
-
-            // Look for L1 data cache (level 1, data type)
-            if (cache_level == 1 && cache_type == 1)
-            {
-                // Cache size = (Ways + 1) × (Partitions + 1) × (Line Size + 1) × (Sets + 1)
-                uint32_t ways = ((regs[1] >> 22) & 0x3FF) + 1;       // EBX[31:22]
-                uint32_t partitions = ((regs[1] >> 12) & 0x3FF) + 1; // EBX[21:12]
-                uint32_t line_size = (regs[1] & 0xFFF) + 1;          // EBX[11:0]
-                uint32_t sets = regs[2] + 1;                         // ECX
-
-                cached_size = ways * partitions * line_size * sets;
-                detected = true;
-                return cached_size;
-            }
-        }
-
-        // Fallback: couldn't detect, assume conservative 32KB
-        cached_size = 32 * 1024;
-        detected = true;
+            uint32_t size = 0;
+            if (detail::detect_cache_by_level(1, /*data_only=*/true, size))
+                return size;
+            return static_cast<uint32_t>(32 * 1024); // Fallback: 32KB
+        }();
         return cached_size;
     }
 
     /**
      * @brief Get L2 cache size in bytes (per core)
-     * @return L2 cache size in bytes, or 0 if unknown
+     * @return L2 cache size in bytes, or 256KB if unknown
      *
-     * Uses CPUID leaf 0x04 (Intel Deterministic Cache Parameters)
-     * Iterates through cache levels to find L2 cache.
+     * Uses CPUID leaf 0x04 (Intel) or 0x8000001D (AMD) for detection.
      *
-     * For Xeon Gold 6238R: Returns 1048576 (1MB per core)
-     * Note: Total L2 per socket = 28MB (28 cores × 1MB)
+     * Typical values:
+     *   - Intel Xeon Gold 6238R: 1MB per core
+     *   - AMD EPYC 9004 (Zen 4): 1MB per core
+     *   - AMD EPYC 9005 (Zen 5): 1MB per core
      */
     inline uint32_t cpu_l2_cache_size()
     {
-        static uint32_t cached_size = 0;
-        static bool detected = false;
-
-        if (detected)
-            return cached_size;
-
-        // CPUID leaf 0x04: Deterministic Cache Parameters (Intel)
-        // Iterate through cache levels (ECX = subleaf index)
-        for (uint32_t subleaf = 0; subleaf < 16; ++subleaf)
+        static const uint32_t cached_size = []
         {
-            uint32_t regs[4];
-            cpuid(0x04, subleaf, regs);
-
-            // EAX[4:0] = Cache Type (1=Data, 2=Instruction, 3=Unified)
-            uint32_t cache_type = regs[0] & 0x1F;
-            if (cache_type == 0)
-                break; // No more cache levels
-
-            // EAX[7:5] = Cache Level (1=L1, 2=L2, 3=L3)
-            uint32_t cache_level = (regs[0] >> 5) & 0x7;
-
-            // Look for L2 cache (level 2, unified or data)
-            if (cache_level == 2 && (cache_type == 1 || cache_type == 3))
-            {
-                // Cache size = (Ways + 1) × (Partitions + 1) × (Line Size + 1) × (Sets + 1)
-                uint32_t ways = ((regs[1] >> 22) & 0x3FF) + 1;       // EBX[31:22]
-                uint32_t partitions = ((regs[1] >> 12) & 0x3FF) + 1; // EBX[21:12]
-                uint32_t line_size = (regs[1] & 0xFFF) + 1;          // EBX[11:0]
-                uint32_t sets = regs[2] + 1;                         // ECX
-
-                cached_size = ways * partitions * line_size * sets;
-                detected = true;
-                return cached_size;
-            }
-        }
-
-        // Fallback: couldn't detect, assume conservative 256KB
-        cached_size = 256 * 1024;
-        detected = true;
+            uint32_t size = 0;
+            if (detail::detect_cache_by_level(2, /*data_only=*/false, size))
+                return size;
+            return static_cast<uint32_t>(256 * 1024); // Fallback: 256KB
+        }();
         return cached_size;
     }
 
     /**
      * @brief Get L3 cache size in bytes (shared across all cores)
-     * @return L3 cache size in bytes, or 0 if unknown
+     * @return L3 cache size in bytes, or 8MB if unknown
      *
-     * For Xeon Gold 6238R: Returns ~39MB (shared L3)
+     * Uses CPUID leaf 0x04 (Intel) or 0x8000001D (AMD) for detection.
+     *
+     * Typical values:
+     *   - Intel Xeon Gold 6238R: ~39MB (shared)
+     *   - AMD EPYC 9004 (Zen 4): 32-384MB depending on SKU
+     *
+     * Note: AMD Zen reports L3 per-CCD (e.g., 32MB per CCD), not total.
+     * The value returned is the L3 slice visible to this core's topology.
      */
     inline uint32_t cpu_l3_cache_size()
     {
-        static uint32_t cached_size = 0;
-        static bool detected = false;
-
-        if (detected)
-            return cached_size;
-
-        // CPUID leaf 0x04: Deterministic Cache Parameters (Intel)
-        for (uint32_t subleaf = 0; subleaf < 16; ++subleaf)
+        static const uint32_t cached_size = []
         {
-            uint32_t regs[4];
-            cpuid(0x04, subleaf, regs);
-
-            uint32_t cache_type = regs[0] & 0x1F;
-            if (cache_type == 0)
-                break;
-
-            uint32_t cache_level = (regs[0] >> 5) & 0x7;
-
-            // Look for L3 cache (level 3, unified)
-            if (cache_level == 3 && (cache_type == 1 || cache_type == 3))
-            {
-                uint32_t ways = ((regs[1] >> 22) & 0x3FF) + 1;
-                uint32_t partitions = ((regs[1] >> 12) & 0x3FF) + 1;
-                uint32_t line_size = (regs[1] & 0xFFF) + 1;
-                uint32_t sets = regs[2] + 1;
-
-                cached_size = ways * partitions * line_size * sets;
-                detected = true;
-                return cached_size;
-            }
-        }
-
-        // Fallback: couldn't detect, assume conservative 8MB
-        cached_size = 8 * 1024 * 1024;
-        detected = true;
+            uint32_t size = 0;
+            if (detail::detect_cache_by_level(3, /*data_only=*/false, size))
+                return size;
+            return static_cast<uint32_t>(8 * 1024 * 1024); // Fallback: 8MB
+        }();
         return cached_size;
     }
 
     /**
-     * @brief Get total L2 cache per socket (L2 per core × num cores)
+     * @brief Get total L2 cache per socket (L2 per core × physical cores)
      * @return Total L2 cache size in bytes
      *
+     * Uses vendor-appropriate CPUID leaves for core count:
+     *   - Intel: leaf 0x04 EAX[31:26]+1
+     *   - AMD:   leaf 0x80000008 ECX[7:0]+1
+     *   - Fallback: leaf 0x01 EBX[23:16] / 2
+     *
      * For Xeon Gold 6238R with 28 cores: Returns 28MB
-     * This is the actual working set available for NC blocking.
+     * For AMD EPYC 9654 with 96 cores: Returns 96MB
      */
     inline uint32_t cpu_l2_cache_total()
     {
-        static uint32_t cached_size = 0;
-        static bool detected = false;
-
-        if (detected)
-            return cached_size;
-
-        // Get number of logical processors (hyperthreaded cores)
-        uint32_t regs[4];
-        cpuid(0x01, 0, regs);
-        uint32_t logical_processors = (regs[1] >> 16) & 0xFF; // EBX[23:16]
-
-        // For Intel with HT: divide by 2 to get physical cores
-        // For simplicity, use logical_processors as upper bound
-        uint32_t l2_per_core = cpu_l2_cache_size();
-
-        // Conservative estimate: assume half of logical processors are physical cores
-        // (covers HT case without over-estimating)
-        uint32_t estimated_physical_cores = logical_processors / 2;
-        if (estimated_physical_cores == 0)
-            estimated_physical_cores = 1;
-
-        cached_size = l2_per_core * estimated_physical_cores;
-        detected = true;
+        static const uint32_t cached_size = []
+        {
+            uint32_t l2_per_core = cpu_l2_cache_size();
+            uint32_t physical_cores = detail::detect_physical_cores_per_package();
+            return l2_per_core * physical_cores;
+        }();
         return cached_size;
     }
 
@@ -592,6 +715,7 @@ namespace llaminar2
     inline bool cpu_supports_amx_int8() { return false; }
     inline const char *cpu_vendor() { return "Unknown"; }
     inline bool cpu_is_intel() { return false; }
+    inline bool cpu_is_amd() { return false; }
     inline uint32_t cpu_l1_cache_size() { return 32 * 1024; }        // Conservative 32KB
     inline uint32_t cpu_l2_cache_size() { return 256 * 1024; }       // Conservative 256KB
     inline uint32_t cpu_l3_cache_size() { return 8 * 1024 * 1024; }  // Conservative 8MB

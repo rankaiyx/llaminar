@@ -12,6 +12,7 @@
 #include <vector>
 #include <string>
 #include "ComputeBackend.h"
+#include "GPUEnumeration.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -76,6 +77,10 @@ namespace llaminar2
                                           << " (SM " << prop.major << "." << prop.minor
                                           << ", " << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB)");
 
+                // Read PCIe link information from sysfs
+                dev.pcie = pcie_enumeration::read_pcie_link_info(
+                    prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+
                 devices.push_back(dev);
             }
 
@@ -87,14 +92,12 @@ namespace llaminar2
 
         int get_cuda_device_numa_node(int device_id)
         {
-            // Try to get NUMA node from PCI bus location
             cudaDeviceProp prop;
             if (cudaGetDeviceProperties(&prop, device_id) != cudaSuccess)
             {
                 return -1;
             }
 
-            // Read from sysfs: /sys/bus/pci/devices/0000:XX:XX.X/numa_node
             char path[256];
             snprintf(path, sizeof(path), "/sys/bus/pci/devices/%04x:%02x:%02x.0/numa_node",
                      prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
@@ -113,6 +116,39 @@ namespace llaminar2
             fclose(f);
 
             return numa_node;
+        }
+
+        P2PMatrix query_p2p_matrix(const std::vector<ComputeDevice> &devices)
+        {
+            P2PMatrix matrix;
+            matrix.backend = ComputeBackendType::GPU_CUDA;
+            const int n = static_cast<int>(devices.size());
+            matrix.device_ids.resize(n);
+            matrix.can_access.resize(n, std::vector<bool>(n, false));
+
+            for (int i = 0; i < n; ++i)
+            {
+                matrix.device_ids[i] = devices[i].device_id;
+                matrix.can_access[i][i] = true; // self-access always works
+            }
+
+            for (int i = 0; i < n; ++i)
+            {
+                for (int j = 0; j < n; ++j)
+                {
+                    if (i == j)
+                        continue;
+                    int can_access = 0;
+                    cudaError_t err = cudaDeviceCanAccessPeer(&can_access,
+                                                              devices[i].device_id, devices[j].device_id);
+                    if (err == cudaSuccess && can_access)
+                    {
+                        matrix.can_access[i][j] = true;
+                    }
+                }
+            }
+
+            return matrix;
         }
 
     } // namespace cuda_enumeration

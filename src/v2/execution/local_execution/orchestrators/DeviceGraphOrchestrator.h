@@ -1564,6 +1564,8 @@ namespace llaminar2
             // Reset model-internal recurrence state (e.g., GDN conv/recurrence in Qwen3.5)
             if (graph_builder_)
                 graph_builder_->resetState();
+            // Note: host_resident_released_ is NOT reset here —
+            // the host data is gone and cannot be re-uploaded.
             ++session_epoch_;
         }
 
@@ -2043,6 +2045,9 @@ namespace llaminar2
         /// Session epoch counter — incremented on each clear_cache() call
         /// Used to detect stale kernel state across inference sessions
         uint64_t session_epoch_ = 0;
+
+        /// Whether host-resident weight data has been released after first prefill
+        bool host_resident_released_ = false;
 
         /// Reset input-dependent dynamic state on all cached kernels
         /// Implemented in .cpp to avoid including KernelFactory.h in the header

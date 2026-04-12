@@ -593,20 +593,21 @@ TEST_F(Test__GlobalTPContext_MPI, Degree_SameOnAllRanks)
 }
 
 /**
- * @test IsGlobal_AllRanks
- * Verify isGlobal()==true, isLocal()==false on all ranks
+ * @test ScopeReflectsNodePlacement_AllRanks
+ * Verify scope reflects node placement on all ranks.
+ * In a dev container (single node), all ranks are same-node → NODE_LOCAL.
  */
-TEST_F(Test__GlobalTPContext_MPI, IsGlobal_AllRanks)
+TEST_F(Test__GlobalTPContext_MPI, ScopeReflectsNodePlacement_AllRanks)
 {
     auto ctx = createTwoRankContext();
     ASSERT_NE(ctx, nullptr);
 
-    // GlobalTPContext should always be global
-    EXPECT_TRUE(ctx->isGlobal()) << "GlobalTPContext should be global on rank " << world_rank_;
-    EXPECT_FALSE(ctx->isLocal()) << "GlobalTPContext should not be local on rank " << world_rank_;
-
-    // isLocal and isGlobal should be exact inverses
-    EXPECT_EQ(ctx->isGlobal(), !ctx->isLocal());
+    // In a dev container, all MPI ranks are on the same physical node
+    // Auto-detection via MPI_Get_processor_name identifies this and returns NODE_LOCAL
+    EXPECT_FALSE(ctx->isLocal()) << "GlobalTPContext should not be LOCAL (intra-rank) on rank " << world_rank_;
+    EXPECT_TRUE(ctx->isNodeLocal()) << "Same-node ranks should be NODE_LOCAL on rank " << world_rank_;
+    EXPECT_TRUE(ctx->isAllRanksOnSameNode()) << "Dev container has single node";
+    EXPECT_EQ(ctx->nodeCount(), 1) << "Should detect 1 node in dev container";
 }
 
 /**

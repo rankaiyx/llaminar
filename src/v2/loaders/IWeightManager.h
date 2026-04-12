@@ -231,6 +231,44 @@ namespace llaminar2
         // Lifecycle (default no-ops — concrete WeightManager overrides these)
         // =========================================================================
 
+        /**
+         * @brief Complete weight lifecycle for a single device
+         *
+         * Runs the full pack → upload → release sequence:
+         * 1. Pack GEMM weights (prepareWeights + GPU upload)
+         * 2. Upload non-GEMM weights (norms, embeddings)
+         * 3. Release host weight data (if GPU device)
+         *
+         * Call ONCE per device, AFTER all weights are loaded and sharding
+         * is configured. Idempotent — second call is a no-op.
+         *
+         * @param device Target device
+         * @return true on success
+         */
+        virtual bool finalizeForDevice(DeviceId /*device*/) { return true; }
+
+        /**
+         * @brief Complete weight lifecycle for multiple LOCAL TP devices
+         *
+         * Runs the full multi-device sequence:
+         * 1. Clone and upload weights to all devices (preloadForDevices)
+         * 2. Pack GEMM weights per device
+         * 3. Release all host weight data (cache_ + per_device_cache_)
+         *
+         * Call ONCE during MultiDeviceOrchestrator init.
+         *
+         * @param devices List of devices that will use the weights
+         * @return true on success
+         */
+        virtual bool finalizeForDevices(const std::vector<DeviceId> & /*devices*/) { return true; }
+
+        // =========================================================================
+        // Internal Lifecycle (called by finalizeForDevice/finalizeForDevices)
+        // =========================================================================
+        // These methods are public for testability but should NOT be called
+        // directly in production code. Use finalizeForDevice() or
+        // finalizeForDevices() instead.
+
         virtual bool packGemmWeights(
             DeviceId /*target_device*/,
             PreloadProgressCallback /*progress_cb*/ = nullptr,
@@ -241,6 +279,27 @@ namespace llaminar2
         virtual bool preloadForDevices(const std::vector<DeviceId> & /*devices*/) { return true; }
 
         virtual size_t releaseAllHostWeightData() { return 0; }
+
+        /**
+         * @brief Release host data for tensors that were retained as host-resident
+         *
+         * Called after the first forward pass completes, when GPU kernels have
+         * uploaded their own device copies (e.g., embedding repack+upload to workspace).
+         * At that point, the host data is no longer needed.
+         *
+         * @return Number of tensors whose host data was released
+         */
+        virtual size_t releaseHostResidentWeightData() { return 0; }
+
+        /**
+         * @brief Query how many prepared embedding entries exist
+         *
+         * Used by releaseAllHostWeightData() to decide whether host-resident
+         * embedding tensors can be freed (because a GPU-side repack exists).
+         * Override in tests to control release decisions without depending
+         * on KernelFactory static state.
+         */
+        virtual size_t getPreparedEmbeddingCount() const { return 0; }
 
         virtual std::pair<size_t, size_t> preloadStats() const { return {0, 0}; }
     };

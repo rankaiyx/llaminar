@@ -25,6 +25,7 @@
 #include "../local_execution/orchestrators/IMultiDeviceOrchestrator.h"
 #include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
 #include "../../config/PipelineConfig.h"
+#include "../../config/TensorParallelConfig.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/Logger.h"
 #include "../../utils/WeightLoadingProfiler.h"
@@ -196,7 +197,6 @@ namespace llaminar2
         int device_idx)
     {
         const int tp_degree = local_tp_ctx->degree();
-        const auto &weights = local_tp_ctx->weights();
 
         if (device_idx < 0 || device_idx >= tp_degree)
         {
@@ -205,65 +205,50 @@ namespace llaminar2
             return false;
         }
 
-        const float my_weight = weights.empty() ? (1.0f / tp_degree) : weights[device_idx];
+        // Use TensorParallelConfig for consistent head/FFN/vocab distribution.
+        // This ensures the graph config matches the weight slicing exactly
+        // (both use distributeProportionally instead of independent std::round).
+        auto tp_config = TensorParallelConfig::fromLocalTPContext(
+            *local_tp_ctx,
+            graph_config.n_heads,
+            graph_config.n_kv_heads,
+            graph_config.d_ff,
+            graph_config.vocab_size);
 
-        // Accumulate starts from devices before this one
-        int head_start = 0;
-        int kv_head_start = 0;
-        int d_ff_start = 0;
-        int vocab_start = 0;
+        const auto &assignment = tp_config.forRank(device_idx);
 
-        for (int i = 0; i < device_idx; ++i)
-        {
-            float w = weights.empty() ? (1.0f / tp_degree) : weights[i];
-            head_start += static_cast<int>(std::round(w * graph_config.n_heads));
-            kv_head_start += static_cast<int>(std::round(w * graph_config.n_kv_heads));
-            d_ff_start += static_cast<int>(std::round(w * graph_config.d_ff));
-            vocab_start += static_cast<int>(std::round(w * graph_config.vocab_size));
-        }
-
-        // Compute counts for this device
-        int local_n_heads = static_cast<int>(std::round(my_weight * graph_config.n_heads));
-        int local_n_kv_heads = static_cast<int>(std::round(my_weight * graph_config.n_kv_heads));
-        int d_ff_local = static_cast<int>(std::round(my_weight * graph_config.d_ff));
-        int vocab_local = static_cast<int>(std::round(my_weight * graph_config.vocab_size));
-
-        // Handle rounding: last device gets remainder
-        if (device_idx == tp_degree - 1)
-        {
-            local_n_heads = graph_config.n_heads - head_start;
-            local_n_kv_heads = graph_config.n_kv_heads - kv_head_start;
-            d_ff_local = graph_config.d_ff - d_ff_start;
-            vocab_local = graph_config.vocab_size - vocab_start;
-        }
-
-        graph_config.head_start = head_start;
-        graph_config.local_n_heads = local_n_heads;
-        graph_config.local_n_kv_heads = local_n_kv_heads;
+        graph_config.head_start = assignment.head_start;
+        graph_config.local_n_heads = assignment.head_count;
+        graph_config.local_n_kv_heads = assignment.kv_head_count;
         graph_config.qkv_column_parallel = true;
         graph_config.local_rank = device_idx;
 
-        graph_config.d_ff_local = d_ff_local;
+        graph_config.d_ff_local = assignment.d_ff_count;
         graph_config.ffn_column_parallel = true;
 
-        graph_config.vocab_local = vocab_local;
+        graph_config.vocab_local = assignment.vocab_count;
         graph_config.lm_head_column_parallel = true;
 
         // Store TP context for collective operations (polymorphic via ITPContext)
         graph_config.tp_ctx = local_tp_ctx;
         graph_config.tp_device_idx = device_idx;
 
+        // Store the TensorParallelConfig so downstream code can access it
+        graph_config.tp_config = std::make_shared<TensorParallelConfig>(tp_config);
+
         const auto &devices = local_tp_ctx->devices();
+        const auto &weights = local_tp_ctx->weights();
+        const float my_weight = weights.empty() ? (1.0f / tp_degree) : weights[device_idx];
         LOG_INFO("[InferenceRunner] LOCAL TP enabled: degree=" << tp_degree
                                                                << " device_idx=" << device_idx
                                                                << " device=" << devices[device_idx].toString()
                                                                << " weight=" << (my_weight * 100.0f) << "%"
                                                                << " backend=" << static_cast<int>(local_tp_ctx->backend()));
-        LOG_DEBUG("[InferenceRunner] LOCAL TP QKV: head_start=" << head_start
-                                                                << " local_n_heads=" << local_n_heads << "/" << graph_config.n_heads
-                                                                << " local_n_kv_heads=" << local_n_kv_heads << "/" << graph_config.n_kv_heads);
-        LOG_DEBUG("[InferenceRunner] LOCAL TP FFN: d_ff_local=" << d_ff_local << "/" << graph_config.d_ff);
-        LOG_DEBUG("[InferenceRunner] LOCAL TP LMHead: vocab_local=" << vocab_local << "/" << graph_config.vocab_size);
+        LOG_DEBUG("[InferenceRunner] LOCAL TP QKV: head_start=" << assignment.head_start
+                                                                << " local_n_heads=" << assignment.head_count << "/" << graph_config.n_heads
+                                                                << " local_n_kv_heads=" << assignment.kv_head_count << "/" << graph_config.n_kv_heads);
+        LOG_DEBUG("[InferenceRunner] LOCAL TP FFN: d_ff_local=" << assignment.d_ff_count << "/" << graph_config.d_ff);
+        LOG_DEBUG("[InferenceRunner] LOCAL TP LMHead: vocab_local=" << assignment.vocab_count << "/" << graph_config.vocab_size);
 
         return true;
     }
@@ -444,88 +429,6 @@ namespace llaminar2
         }
 
         return true;
-    }
-
-    // =========================================================================
-    // Helper: Preload, pack, and upload weights to target device
-    // =========================================================================
-
-    /**
-     * @brief Pack GEMM weights and upload non-GEMM weights to target device
-     *
-     * For GPU targets, overlaps GEMM packing (async) with non-GEMM upload (sync).
-     * On success with GPU device, releases host-side weight data to free memory.
-     *
-     * @param weight_mgr Weight manager with cached weights
-     * @param device Target device for weight upload
-     * @param log_prefix Log message prefix (e.g., "[InferenceRunner]", "[PPStageRunner]")
-     */
-    static void preloadAndUploadWeights(
-        const std::shared_ptr<WeightManager> &weight_mgr,
-        DeviceId device,
-        const char *log_prefix)
-    {
-        const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
-
-        std::future<bool> gemm_pack_future;
-        const bool overlap_enabled = device.is_gpu();
-
-        if (overlap_enabled)
-        {
-            gemm_pack_future = std::async(std::launch::async, [weight_mgr, device]()
-                                          {
-                ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
-                ScopedWeightLoadDetailTimer detail_timer("weights.gemm_pack.async_work");
-                return weight_mgr->packGemmWeights(device); });
-        }
-
-        bool non_gemm_upload_ok = true;
-        {
-            ScopedWeightLoadTimer timer(WeightLoadPhase::DEVICE_UPLOAD);
-            ScopedWeightLoadDetailTimer detail_timer("weights.non_gemm_upload");
-            non_gemm_upload_ok = weight_mgr->uploadNonGemmWeights(device);
-        }
-
-        bool gemm_pack_ok = true;
-        if (overlap_enabled)
-        {
-            ScopedWeightLoadDetailTimer wait_timer("weights.gemm_pack.async_wait");
-            gemm_pack_ok = gemm_pack_future.get();
-        }
-        else
-        {
-            ScopedWeightLoadTimer timer(WeightLoadPhase::GEMM_PACK);
-            ScopedWeightLoadDetailTimer detail_timer("weights.gemm_pack.sync_work");
-            gemm_pack_ok = weight_mgr->packGemmWeights(device);
-        }
-
-        if (!gemm_pack_ok)
-        {
-            LOG_WARN(log_prefix << " Weight packing failed for device "
-                                << device_name << ", will use lazy kernel creation");
-        }
-        else
-        {
-            LOG_DEBUG(log_prefix << " Packed GEMM weights for " << device_name
-                                 << (overlap_enabled ? " (overlapped)" : ""));
-        }
-
-        if (!non_gemm_upload_ok)
-        {
-            LOG_WARN(log_prefix << " Non-GEMM weight upload failed for device " << device_name);
-        }
-        else
-        {
-            LOG_DEBUG(log_prefix << " Uploaded non-GEMM weights for " << device_name);
-        }
-
-        // Release all host-side weight data now that everything is on GPU.
-        if (device.is_gpu() && gemm_pack_ok && non_gemm_upload_ok)
-        {
-            ScopedWeightLoadDetailTimer release_timer("weights.host_release");
-            size_t released = weight_mgr->releaseAllHostWeightData();
-            LOG_INFO(log_prefix << " Released host weight data: " << released << " tensors");
-        }
     }
 
     // =========================================================================
@@ -753,7 +656,8 @@ namespace llaminar2
                 MPI_COMM_WORLD,
                 /*domain_id=*/0,
                 /*color=*/0, // All ranks in same domain
-                /*key=*/mpi_ctx->rank());
+                /*key=*/mpi_ctx->rank(),
+                config.hostfile);
             if (ctx && ctx->isValid())
             {
                 graph_config.tp_ctx = ctx.get();
@@ -1102,9 +1006,9 @@ namespace llaminar2
         const auto &env = debugEnv();
 
         // =====================================================================
-        // Preload weights: preprocess → GEMM pack → reclaim (atomic per weight)
+        // Finalize weights: GEMM pack → upload → release host copies
         // =====================================================================
-        preloadAndUploadWeights(weight_mgr, device, "[InferenceRunner]");
+        weight_mgr->finalizeForDevice(device);
 
         // Build weights via polymorphic builder (centralizes weight name knowledge)
         auto config_builder = createGraphConfigBuilder(arch);
@@ -1267,9 +1171,9 @@ namespace llaminar2
         LOG_DEBUG("[PPStageRunner] All layer weights for stage loaded into cache");
 
         // =====================================================================
-        // Preload weights for target device (GPU packing/upload)
+        // Finalize weights: GEMM pack → upload → release host copies
         // =====================================================================
-        preloadAndUploadWeights(weight_mgr, device, "[PPStageRunner]");
+        weight_mgr->finalizeForDevice(device);
 
         // =====================================================================
         // Layer weight accessor - returns weights ONLY for this stage's layers
@@ -1923,6 +1827,7 @@ namespace llaminar2
 
             orchestrator->setWeights(weights);
         }
+
         LOG_INFO("[InferenceRunner] Testable DeviceGraphOrchestrator created successfully");
 
         return orchestrator;

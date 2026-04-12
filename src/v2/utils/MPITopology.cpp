@@ -15,14 +15,14 @@
 #include "NUMATopology.h"
 #include "Logger.h"
 #include "DebugEnv.h"
+#include "../backends/HardwareInventory.h"
 #include "../tensors/TensorSlice.h"
 #include "../execution/mpi_orchestration/PlacementStrategy.h"
 
 #include <sstream>
 #include <algorithm>
 #include <numeric>
-#include <unistd.h> // gethostname
-#include <cstring>  // memcpy
+#include <cstring> // memcpy
 
 namespace llaminar2
 {
@@ -76,6 +76,53 @@ namespace llaminar2
             return str;
         }
 
+        // Serialize a vector of ints (length-prefixed)
+        void writeIntVector(std::vector<uint8_t> &buffer, const std::vector<int> &vec)
+        {
+            writeValue(buffer, static_cast<int32_t>(vec.size()));
+            for (int v : vec)
+            {
+                writeValue(buffer, static_cast<int32_t>(v));
+            }
+        }
+
+        // Deserialize a vector of ints
+        std::vector<int> readIntVector(const uint8_t *&ptr, const uint8_t *end)
+        {
+            int32_t count = readValue<int32_t>(ptr, end);
+            std::vector<int> vec;
+            vec.reserve(count);
+            for (int32_t i = 0; i < count; ++i)
+            {
+                vec.push_back(readValue<int32_t>(ptr, end));
+            }
+            return vec;
+        }
+
+        // Serialize a CPUSocketInfo
+        void serializeCPUSocketInfo(std::vector<uint8_t> &buffer, const CPUSocketInfo &info)
+        {
+            writeValue(buffer, static_cast<int32_t>(info.socket_id));
+            writeValue(buffer, static_cast<int32_t>(info.numa_node));
+            writeString(buffer, info.model_name);
+            writeIntVector(buffer, info.physical_cores);
+            writeIntVector(buffer, info.ht_threads);
+            writeValue(buffer, static_cast<uint64_t>(info.memory_bytes));
+        }
+
+        // Deserialize a CPUSocketInfo
+        CPUSocketInfo deserializeCPUSocketInfo(const uint8_t *&ptr, const uint8_t *end)
+        {
+            CPUSocketInfo info;
+            info.socket_id = readValue<int32_t>(ptr, end);
+            info.numa_node = readValue<int32_t>(ptr, end);
+            info.model_name = readString(ptr, end);
+            info.physical_cores = readIntVector(ptr, end);
+            info.ht_threads = readIntVector(ptr, end);
+            info.memory_bytes = readValue<uint64_t>(ptr, end);
+            return info;
+        }
+
         // Serialize a single DeviceInfo
         void serializeDeviceInfo(std::vector<uint8_t> &buffer, const DeviceInfo &info)
         {
@@ -94,6 +141,13 @@ namespace llaminar2
             writeValue(buffer, static_cast<uint8_t>(info.supports_p2p ? 1 : 0));
             writeValue(buffer, static_cast<int32_t>(info.pcie_bus_id));
             writeValue(buffer, static_cast<int32_t>(info.numa_node));
+            // PCIe link info
+            writeValue(buffer, static_cast<int32_t>(info.pcie_gen));
+            writeValue(buffer, static_cast<int32_t>(info.pcie_width));
+            writeValue(buffer, info.pcie_speed_gts);
+            writeValue(buffer, static_cast<int32_t>(info.pcie_max_width));
+            writeValue(buffer, info.pcie_max_speed_gts);
+            writeValue(buffer, static_cast<uint8_t>(info.pcie_degraded ? 1 : 0));
         }
 
         // Deserialize a single DeviceInfo
@@ -115,6 +169,13 @@ namespace llaminar2
             info.supports_p2p = (readValue<uint8_t>(ptr, end) != 0);
             info.pcie_bus_id = readValue<int32_t>(ptr, end);
             info.numa_node = readValue<int32_t>(ptr, end);
+            // PCIe link info
+            info.pcie_gen = readValue<int32_t>(ptr, end);
+            info.pcie_width = readValue<int32_t>(ptr, end);
+            info.pcie_speed_gts = readValue<double>(ptr, end);
+            info.pcie_max_width = readValue<int32_t>(ptr, end);
+            info.pcie_max_speed_gts = readValue<double>(ptr, end);
+            info.pcie_degraded = (readValue<uint8_t>(ptr, end) != 0);
             return info;
         }
     } // anonymous namespace
@@ -150,6 +211,25 @@ namespace llaminar2
             serializeDeviceInfo(buffer, gpu);
         }
 
+        // Write per-socket CPU info
+        writeValue(buffer, static_cast<int32_t>(inventory.cpu_socket_info.size()));
+        for (const auto &sock : inventory.cpu_socket_info)
+        {
+            serializeCPUSocketInfo(buffer, sock);
+        }
+
+        // Write P2P matrices
+        writeValue(buffer, static_cast<int32_t>(inventory.p2p_cuda_count));
+        for (int i = 0; i < static_cast<int>(inventory.p2p_cuda.size()); ++i)
+        {
+            writeValue(buffer, static_cast<uint8_t>(inventory.p2p_cuda[i] ? 1 : 0));
+        }
+        writeValue(buffer, static_cast<int32_t>(inventory.p2p_rocm_count));
+        for (int i = 0; i < static_cast<int>(inventory.p2p_rocm.size()); ++i)
+        {
+            writeValue(buffer, static_cast<uint8_t>(inventory.p2p_rocm[i] ? 1 : 0));
+        }
+
         return buffer;
     }
 
@@ -181,6 +261,36 @@ namespace llaminar2
         for (int32_t i = 0; i < gpu_count; ++i)
         {
             inventory.gpus.push_back(deserializeDeviceInfo(ptr, end));
+        }
+
+        // Read per-socket CPU info (if present — backward compat)
+        if (ptr < end)
+        {
+            int32_t socket_count = readValue<int32_t>(ptr, end);
+            inventory.cpu_socket_info.reserve(socket_count);
+            for (int32_t i = 0; i < socket_count; ++i)
+            {
+                inventory.cpu_socket_info.push_back(deserializeCPUSocketInfo(ptr, end));
+            }
+        }
+
+        // Read P2P matrices (if present — backward compat)
+        if (ptr < end)
+        {
+            inventory.p2p_cuda_count = readValue<int32_t>(ptr, end);
+            int cuda_matrix_size = inventory.p2p_cuda_count * inventory.p2p_cuda_count;
+            inventory.p2p_cuda.resize(cuda_matrix_size);
+            for (int i = 0; i < cuda_matrix_size; ++i)
+            {
+                inventory.p2p_cuda[i] = (readValue<uint8_t>(ptr, end) != 0);
+            }
+            inventory.p2p_rocm_count = readValue<int32_t>(ptr, end);
+            int rocm_matrix_size = inventory.p2p_rocm_count * inventory.p2p_rocm_count;
+            inventory.p2p_rocm.resize(rocm_matrix_size);
+            for (int i = 0; i < rocm_matrix_size; ++i)
+            {
+                inventory.p2p_rocm[i] = (readValue<uint8_t>(ptr, end) != 0);
+            }
         }
 
         return inventory;
@@ -227,12 +337,16 @@ namespace llaminar2
           inter_node_comm_(MPI_COMM_NULL),
           owns_comms_(false) // Don't create communicators in explicit mode
     {
-        // Calculate derived values
-        node_count_ = (world_size_ + ranks_per_node_ - 1) / ranks_per_node_;
+        // Use hostname-based node detection even in explicit mode
+        // All ranks share hostname "explicit", so they all land on node 0
+        std::vector<std::string> hostnames(static_cast<size_t>(world_size), "explicit");
+        auto detection = NodeDetection::fromHostnames(hostnames);
+        rank_node_ids_ = std::move(detection.node_ids);
+        node_count_ = detection.node_count;
 
         // Set placement
         placement_.rank = rank_;
-        placement_.node_id = rank_ / ranks_per_node_;
+        placement_.node_id = rank_node_ids_[rank_];
         placement_.local_rank = rank_ % ranks_per_node_;
         placement_.socket_id = placement_.local_rank; // Assume socket = local_rank
         placement_.numa_node = placement_.socket_id;
@@ -278,6 +392,7 @@ namespace llaminar2
           ranks_per_node_(other.ranks_per_node_),
           compute_participant_(other.compute_participant_),
           placement_(std::move(other.placement_)),
+          rank_node_ids_(std::move(other.rank_node_ids_)),
           all_placements_(std::move(other.all_placements_)),
           world_comm_(other.world_comm_),
           intra_node_comm_(other.intra_node_comm_),
@@ -309,6 +424,7 @@ namespace llaminar2
             ranks_per_node_ = other.ranks_per_node_;
             compute_participant_ = other.compute_participant_;
             placement_ = std::move(other.placement_);
+            rank_node_ids_ = std::move(other.rank_node_ids_);
             all_placements_ = std::move(other.all_placements_);
             world_comm_ = other.world_comm_;
             intra_node_comm_ = other.intra_node_comm_;
@@ -328,10 +444,6 @@ namespace llaminar2
 
     void MPITopology::detect_topology()
     {
-        // Get hostname for this rank
-        char hostname[256];
-        gethostname(hostname, sizeof(hostname));
-        placement_.hostname = hostname;
         placement_.rank = rank_;
 
         // Use MPI_Comm_split_type to identify ranks on same node
@@ -347,11 +459,12 @@ namespace llaminar2
         placement_.local_rank = local_rank;
         ranks_per_node_ = local_size;
 
-        // Calculate node_id: gather local_rank==0 from each node to determine ordering
-        // Simple approach: node_id = rank / ranks_per_node (assumes round-robin assignment)
-        // More robust: use hostname hashing
-        placement_.node_id = rank_ / ranks_per_node_;
-        node_count_ = (world_size_ + ranks_per_node_ - 1) / ranks_per_node_;
+        // Use canonical hostname-based node detection (single source of truth)
+        auto detection = NodeDetection::detect(world_comm_);
+        rank_node_ids_ = std::move(detection.node_ids);
+        node_count_ = detection.node_count;
+        placement_.node_id = rank_node_ids_[rank_];
+        placement_.hostname = detection.hostnames[rank_];
 
         // Store shared comm temporarily for setup_communicators
         intra_node_comm_ = shared_comm;
@@ -514,6 +627,73 @@ namespace llaminar2
                 info.type = DeviceType::ROCm;
                 local_inventory.gpus.push_back(info);
             }
+        }
+
+        // Enrich with actual hardware detection (sysfs, GPU APIs)
+        // This gives us per-socket CPU info, PCIe link details, and P2P matrices
+        auto hw = HardwareInventory::detect();
+        local_inventory.cpu_socket_info = hw.cpu_sockets;
+
+        // Enrich CPU info from detected hardware
+        {
+            int total_cores = 0, total_threads = 0;
+            size_t total_mem = 0;
+            for (const auto &sock : hw.cpu_sockets)
+            {
+                total_cores += sock.num_physical_cores();
+                total_threads += sock.num_threads();
+                total_mem += sock.memory_bytes;
+            }
+            local_inventory.cpu_cores = total_cores;
+            local_inventory.cpu_sockets = static_cast<int>(hw.cpu_sockets.size());
+            local_inventory.cpu_memory_bytes = total_mem;
+            local_inventory.numa_nodes = static_cast<int>(hw.cpu_sockets.size());
+        }
+
+        // Enrich GPU DeviceInfos with real hardware data (PCIe, memory, etc.)
+        for (auto &gpu_info : local_inventory.gpus)
+        {
+            const auto &source = (gpu_info.type == DeviceType::CUDA) ? hw.cuda_devices : hw.rocm_devices;
+            for (const auto &dev : source)
+            {
+                if (dev.device_id == gpu_info.local_device_id)
+                {
+                    gpu_info.name = dev.name;
+                    gpu_info.memory_bytes = dev.total_memory_bytes;
+                    gpu_info.free_memory_bytes = dev.free_memory_bytes;
+                    gpu_info.compute_capability_major = dev.compute_capability / 10;
+                    gpu_info.compute_capability_minor = dev.compute_capability % 10;
+                    gpu_info.numa_node = dev.numa_node;
+                    // PCIe link info
+                    gpu_info.pcie_gen = dev.pcie.pcie_gen;
+                    gpu_info.pcie_width = dev.pcie.link_width;
+                    gpu_info.pcie_speed_gts = dev.pcie.link_speed_gts;
+                    gpu_info.pcie_max_width = dev.pcie.max_width;
+                    gpu_info.pcie_max_speed_gts = dev.pcie.max_speed_gts;
+                    gpu_info.pcie_degraded = dev.pcie.degraded;
+                    break;
+                }
+            }
+        }
+
+        // P2P matrices — flatten for serialization
+        if (hw.cuda_p2p.has_value())
+        {
+            const auto &m = hw.cuda_p2p.value();
+            local_inventory.p2p_cuda_count = m.device_count();
+            local_inventory.p2p_cuda.resize(m.device_count() * m.device_count());
+            for (int i = 0; i < m.device_count(); ++i)
+                for (int j = 0; j < m.device_count(); ++j)
+                    local_inventory.p2p_cuda[i * m.device_count() + j] = m.can_access[i][j];
+        }
+        if (hw.rocm_p2p.has_value())
+        {
+            const auto &m = hw.rocm_p2p.value();
+            local_inventory.p2p_rocm_count = m.device_count();
+            local_inventory.p2p_rocm.resize(m.device_count() * m.device_count());
+            for (int i = 0; i < m.device_count(); ++i)
+                for (int j = 0; j < m.device_count(); ++j)
+                    local_inventory.p2p_rocm[i * m.device_count() + j] = m.can_access[i][j];
         }
 
         // Serialize local inventory
@@ -681,7 +861,13 @@ namespace llaminar2
 
     bool MPITopology::same_node(int rank_a, int rank_b) const
     {
-        return (rank_a / ranks_per_node_) == (rank_b / ranks_per_node_);
+        if (rank_a < 0 || rank_a >= world_size_ ||
+            rank_b < 0 || rank_b >= world_size_ ||
+            rank_node_ids_.empty())
+        {
+            return rank_a == rank_b;
+        }
+        return rank_node_ids_[rank_a] == rank_node_ids_[rank_b];
     }
 
     // =========================================================================

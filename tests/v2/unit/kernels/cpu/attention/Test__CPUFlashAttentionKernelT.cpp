@@ -24,8 +24,10 @@
 
 #include "v2/kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "v2/tensors/Tensors.h"
+#include "v2/tensors/TensorFactory.h"
 #include "v2/utils/CPUFeatures.h"
 #include "v2/utils/DebugEnv.h"
+#include "v2/utils/MPIContext.h"
 
 using namespace llaminar2;
 
@@ -1167,4 +1169,370 @@ TEST_F(Test__CPUFlashAttentionKernelT, Decode_MultiTokenQuery_NoCausal)
     runDecodeAndCompare(4, 20, 4, 2, 64, false, 0,
                         FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
                         "Decode_MultiTokenQuery_NoCausal");
+}
+
+// ===========================================================================
+// 14. GQA with head_start / gqa_n_rep (Tensor Parallel scenarios)
+//
+// These tests validate that when head_start > 0 and gqa_n_rep > 0, the
+// kernel correctly maps local Q heads to global KV heads using the formula:
+//   kv_h = (head_start + h) / gqa_n_rep
+//
+// Without the fix, the kernel uses:
+//   kv_h = h / (n_heads / n_kv_heads)       [WRONG for TP]
+//
+// Scenario modeled: Qwen2.5-0.5B (14 Q heads, 2 KV heads, head_dim=64)
+// with 4-way TP and replicated KV heads:
+//   - Rank 0: local_heads=[0..3],  head_start=0,  n_kv_heads=2, gqa_n_rep=7
+//   - Rank 1: local_heads=[4..7],  head_start=4,  n_kv_heads=2, gqa_n_rep=7
+//   - Rank 2: local_heads=[8..11], head_start=8,  n_kv_heads=2, gqa_n_rep=7
+//   - Rank 3: local_heads=[12,13], head_start=12, n_kv_heads=2, gqa_n_rep=7
+//
+// With gqa_n_rep=7, all heads on rank 0 and 1 should map to KV head 0,
+// while heads on rank 2 and 3 should map to KV head 1.
+// ===========================================================================
+
+/// Reference that accounts for head_start/gqa_n_rep in GQA mapping.
+namespace ref_tp
+{
+    static void attention_tp(
+        const float *Q, const float *K, const float *V, float *O,
+        int seq_len, int kv_len,
+        int n_heads, int n_kv_heads, int head_dim,
+        bool causal, int position_offset,
+        int head_start, int gqa_n_rep)
+    {
+        const int heads_per_kv = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
+        const int q_stride = n_heads * head_dim;
+        const int kv_stride = n_kv_heads * head_dim;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+        for (int h = 0; h < n_heads; ++h)
+        {
+            const int kv_h = (head_start + h) / heads_per_kv;
+            for (int q_pos = 0; q_pos < seq_len; ++q_pos)
+            {
+                const float *q_ptr = Q + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
+                float *out = O + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
+                const int q_abs = position_offset + q_pos;
+
+                std::vector<float> scores(kv_len);
+                for (int k = 0; k < kv_len; ++k)
+                {
+                    const float *k_ptr = K + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+                    bool masked = causal && k > q_abs;
+                    if (masked)
+                    {
+                        scores[k] = -std::numeric_limits<float>::infinity();
+                    }
+                    else
+                    {
+                        float dot = 0.0f;
+                        for (int d = 0; d < head_dim; ++d)
+                            dot += q_ptr[d] * k_ptr[d];
+                        scores[k] = dot * scale;
+                    }
+                }
+
+                float max_s = *std::max_element(scores.begin(), scores.end());
+                float sum_exp = 0.0f;
+                for (int k = 0; k < kv_len; ++k)
+                {
+                    if (std::isfinite(scores[k]))
+                    {
+                        scores[k] = std::exp(scores[k] - max_s);
+                        sum_exp += scores[k];
+                    }
+                    else
+                    {
+                        scores[k] = 0.0f;
+                    }
+                }
+                if (sum_exp > 0.0f)
+                    for (int k = 0; k < kv_len; ++k)
+                        scores[k] /= sum_exp;
+
+                std::fill(out, out + head_dim, 0.0f);
+                for (int k = 0; k < kv_len; ++k)
+                {
+                    if (scores[k] == 0.0f)
+                        continue;
+                    const float *v_ptr = V + static_cast<size_t>(k) * kv_stride + static_cast<size_t>(kv_h) * head_dim;
+                    for (int d = 0; d < head_dim; ++d)
+                        out[d] += scores[k] * v_ptr[d];
+                }
+            }
+        }
+    }
+} // namespace ref_tp
+
+/// Test fixture for TP GQA tests using compute_tensor (ITensorAttention interface).
+class Test__CPUFlashAttention_TP_GQA : public ::testing::Test
+{
+protected:
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> kernel_;
+    MPIContext mpi_ctx_{0, 1, MPI_COMM_WORLD};
+    DeviceId device_id_ = DeviceId::cpu();
+
+    void SetUp() override
+    {
+        rng().seed(42);
+        setenv("LLAMINAR_FLASH_PREFILL_I16_I12", "0", 1);
+        mutableDebugEnv().attention.reload();
+    }
+
+    void TearDown() override
+    {
+        unsetenv("LLAMINAR_FLASH_PREFILL_I16_I12");
+        mutableDebugEnv().attention.reload();
+    }
+
+    /// Run compute_tensor with head_start/gqa_n_rep and compare to TP reference.
+    void runTPAndCompare(
+        int seq_len, int kv_len,
+        int local_n_heads, int local_n_kv_heads, int head_dim,
+        bool causal, int position_offset,
+        int head_start, int gqa_n_rep,
+        float max_abs_tol, float cosine_tol,
+        const char *label)
+    {
+        TensorFactory factory(mpi_ctx_);
+        const size_t q_size = static_cast<size_t>(seq_len) * local_n_heads * head_dim;
+        const size_t kv_size = static_cast<size_t>(kv_len) * local_n_kv_heads * head_dim;
+
+        // Create FP32 tensors
+        auto Q_tensor = factory.createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(local_n_heads * head_dim)}, device_id_);
+        auto K_tensor = factory.createFP32(
+            {static_cast<size_t>(kv_len), static_cast<size_t>(local_n_kv_heads * head_dim)}, device_id_);
+        auto V_tensor = factory.createFP32(
+            {static_cast<size_t>(kv_len), static_cast<size_t>(local_n_kv_heads * head_dim)}, device_id_);
+        auto O_tensor = factory.createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(local_n_heads * head_dim)}, device_id_);
+
+        // Fill with random data
+        fill_random(Q_tensor->mutable_data(), q_size);
+        fill_random(K_tensor->mutable_data(), kv_size);
+        fill_random(V_tensor->mutable_data(), kv_size);
+        std::fill(O_tensor->mutable_data(), O_tensor->mutable_data() + q_size, 0.0f);
+
+        // Call via ITensorAttention::compute_tensor with head_start/gqa_n_rep
+        bool ok = kernel_.compute_tensor(
+            Q_tensor.get(), K_tensor.get(), V_tensor.get(), O_tensor.get(),
+            1,                // batch_size
+            seq_len,          // seq_len
+            kv_len,           // kv_len
+            local_n_heads,    // n_heads (local)
+            local_n_kv_heads, // n_kv_heads (local)
+            head_dim,
+            causal,
+            -1,      // window_size
+            nullptr, // workspace_scores
+            nullptr, // workspace_mask
+            &mpi_ctx_,
+            -1, // device_idx (CPU)
+            head_start,
+            local_n_heads,    // local_n_heads
+            local_n_kv_heads, // local_n_kv_heads
+            gqa_n_rep);
+        ASSERT_TRUE(ok) << label << ": compute_tensor() failed";
+
+        // Reference
+        std::vector<float> out_ref(q_size, 0.0f);
+        ref_tp::attention_tp(
+            Q_tensor->data(), K_tensor->data(), V_tensor->data(), out_ref.data(),
+            seq_len, kv_len,
+            local_n_heads, local_n_kv_heads, head_dim,
+            causal, position_offset,
+            head_start, gqa_n_rep);
+
+        const float *out_kernel = O_tensor->data();
+        ASSERT_TRUE(is_finite(out_kernel, q_size)) << label << ": kernel output has NaN/Inf";
+        ASSERT_TRUE(is_finite(out_ref.data(), q_size)) << label << ": reference output has NaN/Inf";
+
+        float mae = max_abs_error(out_kernel, out_ref.data(), q_size);
+        float cos = cosine_similarity(out_kernel, out_ref.data(), q_size);
+
+        EXPECT_LE(mae, max_abs_tol)
+            << label << ": max abs error " << mae << " > " << max_abs_tol;
+        EXPECT_GE(cos, cosine_tol)
+            << label << ": cosine sim " << cos << " < " << cosine_tol;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// 4x TP Qwen2.5-0.5B scenario: 14 Q heads, 2 KV heads, replicated KV
+// head_dim=64, gqa_n_rep=7 (global ratio = 14/2 = 7)
+// ---------------------------------------------------------------------------
+
+// Rank 0: heads [0..3], head_start=0 → all map to KV head 0
+TEST_F(Test__CPUFlashAttention_TP_GQA, Decode_4xTP_Rank0)
+{
+    runTPAndCompare(1, 32, /*local_n_heads=*/4, /*local_n_kv_heads=*/2, 64,
+                    true, 31, /*head_start=*/0, /*gqa_n_rep=*/7,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Decode_4xTP_Rank0");
+}
+
+// Rank 1: heads [4..6] → KV head 0, head [7] → KV head 1
+// (head_start + h) / gqa_n_rep: (4+0)/7=0, (4+1)/7=0, (4+2)/7=0, (4+3)/7=1
+// This is the critical case: without the fix, the local ratio 4/2=2 would
+// give h/2 → [0,0,1,1], incorrectly splitting heads across KV heads.
+TEST_F(Test__CPUFlashAttention_TP_GQA, Decode_4xTP_Rank1)
+{
+    runTPAndCompare(1, 32, 4, 2, 64,
+                    true, 31, /*head_start=*/4, /*gqa_n_rep=*/7,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Decode_4xTP_Rank1");
+}
+
+// Rank 2: heads [8..11], head_start=8 → all map to KV head 1
+TEST_F(Test__CPUFlashAttention_TP_GQA, Decode_4xTP_Rank2)
+{
+    runTPAndCompare(1, 32, 4, 2, 64,
+                    true, 31, /*head_start=*/8, /*gqa_n_rep=*/7,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Decode_4xTP_Rank2");
+}
+
+// Rank 3: heads [12..13], head_start=12, only 2 heads → all map to KV head 1
+TEST_F(Test__CPUFlashAttention_TP_GQA, Decode_4xTP_Rank3)
+{
+    runTPAndCompare(1, 32, 2, 2, 64,
+                    true, 31, /*head_start=*/12, /*gqa_n_rep=*/7,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Decode_4xTP_Rank3");
+}
+
+// Prefill variant of rank 1 (the critical case)
+TEST_F(Test__CPUFlashAttention_TP_GQA, Prefill_4xTP_Rank1)
+{
+    runTPAndCompare(16, 16, 4, 2, 64,
+                    true, 0, /*head_start=*/4, /*gqa_n_rep=*/7,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Prefill_4xTP_Rank1");
+}
+
+// 2x TP scenario: 14 heads split [7,7], KV column-parallel [1,1]
+// Local ratio 7/1=7 matches global ratio 14/2=7, so no gqa_n_rep needed.
+// With column-parallel KV, head_start=0 on both ranks (Q and KV sharded together).
+// gqa_n_rep=0 means use local ratio, head_start=0 means no global offset.
+TEST_F(Test__CPUFlashAttention_TP_GQA, Decode_2xTP_Rank0_NoGqaNRep)
+{
+    runTPAndCompare(1, 32, 7, 1, 64,
+                    true, 31, /*head_start=*/0, /*gqa_n_rep=*/0,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Decode_2xTP_Rank0_NoGqaNRep");
+}
+
+// 2x TP with REPLICATED KV: 14 heads split [7,7], KV replicated [2,2]
+// Rank 1 has head_start=7, gqa_n_rep=7 (global ratio 14/2=7).
+// Local ratio 7/2=3 differs from global ratio 7, so gqa_n_rep is needed.
+// (head_start + h) / gqa_n_rep: (7+0)/7=1, (7+1)/7=1, ..., (7+6)/7=1
+// → All rank 1 heads map to KV head 1.
+TEST_F(Test__CPUFlashAttention_TP_GQA, Decode_2xTP_Rank1_ReplicatedKV)
+{
+    runTPAndCompare(1, 32, 7, 2, 64,
+                    true, 31, /*head_start=*/7, /*gqa_n_rep=*/7,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Decode_2xTP_Rank1_ReplicatedKV");
+}
+
+// MQA scenario: 8 Q heads, 1 KV head, 4x TP → each rank gets 2 Q heads
+// gqa_n_rep=8 (global ratio). With 1 local KV head, all heads trivially map
+// to kv_h=0 regardless of head_start — this tests the MQA code path works
+// but does NOT verify GQA mapping divergence (see 4xTP tests for that).
+TEST_F(Test__CPUFlashAttention_TP_GQA, Decode_MQA_4xTP_Rank2)
+{
+    runTPAndCompare(1, 64, 2, 1, 64,
+                    true, 63, /*head_start=*/4, /*gqa_n_rep=*/8,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Decode_MQA_4xTP_Rank2");
+}
+
+// Longer KV with head_start — exercises tiled attention with TP mapping
+TEST_F(Test__CPUFlashAttention_TP_GQA, Decode_4xTP_Rank1_LongKV)
+{
+    runTPAndCompare(1, 512, 4, 2, 64,
+                    true, 511, /*head_start=*/4, /*gqa_n_rep=*/7,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Decode_4xTP_Rank1_LongKV");
+}
+
+// head_dim=128 variant (Llama-3 style)
+TEST_F(Test__CPUFlashAttention_TP_GQA, Decode_4xTP_HeadDim128)
+{
+    runTPAndCompare(1, 32, 4, 2, 128,
+                    true, 31, /*head_start=*/4, /*gqa_n_rep=*/7,
+                    FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
+                    "Decode_4xTP_HeadDim128");
+}
+
+// ---------------------------------------------------------------------------
+// Batched prefill with TP GQA: compute_tensor batch_size > 1 path.
+// Verifies that compute_batch() forwards head_start/gqa_n_rep correctly.
+// ---------------------------------------------------------------------------
+TEST_F(Test__CPUFlashAttention_TP_GQA, BatchedPrefill_4xTP_Rank1)
+{
+    const int batch_size = 3;
+    const int seq_len = 8;
+    const int local_n_heads = 4;
+    const int local_n_kv_heads = 2;
+    const int head_dim = 64;
+    const int head_start = 4;
+    const int gqa_n_rep = 7;
+
+    TensorFactory factory(mpi_ctx_);
+    const size_t per_batch_q = static_cast<size_t>(seq_len) * local_n_heads * head_dim;
+    const size_t per_batch_kv = static_cast<size_t>(seq_len) * local_n_kv_heads * head_dim;
+    const size_t total_q = per_batch_q * batch_size;
+    const size_t total_kv = per_batch_kv * batch_size;
+
+    auto Q_tensor = factory.createFP32(
+        {static_cast<size_t>(batch_size * seq_len), static_cast<size_t>(local_n_heads * head_dim)}, device_id_);
+    auto K_tensor = factory.createFP32(
+        {static_cast<size_t>(batch_size * seq_len), static_cast<size_t>(local_n_kv_heads * head_dim)}, device_id_);
+    auto V_tensor = factory.createFP32(
+        {static_cast<size_t>(batch_size * seq_len), static_cast<size_t>(local_n_kv_heads * head_dim)}, device_id_);
+    auto O_tensor = factory.createFP32(
+        {static_cast<size_t>(batch_size * seq_len), static_cast<size_t>(local_n_heads * head_dim)}, device_id_);
+
+    fill_random(Q_tensor->mutable_data(), total_q);
+    fill_random(K_tensor->mutable_data(), total_kv);
+    fill_random(V_tensor->mutable_data(), total_kv);
+    std::fill(O_tensor->mutable_data(), O_tensor->mutable_data() + total_q, 0.0f);
+
+    bool ok = kernel_.compute_tensor(
+        Q_tensor.get(), K_tensor.get(), V_tensor.get(), O_tensor.get(),
+        batch_size, seq_len, seq_len,
+        local_n_heads, local_n_kv_heads, head_dim,
+        true, -1, nullptr, nullptr,
+        &mpi_ctx_, -1,
+        head_start, local_n_heads, local_n_kv_heads, gqa_n_rep);
+    ASSERT_TRUE(ok) << "compute_tensor(batch) failed";
+
+    // Reference: run per-batch with TP-aware GQA mapping
+    std::vector<float> out_ref(total_q, 0.0f);
+    const float *Q_ptr = Q_tensor->data();
+    const float *K_ptr = K_tensor->data();
+    const float *V_ptr = V_tensor->data();
+    for (int b = 0; b < batch_size; ++b)
+    {
+        ref_tp::attention_tp(
+            Q_ptr + b * per_batch_q,
+            K_ptr + b * per_batch_kv,
+            V_ptr + b * per_batch_kv,
+            out_ref.data() + b * per_batch_q,
+            seq_len, seq_len,
+            local_n_heads, local_n_kv_heads, head_dim,
+            true, 0, head_start, gqa_n_rep);
+    }
+
+    const float *out_kernel = O_tensor->data();
+    ASSERT_TRUE(is_finite(out_kernel, total_q)) << "kernel output has NaN/Inf";
+    float mae = max_abs_error(out_kernel, out_ref.data(), total_q);
+    float cos = cosine_similarity(out_kernel, out_ref.data(), total_q);
+
+    EXPECT_LE(mae, FP32_TOLERANCE) << "batch TP: max abs error " << mae;
+    EXPECT_GE(cos, FP32_COSINE_THRESHOLD) << "batch TP: cosine sim " << cos;
 }

@@ -21,6 +21,9 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
 #include "../../common/EmbedQ8Repack.h"
+#include "../../common/PreparedEmbeddingWeights.h"
+#include "../../KernelFactory.h"
+#include <climits>
 #include "../../rope/RoPEDeviceParams.h"
 
 #include <cuda_runtime.h>
@@ -144,6 +147,8 @@ extern "C"
         float *output,
         int num_tokens,
         int d_model,
+        int vocab_size,
+        int vocab_offset,
         cudaStream_t stream);
 
     // Embedding lookup - EmbedQ8 (universal quantized format)
@@ -154,6 +159,8 @@ extern "C"
         int num_tokens,
         int d_model,
         int blocks_per_row,
+        int vocab_size,
+        int vocab_offset,
         cudaStream_t stream);
 }
 
@@ -1121,7 +1128,9 @@ namespace llaminar2
 
         CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::EMBEDDING_LOOKUP);
         cudaError_t err = launch_embedding_lookup(embed_data, token_ids, output,
-                                                  num_tokens, d_model, static_cast<cudaStream_t>(gpu_stream_));
+                                                  num_tokens, d_model,
+                                                  INT_MAX, 0,
+                                                  static_cast<cudaStream_t>(gpu_stream_));
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[CUDAEmbeddingKernelT] Kernel launch failed: %s\n",
@@ -1364,53 +1373,80 @@ namespace llaminar2
         const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(embed_table);
         if (unpackable)
         {
-            void *d_embed_q8 = workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE);
-            if (!d_embed_q8)
-            {
-                fprintf(stderr, "[CUDAEmbeddingKernelT] Workspace buffer '%s' not found\n",
-                        EmbeddingWorkspaceBuffers::EMBED_TABLE);
-                return false;
-            }
+            // --- Preferred path: use PreparedEmbeddingWeights from KernelFactory ---
+            using namespace llaminar::v2::kernels;
+            const DeviceId dev_id = DeviceId::cuda(dev);
+            const auto *prepared = KernelFactory::getPreparedEmbeddingWeights(embed_table, dev_id);
 
-            // Check if we need to repack + upload (first call or different tensor for THIS workspace)
-            bool needs_upload = false;
-            {
-                std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-                auto it = s_workspace_embed_cache_.find(workspace_);
-                needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
-            }
-            if (needs_upload)
-            {
-                // CPU-side repack: any quant format → EmbedQ8Block via IINT8Unpackable
-                auto repacked = repackEmbeddingToQ8(embed_table, d_model);
+            void *d_embed_q8 = nullptr;
+            size_t blocks_per_row = 0;
+            int vocab_offset = 0;
+            int local_vocab_size = static_cast<int>(embed_table->rows());
 
-                err = cudaMemcpy(d_embed_q8, repacked.data.data(), repacked.byte_size,
-                                 cudaMemcpyHostToDevice);
-                if (err != cudaSuccess)
+            if (prepared && prepared->weights && prepared->weights->device_data)
+            {
+                // Fast path: GPU-resident prepared data from weight loading
+                d_embed_q8 = prepared->weights->device_data;
+                blocks_per_row = prepared->weights->blocks_per_row;
+                vocab_offset = static_cast<int>(prepared->weights->vocab_offset);
+                local_vocab_size = static_cast<int>(prepared->weights->vocab_size);
+            }
+            else
+            {
+                // Fallback: workspace-based lazy repack (for tests, CPU-only, etc.)
+                d_embed_q8 = workspace_ ? workspace_->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE) : nullptr;
+                if (!d_embed_q8)
                 {
-                    fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to upload EmbedQ8 data: %s\n",
-                            cudaGetErrorString(err));
+                    fprintf(stderr, "[CUDAEmbeddingKernelT] No prepared embedding weights and no workspace EMBED_TABLE buffer\n");
                     return false;
                 }
 
+                // Check if we need to repack + upload (first call or different tensor for THIS workspace)
+                bool needs_upload = false;
                 {
                     std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
-                    s_workspace_embed_cache_[workspace_] = embed_table;
+                    auto it = s_workspace_embed_cache_.find(workspace_);
+                    needs_upload = (it == s_workspace_embed_cache_.end()) || (it->second != embed_table);
                 }
-                LOG_INFO("[CUDAEmbeddingKernelT] Uploaded EmbedQ8 embedding: "
-                         << tensorTypeName(embed_table->native_type()) << " "
-                         << repacked.vocab_size << "x" << d_model
-                         << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                         << " (" << repacked.blocks_per_row << " blocks/row)"
-                         << " workspace=" << static_cast<void *>(workspace_));
+                if (needs_upload)
+                {
+                    // CPU-side repack: any quant format → EmbedQ8Block via IINT8Unpackable
+                    auto repacked = repackEmbeddingToQ8(embed_table, d_model);
+
+                    err = cudaMemcpy(d_embed_q8, repacked.data.data(), repacked.byte_size,
+                                     cudaMemcpyHostToDevice);
+                    if (err != cudaSuccess)
+                    {
+                        fprintf(stderr, "[CUDAEmbeddingKernelT] Failed to upload EmbedQ8 data: %s\n",
+                                cudaGetErrorString(err));
+                        return false;
+                    }
+
+                    blocks_per_row = repacked.blocks_per_row;
+
+                    {
+                        std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
+                        s_workspace_embed_cache_[workspace_] = embed_table;
+                    }
+                    LOG_INFO("[CUDAEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
+                             << tensorTypeName(embed_table->native_type()) << " "
+                             << repacked.vocab_size << "x" << d_model
+                             << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
+                             << " (" << repacked.blocks_per_row << " blocks/row)");
+                }
+                else
+                {
+                    blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
+                }
             }
 
             // Launch EmbedQ8 kernel
-            size_t blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::EMBEDDING_LOOKUP);
             err = launch_embedding_lookup_q8(d_embed_q8, d_token_ids, d_output,
                                              num_tokens, d_model,
-                                             static_cast<int>(blocks_per_row), static_cast<cudaStream_t>(gpu_stream_));
+                                             static_cast<int>(blocks_per_row),
+                                             local_vocab_size, vocab_offset,
+                                             static_cast<cudaStream_t>(gpu_stream_));
             if (err != cudaSuccess)
             {
                 fprintf(stderr, "[CUDAEmbeddingKernelT] EmbedQ8 kernel failed: %s\n",
@@ -1449,19 +1485,20 @@ namespace llaminar2
         });
 
         // Buffer 2: Embedding table temp [vocab_size × blocks_per_row × sizeof(EmbedQ8Block)]
-        // Used when embedding table is not already on GPU (quantized → EmbedQ8 repack)
-        // Use conservative estimates: vocab_size = 151936 (Qwen2), d_model = k
-        // If k not provided, use 896 (Qwen2.5-0.5B d_model)
-        constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
-        size_t d_model_size = (k > 0) ? static_cast<size_t>(k) : 896;
-        size_t blocks_per_row = (d_model_size + 31) / 32;
-        size_t embed_table_bytes = DEFAULT_VOCAB_SIZE * blocks_per_row * sizeof(EmbedQ8Block);
-        reqs.buffers.push_back({
-            EmbeddingWorkspaceBuffers::EMBED_TABLE,
-            embed_table_bytes,
-            256, // Alignment for CUDA
-            true // Required - needed for quantized embedding tables
-        });
+        // Only needed when PreparedEmbeddingWeights are NOT available (test/fallback path).
+        // When weights are prepared during loading, the prepared data lives in its own
+        // GPU allocation and this workspace buffer is unused.
+        if (llaminar::v2::kernels::KernelFactory::preparedEmbeddingRegistrySize() == 0)
+        {
+            constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
+            size_t d_model_size = (k > 0) ? static_cast<size_t>(k) : 896;
+            size_t blocks_per_row = (d_model_size + 31) / 32;
+            size_t embed_table_bytes = DEFAULT_VOCAB_SIZE * blocks_per_row * sizeof(EmbedQ8Block);
+            reqs.buffers.push_back({EmbeddingWorkspaceBuffers::EMBED_TABLE,
+                                    embed_table_bytes,
+                                    256,
+                                    true});
+        }
 
         return reqs;
     }

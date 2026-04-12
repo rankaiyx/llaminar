@@ -555,12 +555,43 @@ namespace llaminar2
             return nullptr;
         }
 
+        // Pre-allocation memory check: verify sufficient free VRAM before attempting hipMalloc.
+        // This provides a graceful error with actionable diagnostics instead of a raw OOM crash.
+        {
+            size_t free_bytes = 0, total_bytes = 0;
+            hipError_t mem_err = hipMemGetInfo(&free_bytes, &total_bytes);
+            if (mem_err == hipSuccess)
+            {
+                // Require at least 64MB headroom beyond the allocation itself
+                constexpr size_t HEADROOM = 64ULL * 1024 * 1024;
+                if (bytes + HEADROOM > free_bytes)
+                {
+                    double req_mb = bytes / (1024.0 * 1024.0);
+                    double free_mb = free_bytes / (1024.0 * 1024.0);
+                    double total_mb = total_bytes / (1024.0 * 1024.0);
+                    double used_mb = (total_bytes - free_bytes) / (1024.0 * 1024.0);
+                    LOG_ERROR("[ROCmBackend] Insufficient GPU memory on device " << device_id
+                              << ": requested " << std::fixed << std::setprecision(1) << req_mb
+                              << " MB but only " << free_mb << " MB free ("
+                              << used_mb << " / " << total_mb << " MB used). "
+                              << "Try reducing context length (-c), using a smaller model, "
+                              << "or adding more GPUs for tensor parallelism.");
+                    return nullptr;
+                }
+            }
+        }
+
         void *ptr = nullptr;
         err = hipMalloc(&ptr, bytes);
         if (err != hipSuccess)
         {
+            // Include memory diagnostics in the error message
+            size_t free_bytes = 0, total_bytes = 0;
+            hipMemGetInfo(&free_bytes, &total_bytes);
             LOG_ERROR("[ROCmBackend] hipMalloc failed for " << bytes << " bytes on device "
-                                                            << device_id << ": " << hipGetErrorString(err));
+                                                            << device_id << ": " << hipGetErrorString(err)
+                                                            << " (free: " << (free_bytes / (1024 * 1024))
+                                                            << " MB, total: " << (total_bytes / (1024 * 1024)) << " MB)");
             return nullptr;
         }
 

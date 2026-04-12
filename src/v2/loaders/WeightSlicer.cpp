@@ -362,6 +362,21 @@ namespace llaminar2
             return {static_cast<size_t>(assignment.vocab_start),
                     static_cast<size_t>(assignment.vocab_count)};
 
+        case WeightDimensionType::ProportionalHeads:
+        {
+            if (!tp_config_)
+            {
+                LOG_ERROR("[WeightSlicer] No TensorParallelConfig for ProportionalHeads dimension");
+                return {0, total_size};
+            }
+            const int total_heads = tp_config_->totalHeads();
+            if (total_heads <= 0)
+                return {0, total_size};
+            const size_t start = total_size * static_cast<size_t>(assignment.head_start) / static_cast<size_t>(total_heads);
+            const size_t end = total_size * static_cast<size_t>(assignment.head_start + assignment.head_count) / static_cast<size_t>(total_heads);
+            return {start, end - start};
+        }
+
         case WeightDimensionType::Bias1D:
         case WeightDimensionType::None:
         default:

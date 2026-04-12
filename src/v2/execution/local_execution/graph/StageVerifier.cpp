@@ -293,7 +293,7 @@ namespace llaminar2
                                         {
                                             LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
                                                                                << "' appears to be all zeros (GPU validation)");
-                                            if (validation.fail_on_zero)
+                                            if (validation.fail_on_zero && !node.stage->allowsZeroOutput())
                                             {
                                                 LOG_ERROR("[StageVerifier] Buffer validation failed: zero tensor detected");
                                                 all_valid = false;
@@ -367,7 +367,7 @@ namespace llaminar2
                     LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
                                                        << "' appears to be all zeros (likely uninitialized)");
 
-                    if (validation.fail_on_zero)
+                    if (validation.fail_on_zero && !node.stage->allowsZeroOutput())
                     {
                         LOG_ERROR("[StageVerifier] Buffer validation failed: zero tensor detected");
                         all_valid = false;

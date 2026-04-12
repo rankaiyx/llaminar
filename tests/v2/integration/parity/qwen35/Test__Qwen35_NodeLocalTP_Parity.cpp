@@ -16,7 +16,7 @@
  *
  * REQUIREMENTS:
  *   - Must run via ctest for proper MPI rank settings and initialization
- *   - Each rank participates in GlobalTPContext collective operations
+ *   - Each rank participates in NodeLocalTP collective operations (via GlobalTPContext)
  *
  * Test configurations:
  *   - NodeLocalTP_2xMPI_CPU_08B: 2 MPI ranks, CPU, Qwen3.5-0.8B Q4_0
@@ -37,7 +37,7 @@ using namespace llaminar2::test::parity;
 using namespace llaminar2::test::parity::qwen35;
 
 // =============================================================================
-// Common Excluded Stages for GlobalTP
+// Common Excluded Stages for NodeLocalTP
 // =============================================================================
 
 // For NodeLocalTP, intermediate activations are SHARDED across ranks. Only the final
@@ -50,6 +50,8 @@ static const std::vector<std::string> kNodeLocalTPExcludedStages = {
     "Q_PROJECTION",
     "K_PROJECTION",
     "V_PROJECTION",
+    "Q_NORM",
+    "K_NORM", // Qwen3.5 per-head norms are head-sharded in TP
     "Q_ROPE",
     "K_ROPE",
     "ATTENTION_CONTEXT",
@@ -144,7 +146,7 @@ public:
  * @brief Verify NodeLocalTP infrastructure initialization
  *
  * Tests that:
- * - GlobalTPContext is created successfully on each rank
+ * - NodeLocalTP context (GlobalTPContext) is created successfully on each rank
  * - MPI communicator is valid
  * - Rank indices are correct
  */
@@ -157,14 +159,14 @@ TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPContextInitialization)
     EXPECT_GE(mpi_ctx_->world_size(), cfg().mpi_ranks)
         << "World size should be at least " << cfg().mpi_ranks;
 
-    // Verify GlobalTPContext (implements cross-rank TP communication)
-    ASSERT_NE(global_tp_ctx_, nullptr) << "GlobalTPContext should be created";
+    // Verify NodeLocalTP context (GlobalTPContext implements cross-rank TP communication)
+    ASSERT_NE(global_tp_ctx_, nullptr) << "NodeLocalTP context should be created";
     EXPECT_EQ(global_tp_ctx_->degree(), mpi_ctx_->world_size())
         << "TP degree should match world size";
     EXPECT_EQ(global_tp_ctx_->myIndex(), mpi_ctx_->rank())
         << "TP index should match MPI rank";
     EXPECT_FALSE(global_tp_ctx_->isLocal())
-        << "GlobalTPContext should not be local";
+        << "NodeLocalTP context should not be local (uses MPI, not intra-process)";
     EXPECT_EQ(global_tp_ctx_->backend(), CollectiveBackendType::UPI)
         << "NodeLocalTP should use UPI backend";
 
@@ -172,7 +174,7 @@ TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPContextInitialization)
 }
 
 /**
- * @brief Test GlobalTP allreduce operation
+ * @brief Test NodeLocalTP allreduce operation
  *
  * Each rank creates a tensor with its rank value, performs allreduce,
  * and verifies the result is the sum of all ranks.
@@ -180,7 +182,7 @@ TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPContextInitialization)
 TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPAllreduce)
 {
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    ASSERT_NE(global_tp_ctx_, nullptr) << "GlobalTPContext required";
+    ASSERT_NE(global_tp_ctx_, nullptr) << "NodeLocalTP context required";
 
     // Create a simple tensor with rank value
     auto tensor_factory = std::make_unique<TensorFactory>(*mpi_ctx_);
@@ -208,14 +210,14 @@ TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPAllreduce)
 }
 
 /**
- * @brief Test GlobalTP broadcast operation
+ * @brief Test NodeLocalTP broadcast operation
  *
  * Rank 0 broadcasts a tensor with specific values, all ranks verify receipt.
  */
 TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPBroadcast)
 {
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    ASSERT_NE(global_tp_ctx_, nullptr) << "GlobalTPContext required";
+    ASSERT_NE(global_tp_ctx_, nullptr) << "NodeLocalTP context required";
 
     auto tensor_factory = std::make_unique<TensorFactory>(*mpi_ctx_);
     auto tensor = tensor_factory->createFP32({1, 64});
@@ -247,12 +249,12 @@ TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPBroadcast)
 }
 
 /**
- * @brief Test GlobalTP barrier synchronization
+ * @brief Test NodeLocalTP barrier synchronization
  */
 TEST_P(Qwen35NodeLocalTPParityTest, NodeLocalTPBarrier)
 {
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
-    ASSERT_NE(global_tp_ctx_, nullptr) << "GlobalTPContext required";
+    ASSERT_NE(global_tp_ctx_, nullptr) << "NodeLocalTP context required";
 
     LOG_INFO("[NodeLocalTP Qwen3.5] Rank " << mpi_ctx_->rank() << " entering barrier");
 

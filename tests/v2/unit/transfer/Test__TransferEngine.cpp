@@ -8,6 +8,7 @@
 #include "backends/DeviceId.h"
 #include "tensors/TensorClasses.h"
 #include "../../mocks/MockBackend.h"
+#include "../../utils/TestTensorFactory.h"
 
 #include <cstring>
 #include <memory>
@@ -123,6 +124,40 @@ TEST(Test__TransferEngine_Plan, Mapped_AlwaysMappedNoop)
               TransferMethod::MAPPED_NOOP);
 }
 
+TEST(Test__TransferEngine_Plan, HostResident_AlwaysNoop)
+{
+    // HOST_RESIDENT tensors never move to device — always NOOP regardless of direction
+    EXPECT_EQ(TransferEngine::planTransfer(
+                  DeviceId::cpu(), DeviceId::cuda(0), MemoryResidency::HOST_RESIDENT),
+              TransferMethod::NOOP);
+
+    EXPECT_EQ(TransferEngine::planTransfer(
+                  DeviceId::cpu(), DeviceId::rocm(0), MemoryResidency::HOST_RESIDENT),
+              TransferMethod::NOOP);
+
+    EXPECT_EQ(TransferEngine::planTransfer(
+                  DeviceId::cuda(0), DeviceId::cpu(), MemoryResidency::HOST_RESIDENT),
+              TransferMethod::NOOP);
+
+    EXPECT_EQ(TransferEngine::planTransfer(
+                  DeviceId::cuda(0), DeviceId::rocm(0), MemoryResidency::HOST_RESIDENT),
+              TransferMethod::NOOP);
+
+    // Same device also NOOP (both paths agree)
+    EXPECT_EQ(TransferEngine::planTransfer(
+                  DeviceId::cpu(), DeviceId::cpu(), MemoryResidency::HOST_RESIDENT),
+              TransferMethod::NOOP);
+}
+
+TEST(Test__TransferEngine_Plan, HostResident_PrecedesOtherChecks)
+{
+    // HOST_RESIDENT should NOOP even for cross-vendor transfers that would
+    // normally be HOST_STAGED or BAR_HOST_BOUNCE — residency takes priority.
+    EXPECT_EQ(TransferEngine::planTransfer(
+                  DeviceId::rocm(0), DeviceId::cuda(0), MemoryResidency::HOST_RESIDENT),
+              TransferMethod::NOOP);
+}
+
 TEST(Test__TransferEngine_Plan, DescribeTransferPlan_HumanReadable)
 {
     auto desc = TransferEngine::describeTransferPlan(
@@ -130,6 +165,15 @@ TEST(Test__TransferEngine_Plan, DescribeTransferPlan_HumanReadable)
 
     // Should contain source, destination, method
     EXPECT_NE(desc.find("HOST_TO_DEVICE"), std::string::npos);
+}
+
+TEST(Test__TransferEngine_Plan, DescribeTransferPlan_HostResident)
+{
+    auto desc = TransferEngine::describeTransferPlan(
+        DeviceId::cpu(), DeviceId::cuda(0), MemoryResidency::HOST_RESIDENT);
+
+    EXPECT_NE(desc.find("HOST_RESIDENT"), std::string::npos);
+    EXPECT_NE(desc.find("NOOP"), std::string::npos);
 }
 
 // ============================================================================
@@ -400,6 +444,114 @@ TEST_F(Test__TransferEngine_Execute, MappedNoop_NoBackendCall)
 }
 
 // ============================================================================
+// HOST_RESIDENT high-level tests — verifies upload/uploadFull/transferActivation
+// skip device allocation and transfer for HOST_RESIDENT tensors.
+// All paths exit before any backend interaction, so MockBackend is sufficient.
+// ============================================================================
+
+TEST_F(Test__TransferEngine_Execute, Upload_HostResident_SkipsTransfer)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    // Create a tensor and mark it HOST_RESIDENT
+    auto tensor = TestTensorFactory::createFP32Random({4, 4});
+    tensor->setHostResident();
+
+    EXPECT_TRUE(tensor->isHostResident());
+
+    // Upload should succeed as NOOP — no backend calls
+    auto result = engine.upload(tensor.get(), DeviceId::cuda(0));
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.method_used, TransferMethod::NOOP);
+
+    // Verify zero backend interaction
+    auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 0u);
+}
+
+TEST_F(Test__TransferEngine_Execute, UploadFull_HostResident_SkipsTransfer)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    auto tensor = TestTensorFactory::createFP32Random({8, 8});
+    tensor->setHostResident();
+
+    // uploadFull should also NOOP for HOST_RESIDENT
+    auto result = engine.uploadFull(tensor.get(), DeviceId::rocm(0));
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.method_used, TransferMethod::NOOP);
+
+    // Zero backend interaction
+    auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 0u);
+}
+
+TEST_F(Test__TransferEngine_Execute, TransferActivation_HostResident_SkipsTransfer)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    auto tensor = TestTensorFactory::createFP32Random({2, 2});
+    tensor->setHostResident();
+
+    // transferActivation should NOOP for HOST_RESIDENT
+    auto result = engine.transferActivation(tensor.get(), DeviceId::cuda(1));
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.method_used, TransferMethod::NOOP);
+
+    // Zero backend interaction
+    auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 0u);
+}
+
+TEST_F(Test__TransferEngine_Execute, Upload_HostResident_HostDataStillAccessible)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setHostResident();
+
+    // Upload does nothing for HOST_RESIDENT
+    auto result = engine.upload(tensor.get(), DeviceId::cuda(0));
+    EXPECT_TRUE(result.success);
+
+    // Host data remains accessible and valid — no device buffer was allocated
+    const float *data = tensor->data();
+    ASSERT_NE(data, nullptr);
+    for (size_t i = 0; i < 16; ++i)
+    {
+        EXPECT_FLOAT_EQ(data[i], 1.0f);
+    }
+}
+
+TEST_F(Test__TransferEngine_Execute, Upload_HostResident_MultipleCallsStillNoop)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    auto tensor = TestTensorFactory::createFP32Random({4, 4});
+    tensor->setHostResident();
+
+    // Multiple uploads to different devices should all NOOP
+    for (int i = 0; i < 3; ++i)
+    {
+        auto result = engine.upload(tensor.get(), DeviceId::rocm(i));
+        EXPECT_TRUE(result.success);
+        EXPECT_EQ(result.method_used, TransferMethod::NOOP);
+    }
+
+    auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 0u);
+}
+
+// ============================================================================
 // Error handling tests
 // ============================================================================
 
@@ -505,4 +657,92 @@ TEST(Test__TransferEngine_Descriptor, TransferResult_Fail)
     auto r = TransferResult::fail(TransferMethod::DEVICE_TO_HOST, "test error");
     EXPECT_FALSE(r.success);
     EXPECT_EQ(r.error, "test error");
+}
+
+// ============================================================================
+// GPU_ONLY planTransfer tests — GPU_ONLY uses standard transfer logic
+// ============================================================================
+
+TEST(Test__TransferEngine_Plan, GpuOnly_CpuToCuda_HostToDevice)
+{
+    // GPU_ONLY does NOT affect planTransfer — data still moves H2D normally.
+    // The host release happens AFTER the transfer, not instead of it.
+    auto method = TransferEngine::planTransfer(
+        DeviceId::cpu(), DeviceId::cuda(0), MemoryResidency::GPU_ONLY);
+    EXPECT_EQ(method, TransferMethod::HOST_TO_DEVICE);
+}
+
+TEST(Test__TransferEngine_Plan, GpuOnly_CpuToRocm_HostToDevice)
+{
+    auto method = TransferEngine::planTransfer(
+        DeviceId::cpu(), DeviceId::rocm(0), MemoryResidency::GPU_ONLY);
+    EXPECT_EQ(method, TransferMethod::HOST_TO_DEVICE);
+}
+
+TEST(Test__TransferEngine_Plan, GpuOnly_SameDevice_Noop)
+{
+    auto method = TransferEngine::planTransfer(
+        DeviceId::cuda(0), DeviceId::cuda(0), MemoryResidency::GPU_ONLY);
+    EXPECT_EQ(method, TransferMethod::NOOP);
+}
+
+TEST(Test__TransferEngine_Plan, GpuOnly_GpuToCpu_DeviceToHost)
+{
+    auto method = TransferEngine::planTransfer(
+        DeviceId::cuda(0), DeviceId::cpu(), MemoryResidency::GPU_ONLY);
+    EXPECT_EQ(method, TransferMethod::DEVICE_TO_HOST);
+}
+
+// ============================================================================
+// GPU_ONLY TensorBase API tests
+// ============================================================================
+
+TEST(Test__TransferEngine_GpuOnly, SetGpuOnly_SetsResidency)
+{
+    auto tensor = TestTensorFactory::createFP32Random({4, 4});
+    EXPECT_FALSE(tensor->isGpuOnly());
+    EXPECT_EQ(tensor->memoryResidency(), MemoryResidency::STANDARD);
+
+    tensor->setGpuOnly();
+    EXPECT_TRUE(tensor->isGpuOnly());
+    EXPECT_EQ(tensor->memoryResidency(), MemoryResidency::GPU_ONLY);
+}
+
+TEST(Test__TransferEngine_GpuOnly, GpuOnly_MutuallyExclusive_WithHostResident)
+{
+    auto tensor = TestTensorFactory::createFP32Random({4, 4});
+
+    tensor->setGpuOnly();
+    EXPECT_TRUE(tensor->isGpuOnly());
+    EXPECT_FALSE(tensor->isHostResident());
+
+    tensor->setHostResident();
+    EXPECT_FALSE(tensor->isGpuOnly());
+    EXPECT_TRUE(tensor->isHostResident());
+}
+
+TEST(Test__TransferEngine_GpuOnly, MemoryResidency_ToString)
+{
+    EXPECT_EQ(to_string(MemoryResidency::GPU_ONLY), "GPU_ONLY");
+}
+
+TEST(Test__TransferEngine_GpuOnly, ReleaseHostWeightData_FreesMemory)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({32, 32});
+    EXPECT_FALSE(tensor->is_raw_data_released());
+
+    tensor->release_host_weight_data();
+    EXPECT_TRUE(tensor->is_raw_data_released());
+}
+
+TEST(Test__TransferEngine_GpuOnly, ReleaseHostWeightData_Idempotent)
+{
+    auto tensor = TestTensorFactory::createFP32Ones({32, 32});
+
+    tensor->release_host_weight_data();
+    EXPECT_TRUE(tensor->is_raw_data_released());
+
+    // Second call is safe (no-op)
+    tensor->release_host_weight_data();
+    EXPECT_TRUE(tensor->is_raw_data_released());
 }

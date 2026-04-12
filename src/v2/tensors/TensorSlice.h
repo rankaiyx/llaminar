@@ -312,6 +312,31 @@ namespace llaminar2
             return inner()->isHostValid();
         }
 
+        // HOST_RESIDENT must propagate to inner because ensureOnDevice()
+        // delegates to inner — if only the slice wrapper is marked, the
+        // inner tensor still gets a full GPU upload.
+        void setHostResident() override
+        {
+            TensorBase::setHostResident();
+            inner()->setHostResident();
+        }
+
+        void setGpuOnly() override
+        {
+            TensorBase::setGpuOnly();
+            inner()->setGpuOnly();
+        }
+
+        bool allocateOnDevice(DeviceId target_device) override
+        {
+            return inner()->allocateOnDevice(target_device);
+        }
+
+        void invalidateGpuData() override
+        {
+            inner()->invalidateGpuData();
+        }
+
         // =======================================================================
         // GPU Data Pointer (delegate to inner)
         // =======================================================================

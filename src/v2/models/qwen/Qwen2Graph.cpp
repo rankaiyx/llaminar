@@ -460,6 +460,18 @@ namespace llaminar2
             attn_params.n_heads = local_n_heads;
             attn_params.n_kv_heads = local_n_kv_heads;
             attn_params.head_dim = config_.head_dim;
+            attn_params.head_start = config_.head_start;
+            // Only set gqa_n_rep when KV heads are REPLICATED (each device has all KV heads).
+            // When KV is column-parallel (each device gets local_n_kv_heads < global n_kv_heads),
+            // the local ratio (local_n_heads / local_n_kv_heads) is correct.
+            if (local_n_kv_heads == config_.n_kv_heads && config_.n_kv_heads > 0 && local_n_heads != config_.n_heads)
+            {
+                attn_params.gqa_n_rep = config_.n_heads / config_.n_kv_heads;
+            }
+            else
+            {
+                attn_params.gqa_n_rep = 0; // use local ratio
+            }
             attn_params.causal = true;
             attn_params.window_size = -1;
             attn_params.attention_mode = mode;
@@ -478,8 +490,13 @@ namespace llaminar2
             attn_params.device_id = device;
             attn_params.q_buffer_id = BufferId::Q_PROJ;
             attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
-            attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
-            attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
+            // GPU flash attention doesn't use score/context workspace buffers —
+            // only register them for CPU attention to avoid wasting 544 MB VRAM.
+            if (!device.is_gpu())
+            {
+                attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
+                attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
+            }
             attn_params.turboquant_ctx = config_.turboquant_ctx;
             attn_params.kv_rotation = config_.kv_rotation;
 

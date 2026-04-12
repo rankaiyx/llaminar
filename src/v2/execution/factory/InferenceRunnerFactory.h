@@ -156,6 +156,11 @@ namespace llaminar2
         /// as indicated by the PP stage config) and sets pp_layer_offset on the graph.
         std::optional<FactoryPPStageConfig> pp_stage_config;
 
+        /// Optional MPI hostfile path for hostfile-aware node detection.
+        /// When set, NodeDetection uses hostfile hostname ordering to assign node IDs
+        /// instead of relying purely on first-appearance ordering from MPI_Allgather.
+        std::string hostfile;
+
         /**
          * @brief Canonical factory: build InferenceRunnerConfig from a RankExecutionPlan
          *

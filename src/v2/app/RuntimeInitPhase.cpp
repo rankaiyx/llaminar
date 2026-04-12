@@ -7,6 +7,7 @@
 #include "app/MPIBootstrapPhase.h"
 #include "app/ChatTemplateResolver.h"
 #include "backends/ComputeBackend.h"
+#include "backends/InventoryPrinter.h"
 #include "config/OrchestrationConfigParser.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "utils/Logger.h"
@@ -199,7 +200,14 @@ namespace llaminar2
         }
 
         auto &dm = DeviceManager::instance();
-        dm.initialize(device_manager_numa_filter);
+        dm.initialize(device_manager_numa_filter, false); // No local table printing
+
+        // Print hardware inventory tables on rank 0 from AllGathered cluster data
+        if (mpi_ctx->rank() == 0)
+        {
+            const auto &cluster = mpi_ctx->topology().clusterInventory();
+            InventoryPrinter::printClusterInventory(cluster);
+        }
 
         // Dry-run check (post-MPI)
         if (config.dry_run)

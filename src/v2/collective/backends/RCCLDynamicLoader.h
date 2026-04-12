@@ -140,6 +140,23 @@ namespace llaminar2
          */
         bool isCommAbortAvailable();
 
+        /**
+         * @brief Finalize a communicator before destroying it (NCCL 2.14+ API)
+         *
+         * ncclCommFinalize marks the communicator as no longer in use and allows
+         * RCCL to clean up internal async resources. Must be followed by
+         * ncclCommDestroy after all streams have been synchronized.
+         *
+         * @param comm Communicator to finalize
+         * @return ncclSuccess on success
+         */
+        ncclResult_t ncclCommFinalize(ncclComm_t comm);
+
+        /**
+         * @brief Check if ncclCommFinalize is available in the loaded RCCL library
+         */
+        bool isCommFinalizeAvailable();
+
         ncclResult_t ncclCommCount(const ncclComm_t comm, int *count);
         ncclResult_t ncclCommCuDevice(const ncclComm_t comm, int *device);
         ncclResult_t ncclCommUserRank(const ncclComm_t comm, int *rank);

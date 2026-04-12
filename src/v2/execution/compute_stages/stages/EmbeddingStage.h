@@ -62,6 +62,12 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return true; }
         bool hasDynamicParams() const override { return true; }
+        /// In vocab-parallel TP, each rank only embeds tokens in its shard;
+        /// tokens outside the shard produce all-zero output (summed via AllReduce).
+        bool allowsZeroOutput() const override
+        {
+            return params_.mpi_ctx && params_.mpi_ctx->world_size() > 1;
+        }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             (void)pos_offset;

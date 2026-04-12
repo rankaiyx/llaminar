@@ -452,13 +452,14 @@ TEST_F(Test__KernelFactoryOps, CreateAttention_FP16_CPU)
     EXPECT_TRUE(kernel->supports_device(-1));
 }
 
-TEST_F(Test__KernelFactoryOps, CreateAttention_Q8_1_CPU)
+TEST_F(Test__KernelFactoryOps, CreateAttention_Q8_1_CPU_Throws)
 {
+    // Q8_1 activation precision attention was retired — factory should throw
     auto tensor = TestTensorFactory::createQ8_1Random({32, 64});
-    auto kernel = KernelFactory::createAttention(
-        static_cast<const Q8_1Tensor *>(tensor.get()), DeviceType::CPU);
-    ASSERT_NE(kernel, nullptr);
-    EXPECT_TRUE(kernel->supports_device(-1));
+    EXPECT_THROW(
+        KernelFactory::createAttention(
+            static_cast<const Q8_1Tensor *>(tensor.get()), DeviceType::CPU),
+        std::runtime_error);
 }
 
 TEST_F(Test__KernelFactoryOps, CreateAttention_GenericDispatch_FP32)

@@ -115,6 +115,14 @@ namespace llaminar2
         /// Cached EmbedQ8 repack of quantized embedding table (avoids full FP32 dequant)
         mutable const TensorBase *cached_embed_table_ = nullptr;
         mutable std::shared_ptr<const EmbedQ8RepackResult> cached_repack_;
+
+        /// Vocab-parallel sharding state (set by apply_tensor, used by inner apply* functions)
+        /// When embedding table is sharded across TP ranks, each rank holds a slice of the
+        /// vocabulary. vocab_offset_ is the first global vocab index in this shard.
+        /// local_vocab_size_ is the number of rows in this shard.
+        /// Tokens outside [vocab_offset_, vocab_offset_ + local_vocab_size_) produce zeros.
+        int vocab_offset_ = 0;
+        int local_vocab_size_ = 0;
     };
 
     // Backward compatibility alias

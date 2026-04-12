@@ -1233,6 +1233,9 @@ namespace llaminar2
 
                 if (async_enabled)
                 {
+                    // Async path: stage through pinned host memory to avoid
+                    // ROCm hipMemcpy failures on pageable brk-heap addresses,
+                    // and to enable DMA overlap with other GPU work.
                     const void *copy_src = src;
                     if (bytes > 0 && pinned_staging_slot)
                     {
@@ -1253,6 +1256,8 @@ namespace llaminar2
                     }
                     return hipMemcpyAsync(dst, copy_src, bytes, hipMemcpyHostToDevice, reinterpret_cast<hipStream_t>(stream));
                 }
+
+                // Synchronous fallback (only used when stream creation fails)
                 return hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
 #else
                 (void)dst;
@@ -5048,8 +5053,30 @@ namespace llaminar2
                     // Upload scales
                     rocmQuantGemm_setDevice(rocm_device_id_);
 
+                    // Create a dedicated H2D upload stream for this weight.
+                    // Using an explicit stream instead of the NULL stream avoids
+                    // contention when multiple upload threads work on the same
+                    // device concurrently, and the async path's pinned staging
+                    // (hipHostMalloc + memcpy + hipMemcpyAsync) naturally works
+                    // around ROCm hipMemcpy failures on pageable brk-heap memory.
                     bool async_upload_enabled = false;
-                    if (startup_repack_enabled)
+                    hipStream_t h2d_upload_stream = nullptr;
+#ifdef HAVE_ROCM
+                    {
+                        hipError_t stream_err = hipStreamCreateWithFlags(&h2d_upload_stream, hipStreamNonBlocking);
+                        if (stream_err == hipSuccess)
+                        {
+                            upload.startup_h2d_stream = reinterpret_cast<void *>(h2d_upload_stream);
+                            async_upload_enabled = true;
+                        }
+                        else
+                        {
+                            LOG_WARN("[ROCmQuantisedGemmKernel] Failed to create H2D stream: "
+                                     << hipGetErrorString(stream_err) << "; falling back to sync uploads");
+                        }
+                    }
+#endif
+                    if (startup_repack_enabled && !async_upload_enabled)
                     {
                         async_upload_enabled = ensureStartupStreamsAndEvents(
                             upload,
@@ -5057,7 +5084,7 @@ namespace llaminar2
                             "ROCmQuantisedGemmKernel::ensureWeightsConverted");
                     }
 
-                    auto cleanup_startup_async_resources = [&upload]()
+                    auto cleanup_startup_async_resources = [&upload, &h2d_upload_stream]()
                     {
 #ifdef HAVE_ROCM
                         upload.startup_h2d_event_pending = false;
@@ -5094,6 +5121,7 @@ namespace llaminar2
                         upload.startup_h2d_stream = nullptr;
                         upload.startup_repack_stream = nullptr;
                         upload.startup_commit_stream = nullptr;
+                        h2d_upload_stream = nullptr;
 #endif
                     };
 
@@ -5159,7 +5187,12 @@ namespace llaminar2
                                 upload.d_scales = nullptr;
                                 cleanup_startup_async_resources();
                                 LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload VNNI weights: "
-                                          << hipGetErrorString(err));
+                                          << hipGetErrorString(err)
+                                          << " (device=" << rocm_device_id_
+                                          << " N=" << packed_->N << " K=" << packed_->K
+                                          << " vnni_size=" << packed_->int8_data_vnni.size()
+                                          << " src=" << (void *)packed_->int8_data_vnni.data()
+                                          << " uploads=" << packed_->device_uploads.size() << ")");
                                 return;
                             }
 
@@ -5362,6 +5395,21 @@ namespace llaminar2
                             }
 #endif
                         }
+
+                        // Synchronize and destroy the per-weight H2D stream.
+                        // All hipMemcpyAsync calls on this stream must complete
+                        // before we commit the upload and release pinned staging.
+#ifdef HAVE_ROCM
+                        if (h2d_upload_stream)
+                        {
+                            hipStreamSynchronize(h2d_upload_stream);
+                            hipStreamDestroy(h2d_upload_stream);
+                            h2d_upload_stream = nullptr;
+                            upload.startup_h2d_stream = nullptr;
+                        }
+#endif
+                        // Free pinned staging buffers now that the stream is synced
+                        freeStartupPinnedStaging(upload);
                     }
 
                     {

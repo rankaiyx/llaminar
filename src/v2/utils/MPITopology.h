@@ -30,6 +30,7 @@
 #include <functional>
 #include "../interfaces/IMPITopology.h"
 #include "../execution/mpi_orchestration/DeviceInventory.h"
+#include "NodeDetection.h"
 
 namespace llaminar2
 {
@@ -557,6 +558,7 @@ namespace llaminar2
         bool compute_participant_ = true; ///< All ranks compute by default
 
         RankPlacement placement_;
+        std::vector<int> rank_node_ids_;               ///< Node ID per rank (from NodeDetection)
         std::vector<RankPlacement> all_placements_;    ///< Placements from all ranks
         mutable ClusterInventory cluster_inventory_;   ///< Cached cluster inventory (lazy-built)
         mutable bool cluster_inventory_built_ = false; ///< Whether cluster inventory was built

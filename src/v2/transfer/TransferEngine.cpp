@@ -36,6 +36,10 @@ namespace llaminar2
 
     TransferMethod TransferEngine::planTransfer(DeviceId src, DeviceId dst, MemoryResidency residency)
     {
+        // Host-resident tensors never move to device
+        if (residency == MemoryResidency::HOST_RESIDENT)
+            return TransferMethod::NOOP;
+
         // Mapped memory is always in-place
         if (residency == MemoryResidency::MAPPED)
             return TransferMethod::MAPPED_NOOP;
@@ -141,14 +145,8 @@ namespace llaminar2
         if (!tensor)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor");
 
-        // Determine current residency
-        MemoryResidency residency = MemoryResidency::STANDARD;
-        if (tensor->isMapped())
-            residency = MemoryResidency::MAPPED;
-        else if (tensor->isBARBacked())
-            residency = MemoryResidency::BAR_BACKED;
-
-        // Determine source device
+        // Determine current residency and source device
+        MemoryResidency residency = tensor->memoryResidency();
         DeviceId src = DeviceId::cpu();
         if (tensor->gpu_device_.has_value() && tensor->deviceValid())
             src = tensor->gpu_device_.value();
@@ -182,7 +180,13 @@ namespace llaminar2
         if (result.success)
         {
             tensor->applyCoherenceOp_(CoherenceOp::UPLOAD); // Both host and device now valid
-            // gpu_device_ was set by getOrAllocateDeviceBuffer
+
+            // GPU_ONLY policy: free host data now that device has it
+            if (tensor->memoryResidency() == MemoryResidency::GPU_ONLY &&
+                !tensor->is_raw_data_released())
+            {
+                tensor->release_host_weight_data();
+            }
         }
 
         return result;
@@ -202,12 +206,7 @@ namespace llaminar2
             return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
                                         "neither host nor device data is valid");
 
-        MemoryResidency residency = MemoryResidency::STANDARD;
-        if (tensor->isMapped())
-            residency = MemoryResidency::MAPPED;
-        else if (tensor->isBARBacked())
-            residency = MemoryResidency::BAR_BACKED;
-
+        MemoryResidency residency = tensor->memoryResidency();
         DeviceId src = tensor->gpu_device_.value();
         TransferMethod method = planTransfer(src, DeviceId::cpu(), residency);
 
@@ -246,11 +245,7 @@ namespace llaminar2
                                         "tensor has no valid data on any device");
 
         // Determine residency
-        MemoryResidency residency = MemoryResidency::STANDARD;
-        if (tensor->isMapped())
-            residency = MemoryResidency::MAPPED;
-        else if (tensor->isBARBacked())
-            residency = MemoryResidency::BAR_BACKED;
+        MemoryResidency residency = tensor->memoryResidency();
 
         TransferMethod method = planTransfer(src, target_device, residency);
 
@@ -504,6 +499,13 @@ namespace llaminar2
     {
         if (!tensor)
             return TransferResult::fail(TransferMethod::NOOP, "null tensor");
+
+        // ===== HOST-RESIDENT FAST PATH =====
+        // Tensors marked HOST_RESIDENT are consumed on host only (e.g., embedding
+        // tables that get repacked into a device workspace by the kernel).
+        // Skip device allocation and upload entirely.
+        if (tensor->memoryResidency() == MemoryResidency::HOST_RESIDENT)
+            return TransferResult::ok(TransferMethod::NOOP);
 
         const bool trace = debugEnv().rocm.trace_coherence;
         auto overall_start = std::chrono::high_resolution_clock::now();
@@ -825,6 +827,13 @@ namespace llaminar2
             }
 
             tensor->applyCoherenceOp_(CoherenceOp::UPLOAD);
+
+            // GPU_ONLY policy: free host data now that device has it
+            if (tensor->memoryResidency() == MemoryResidency::GPU_ONLY &&
+                !tensor->is_raw_data_released())
+            {
+                tensor->release_host_weight_data();
+            }
 
             LOG_DEBUG("[TransferEngine::uploadFull] Uploaded " << bytes
                                                                << " bytes to device " << target_device.toString()
@@ -1155,16 +1164,15 @@ namespace llaminar2
             desc.device = DeviceId::cpu();
         }
 
-        // Memory residency and special pointers
-        if (tensor->isMapped())
+        // Memory residency from canonical source
+        desc.residency = tensor->memoryResidency();
+        if (desc.residency == MemoryResidency::MAPPED)
         {
-            desc.residency = MemoryResidency::MAPPED;
             desc.mapped_host_ptr = tensor->mapped_host_ptr_;
             desc.mapped_device_ptr = tensor->mapped_device_ptr_;
         }
-        else if (tensor->isBARBacked())
+        else if (desc.residency == MemoryResidency::BAR_BACKED)
         {
-            desc.residency = MemoryResidency::BAR_BACKED;
             desc.bar_staging_ptr = tensor->hip_staging_ptr_;
             desc.bar_rocm_ptr = tensor->bar_rocm_ptr_;
             desc.bar_cuda_ptr = tensor->bar_cuda_device_ptr_;

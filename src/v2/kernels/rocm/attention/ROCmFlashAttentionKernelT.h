@@ -249,7 +249,9 @@ namespace llaminar2
                 bool causal, int window_size, int position_offset,
                 int device_idx,
                 const attention::AttentionDeviceParams *device_params = nullptr,
-                const float *mask = nullptr);
+                const float *mask = nullptr,
+                int head_start = 0,
+                int gqa_n_rep = 0);
 
             /**
              * @brief Tensor-based attention dispatch
@@ -276,7 +278,8 @@ namespace llaminar2
                 int device_idx = -1,
                 int head_start = 0,
                 int local_n_heads = -1,
-                int local_n_kv_heads = -1) override;
+                int local_n_kv_heads = -1,
+                int gqa_n_rep = 0) override;
 
         private:
             int device_idx_;
@@ -373,7 +376,9 @@ namespace llaminar2
                 bool causal, int window_size, int position_offset,
                 int device_idx,
                 const attention::AttentionDeviceParams *device_params = nullptr,
-                const float *mask = nullptr);
+                const float *mask = nullptr,
+                int head_start = 0,
+                int gqa_n_rep = 0);
 
             bool compute_tensor(
                 const ITensor *Q,
@@ -394,7 +399,8 @@ namespace llaminar2
                 int device_idx = -1,
                 int head_start = 0,
                 int local_n_heads = -1,
-                int local_n_kv_heads = -1) override;
+                int local_n_kv_heads = -1,
+                int gqa_n_rep = 0) override;
 
             /// Update device-side attention params for graph-capture replay
             void setDynamicAttnParams(int kv_len, int position_offset) override;
@@ -577,7 +583,8 @@ namespace llaminar2
                 int device_idx = -1,
                 int head_start = 0,
                 int local_n_heads = -1,
-                int local_n_kv_heads = -1) override;
+                int local_n_kv_heads = -1,
+                int gqa_n_rep = 0) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface
@@ -713,7 +720,8 @@ namespace llaminar2
                 int device_idx = -1,
                 int head_start = 0,
                 int local_n_heads = -1,
-                int local_n_kv_heads = -1) override;
+                int local_n_kv_heads = -1,
+                int gqa_n_rep = 0) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface

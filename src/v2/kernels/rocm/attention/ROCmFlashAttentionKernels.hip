@@ -661,7 +661,9 @@ namespace
         const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
         const float *__restrict__ mask,
         int tile_q,
-        int tile_kv)
+        int tile_kv,
+        int head_start,
+        int gqa_n_rep)
     {
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
@@ -685,8 +687,8 @@ namespace
         const int lane_id = tid % WAVEFRONT_SIZE;
 
         // GQA mapping: multiple Q heads can share one KV head
-        const int gqa_ratio = n_heads / n_kv_heads;
-        const int kv_head_idx = head_idx / gqa_ratio;
+        const int effective_gqa_ratio = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
+        const int kv_head_idx = (head_start + head_idx) / effective_gqa_ratio;
 
         // Q row range for this block
         const int q_block_start = q_tile_idx * tile_q;
@@ -1158,7 +1160,9 @@ namespace
         int head_dim,
         int num_splits,
         float softmax_scale,
-        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        int head_start = 0,
+        int gqa_n_rep = 0)
     {
         int kv_len_runtime = kv_len;
         int kv_batch_stride = kv_len;
@@ -1171,8 +1175,8 @@ namespace
         const int split_idx = blockIdx.y;
         const int batch_idx = blockIdx.z;
 
-        const int gqa_ratio = n_heads / n_kv_heads;
-        const int kv_head_idx = head_idx / gqa_ratio;
+        const int effective_gqa_ratio = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
+        const int kv_head_idx = (head_start + head_idx) / effective_gqa_ratio;
 
         // Split range
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
@@ -1623,7 +1627,8 @@ static int launch_decode(
     int n_heads, int n_kv_heads, int head_dim,
     int num_splits,
     const llaminar2::attention::AttentionDeviceParams *device_params,
-    hipStream_t hip_stream)
+    hipStream_t hip_stream,
+    int head_start = 0, int gqa_n_rep = 0)
 {
     if (head_dim <= 0 || head_dim > 256)
     {
@@ -1686,7 +1691,8 @@ static int launch_decode(
         Q, K_cache, V_cache,
         O_partial, m_partial, l_partial,
         kv_len, n_heads, n_kv_heads, head_dim,
-        effective_num_splits, softmax_scale, device_params);
+        effective_num_splits, softmax_scale, device_params,
+        head_start, gqa_n_rep);
 
     // Reduction kernel (unchanged — operates on FP32 partials only)
     dim3 grid_reduce(n_heads, batch_size);
@@ -1945,7 +1951,8 @@ static int rocblas_prefill_impl(
     int batch_size, int seq_len, int kv_len,
     int n_heads, int n_kv_heads, int head_dim,
     float softmax_scale, bool causal, int position_offset,
-    hipStream_t hip_stream)
+    hipStream_t hip_stream,
+    int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
     hipGetDevice(&device_id);
@@ -1964,10 +1971,14 @@ static int rocblas_prefill_impl(
     }
 
     const int gqa_ratio = n_heads / n_kv_heads;
+    // Effective GQA repetition: use global ratio when provided (TP replicated KV)
+    const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : gqa_ratio;
 
-    // Per-stream scores buffer: [gqa_ratio, seq, kv_len]
+    // Per-stream scores buffer: sized for max local Q heads in any single KV group
     const size_t scores_per_head = static_cast<size_t>(seq_len) * kv_len;
-    const size_t scores_per_group = static_cast<size_t>(gqa_ratio) * scores_per_head;
+    // When using global GQA mapping, a single KV head may serve up to n_heads local Q heads
+    const int max_group_size = (gqa_n_rep > 0) ? n_heads : gqa_ratio;
+    const size_t scores_per_group = static_cast<size_t>(max_group_size) * scores_per_head;
     const size_t scores_bytes = scores_per_group * sizeof(float);
 
     // Ensure all stream buffers are large enough
@@ -2004,14 +2015,30 @@ static int rocblas_prefill_impl(
         float* O_batch = O + static_cast<size_t>(b) * seq_len * lda_o;
 
         for (int kh = 0; kh < n_kv_heads; kh++) {
+            // TP-aware GQA mapping: compute which LOCAL Q heads map to this KV head
+            // Global Q heads [kh * effective_gqa, (kh+1) * effective_gqa) use KV head kh
+            // Local Q heads are [0, n_heads) corresponding to global [head_start, head_start + n_heads)
+            int local_first, local_last;
+            if (gqa_n_rep > 0) {
+                int global_q_first = kh * effective_gqa;
+                int global_q_last = (kh + 1) * effective_gqa - 1;
+                local_first = max(0, global_q_first - head_start);
+                local_last = min(n_heads - 1, global_q_last - head_start);
+            } else {
+                // Standard (non-TP) path: uniform gqa_ratio heads per KV head
+                local_first = kh * gqa_ratio;
+                local_last = local_first + gqa_ratio - 1;
+            }
+            if (local_first > local_last) continue;  // No local Q heads for this KV head
+            const int local_group_size = local_last - local_first + 1;
+
             const int stream_idx = kh % NUM_PREFILL_STREAMS;
             auto& ctx = pool[stream_idx];
 
-            const int h_first = kh * gqa_ratio;
-            const float* Q_group = Q_batch + h_first * head_dim;
+            const float* Q_group = Q_batch + local_first * head_dim;
             const float* K_kh = K_batch + kh * head_dim;
             const float* V_kh = V_batch + kh * head_dim;
-            float* O_group = O_batch + h_first * head_dim;
+            float* O_group = O_batch + local_first * head_dim;
 
             // ─── Pass 1: S = softmax_scale * Q @ K^T  (scale baked into alpha) ───
             hipblasStatus_t status = hipblasSgemmStridedBatched(
@@ -2023,24 +2050,21 @@ static int rocblas_prefill_impl(
                 Q_group, lda_q, strideB_qkt,
                 &beta_zero,
                 ctx.scores_buf, kv_len, strideC_qkt,
-                gqa_ratio);
+                local_group_size);
             if (status != HIPBLAS_STATUS_SUCCESS) {
                 printf("[rocblas_prefill] QK^T GEMM failed: %d (kv_head %d)\n", (int)status, kh);
                 return -1;
             }
 
             // ─── Pass 2: causal softmax (no scale — already applied) ───
-            dim3 grid_sm(gqa_ratio * seq_len);
+            dim3 grid_sm(local_group_size * seq_len);
             dim3 block_sm(256);
             hipLaunchKernelGGL(
                 causal_softmax_inplace_kernel,
                 grid_sm, block_sm, 0, ctx.stream,
-                ctx.scores_buf, gqa_ratio * seq_len, seq_len, kv_len, pos_off);
+                ctx.scores_buf, local_group_size * seq_len, seq_len, kv_len, pos_off);
 
             // ─── Pass 3: O = P @ V ───
-            // Col-major view: O^T[head_dim × seq] = V^T[head_dim × kv] @ P^T[kv × seq]
-            // V in row-major [kv, stride=lda_v] → col-major [lda_v, kv] with OP_N reads
-            // the first head_dim rows, giving us V^T naturally.
             status = hipblasSgemmStridedBatched(
                 ctx.handle,
                 HIPBLAS_OP_N, HIPBLAS_OP_N,
@@ -2050,7 +2074,7 @@ static int rocblas_prefill_impl(
                 ctx.scores_buf, kv_len, strideB_pv,
                 &beta_zero,
                 O_group, lda_o, strideC_pv,
-                gqa_ratio);
+                local_group_size);
             if (status != HIPBLAS_STATUS_SUCCESS) {
                 printf("[rocblas_prefill] PV GEMM failed: %d (kv_head %d)\n", (int)status, kh);
                 return -1;
@@ -2185,7 +2209,8 @@ static int rocblas_prefill_fp16_impl(
     int batch_size, int seq_len, int kv_len,
     int n_heads, int n_kv_heads, int head_dim,
     float softmax_scale, bool causal, int position_offset,
-    hipStream_t hip_stream)
+    hipStream_t hip_stream,
+    int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
     hipGetDevice(&device_id);
@@ -2217,7 +2242,8 @@ static int rocblas_prefill_fp16_impl(
         batch_size, seq_len, kv_len,
         n_heads, n_kv_heads, head_dim,
         softmax_scale, causal, position_offset,
-        hip_stream);
+        hip_stream,
+        head_start, gqa_n_rep);
 }
 
 /**
@@ -2230,7 +2256,8 @@ static int rocblas_prefill_q8_1_impl(
     int batch_size, int seq_len, int kv_len,
     int n_heads, int n_kv_heads, int head_dim,
     float softmax_scale, bool causal, int position_offset,
-    hipStream_t hip_stream)
+    hipStream_t hip_stream,
+    int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
     hipGetDevice(&device_id);
@@ -2265,7 +2292,8 @@ static int rocblas_prefill_q8_1_impl(
         batch_size, seq_len, kv_len,
         n_heads, n_kv_heads, head_dim,
         softmax_scale, causal, position_offset,
-        hip_stream);
+        hip_stream,
+        head_start, gqa_n_rep);
 }
 
 } // anonymous namespace
@@ -2288,7 +2316,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
-        void *stream)
+        void *stream,
+        int head_start, int gqa_n_rep)
     {
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
@@ -2313,7 +2342,7 @@ extern "C"
                 batch_size, seq_len, kv_len,
                 n_heads, n_kv_heads, head_dim,
                 softmax_scale, causal, position_offset,
-                hip_stream);
+                hip_stream, head_start, gqa_n_rep);
         }
 
         // Fall through to existing tiled kernel for head_dim < 64
@@ -2392,7 +2421,8 @@ extern "C"
             n_heads, n_kv_heads, head_dim,
             softmax_scale, causal, window_size, position_offset,
             device_params, mask,
-            tile_q, tile_kv);
+            tile_q, tile_kv,
+            head_start, gqa_n_rep);
 
         (void)hipGetLastError();  // Clear stale errors
         hipError_t err = hipGetLastError();
@@ -2422,7 +2452,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
-        void *stream)
+        void *stream,
+        int head_start, int gqa_n_rep)
     {
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
@@ -2450,7 +2481,8 @@ extern "C"
             batch_size, seq_len, kv_len,
             n_heads, n_kv_heads, head_dim,
             softmax_scale, causal, position_offset,
-            hip_stream);
+            hip_stream,
+            head_start, gqa_n_rep);
     }
 
     /**
@@ -2469,7 +2501,8 @@ extern "C"
         bool causal, int window_size, int position_offset,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
-        void *stream)
+        void *stream,
+        int head_start, int gqa_n_rep)
     {
         hipStream_t hip_stream = static_cast<hipStream_t>(stream);
 
@@ -2502,7 +2535,8 @@ extern "C"
             batch_size, seq_len, kv_len,
             n_heads, n_kv_heads, head_dim,
             softmax_scale, causal, position_offset,
-            hip_stream);
+            hip_stream,
+            head_start, gqa_n_rep);
     }
 
     /**
@@ -2515,13 +2549,15 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
-        void *stream)
+        void *stream,
+        int head_start, int gqa_n_rep)
     {
         return launch_decode<KVTypeTag::FP32>(
             Q, K_cache, V_cache, O,
             O_partial, m_partial, l_partial,
             batch_size, kv_len, n_heads, n_kv_heads, head_dim,
-            num_splits, device_params, static_cast<hipStream_t>(stream));
+            num_splits, device_params, static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
     }
 
     /**
@@ -2537,13 +2573,15 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
-        void *stream)
+        void *stream,
+        int head_start, int gqa_n_rep)
     {
         return launch_decode<KVTypeTag::FP16>(
             Q, K_cache, V_cache, O,
             O_partial, m_partial, l_partial,
             batch_size, kv_len, n_heads, n_kv_heads, head_dim,
-            num_splits, device_params, static_cast<hipStream_t>(stream));
+            num_splits, device_params, static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
     }
 
     /**
@@ -2559,7 +2597,8 @@ extern "C"
         int n_heads, int n_kv_heads, int head_dim,
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
-        void *stream)
+        void *stream,
+        int head_start, int gqa_n_rep)
     {
         if (head_dim % 32 != 0)
         {
@@ -2570,7 +2609,8 @@ extern "C"
             Q, K_cache, V_cache, O,
             O_partial, m_partial, l_partial,
             batch_size, kv_len, n_heads, n_kv_heads, head_dim,
-            num_splits, device_params, static_cast<hipStream_t>(stream));
+            num_splits, device_params, static_cast<hipStream_t>(stream),
+            head_start, gqa_n_rep);
     }
 
     /**

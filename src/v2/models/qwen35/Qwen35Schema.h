@@ -76,6 +76,10 @@ namespace llaminar2
             config.exact_matches["output.weight"] = WeightShardingMode::ColumnParallel;
             config.exact_dimension_matches["output.weight"] = WeightDimensionType::Vocab;
 
+            // Vocab-parallel embedding: each device holds vocab_size/tp_degree rows
+            config.exact_matches["token_embd.weight"] = WeightShardingMode::ColumnParallel;
+            config.exact_dimension_matches["token_embd.weight"] = WeightDimensionType::Vocab;
+
             config.patterns = {
                 // ===== Full Attention Weights =====
                 {"attn_output.weight", WeightShardingMode::InputParallel, WeightDimensionType::Heads,
@@ -102,19 +106,22 @@ namespace llaminar2
                 // SSM output projection is row-parallel (split input dim)
                 {"ssm_out.weight", WeightShardingMode::InputParallel, WeightDimensionType::Heads,
                  "GDN output projection - split input dim, allreduce after"},
-                // SSM alpha/beta: column-parallel to match local head count in recurrence
-                {"ssm_alpha.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
-                 "GDN alpha (decay) - split by heads for TP"},
-                {"ssm_beta.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
-                 "GDN beta (input gate) - split by heads for TP"},
+                // SSM alpha/beta: column-parallel to match local head count in recurrence.
+                // Uses ProportionalHeads because output dim is n_v_heads (time_step_rank),
+                // which may differ from n_heads (e.g. 4B: n_v_heads=32 vs n_heads=36).
+                {"ssm_alpha.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::ProportionalHeads,
+                 "GDN alpha (decay) - proportional split for TP"},
+                {"ssm_beta.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::ProportionalHeads,
+                 "GDN beta (input gate) - proportional split for TP"},
                 // SSM conv1d: column-parallel (channels == QKV dim, must match sharded QKV)
                 {"ssm_conv1d.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::FusedQKVHeads,
                  "GDN conv1d kernel - channels match fused QKV [Q|K|V] structure"},
-                // SSM per-head scalars: column-parallel for correct head assignment per rank
-                {"ssm_dt.bias", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
-                 "GDN dt bias - split by heads for TP"},
-                {"ssm_a", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
-                 "GDN decay A - split by heads for TP"},
+                // SSM per-head scalars: column-parallel for correct head assignment per rank.
+                // Uses ProportionalHeads because these are n_v_heads-sized, not n_heads-sized.
+                {"ssm_dt.bias", WeightShardingMode::ColumnParallel, WeightDimensionType::ProportionalHeads,
+                 "GDN dt bias - proportional split for TP"},
+                {"ssm_a", WeightShardingMode::ColumnParallel, WeightDimensionType::ProportionalHeads,
+                 "GDN decay A - proportional split for TP"},
                 // SSM norm: replicated (gamma size = d_v = state_size, shared across all heads)
                 {"ssm_norm.weight", WeightShardingMode::Replicate, WeightDimensionType::Heads,
                  "GDN output norm gamma (size=d_v) - replicated, shared across all heads"},
@@ -156,6 +163,7 @@ namespace llaminar2
                     {"token_ids", BufferSemantic::Input},
                     {"weights.embedding_table", BufferSemantic::Input}},
                 .outputs = {{"hidden", BufferSemantic::Output}},
+                .tp_mode = TPMode::RowParallel,
                 .is_optional = true,
                 .exec_policy_key = "exec_embedding"};
 

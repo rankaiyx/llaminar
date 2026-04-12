@@ -1033,8 +1033,10 @@ namespace llaminar2
             int device_idx = -1,
             int head_start = 0,
             int local_n_heads = -1,
-            int local_n_kv_heads = -1) override
+            int local_n_kv_heads = -1,
+            int gqa_n_rep = 0) override
         {
+            (void)gqa_n_rep;
             // Cast ITensor* to TensorBase* - CPU kernel requires CPU tensors
             const TensorBase *Q_base = dynamic_cast<const TensorBase *>(Q);
             const TensorBase *K_base = dynamic_cast<const TensorBase *>(K);

@@ -282,7 +282,7 @@ namespace llaminar2
     void MPIBootstrapPhase::listDevices()
     {
         auto &dm = DeviceManager::instance();
-        dm.initialize(-1);
+        dm.initialize(-1, false); // No tables — printed post-MPI via InventoryPrinter
 
         const auto &devices = dm.devices();
 
@@ -347,7 +347,7 @@ namespace llaminar2
         // Phase 1: Full device enumeration (no NUMA filtering)
         // =================================================================
         auto &dm = DeviceManager::instance();
-        dm.initialize(-1);
+        dm.initialize(-1, false); // No tables — printed post-MPI via InventoryPrinter
 
         // =================================================================
         // Phase 2: Determine inference NUMA nodes

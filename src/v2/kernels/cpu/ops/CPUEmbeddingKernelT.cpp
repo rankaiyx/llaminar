@@ -109,12 +109,19 @@ namespace llaminar2
                 return false;
             }
 
-            // Direct memcpy for FP32 output
+            // Direct memcpy for FP32 output (with vocab-parallel sharding support)
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
+                int local_id = token_id - vocab_offset_;
+                if (local_id < 0 || local_id >= local_vocab_size_)
+                {
+                    // Token belongs to a different rank's shard — output zeros
+                    std::memset(output + i * d_model, 0, d_model * sizeof(float));
+                    continue;
+                }
                 std::memcpy(output + i * d_model,
-                            embed_data + token_id * d_model,
+                            embed_data + local_id * d_model,
                             d_model * sizeof(float));
             }
 
@@ -146,11 +153,18 @@ namespace llaminar2
                 return false;
             }
 
-            // Lookup FP32 embeddings, convert to BF16
+            // Lookup FP32 embeddings, convert to BF16 (with vocab-parallel sharding support)
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
-                const float *embed_row = embed_data + token_id * d_model;
+                int local_id = token_id - vocab_offset_;
+                if (local_id < 0 || local_id >= local_vocab_size_)
+                {
+                    // Token belongs to a different rank's shard — output zeros
+                    std::memset(output + i * d_model, 0, d_model * sizeof(uint16_t));
+                    continue;
+                }
+                const float *embed_row = embed_data + local_id * d_model;
                 uint16_t *out_row = output + i * d_model;
 
                 for (int j = 0; j < d_model; ++j)
@@ -187,11 +201,18 @@ namespace llaminar2
                 return false;
             }
 
-            // Lookup FP32 embeddings, convert to FP16
+            // Lookup FP32 embeddings, convert to FP16 (with vocab-parallel sharding support)
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
-                const float *embed_row = embed_data + token_id * d_model;
+                int local_id = token_id - vocab_offset_;
+                if (local_id < 0 || local_id >= local_vocab_size_)
+                {
+                    // Token belongs to a different rank's shard — output zeros
+                    std::memset(output + i * d_model, 0, d_model * sizeof(uint16_t));
+                    continue;
+                }
+                const float *embed_row = embed_data + local_id * d_model;
                 uint16_t *out_row = output + i * d_model;
 
                 for (int j = 0; j < d_model; ++j)
@@ -237,12 +258,21 @@ namespace llaminar2
 
             Q8_1Block *output_blocks = static_cast<Q8_1Block *>(output);
 
-            // Lookup FP32 embeddings, quantize to Q8_1
+            // Lookup FP32 embeddings, quantize to Q8_1 (with vocab-parallel sharding support)
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
-                const float *embed_row = embed_data + token_id * d_model;
+                int local_id = token_id - vocab_offset_;
                 Q8_1Block *out_row = output_blocks + i * blocks_per_row;
+
+                if (local_id < 0 || local_id >= local_vocab_size_)
+                {
+                    // Token belongs to a different rank's shard — output zero blocks
+                    std::memset(out_row, 0, blocks_per_row * sizeof(Q8_1Block));
+                    continue;
+                }
+
+                const float *embed_row = embed_data + local_id * d_model;
 
                 // Quantize FP32 row to Q8_1 blocks using SIMD primitives
                 simd::quantize_fp32_to_q8_1_blocks(embed_row, out_row, d_model);
@@ -270,6 +300,17 @@ namespace llaminar2
         if (!embed_table || !token_ids || !output)
         {
             return false;
+        }
+
+        // Compute vocab-parallel sharding state
+        // When the embedding table is column-parallel sharded, each rank holds
+        // vocab_size/tp_degree rows. Tokens outside the local range must produce zeros;
+        // the subsequent AllReduce sums partial results across ranks.
+        local_vocab_size_ = static_cast<int>(embed_table->rows());
+        vocab_offset_ = 0;
+        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        {
+            vocab_offset_ = mpi_ctx->rank() * local_vocab_size_;
         }
 
         // =====================================================================
@@ -355,10 +396,18 @@ namespace llaminar2
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
+                int local_id = token_id - vocab_offset_;
                 float *out_row = out + static_cast<size_t>(i) * d_model;
+
+                if (local_id < 0 || local_id >= local_vocab_size_)
+                {
+                    std::memset(out_row, 0, d_model * sizeof(float));
+                    continue;
+                }
+
                 for (size_t b = 0; b < blocks_per_row; ++b)
                 {
-                    const EmbedQ8Block &blk = blocks[token_id * blocks_per_row + b];
+                    const EmbedQ8Block &blk = blocks[local_id * blocks_per_row + b];
                     float scale = fp16_to_fp32(blk.d);
                     float min_val = fp16_to_fp32(blk.m);
                     int base = static_cast<int>(b) * 32;
@@ -381,10 +430,18 @@ namespace llaminar2
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
+                int local_id = token_id - vocab_offset_;
                 uint16_t *out_row = out + static_cast<size_t>(i) * d_model;
+
+                if (local_id < 0 || local_id >= local_vocab_size_)
+                {
+                    std::memset(out_row, 0, d_model * sizeof(uint16_t));
+                    continue;
+                }
+
                 for (size_t b = 0; b < blocks_per_row; ++b)
                 {
-                    const EmbedQ8Block &blk = blocks[token_id * blocks_per_row + b];
+                    const EmbedQ8Block &blk = blocks[local_id * blocks_per_row + b];
                     float scale = fp16_to_fp32(blk.d);
                     float min_val = fp16_to_fp32(blk.m);
                     int base = static_cast<int>(b) * 32;
@@ -410,10 +467,18 @@ namespace llaminar2
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
+                int local_id = token_id - vocab_offset_;
                 uint16_t *out_row = out + static_cast<size_t>(i) * d_model;
+
+                if (local_id < 0 || local_id >= local_vocab_size_)
+                {
+                    std::memset(out_row, 0, d_model * sizeof(uint16_t));
+                    continue;
+                }
+
                 for (size_t b = 0; b < blocks_per_row; ++b)
                 {
-                    const EmbedQ8Block &blk = blocks[token_id * blocks_per_row + b];
+                    const EmbedQ8Block &blk = blocks[local_id * blocks_per_row + b];
                     float scale = fp16_to_fp32(blk.d);
                     float min_val = fp16_to_fp32(blk.m);
                     int base = static_cast<int>(b) * 32;
@@ -446,10 +511,19 @@ namespace llaminar2
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
+                int local_id = token_id - vocab_offset_;
+                Q8_1Block *out_blocks = output_blocks + i * q8_blocks_per_row;
+
+                if (local_id < 0 || local_id >= local_vocab_size_)
+                {
+                    std::memset(out_blocks, 0, q8_blocks_per_row * sizeof(Q8_1Block));
+                    continue;
+                }
+
                 // Dequant from EmbedQ8 to FP32 temp
                 for (size_t b = 0; b < blocks_per_row; ++b)
                 {
-                    const EmbedQ8Block &blk = blocks[token_id * blocks_per_row + b];
+                    const EmbedQ8Block &blk = blocks[local_id * blocks_per_row + b];
                     float scale = fp16_to_fp32(blk.d);
                     float min_val = fp16_to_fp32(blk.m);
                     int base = static_cast<int>(b) * 32;
@@ -459,7 +533,7 @@ namespace llaminar2
                 }
                 // Quantize FP32 row → Q8_1 blocks
                 simd::quantize_fp32_to_q8_1_blocks(
-                    row_buf, output_blocks + i * q8_blocks_per_row, d_model);
+                    row_buf, out_blocks, d_model);
             }
             return true;
         }

@@ -1118,6 +1118,53 @@ namespace llaminar2
         bool isMapped() const { return is_mapped_; }
 
         /**
+         * @brief Check if tensor is host-resident (never uploaded to device)
+         * @return true if tensor is marked HOST_RESIDENT
+         *
+         * Host-resident tensors live exclusively on the host. Device upload
+         * requests (ensureOnDevice, TransferEngine::uploadFull) are no-ops.
+         * Use this for weights that are consumed on CPU and repacked into a
+         * device workspace by the kernel (e.g., embedding tables → EmbedQ8).
+         */
+        bool isHostResident() const { return memory_residency_ == MemoryResidency::HOST_RESIDENT; }
+
+        /**
+         * @brief Mark this tensor as host-resident (device uploads become no-ops)
+         *
+         * Once set, ensureOnDevice() and TransferEngine::uploadFull() will
+         * return immediately without allocating or uploading to GPU. The
+         * tensor stays in HOST_ONLY coherence state.
+         *
+         * This is enforced in TransferEngine via MemoryResidency, so ALL
+         * upload paths are blocked at the single chokepoint — no caller-side
+         * name checks needed.
+         */
+        virtual void setHostResident()
+        {
+            memory_residency_ = MemoryResidency::HOST_RESIDENT;
+        }
+
+        /**
+         * @brief Check if tensor is GPU-only (host freed after upload)
+         */
+        bool isGpuOnly() const { return memory_residency_ == MemoryResidency::GPU_ONLY; }
+
+        /**
+         * @brief Mark this tensor as GPU-only
+         *
+         * After the next successful H2D upload, the TransferEngine's
+         * IHostMemoryReleaser will free host-side storage. If a D2H
+         * download is requested later, host storage is re-allocated.
+         *
+         * Use this for activation buffers and weights that live
+         * exclusively on GPU during inference.
+         */
+        virtual void setGpuOnly()
+        {
+            memory_residency_ = MemoryResidency::GPU_ONLY;
+        }
+
+        /**
          * @brief Notify a mapped tensor that the GPU stream has been externally
          *        synchronized, so no per-access event wait is needed.
          *

@@ -668,7 +668,11 @@ namespace llaminar2
             params_.workspace_scores,
             mask_to_use, // Use our decode mask if we built one
             params_.mpi_ctx,
-            device_idx);
+            device_idx,
+            params_.head_start,
+            -1, // local_n_heads (n_heads is already local)
+            -1, // local_n_kv_heads (n_kv_heads is already local)
+            params_.gqa_n_rep);
 
         if (kv_rot)
         {

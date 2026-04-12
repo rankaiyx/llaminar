@@ -572,62 +572,24 @@ namespace llaminar2
         }
 
         // Step 2: Generate NCCL unique ID
-        nccl::ncclUniqueId unique_id;
-        nccl::ncclResult_t r = nccl::ncclGetUniqueId(&unique_id);
+        // Step 2: Initialize NCCL communicators using ncclCommInitAll.
+        // This is the correct API for single-process multi-GPU initialization.
+        // The GroupStart/CommInitRank/GroupEnd pattern has a shared memory race
+        // condition in NCCL's topology exchange layer that can cause failures
+        // with multiple GPUs (threads race to attach to /dev/shm segments).
+        std::vector<nccl::ncclComm_t> nccl_comms(num_devices_);
+        nccl::ncclResult_t r = nccl::ncclCommInitAll(nccl_comms.data(), num_devices_, device_ordinals_.data());
         if (r != nccl::ncclSuccess)
         {
-            last_error_ = std::string("ncclGetUniqueId failed: ") + nccl::ncclGetErrorString(r);
+            last_error_ = std::string("ncclCommInitAll failed: ") + nccl::ncclGetErrorString(r);
             LOG_ERROR("[NCCLCoordinator] " << last_error_);
             cleanupOnThread();
             return;
         }
-
-        // Step 3: Initialize NCCL communicators using ncclGroupStart/End
-        // This is the proper way to initialize multiple communicators from a single thread
-        r = nccl::ncclGroupStart();
-        if (r != nccl::ncclSuccess)
-        {
-            last_error_ = std::string("ncclGroupStart failed: ") + nccl::ncclGetErrorString(r);
-            LOG_ERROR("[NCCLCoordinator] " << last_error_);
-            cleanupOnThread();
-            return;
-        }
-
         for (int i = 0; i < num_devices_; ++i)
         {
-            cudaError_t cuda_err = cudaSetDevice(device_ordinals_[i]);
-            if (cuda_err != cudaSuccess)
-            {
-                last_error_ = std::string("cudaSetDevice in ncclCommInitRank failed: ") +
-                              cudaGetErrorString(cuda_err);
-                LOG_ERROR("[NCCLCoordinator] " << last_error_);
-                nccl::ncclGroupEnd();
-                cleanupOnThread();
-                return;
-            }
-
-            nccl::ncclComm_t comm;
-            r = nccl::ncclCommInitRank(&comm, num_devices_, unique_id, i);
-            if (r != nccl::ncclSuccess)
-            {
-                last_error_ = std::string("ncclCommInitRank failed for rank ") +
-                              std::to_string(i) + ": " + nccl::ncclGetErrorString(r);
-                LOG_ERROR("[NCCLCoordinator] " << last_error_);
-                nccl::ncclGroupEnd();
-                cleanupOnThread();
-                return;
-            }
-            comms_[i] = static_cast<void *>(comm);
+            comms_[i] = static_cast<void *>(nccl_comms[i]);
             LOG_TRACE("[NCCLCoordinator] Initialized NCCL comm for device " << device_ordinals_[i]);
-        }
-
-        r = nccl::ncclGroupEnd();
-        if (r != nccl::ncclSuccess)
-        {
-            last_error_ = std::string("ncclGroupEnd failed: ") + nccl::ncclGetErrorString(r);
-            LOG_ERROR("[NCCLCoordinator] " << last_error_);
-            cleanupOnThread();
-            return;
         }
 
         init_success_.store(true);

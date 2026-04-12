@@ -14,8 +14,11 @@
 #include "../config/TPDomain.h"
 #include "../tensors/Tensors.h"
 #include "../utils/Logger.h"
+#include "../utils/NodeDetection.h"
 #include <mpi.h>
 #include <utility>
+#include <algorithm>
+#include <set>
 
 namespace llaminar2
 {
@@ -31,9 +34,29 @@ namespace llaminar2
         int domain_size,
         std::vector<int> world_ranks,
         bool owns_communicator,
-        CollectiveBackendType backend_type)
-        : domain_comm_(domain_comm), domain_id_(domain_id), my_rank_in_domain_(my_rank_in_domain), domain_size_(domain_size), world_ranks_(std::move(world_ranks)), owns_communicator_(owns_communicator), backend_type_(backend_type), backend_(nullptr)
+        CollectiveBackendType backend_type,
+        std::vector<int> node_ids)
+        : domain_comm_(domain_comm), domain_id_(domain_id), my_rank_in_domain_(my_rank_in_domain), domain_size_(domain_size), world_ranks_(std::move(world_ranks)), node_ids_(std::move(node_ids)), all_same_node_(false), node_count_(0), owns_communicator_(owns_communicator), backend_type_(backend_type), backend_(nullptr)
     {
+        // Auto-detect node IDs if not provided
+        if (node_ids_.empty() && domain_comm_ != MPI_COMM_NULL)
+        {
+            detectNodeIds();
+        }
+
+        // Compute cached node topology fields
+        if (!node_ids_.empty())
+        {
+            std::set<int> unique_nodes(node_ids_.begin(), node_ids_.end());
+            node_count_ = static_cast<int>(unique_nodes.size());
+            all_same_node_ = (node_count_ == 1);
+        }
+        else
+        {
+            // No node info available (e.g., null communicator)
+            node_count_ = domain_size_;
+            all_same_node_ = (domain_size_ <= 1);
+        }
         // Create UPI backend for collective operations
         if (domain_comm_ != MPI_COMM_NULL)
         {
@@ -52,7 +75,9 @@ namespace llaminar2
             LOG_DEBUG("GlobalTPContext: Created for domain " << domain_id_
                                                              << " with rank " << my_rank_in_domain_
                                                              << "/" << domain_size_
-                                                             << " (owns_comm=" << owns_communicator_ << ")");
+                                                             << " (owns_comm=" << owns_communicator_
+                                                             << ", all_same_node=" << all_same_node_
+                                                             << ", node_count=" << node_count_ << ")");
         }
     }
 
@@ -116,7 +141,8 @@ namespace llaminar2
         MPI_Comm base_comm,
         int domain_id,
         int color,
-        int key)
+        int key,
+        const std::string &hostfile_path)
     {
         if (base_comm == MPI_COMM_NULL)
         {
@@ -153,6 +179,11 @@ namespace llaminar2
                                                                        << " with color=" << color << ", key=" << key
                                                                        << ", size=" << domain_size);
 
+        // Detect node IDs using hostfile if provided, else auto-detect
+        // Doing this here (before constructor) means we pass node_ids directly,
+        // and the constructor skips detectNodeIds() since node_ids will be non-empty.
+        auto detection = NodeDetection::detect(new_comm, hostfile_path);
+
         // Create context - we own the communicator since we created it
         return std::unique_ptr<GlobalTPContext>(new GlobalTPContext(
             new_comm,
@@ -160,14 +191,16 @@ namespace llaminar2
             my_rank,
             domain_size,
             std::move(world_ranks),
-            true // owns_communicator = true (we created it)
-            ));
+            true, // owns_communicator = true (we created it)
+            CollectiveBackendType::UPI,
+            std::move(detection.node_ids)));
     }
 
     std::unique_ptr<GlobalTPContext> GlobalTPContext::createForTest(
         MPI_Comm comm,
         int domain_id,
-        std::vector<int> world_ranks)
+        std::vector<int> world_ranks,
+        std::vector<int> node_ids)
     {
         if (comm == MPI_COMM_NULL)
         {
@@ -197,8 +230,9 @@ namespace llaminar2
             my_rank,
             domain_size,
             std::move(world_ranks),
-            false // owns_communicator = false (test owns it)
-            ));
+            false, // owns_communicator = false (test owns it)
+            CollectiveBackendType::UPI,
+            std::move(node_ids)));
     }
 
     // =============================================================================
@@ -221,7 +255,7 @@ namespace llaminar2
     // =============================================================================
 
     GlobalTPContext::GlobalTPContext(GlobalTPContext &&other) noexcept
-        : domain_comm_(other.domain_comm_), domain_id_(other.domain_id_), my_rank_in_domain_(other.my_rank_in_domain_), domain_size_(other.domain_size_), world_ranks_(std::move(other.world_ranks_)), owns_communicator_(other.owns_communicator_), backend_(std::move(other.backend_))
+        : domain_comm_(other.domain_comm_), domain_id_(other.domain_id_), my_rank_in_domain_(other.my_rank_in_domain_), domain_size_(other.domain_size_), world_ranks_(std::move(other.world_ranks_)), node_ids_(std::move(other.node_ids_)), all_same_node_(other.all_same_node_), node_count_(other.node_count_), owns_communicator_(other.owns_communicator_), backend_(std::move(other.backend_))
     {
         // Clear source to prevent double-free
         other.domain_comm_ = MPI_COMM_NULL;
@@ -229,6 +263,8 @@ namespace llaminar2
         other.domain_id_ = -1;
         other.my_rank_in_domain_ = -1;
         other.domain_size_ = 0;
+        other.all_same_node_ = false;
+        other.node_count_ = 0;
     }
 
     GlobalTPContext &GlobalTPContext::operator=(GlobalTPContext &&other) noexcept
@@ -247,6 +283,9 @@ namespace llaminar2
             my_rank_in_domain_ = other.my_rank_in_domain_;
             domain_size_ = other.domain_size_;
             world_ranks_ = std::move(other.world_ranks_);
+            node_ids_ = std::move(other.node_ids_);
+            all_same_node_ = other.all_same_node_;
+            node_count_ = other.node_count_;
             owns_communicator_ = other.owns_communicator_;
             backend_ = std::move(other.backend_);
 
@@ -256,6 +295,8 @@ namespace llaminar2
             other.domain_id_ = -1;
             other.my_rank_in_domain_ = -1;
             other.domain_size_ = 0;
+            other.all_same_node_ = false;
+            other.node_count_ = 0;
         }
         return *this;
     }
@@ -585,6 +626,52 @@ namespace llaminar2
     bool GlobalTPContext::isValid() const
     {
         return domain_comm_ != MPI_COMM_NULL && domain_size_ > 0;
+    }
+
+    // =============================================================================
+    // Node Awareness
+    // =============================================================================
+
+    TPScope GlobalTPContext::scope() const
+    {
+        return all_same_node_ ? TPScope::NODE_LOCAL : TPScope::GLOBAL;
+    }
+
+    bool GlobalTPContext::isAllRanksOnSameNode() const
+    {
+        return all_same_node_;
+    }
+
+    int GlobalTPContext::nodeId(int domain_index) const
+    {
+        if (domain_index < 0 || static_cast<size_t>(domain_index) >= node_ids_.size())
+        {
+            return -1;
+        }
+        return node_ids_[domain_index];
+    }
+
+    const std::vector<int> &GlobalTPContext::nodeIds() const
+    {
+        return node_ids_;
+    }
+
+    int GlobalTPContext::nodeCount() const
+    {
+        return node_count_;
+    }
+
+    void GlobalTPContext::detectNodeIds()
+    {
+        if (domain_comm_ == MPI_COMM_NULL || domain_size_ <= 0)
+        {
+            return;
+        }
+
+        // Delegate to the canonical hostname-based node detection
+        auto detection = NodeDetection::detect(domain_comm_);
+        node_ids_ = std::move(detection.node_ids);
+        // node_count_ and all_same_node_ are computed by the caller
     }
 
 } // namespace llaminar2

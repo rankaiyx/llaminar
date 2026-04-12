@@ -31,7 +31,7 @@
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
-#include "kernels/cpu/attention/CPUAttentionKernelT.h"
+#include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include <cuda_runtime.h>
 #endif
 
@@ -270,7 +270,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Small)
     std::vector<float> cuda_output(out_size, 0.0f);
 
     // CPU reference
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -364,7 +364,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Medium)
     std::vector<float> cuda_output(out_size, 0.0f);
 
     // CPU reference
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -431,7 +431,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Large)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -501,8 +501,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // CPU reference using CPUAttentionKernelT::compute_decode() - apples-to-apples comparison
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using CPUFlashAttentionKernelT::compute_decode() - apples-to-apples comparison
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         1, // seq_len = 1 (single query token)
@@ -576,8 +576,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // CPU reference using CPUAttentionKernelT::compute_decode() - apples-to-apples comparison
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using CPUFlashAttentionKernelT::compute_decode() - apples-to-apples comparison
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         1, kv_len, n_heads, n_kv_heads, head_dim,
@@ -619,7 +619,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long_Parity)
     double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
     double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
 
-    printComparisonStats("FlashDecode FP32 Long Parity (split-K) vs CPUAttentionKernelT", cosine, l2_error, max_error, out_size);
+    printComparisonStats("FlashDecode FP32 Long Parity (split-K) vs CPUFlashAttentionKernelT", cosine, l2_error, max_error, out_size);
 
     EXPECT_GE(cosine, 0.99) << "Cosine similarity too low - split-K reduction may be incorrect";
     EXPECT_LE(l2_error, 0.05) << "L2 error too high";
@@ -646,7 +646,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
     std::vector<float> cpu_q81_output(out_size, 0.0f);
     std::vector<float> cuda_q81_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
 
     ASSERT_TRUE(cpu_kernel.compute_decode(
         Q_data.data(), K_data_fp32.data(), V_data_fp32.data(), cpu_baseline_output.data(),
@@ -762,8 +762,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // CPU reference using production CPUAttentionKernelT::compute_decode()
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         1, kv_len, n_heads, n_kv_heads, head_dim, true);
@@ -829,8 +829,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // CPU reference using production CPUAttentionKernelT::compute_decode()
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         1, kv_len, n_heads, n_kv_heads, head_dim, true);
@@ -870,7 +870,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
     double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
 
-    printComparisonStats("FlashDecode FP32 MHA Parity (CPUAttentionKernelT vs CUDA)", cosine, l2_error, max_error, out_size);
+    printComparisonStats("FlashDecode FP32 MHA Parity (CPUFlashAttentionKernelT vs CUDA)", cosine, l2_error, max_error, out_size);
 
     EXPECT_GE(cosine, 0.99);
     EXPECT_LE(l2_error, 0.05);
@@ -895,8 +895,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // CPU reference using production CPUAttentionKernelT::compute_decode()
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         1, kv_len, n_heads, n_kv_heads, head_dim, true);
@@ -961,8 +961,8 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    // CPU reference using production CPUAttentionKernelT::compute_decode()
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         1, kv_len, n_heads, n_kv_heads, head_dim, false); // non-causal
@@ -1033,7 +1033,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_HeadDim128)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -1103,7 +1103,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_NonCausal)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -1203,7 +1203,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_CausalMasking)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> cuda_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,

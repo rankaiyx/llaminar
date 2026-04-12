@@ -64,11 +64,11 @@ namespace llaminar2
      * Implements IWorkspaceConsumer by forwarding all calls to a kernel obtained
      * via getKernelAsWorkspaceConsumer().
      *
-    * ## Kernel Resolution
+     * ## Kernel Resolution
      *
-    * KernelFactory owns prepared GEMM handles and device-scoped GEMM engines,
-    * so stages don't need their own caching. getKernelAsWorkspaceConsumer() can
-    * resolve the active kernel from those shared registries.
+     * KernelFactory owns prepared GEMM handles and device-scoped GEMM engines,
+     * so stages don't need their own caching. getKernelAsWorkspaceConsumer() can
+     * resolve the active kernel from those shared registries.
      *
      * ## Thread Safety
      *

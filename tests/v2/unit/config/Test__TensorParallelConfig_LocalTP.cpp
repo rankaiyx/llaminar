@@ -339,14 +339,16 @@ namespace llaminar2
             EXPECT_EQ(config.worldSize(), 3);
             EXPECT_TRUE(config.validate()) << config.validationError();
 
-            // 14 heads / 3 = 4.67, so expect 5 + 5 + 4 or similar
+            // 14 heads / 3 with GQA alignment (n_kv_heads=2) → multiples of 2
+            // Expected: [6, 4, 4] (first device gets extra aligned chunk)
             int total_heads = 0;
             for (int i = 0; i < 3; ++i)
             {
                 const auto &a = config.forRank(i);
                 total_heads += a.head_count;
-                EXPECT_GE(a.head_count, 4) << "Rank " << i << " should have at least 4 heads";
-                EXPECT_LE(a.head_count, 5) << "Rank " << i << " should have at most 5 heads";
+                EXPECT_EQ(a.head_count % TEST_KV_HEADS, 0)
+                    << "Rank " << i << " head_count=" << a.head_count
+                    << " must be divisible by n_kv_heads=" << TEST_KV_HEADS;
             }
             EXPECT_EQ(total_heads, TEST_HEADS);
         }

@@ -32,7 +32,9 @@ extern "C"
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
         void *stream,
-        int device_idx);
+        int device_idx,
+        int head_start,
+        int gqa_n_rep);
 
     // FA2 with FP16 K/V inputs — skips FP16→FP32→FP16 round-trip when KV cache is FP16
     int cudaFlashAttn_prefill_fa2_fp16kv(
@@ -43,7 +45,9 @@ extern "C"
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
         void *stream,
-        int device_idx);
+        int device_idx,
+        int head_start,
+        int gqa_n_rep);
 
     // cuBLAS-based unfused attention for prefill with FP16 KV
     int cudaFlashAttn_prefill_cublas_fp16kv(
@@ -63,7 +67,9 @@ extern "C"
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream,
-        int device_idx);
+        int device_idx,
+        int head_start,
+        int gqa_n_rep);
 
     // Flash Decoding with FP16 KV cache — reads half directly, no conversion
     int cudaFlashAttn_decode_fp16kv(
@@ -74,7 +80,9 @@ extern "C"
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream,
-        int device_idx);
+        int device_idx,
+        int head_start,
+        int gqa_n_rep);
 
     // Flash Decoding with Q8_1 KV cache — fused inline dequant, no workspace
     int cudaFlashAttn_decode_q8_1(
@@ -85,7 +93,9 @@ extern "C"
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream,
-        int device_idx);
+        int device_idx,
+        int head_start,
+        int gqa_n_rep);
 
     // Flash Decoding with TQ8 K / TQ4 V — fused rotation + centroid attention
     int cudaFlashAttn_decode_tqkv(
@@ -100,7 +110,9 @@ extern "C"
         int k_block_size, int v_block_size,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream,
-        int device_idx);
+        int device_idx,
+        int head_start,
+        int gqa_n_rep);
 
     int cudaFlashAttn_allocWorkspace(
         void **partial_output, void **partial_m, void **partial_l,
@@ -419,7 +431,9 @@ namespace llaminar2
             bool causal, int window_size, int position_offset,
             int device_idx,
             const attention::AttentionDeviceParams *device_params,
-            const float *mask)
+            const float *mask,
+            int head_start,
+            int gqa_n_rep)
         {
             if (!Q || !K || !V || !output)
             {
@@ -480,7 +494,8 @@ namespace llaminar2
                         batch_size, kv_len,
                         n_heads, n_kv_heads, head_dim,
                         num_splits, device_params, stream_,
-                        device_idx);
+                        device_idx,
+                        head_start, gqa_n_rep);
                 }
             }
             else
@@ -499,7 +514,8 @@ namespace llaminar2
                         causal, window_size, position_offset,
                         device_params, mask,
                         stream_,
-                        device_idx);
+                        device_idx,
+                        head_start, gqa_n_rep);
                 }
             }
 
@@ -534,11 +550,11 @@ namespace llaminar2
             int device_idx,
             int head_start,
             int local_n_heads,
-            int local_n_kv_heads)
+            int local_n_kv_heads,
+            int gqa_n_rep)
         {
             (void)workspace_scores;
             (void)mpi_ctx;
-            (void)head_start;
             (void)local_n_heads;
             (void)local_n_kv_heads;
 
@@ -797,7 +813,8 @@ namespace llaminar2
                             static_cast<float *>(partial_l_buf_),
                             batch_size, kv_len,
                             n_heads, n_kv_heads, head_dim,
-                            num_splits, d_attn_params, stream_, dev);
+                            num_splits, d_attn_params, stream_, dev,
+                            head_start, gqa_n_rep);
                     }
                     if (result != 0)
                     {
@@ -845,7 +862,8 @@ namespace llaminar2
                         n_heads, n_kv_heads, head_dim,
                         causal, window_size, 0,
                         d_attn_params, mask_ptr,
-                        stream_, dev);
+                        stream_, dev,
+                        head_start, gqa_n_rep);
                 }
                 if (result != 0)
                 {
@@ -885,7 +903,8 @@ namespace llaminar2
                         static_cast<float *>(partial_l_buf_),
                         batch_size, kv_len,
                         n_heads, n_kv_heads, head_dim,
-                        num_splits, d_attn_params, stream_, dev);
+                        num_splits, d_attn_params, stream_, dev,
+                        head_start, gqa_n_rep);
                 }
                 if (result != 0)
                 {
@@ -903,7 +922,8 @@ namespace llaminar2
                                    batch_size, seq_len, kv_len,
                                    n_heads, n_kv_heads, head_dim,
                                    causal, window_size, 0, dev,
-                                   d_attn_params, mask_ptr);
+                                   d_attn_params, mask_ptr,
+                                   head_start, gqa_n_rep);
             }
             else
             {
@@ -912,7 +932,8 @@ namespace llaminar2
                                    batch_size, seq_len, seq_len,
                                    n_heads, n_kv_heads, head_dim,
                                    causal, window_size, 0, dev,
-                                   d_attn_params, mask_ptr);
+                                   d_attn_params, mask_ptr,
+                                   head_start, gqa_n_rep);
             }
         }
 
@@ -1049,7 +1070,9 @@ namespace llaminar2
             int max_seq_len,
             int tail,
             int k_block_size,
-            int v_block_size)
+            int v_block_size,
+            int head_start,
+            int gqa_n_rep)
         {
             const int num_splits = std::max(1, std::min(kv_count / 64, 32));
 
@@ -1088,7 +1111,8 @@ namespace llaminar2
                     max_seq_len, tail,
                     k_block_size, v_block_size,
                     d_params,
-                    stream_, device_idx_);
+                    stream_, device_idx_,
+                    head_start, gqa_n_rep);
 
                 if (result != 0)
                 {
@@ -1116,7 +1140,8 @@ namespace llaminar2
                 max_seq_len, tail,
                 k_block_size, v_block_size,
                 nullptr,
-                stream_, device_idx_);
+                stream_, device_idx_,
+                head_start, gqa_n_rep);
 
             if (result != 0)
             {
@@ -1354,7 +1379,8 @@ namespace llaminar2
             int device_idx,
             int head_start,
             int local_n_heads,
-            int local_n_kv_heads)
+            int local_n_kv_heads,
+            int gqa_n_rep)
         {
             // FP16 compute_tensor: delegate to FP32 for now
             LOG_WARN("[CUDAFlashAttentionKernelT<FP16>] FP16 compute_tensor not yet implemented, using FP32");
@@ -1362,7 +1388,7 @@ namespace llaminar2
             return fp32_kernel.compute_tensor(Q, K, V, output, batch_size, seq_len, kv_len,
                                               n_heads, n_kv_heads, head_dim, causal, window_size,
                                               workspace_scores, workspace_mask, mpi_ctx, device_idx,
-                                              head_start, local_n_heads, local_n_kv_heads);
+                                              head_start, local_n_heads, local_n_kv_heads, gqa_n_rep);
         }
 
         // =====================================================================
@@ -1657,7 +1683,8 @@ namespace llaminar2
             int device_idx,
             int head_start,
             int local_n_heads,
-            int local_n_kv_heads)
+            int local_n_kv_heads,
+            int gqa_n_rep)
         {
             // BF16 compute_tensor: delegate to FP32 for now
             LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 compute_tensor not yet implemented, using FP32");
@@ -1665,7 +1692,7 @@ namespace llaminar2
             return fp32_kernel.compute_tensor(Q, K, V, output, batch_size, seq_len, kv_len,
                                               n_heads, n_kv_heads, head_dim, causal, window_size,
                                               workspace_scores, workspace_mask, mpi_ctx, device_idx,
-                                              head_start, local_n_heads, local_n_kv_heads);
+                                              head_start, local_n_heads, local_n_kv_heads, gqa_n_rep);
         }
 
         // =====================================================================

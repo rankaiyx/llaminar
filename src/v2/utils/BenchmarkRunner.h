@@ -126,9 +126,10 @@ namespace llaminar2
          * @brief Run decode phase and measure timing
          * @param n_tokens Number of tokens to generate
          * @param eos_token_id EOS token ID for early stopping
+         * @param ignore_stop_tokens If true, never stop on EOS/stop tokens (for throughput benchmarks)
          * @return Tuple of (success, time_ms, tokens_generated, generated_text)
          */
-        std::tuple<bool, double, int, std::string> runDecode(int n_tokens, int eos_token_id);
+        std::tuple<bool, double, int, std::string> runDecode(int n_tokens, int eos_token_id, bool ignore_stop_tokens = false);
     };
 
 } // namespace llaminar2

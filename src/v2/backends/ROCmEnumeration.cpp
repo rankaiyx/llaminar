@@ -15,6 +15,7 @@
 #include <cstring>
 #include <cstdio>
 #include "ComputeBackend.h"
+#include "GPUEnumeration.h"
 #include "../utils/Logger.h"
 
 namespace llaminar2
@@ -133,6 +134,10 @@ namespace llaminar2
                 LOG_INFO("[ROCm] Device " << i << ": " << dev.name
                                           << " (" << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB)");
 
+                // Read PCIe link information from sysfs
+                dev.pcie = pcie_enumeration::read_pcie_link_info(
+                    prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+
                 devices.push_back(dev);
             }
 
@@ -169,6 +174,39 @@ namespace llaminar2
             fclose(f);
 
             return numa_node;
+        }
+
+        P2PMatrix query_p2p_matrix(const std::vector<ComputeDevice> &devices)
+        {
+            P2PMatrix matrix;
+            matrix.backend = ComputeBackendType::GPU_ROCM;
+            const int n = static_cast<int>(devices.size());
+            matrix.device_ids.resize(n);
+            matrix.can_access.resize(n, std::vector<bool>(n, false));
+
+            for (int i = 0; i < n; ++i)
+            {
+                matrix.device_ids[i] = devices[i].device_id;
+                matrix.can_access[i][i] = true;
+            }
+
+            for (int i = 0; i < n; ++i)
+            {
+                for (int j = 0; j < n; ++j)
+                {
+                    if (i == j)
+                        continue;
+                    int can_access = 0;
+                    hipError_t err = hipDeviceCanAccessPeer(&can_access,
+                                                            devices[i].device_id, devices[j].device_id);
+                    if (err == hipSuccess && can_access)
+                    {
+                        matrix.can_access[i][j] = true;
+                    }
+                }
+            }
+
+            return matrix;
         }
 
     } // namespace rocm_enumeration

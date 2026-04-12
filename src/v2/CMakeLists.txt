@@ -1214,6 +1214,9 @@ add_library(llaminar2_core STATIC
     # Interfaces
     interfaces/IMPIContext.cpp
     backends/ComputeBackend.cpp
+    backends/HardwareInventory.cpp
+    backends/InventoryPrinter.cpp
+    backends/PCIeEnumeration.cpp
     backends/BackendManager.cpp
     backends/CPUBackend.cpp
     # GPUDeviceContextPool is backend-agnostic (uses factory functions registered by cuda_backend/rocm_backend)
@@ -1348,7 +1351,6 @@ add_library(llaminar2_core STATIC
     loaders/WeightManager.cpp
     loaders/WeightSlicer.cpp
     loaders/WeightPlacementMap.cpp
-    loaders/WeightPreloader.cpp
     loaders/DeviceOrchestrator.cpp
     loaders/LayerWeightStreamer.cpp
     loaders/WeightStreamerFactory.cpp
@@ -1418,13 +1420,13 @@ add_library(llaminar2_core STATIC
     kernels/cpu/ops/CPUSoftmaxKernelT.cpp  # Typed Softmax with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/ops/CPUSwiGLUKernelT.cpp   # Typed SwiGLU with native precision paths (FP32/BF16/FP16/Q8_1)
     kernels/cpu/ops/CPUEmbeddingKernelT.cpp    # Typed Embedding lookup with native precision paths (FP32/BF16/FP16/Q8_1)
-    kernels/cpu/attention/CPUAttentionKernelT.cpp # Typed attention kernel (FP32/BF16/FP16/Q8_1)
     kernels/cpu/attention/CPUFlashAttentionKernelT.cpp # FlashAttention2-style tiled CPU attention (FP32 with fallbacks)
     # GDN kernel implementations (Gated Delta Net)
     kernels/cpu/gdn/CPUShortConvolution.cpp
     kernels/cpu/gdn/CPUGatedDeltaNet.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
+    kernels/common/PreparedEmbeddingWeights.cpp
     # Universal device kernel cache (hipBLAS, cuBLAS handles, etc.)
     kernels/DeviceKernelCache.cpp
     # Testing infrastructure
@@ -1434,6 +1436,7 @@ add_library(llaminar2_core STATIC
     utils/NUMATopology.cpp
     utils/NodeTopology.cpp
     utils/MPITopology.cpp
+    utils/NodeDetection.cpp
     utils/MPIStager.cpp
     utils/Tokenizer.cpp
     utils/Sampler.cpp

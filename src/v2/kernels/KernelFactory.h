@@ -72,6 +72,7 @@
 #include "../backends/DeviceType.h"            // Shared DeviceType enum
 #include "../backends/DeviceId.h"              // Type-safe device identification
 #include "../execution/config/RuntimeConfig.h" // ActivationPrecision
+#include "common/PreparedEmbeddingWeights.h"   // PreparedEmbeddingWeights/Handle
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -910,12 +911,6 @@ namespace llaminar
                 static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
                     const llaminar2::FP16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
 
-                /**
-                 * @brief Create Attention kernel for Q8_1 activation tensor
-                 */
-                static std::unique_ptr<llaminar2::ITensorAttention> createAttention(
-                    const llaminar2::Q8_1Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
-
                 // ==========================================================================
                 // Embedding Kernel Creation - Device-aware dispatch
                 // ==========================================================================
@@ -1149,7 +1144,7 @@ namespace llaminar
                  * Dispatches to the appropriate typed createAttention overload based on
                  * tensor->native_type().
                  *
-                 * @param tensor Input tensor (FP32, BF16, FP16, or Q8_1)
+                 * @param tensor Input tensor (FP32, BF16, or FP16)
                  * @param dev_type Target device type
                  * @return ITensorAttention implementation appropriate for the tensor type
                  * @throws std::runtime_error if tensor type is unsupported
@@ -1539,6 +1534,48 @@ namespace llaminar
                  */
                 static size_t deviceScopedGemmEngineRegistrySize();
 
+                // =================================================================
+                // Prepared Embedding Weights
+                // =================================================================
+
+                /**
+                 * @brief Get or create prepared embedding weights for a device
+                 *
+                 * Repacks the embedding table from its native quantized format to
+                 * EmbedQ8Block and uploads to GPU memory. Results are cached by
+                 * (tensor, device) — subsequent calls return the cached handle.
+                 *
+                 * Called during weight loading (Phase 4) alongside GEMM preparation.
+                 *
+                 * @param tensor     Source embedding tensor (must implement IINT8Unpackable)
+                 * @param d_model    Embedding dimension
+                 * @param target_device Target GPU device
+                 * @param vocab_offset Global vocab index of this shard's first row (0 = unsharded)
+                 * @param total_vocab  Total vocab size across all shards (0 = use tensor->rows())
+                 * @return Handle to prepared GPU-resident data, or nullptr on failure
+                 */
+                static const llaminar2::PreparedEmbeddingHandle *getOrCreatePreparedEmbeddingWeights(
+                    const llaminar2::TensorBase *tensor,
+                    int d_model,
+                    llaminar2::DeviceId target_device,
+                    size_t vocab_offset = 0,
+                    size_t total_vocab = 0);
+
+                /**
+                 * @brief Look up already-prepared embedding weights (no creation)
+                 *
+                 * Returns nullptr if no prepared entry exists for this tensor/device.
+                 * Used by embedding kernels during execution to find their GPU data.
+                 */
+                static const llaminar2::PreparedEmbeddingHandle *getPreparedEmbeddingWeights(
+                    const llaminar2::TensorBase *tensor,
+                    llaminar2::DeviceId target_device);
+
+                /**
+                 * @brief Number of prepared embedding registry entries
+                 */
+                static size_t preparedEmbeddingRegistrySize();
+
             private:
                 KernelFactory() = delete; // Static-only class
 
@@ -1818,6 +1855,33 @@ namespace llaminar
                 // Prepared-weight and device-scoped GEMM engine registries
                 static std::unordered_map<PreparedGemmKey, std::shared_ptr<PreparedGemmHandle>, PreparedGemmKeyHash> prepared_gemm_registry_;
                 static std::unordered_map<DeviceKernelKey, std::shared_ptr<IGemmEngine>, DeviceKernelKeyHash> device_gemm_engine_registry_;
+
+                // Prepared embedding registry — keyed by (tensor pointer, device)
+                struct PreparedEmbeddingKey
+                {
+                    const llaminar2::TensorBase *tensor{nullptr};
+                    llaminar2::DeviceId device_id;
+
+                    bool operator==(const PreparedEmbeddingKey &other) const
+                    {
+                        return tensor == other.tensor && device_id == other.device_id;
+                    }
+                };
+
+                struct PreparedEmbeddingKeyHash
+                {
+                    size_t operator()(const PreparedEmbeddingKey &k) const
+                    {
+                        return std::hash<const void *>()(k.tensor) ^
+                               (std::hash<int>()(static_cast<int>(k.device_id.type)) << 1) ^
+                               (std::hash<int>()(k.device_id.ordinal) << 2);
+                    }
+                };
+
+                static std::unordered_map<PreparedEmbeddingKey,
+                                          std::shared_ptr<llaminar2::PreparedEmbeddingHandle>,
+                                          PreparedEmbeddingKeyHash>
+                    prepared_embedding_registry_;
 
                 // NOTE: Universal device kernel caching (hipBLAS, cuBLAS handles, etc.)
                 // has moved to DeviceKernelCache. See kernels/DeviceKernelCache.h

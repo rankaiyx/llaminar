@@ -28,6 +28,8 @@
 
 namespace llaminar2
 {
+    // Forward declaration — full include only in ComputeBackend.cpp
+    struct HardwareInventory;
 
     /**
      * @brief Compute backend types
@@ -39,6 +41,46 @@ namespace llaminar2
         GPU_ROCM,   // AMD GPU with ROCm
         GPU_VULKAN, // Cross-platform GPU with Vulkan
         GPU_METAL   // Apple GPU with Metal
+    };
+
+    /**
+     * @brief PCIe link information for a device
+     */
+    struct PCIeLinkInfo
+    {
+        std::string pci_address;   // BDF address (e.g., "0000:8f:00.0")
+        double link_speed_gts = 0; // Current link speed in GT/s (e.g., 16.0 for Gen4)
+        int link_width = 0;        // Current link width (e.g., 16 for x16)
+        double max_speed_gts = 0;  // Max (capable) link speed in GT/s
+        int max_width = 0;         // Max (capable) link width
+        int pcie_gen = 0;          // PCIe generation (3, 4, 5, ...)
+        bool degraded = false;     // True if current < max speed or width
+
+        double bandwidth_gbps() const // Effective bandwidth in GB/s (per direction)
+        {
+            // PCIe encoding: Gen1/2 = 8b/10b (80%), Gen3+ = 128b/130b (~98.46%)
+            double encoding_efficiency = (pcie_gen >= 3) ? (128.0 / 130.0) : 0.8;
+            return link_speed_gts * link_width * encoding_efficiency / 8.0;
+        }
+    };
+
+    /**
+     * @brief P2P access matrix for a set of GPU devices
+     */
+    struct P2PMatrix
+    {
+        ComputeBackendType backend;
+        std::vector<int> device_ids;               // Backend device IDs (ordered)
+        std::vector<std::vector<bool>> can_access; // can_access[i][j] = device i can access device j's memory
+
+        int device_count() const { return static_cast<int>(device_ids.size()); }
+
+        bool has_p2p(int from_idx, int to_idx) const
+        {
+            if (from_idx < 0 || from_idx >= device_count() || to_idx < 0 || to_idx >= device_count())
+                return false;
+            return can_access[from_idx][to_idx];
+        }
     };
 
     /**
@@ -56,6 +98,7 @@ namespace llaminar2
         bool supports_fp16;        // Hardware FP16 support
         bool supports_bf16;        // Hardware BF16 support
         bool supports_int8;        // Hardware INT8 support
+        PCIeLinkInfo pcie;         // PCIe link information (GPU devices only)
     };
 
     /**
@@ -257,8 +300,10 @@ public:
          *
          *   // Testing or single-socket system
          *   dm.initialize(-1);  // Sees all devices
+         *
+         * @param log_inventory If true, print device inventory tables (CPU, GPU, P2P)
          */
-        void initialize(int local_numa_node = -1);
+        void initialize(int local_numa_node = -1, bool log_inventory = true);
 
         /**
          * @brief Get all enumerated devices
@@ -401,13 +446,28 @@ public:
          */
         std::string availableDevicesString() const;
 
+        /**
+         * @brief Get the hardware inventory detected at startup
+         *
+         * Contains the complete, unfiltered view of all hardware:
+         * CPU sockets (model, cores, HT, memory), GPU devices, P2P matrices.
+         * Detected once on first initialize() call and cached.
+         *
+         * @return Reference to the hardware inventory
+         */
+        const HardwareInventory *hardware() const { return hardware_.get(); }
+
     private:
-        DeviceManager() = default;
+        DeviceManager();
+        ~DeviceManager();
 
         std::vector<ComputeDevice> devices_;
         std::vector<std::shared_ptr<ComputeContext>> contexts_; // Cached per device
-        size_t last_selected_device_ = 0;                       // Round-robin state
+        std::vector<P2PMatrix> p2p_matrices_;                   // P2P access matrices (one per GPU backend)
+        std::unique_ptr<HardwareInventory> hardware_;           // Complete hardware inventory (detected once)
+        bool hardware_detected_ = false;                        // Whether hardware_ has been populated        size_t last_selected_device_ = 0;                       // Round-robin state
         int local_numa_node_ = -1;                              // NUMA node filter (-1 = no filter)
+        bool inventory_logged_ = false;                         // Only print device tables once
     };
 
 } // namespace llaminar2

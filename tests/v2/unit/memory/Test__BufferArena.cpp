@@ -316,6 +316,69 @@ TEST(Test__BufferArena, AliasingGroupAssignment)
     EXPECT_NE(arena.getTensor(BufferId::GATE_PROJ), nullptr);
 }
 
+// Verify that registerAlias transitively merges groups:
+// alias(A,B) + alias(B,C) → A,B,C in the same group.
+// A write borrow on A must block a write borrow on C.
+TEST(Test__BufferArena, AliasingGroupMerge)
+{
+    BufferArena arena;
+    arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
+    arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
+    arena.registerBuffer(BufferId::UP_PROJ, 4, 4864, "FP32", DeviceId::cpu());
+
+    // Create group {ATTN_OUTPUT, GATE_PROJ}, then merge UP_PROJ via GATE_PROJ
+    arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
+    arena.registerAlias(BufferId::GATE_PROJ, BufferId::UP_PROJ);
+
+    arena.allocate();
+
+    // Serial access across all three must work
+    arena.acquireWriteBorrow(BufferId::ATTN_OUTPUT);
+    arena.releaseWriteBorrow(BufferId::ATTN_OUTPUT);
+
+    arena.acquireWriteBorrow(BufferId::UP_PROJ);
+    arena.releaseWriteBorrow(BufferId::UP_PROJ);
+
+    EXPECT_TRUE(arena.validateNoBorrowsActive());
+}
+
+// Verify multiple read borrows on aliased buffers are allowed simultaneously.
+// Only writes conflict; reads can coexist freely.
+TEST(Test__BufferArena, AliasingConcurrentReadsAllowed)
+{
+    BufferArena arena;
+    arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
+    arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
+    arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
+    arena.allocate();
+
+    // Two simultaneous read borrows on aliased buffers — should NOT conflict
+    arena.acquireReadBorrow(BufferId::ATTN_OUTPUT);
+    arena.acquireReadBorrow(BufferId::GATE_PROJ); // must not die
+    arena.releaseReadBorrow(BufferId::GATE_PROJ);
+    arena.releaseReadBorrow(BufferId::ATTN_OUTPUT);
+    EXPECT_TRUE(arena.validateNoBorrowsActive());
+}
+
+// Verify aliasing is idempotent — calling registerAlias(A,B) twice should
+// not create duplicate groups or cause any issues.
+TEST(Test__BufferArena, AliasingIdempotent)
+{
+    BufferArena arena;
+    arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
+    arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
+    arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
+    arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ); // no-op
+    arena.allocate();
+
+    // Serial borrow still works (group wasn't corrupted by double alias)
+    arena.acquireWriteBorrow(BufferId::ATTN_OUTPUT);
+    arena.releaseWriteBorrow(BufferId::ATTN_OUTPUT);
+    arena.acquireWriteBorrow(BufferId::GATE_PROJ);
+    arena.releaseWriteBorrow(BufferId::GATE_PROJ);
+    EXPECT_TRUE(arena.validateNoBorrowsActive());
+}
+
 TEST(Test__BufferArena, AliasingSerialBorrowsSucceed)
 {
     BufferArena arena;
@@ -362,6 +425,41 @@ TEST(Test__BufferArena, AliasingWriteConflictsWithReadDies)
     arena.acquireReadBorrow(BufferId::ATTN_OUTPUT);
     EXPECT_DEATH(arena.acquireWriteBorrow(BufferId::GATE_PROJ), "aliased buffer");
     arena.releaseReadBorrow(BufferId::ATTN_OUTPUT);
+}
+
+// Verify that group merging propagates conflicts: alias(A,B) + alias(B,C)
+// means write on A must block write on C, even though they were never
+// directly aliased.
+TEST(Test__BufferArena, AliasingMergedGroupWriteConflictDies)
+{
+    BufferArena arena;
+    arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
+    arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
+    arena.registerBuffer(BufferId::UP_PROJ, 4, 4864, "FP32", DeviceId::cpu());
+    arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
+    arena.registerAlias(BufferId::GATE_PROJ, BufferId::UP_PROJ);
+    arena.allocate();
+
+    arena.acquireWriteBorrow(BufferId::ATTN_OUTPUT);
+    // UP_PROJ was never directly aliased with ATTN_OUTPUT, but they share
+    // a group via GATE_PROJ — must still conflict
+    EXPECT_DEATH(arena.acquireWriteBorrow(BufferId::UP_PROJ), "aliased buffer");
+    arena.releaseWriteBorrow(BufferId::ATTN_OUTPUT);
+}
+
+// Read on aliased buffer must block write on a different member (reversed direction)
+TEST(Test__BufferArena, AliasingReadBlocksWriteOnOtherMemberDies)
+{
+    BufferArena arena;
+    arena.registerBuffer(BufferId::ATTN_OUTPUT, 4, 896, "FP32", DeviceId::cpu());
+    arena.registerBuffer(BufferId::GATE_PROJ, 4, 4864, "FP32", DeviceId::cpu());
+    arena.registerAlias(BufferId::ATTN_OUTPUT, BufferId::GATE_PROJ);
+    arena.allocate();
+
+    // Write on GATE_PROJ while ATTN_OUTPUT has read borrow (reversed param order)
+    arena.acquireReadBorrow(BufferId::GATE_PROJ);
+    EXPECT_DEATH(arena.acquireWriteBorrow(BufferId::ATTN_OUTPUT), "aliased buffer");
+    arena.releaseReadBorrow(BufferId::GATE_PROJ);
 }
 
 #endif // NDEBUG

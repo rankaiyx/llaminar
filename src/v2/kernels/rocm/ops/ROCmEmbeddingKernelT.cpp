@@ -9,6 +9,8 @@
 #include "utils/DebugEnv.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../common/EmbedQ8Repack.h"
+#include "../../common/PreparedEmbeddingWeights.h"
+#include "../../KernelFactory.h"
 #include "../ROCmKernelBase.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../backends/rocm/ROCmBackend.h"
@@ -18,6 +20,7 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#include <climits>
 
 // Forward declarations for HIP kernels (defined in ROCmEmbeddingKernels.hip)
 extern "C"
@@ -28,6 +31,8 @@ extern "C"
         float *output,
         int num_tokens,
         int d_model,
+        int vocab_size,
+        int vocab_offset,
         hipStream_t stream);
 
     hipError_t hipOps_embedding_bf16(
@@ -62,6 +67,7 @@ extern "C"
         int d_model,
         int blocks_per_row,
         int vocab_size,
+        int vocab_offset,
         int debug_probe,
         hipStream_t stream);
 }
@@ -334,7 +340,7 @@ namespace llaminar2
             return false;
         }
 
-        hipError_t err = hipOps_embedding_fp32(embed_data, token_ids, output, num_tokens, d_model, static_cast<hipStream_t>(getStream()));
+        hipError_t err = hipOps_embedding_fp32(embed_data, token_ids, output, num_tokens, d_model, INT_MAX, 0, static_cast<hipStream_t>(getStream()));
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
@@ -590,7 +596,8 @@ namespace llaminar2
             }
             LOG_DEBUG("[ROCmEmbeddingKernelT] FP32 fast path: d_embed=" << static_cast<void *>(d_embed)
                                                                         << " num_tokens=" << num_tokens << " d_model=" << d_model);
-            err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model, stream);
+            err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model,
+                                        static_cast<int>(embed_fp32->rows()), 0, stream);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
@@ -619,74 +626,94 @@ namespace llaminar2
             constexpr unsigned char kCanaryPrePattern = 0xA5;
             constexpr unsigned char kCanaryPostPattern = 0x5A;
 
-            void *d_embed_q8 = workspace->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE);
-            if (!d_embed_q8)
-            {
-                LOG_ERROR("[ROCmEmbeddingKernelT] Workspace buffer '" << EmbeddingWorkspaceBuffers::EMBED_TABLE << "' not found");
-                return false;
-            }
+            // --- Preferred path: use PreparedEmbeddingWeights from KernelFactory ---
+            using namespace llaminar::v2::kernels;
+            const DeviceId dev_id = DeviceId::rocm(dev);
+            const auto *prepared = KernelFactory::getPreparedEmbeddingWeights(embed_table, dev_id);
 
-            // Validate device ownership of workspace pointers (critical for no-P2P systems).
-            if (validate_gpu_ptrs)
+            void *d_embed_q8 = nullptr;
+            size_t blocks_per_row = 0;
+            int vocab_offset = 0;
+            int local_vocab_size = static_cast<int>(embed_table->rows());
+
+            if (prepared && prepared->weights && prepared->weights->device_data)
             {
-                if (!validatePointerForDevice(d_token_ids, dev, "TOKEN_IDS", /*fail_on_query_error=*/true) ||
-                    !validatePointerForDevice(d_embed_q8, dev, "EMBED_TABLE", /*fail_on_query_error=*/true) ||
-                    !validatePointerForDevice(d_output, dev, "OUTPUT", /*fail_on_query_error=*/true))
+                // Fast path: GPU-resident prepared data from weight loading
+                d_embed_q8 = prepared->weights->device_data;
+                blocks_per_row = prepared->weights->blocks_per_row;
+                vocab_offset = static_cast<int>(prepared->weights->vocab_offset);
+                local_vocab_size = static_cast<int>(prepared->weights->vocab_size);
+            }
+            else
+            {
+                // Fallback: workspace-based lazy repack (for tests, CPU-only, etc.)
+                d_embed_q8 = workspace ? workspace->getBuffer(EmbeddingWorkspaceBuffers::EMBED_TABLE) : nullptr;
+                if (!d_embed_q8)
                 {
-                    return false;
-                }
-            }
-
-            bool needs_upload = false;
-            {
-                std::lock_guard<std::mutex> lock(embed_cache_mutex_);
-                auto it = cached_embed_table_by_device_.find(dev);
-                const TensorBase *cached_for_device =
-                    (it != cached_embed_table_by_device_.end()) ? it->second : cached_embed_table_;
-                needs_upload = (cached_for_device != embed_table);
-            }
-            if (needs_upload)
-            {
-                auto repacked = repackEmbeddingToQ8(embed_table, d_model);
-
-                const size_t embed_buf_size = workspace->getBufferSize(EmbeddingWorkspaceBuffers::EMBED_TABLE);
-                if (embed_buf_size < repacked.byte_size)
-                {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] EMBED_TABLE workspace too small: have=" << embed_buf_size
-                                                                                              << " need=" << repacked.byte_size
-                                                                                              << " vocab=" << repacked.vocab_size
-                                                                                              << " d_model=" << d_model
-                                                                                              << " blocks_per_row=" << repacked.blocks_per_row
-                                                                                              << " workspace=" << static_cast<void *>(workspace)
-                                                                                              << " device=" << workspace_device.to_string());
+                    LOG_ERROR("[ROCmEmbeddingKernelT] No prepared embedding weights and no workspace EMBED_TABLE buffer");
                     return false;
                 }
 
-                // Use sync copy for the large one-time embedding upload.
-                // This only happens on the first forward pass, not during
-                // cached decode, so it won't conflict with graph capture.
-                err = hipMemcpy(d_embed_q8, repacked.data.data(), repacked.byte_size,
-                                hipMemcpyHostToDevice);
-                if (err != hipSuccess)
+                // Validate device ownership of workspace pointers (critical for no-P2P systems).
+                if (validate_gpu_ptrs)
                 {
-                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to upload EmbedQ8 data: " << hipGetErrorString(err));
-                    return false;
+                    if (!validatePointerForDevice(d_embed_q8, dev, "EMBED_TABLE", /*fail_on_query_error=*/true))
+                    {
+                        return false;
+                    }
                 }
 
+                bool needs_upload = false;
                 {
                     std::lock_guard<std::mutex> lock(embed_cache_mutex_);
-                    cached_embed_table_ = embed_table;
-                    cached_embed_table_by_device_[dev] = embed_table;
+                    auto it = cached_embed_table_by_device_.find(dev);
+                    const TensorBase *cached_for_device =
+                        (it != cached_embed_table_by_device_.end()) ? it->second : cached_embed_table_;
+                    needs_upload = (cached_for_device != embed_table);
                 }
-                LOG_INFO("[ROCmEmbeddingKernelT] Uploaded EmbedQ8 embedding: "
-                         << tensorTypeName(embed_table->native_type()) << " "
-                         << repacked.vocab_size << "x" << d_model
-                         << " \u2192 " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                         << " (" << repacked.blocks_per_row << " blocks/row)"
-                         << " workspace=" << static_cast<void *>(workspace_));
-            }
+                if (needs_upload)
+                {
+                    auto repacked = repackEmbeddingToQ8(embed_table, d_model);
 
-            size_t blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
+                    const size_t embed_buf_size = workspace->getBufferSize(EmbeddingWorkspaceBuffers::EMBED_TABLE);
+                    if (embed_buf_size < repacked.byte_size)
+                    {
+                        LOG_ERROR("[ROCmEmbeddingKernelT] EMBED_TABLE workspace too small: have=" << embed_buf_size
+                                                                                                  << " need=" << repacked.byte_size
+                                                                                                  << " vocab=" << repacked.vocab_size
+                                                                                                  << " d_model=" << d_model
+                                                                                                  << " blocks_per_row=" << repacked.blocks_per_row
+                                                                                                  << " workspace=" << static_cast<void *>(workspace)
+                                                                                                  << " device=" << workspace_device.to_string());
+                        return false;
+                    }
+
+                    err = hipMemcpy(d_embed_q8, repacked.data.data(), repacked.byte_size,
+                                    hipMemcpyHostToDevice);
+                    if (err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmEmbeddingKernelT] Failed to upload EmbedQ8 data: " << hipGetErrorString(err));
+                        return false;
+                    }
+
+                    blocks_per_row = repacked.blocks_per_row;
+
+                    {
+                        std::lock_guard<std::mutex> lock(embed_cache_mutex_);
+                        cached_embed_table_ = embed_table;
+                        cached_embed_table_by_device_[dev] = embed_table;
+                    }
+                    LOG_INFO("[ROCmEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
+                             << tensorTypeName(embed_table->native_type()) << " "
+                             << repacked.vocab_size << "x" << d_model
+                             << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
+                             << " (" << repacked.blocks_per_row << " blocks/row)");
+                }
+                else
+                {
+                    blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
+                }
+            }
             const size_t output_bytes = static_cast<size_t>(num_tokens) * static_cast<size_t>(d_model) * sizeof(float);
             const bool use_dev0_canary = validate_gpu_ptrs && (dev == 0);
             float *kernel_output = d_output;
@@ -745,7 +772,8 @@ namespace llaminar2
             err = hipOps_embedding_q8(d_embed_q8, d_token_ids, kernel_output,
                                       num_tokens, d_model,
                                       static_cast<int>(blocks_per_row),
-                                      static_cast<int>(embed_table->rows()),
+                                      local_vocab_size,
+                                      vocab_offset,
                                       (validate_gpu_ptrs && dev == 0) ? 1 : 0,
                                       stream);
             if (validate_gpu_ptrs)
@@ -886,20 +914,21 @@ namespace llaminar2
         });
 
         // Buffer 2: Embedding table temp [vocab_size × blocks_per_row × sizeof(EmbedQ8Block)]
-        // Used when embedding table is not already on GPU (quantized → EmbedQ8 repack)
-        // n is treated as vocab_size hint when provided by graph sizing hints.
-        // If n is not provided, fall back to a conservative default.
-        constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
-        size_t vocab_size = (n > 0) ? static_cast<size_t>(n) : DEFAULT_VOCAB_SIZE;
-        size_t d_model = (k > 0) ? static_cast<size_t>(k) : 896;
-        size_t blocks_per_row = (d_model + 31) / 32;
-        size_t embed_table_bytes = vocab_size * blocks_per_row * sizeof(EmbedQ8Block);
-        reqs.buffers.push_back({
-            EmbeddingWorkspaceBuffers::EMBED_TABLE,
-            embed_table_bytes,
-            256, // Alignment for HIP
-            true // Required - needed for quantized embedding tables
-        });
+        // Only needed when PreparedEmbeddingWeights are NOT available (test/fallback path).
+        // When weights are prepared during loading, the prepared data lives in its own
+        // GPU allocation and this workspace buffer is unused.
+        if (llaminar::v2::kernels::KernelFactory::preparedEmbeddingRegistrySize() == 0)
+        {
+            constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
+            size_t vocab_size = (n > 0) ? static_cast<size_t>(n) : DEFAULT_VOCAB_SIZE;
+            size_t d_model = (k > 0) ? static_cast<size_t>(k) : 896;
+            size_t blocks_per_row = (d_model + 31) / 32;
+            size_t embed_table_bytes = vocab_size * blocks_per_row * sizeof(EmbedQ8Block);
+            reqs.buffers.push_back({EmbeddingWorkspaceBuffers::EMBED_TABLE,
+                                    embed_table_bytes,
+                                    256,
+                                    true});
+        }
 
         return reqs;
     }

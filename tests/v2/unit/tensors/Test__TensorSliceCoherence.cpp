@@ -61,7 +61,10 @@ public:
     // Track calls
     mutable int ensureOnDevice_calls = 0;
     mutable int ensureOnHost_calls = 0;
+    mutable int allocateOnDevice_calls = 0;
+    mutable int invalidateGpuData_calls = 0;
     mutable DeviceId last_ensureOnDevice_target = DeviceId::cpu();
+    mutable DeviceId last_allocateOnDevice_target = DeviceId::cpu();
 
     // Override coherence methods to track calls
     bool ensureOnDevice(DeviceId target_device) override
@@ -78,11 +81,31 @@ public:
         return true;
     }
 
+    bool allocateOnDevice(DeviceId target_device) override
+    {
+        allocateOnDevice_calls++;
+        last_allocateOnDevice_target = target_device;
+        return true;
+    }
+
+    void invalidateGpuData() override
+    {
+        invalidateGpuData_calls++;
+    }
+
+    /// Inject a fake GPU pointer (simulates what ensureOnDevice does)
+    void injectGpuDataPtr(void *ptr) { gpu_data_ptr_ = ptr; }
+
+    /// Get the raw gpu_data_ptr_ member directly (not through virtual method)
+    void *getRawGpuDataPtr() const { return gpu_data_ptr_; }
+
     // Reset call counters
     void resetCallCounters()
     {
         ensureOnDevice_calls = 0;
         ensureOnHost_calls = 0;
+        allocateOnDevice_calls = 0;
+        invalidateGpuData_calls = 0;
     }
 };
 
@@ -533,89 +556,43 @@ TEST_F(Test__TensorSliceCoherence, FullSlice_InnerAccessible)
 
 // =============================================================================
 // Test Category 9: gpu_data_ptr() Delegation (Regression for Bug #1)
-//
-// Bug: TensorSlice::ensureOnDevice() delegated to inner tensor, which sets
-// inner's gpu_data_ptr_. But TensorSlice::gpu_data_ptr() (inherited from
-// CPUTensorBase) returned TensorSlice's OWN gpu_data_ptr_ member, which was
-// always null. GPU stages then received null device pointers for sharded weights
-// on device 1 (device 0 worked by coincidence since ensureOnDevice wasn't
-// needed for the first device assigned to a pre-placed weight).
-//
-// Fix: Override gpu_data_ptr() in TensorSlice to return inner()->gpu_data_ptr().
 // =============================================================================
-
-/**
- * @brief Mock tensor that exposes gpu_data_ptr_ injection for testing
- *
- * Subclass FP32Tensor to provide access to the protected gpu_data_ptr_ member
- * so we can simulate what happens after ensureOnDevice() sets it.
- */
-class MockGpuPtrTensor : public FP32Tensor
-{
-public:
-    MockGpuPtrTensor(size_t rows, size_t cols) : FP32Tensor({rows, cols})
-    {
-        float *ptr = mutable_fp32_data();
-        for (size_t i = 0; i < rows * cols; ++i)
-            ptr[i] = static_cast<float>(i) * 0.1f;
-    }
-
-    /// Inject a fake GPU pointer (simulates what ensureOnDevice does)
-    void injectGpuDataPtr(void *ptr) { gpu_data_ptr_ = ptr; }
-
-    /// Get the raw gpu_data_ptr_ member directly (not through virtual method)
-    void *getRawGpuDataPtr() const { return gpu_data_ptr_; }
-};
 
 TEST_F(Test__TensorSliceCoherence, GpuDataPtrDelegatesToInner)
 {
-    // Create inner tensor with a fake GPU pointer
-    auto inner = std::make_unique<MockGpuPtrTensor>(256, 128);
+    auto inner = std::make_unique<MockCoherenceTensor>(256, 128);
     auto *inner_ptr = inner.get();
 
-    // Initially, no GPU pointer
     ASSERT_EQ(inner_ptr->getRawGpuDataPtr(), nullptr);
 
     auto slice = createSlice(std::move(inner));
 
-    // TensorSlice should also show null initially
     EXPECT_EQ(slice->gpu_data_ptr(), nullptr)
         << "TensorSlice::gpu_data_ptr() should be null when inner has no GPU pointer";
 
-    // Simulate ensureOnDevice() setting inner's gpu_data_ptr_
     int fake_gpu_buffer = 42;
     inner_ptr->injectGpuDataPtr(&fake_gpu_buffer);
 
-    // Now TensorSlice::gpu_data_ptr() MUST return inner's pointer, not its own null
     EXPECT_EQ(slice->gpu_data_ptr(), &fake_gpu_buffer)
         << "TensorSlice::gpu_data_ptr() must delegate to inner()->gpu_data_ptr()";
 
-    // Also verify const version
     const TensorSlice *const_slice = slice.get();
     EXPECT_EQ(const_slice->gpu_data_ptr(), &fake_gpu_buffer)
         << "const TensorSlice::gpu_data_ptr() must also delegate to inner";
 
-    // Clean up: reset to null to prevent dangling pointer issues
     inner_ptr->injectGpuDataPtr(nullptr);
 }
 
 TEST_F(Test__TensorSliceCoherence, GpuDataPtrNotFromSliceOwnMember)
 {
-    // This test verifies the specific bug scenario: TensorSlice's OWN
-    // gpu_data_ptr_ member (inherited from CPUTensorBase) must NOT be used.
-    // Even if someone accidentally sets TensorSlice's member directly,
-    // gpu_data_ptr() should still return inner's pointer.
-
-    auto inner = std::make_unique<MockGpuPtrTensor>(256, 128);
+    auto inner = std::make_unique<MockCoherenceTensor>(256, 128);
     auto *inner_ptr = inner.get();
 
     auto slice = createSlice(std::move(inner));
 
-    // Set inner's GPU pointer
     int fake_inner_gpu = 99;
     inner_ptr->injectGpuDataPtr(&fake_inner_gpu);
 
-    // TensorSlice::gpu_data_ptr() should return inner's pointer
     void *result = slice->gpu_data_ptr();
     EXPECT_EQ(result, &fake_inner_gpu)
         << "gpu_data_ptr() must come from inner tensor, not TensorSlice's own member";
@@ -625,35 +602,323 @@ TEST_F(Test__TensorSliceCoherence, GpuDataPtrNotFromSliceOwnMember)
 
 TEST_F(Test__TensorSliceCoherence, GpuDataPtrConsistentWithEnsureOnDevice)
 {
-    // Test the full coherence flow: ensureOnDevice on slice → inner's
-    // gpu_data_ptr_ gets set → slice.gpu_data_ptr() returns it.
-    // Uses MockCoherenceTensor which overrides ensureOnDevice.
-
-    auto inner = std::make_unique<MockGpuPtrTensor>(256, 128);
+    auto inner = std::make_unique<MockCoherenceTensor>(256, 128);
     auto *inner_ptr = inner.get();
 
     auto slice = createSlice(std::move(inner));
 
-    // Before ensureOnDevice: both null
     EXPECT_EQ(slice->gpu_data_ptr(), nullptr);
     EXPECT_EQ(inner_ptr->getRawGpuDataPtr(), nullptr);
 
-    // Simulate the real sequence:
-    // 1. TensorSlice::ensureOnDevice delegates to inner->ensureOnDevice
-    // 2. Inner's ensureOnDevice allocates GPU memory and sets gpu_data_ptr_
-    // We can't call real ensureOnDevice without a GPU, so simulate step 2
     float fake_device_mem[128];
     inner_ptr->injectGpuDataPtr(fake_device_mem);
 
-    // Now verify TensorSlice sees the pointer
     EXPECT_EQ(slice->gpu_data_ptr(), fake_device_mem)
         << "After ensureOnDevice sets inner's gpu_data_ptr_, "
            "TensorSlice::gpu_data_ptr() must reflect it";
 
-    // Verify through TensorBase pointer (which is what GPU stages use)
     TensorBase *as_base = slice.get();
     EXPECT_EQ(as_base->gpu_data_ptr(), fake_device_mem)
         << "gpu_data_ptr() must work through TensorBase interface too";
 
     inner_ptr->injectGpuDataPtr(nullptr);
+}
+
+// =============================================================================
+// Test Category 10: setHostResident() Propagation
+//
+// Bug: setHostResident() on a TensorSlice only set the wrapper's
+// memory_residency_ field. Since ensureOnDevice() delegates to inner(),
+// the inner tensor still got a full GPU upload. The fix makes
+// TensorSlice::setHostResident() propagate to both wrapper and inner.
+// =============================================================================
+
+TEST_F(Test__TensorSliceCoherence, SetHostResident_PropagatesToInner)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+
+    EXPECT_EQ(slice->memoryResidency(), MemoryResidency::STANDARD);
+    EXPECT_EQ(inner_ptr->memoryResidency(), MemoryResidency::STANDARD);
+
+    slice->setHostResident();
+
+    EXPECT_EQ(slice->memoryResidency(), MemoryResidency::HOST_RESIDENT)
+        << "Wrapper should be HOST_RESIDENT";
+    EXPECT_EQ(inner_ptr->memoryResidency(), MemoryResidency::HOST_RESIDENT)
+        << "Inner tensor must also be HOST_RESIDENT after slice->setHostResident()";
+}
+
+TEST_F(Test__TensorSliceCoherence, SetHostResident_IsHostResidentReflectsInner)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+
+    EXPECT_FALSE(slice->isHostResident());
+    EXPECT_FALSE(inner_ptr->isHostResident());
+
+    slice->setHostResident();
+
+    EXPECT_TRUE(slice->isHostResident());
+    EXPECT_TRUE(inner_ptr->isHostResident());
+}
+
+TEST_F(Test__TensorSliceCoherence, SetHostResident_ViaBasePointer)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+
+    TensorBase *as_base = slice.get();
+    as_base->setHostResident();
+
+    EXPECT_TRUE(inner_ptr->isHostResident())
+        << "setHostResident() via TensorBase* must propagate to inner";
+}
+
+TEST_F(Test__TensorSliceCoherence, SetHostResident_EnsureOnDeviceBecomesNoop)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+    slice->setHostResident();
+    inner_ptr->resetCallCounters();
+
+    slice->ensureOnDevice(DeviceId::rocm(0));
+
+    EXPECT_EQ(inner_ptr->memoryResidency(), MemoryResidency::HOST_RESIDENT)
+        << "Inner must be HOST_RESIDENT so TransferEngine skips upload";
+}
+
+// =============================================================================
+// Test Category 11: allocateOnDevice() Delegation
+// =============================================================================
+
+TEST_F(Test__TensorSliceCoherence, AllocateOnDevice_DelegatesToInner)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+    inner_ptr->resetCallCounters();
+
+    slice->allocateOnDevice(DeviceId::cuda(0));
+
+    EXPECT_EQ(inner_ptr->allocateOnDevice_calls, 1)
+        << "allocateOnDevice must delegate to inner tensor";
+    EXPECT_EQ(inner_ptr->last_allocateOnDevice_target.to_string(), "CUDA:0")
+        << "Target device must be passed through";
+}
+
+TEST_F(Test__TensorSliceCoherence, AllocateOnDevice_ViaBasePointer)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+    inner_ptr->resetCallCounters();
+
+    TensorBase *as_base = slice.get();
+    as_base->allocateOnDevice(DeviceId::rocm(1));
+
+    EXPECT_EQ(inner_ptr->allocateOnDevice_calls, 1)
+        << "allocateOnDevice via TensorBase* must delegate to inner";
+}
+
+// =============================================================================
+// Test Category 12: invalidateGpuData() Delegation
+// =============================================================================
+
+TEST_F(Test__TensorSliceCoherence, InvalidateGpuData_DelegatesToInner)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+    inner_ptr->resetCallCounters();
+
+    slice->invalidateGpuData();
+
+    EXPECT_EQ(inner_ptr->invalidateGpuData_calls, 1)
+        << "invalidateGpuData must delegate to inner tensor";
+}
+
+TEST_F(Test__TensorSliceCoherence, InvalidateGpuData_ViaBasePointer)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+    inner_ptr->resetCallCounters();
+
+    TensorBase *as_base = slice.get();
+    as_base->invalidateGpuData();
+
+    EXPECT_EQ(inner_ptr->invalidateGpuData_calls, 1)
+        << "invalidateGpuData via TensorBase* must delegate to inner";
+}
+
+// =============================================================================
+// Test Category 13: Coherence State Queries
+// =============================================================================
+
+TEST_F(Test__TensorSliceCoherence, CoherenceState_InnerReflectsTransitions)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+
+    EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::HOST_ONLY);
+
+    inner_ptr->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
+}
+
+TEST_F(Test__TensorSliceCoherence, MemoryResidency_InnerReflectsHostResident)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+
+    EXPECT_EQ(inner_ptr->memoryResidency(), MemoryResidency::STANDARD);
+
+    slice->setHostResident();
+
+    EXPECT_EQ(inner_ptr->memoryResidency(), MemoryResidency::HOST_RESIDENT);
+}
+
+TEST_F(Test__TensorSliceCoherence, HostValid_QueriesInnerState)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+
+    auto slice = createSlice(std::move(inner));
+
+    EXPECT_TRUE(slice->isHostValid())
+        << "isHostValid() (delegated) should reflect inner's HOST_ONLY state";
+}
+
+// =============================================================================
+// Test Category 14: Full Coherence Lifecycle Through TensorSlice
+// =============================================================================
+
+TEST_F(Test__TensorSliceCoherence, FullLifecycle_GemmWeightHostResident)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(1024, 896);
+    auto *inner_ptr = inner.get();
+    float *host_data = inner_ptr->mutable_fp32_data();
+    host_data[0] = 42.0f;
+
+    auto slice = createSlice(std::move(inner));
+
+    slice->setHostResident();
+    EXPECT_TRUE(slice->isHostResident());
+    EXPECT_TRUE(inner_ptr->isHostResident());
+
+    inner_ptr->resetCallCounters();
+    slice->ensureOnDevice(DeviceId::rocm(0));
+
+    const float *read_data = slice->data();
+    ASSERT_NE(read_data, nullptr);
+    EXPECT_EQ(read_data[0], 42.0f)
+        << "Host data must remain accessible after setHostResident()";
+
+    const void *raw_ptr = static_cast<const TensorBase *>(slice.get())->raw_data();
+    EXPECT_NE(raw_ptr, nullptr)
+        << "raw_data() must return host data for VNNI repacker to read";
+}
+
+TEST_F(Test__TensorSliceCoherence, FullLifecycle_MarkDirtyAfterGpuCompute)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    auto slice = createSlice(std::move(inner));
+    inner_ptr->resetCallCounters();
+
+    slice->allocateOnDevice(DeviceId::cuda(0));
+    EXPECT_EQ(inner_ptr->allocateOnDevice_calls, 1);
+
+    slice->mark_host_dirty();
+}
+
+// =============================================================================
+// Test Category 15: Shared Ownership (shared_ptr constructor)
+// =============================================================================
+
+TEST_F(Test__TensorSliceCoherence, SharedPtrConstruction_SetHostResidentPropagates)
+{
+    auto inner = std::make_shared<MockCoherenceTensor>(512, 256);
+    MockCoherenceTensor *inner_ptr = inner.get();
+
+    SliceMetadata meta;
+    meta.mode = SliceMode::ROW_PARALLEL;
+    meta.original_rows = 1024;
+    meta.original_cols = 256;
+    meta.slice_start = 0;
+    meta.slice_end = 512;
+    meta.rank = 0;
+    meta.world_size = 2;
+    meta.inner_is_presliced = true;
+
+    auto slice = std::make_unique<TensorSlice>(inner, std::move(meta));
+
+    slice->setHostResident();
+
+    EXPECT_TRUE(inner_ptr->isHostResident())
+        << "setHostResident must propagate to inner even with shared_ptr construction";
+    EXPECT_EQ(inner_ptr->memoryResidency(), MemoryResidency::HOST_RESIDENT);
+}
+
+TEST_F(Test__TensorSliceCoherence, SharedPtrConstruction_AllocateOnDeviceDelegates)
+{
+    auto inner = std::make_shared<MockCoherenceTensor>(512, 256);
+    MockCoherenceTensor *inner_ptr = inner.get();
+
+    SliceMetadata meta;
+    meta.mode = SliceMode::COLUMN_PARALLEL;
+    meta.original_rows = 512;
+    meta.original_cols = 512;
+    meta.slice_start = 0;
+    meta.slice_end = 256;
+    meta.rank = 0;
+    meta.world_size = 2;
+    meta.inner_is_presliced = true;
+
+    auto slice = std::make_unique<TensorSlice>(inner, std::move(meta));
+    inner_ptr->resetCallCounters();
+
+    slice->allocateOnDevice(DeviceId::rocm(0));
+
+    EXPECT_EQ(inner_ptr->allocateOnDevice_calls, 1)
+        << "allocateOnDevice must delegate to inner with shared_ptr construction";
+}
+
+TEST_F(Test__TensorSliceCoherence, SharedPtrConstruction_InvalidateGpuDataDelegates)
+{
+    auto inner = std::make_shared<MockCoherenceTensor>(512, 256);
+    MockCoherenceTensor *inner_ptr = inner.get();
+
+    SliceMetadata meta;
+    meta.mode = SliceMode::FULL;
+    meta.original_rows = 512;
+    meta.original_cols = 256;
+    meta.slice_start = 0;
+    meta.slice_end = 512;
+    meta.inner_is_presliced = true;
+
+    auto slice = std::make_unique<TensorSlice>(inner, std::move(meta));
+    inner_ptr->resetCallCounters();
+
+    slice->invalidateGpuData();
+
+    EXPECT_EQ(inner_ptr->invalidateGpuData_calls, 1)
+        << "invalidateGpuData must delegate to inner with shared_ptr construction";
 }

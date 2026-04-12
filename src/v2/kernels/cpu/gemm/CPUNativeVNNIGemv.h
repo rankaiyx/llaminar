@@ -1131,7 +1131,10 @@ namespace llaminar2::cpu::native_vnni
 #endif
 
         // Small-N dispatch: M×N 2D parallel grid
-        if (total_n_blocks <= num_threads / 4 && M >= 2)
+        // Also forced when ldc < 64: the 2-row tiled microkernel always stores
+        // 64 floats per row via _mm512_storeu_ps, which overflows into adjacent
+        // rows when the output stride is narrower than one VNNI chunk.
+        if ((total_n_blocks <= num_threads / 4 && M >= 2) || ldc < 64)
         {
             auto do_compute = [&]()
             {
@@ -1173,164 +1176,148 @@ namespace llaminar2::cpu::native_vnni
                 }
             };
             OMP_WORKSHARE_REGION(do_compute);
-            return;
-        }
+            bool accum = (kt > 0);
 
-        // Tiled GEMM path: N-parallel with 2-row microkernels and K-tiling
-        auto do_compute = [&]()
-        {
-#pragma omp for schedule(static)
-            for (int block_idx = 0; block_idx < total_n_blocks; ++block_idx)
+            int m = 0;
+            for (; m + 1 < M; m += 2)
             {
-                int chunk_start = block_idx * n_block_chunks;
-                int chunk_count = std::min(n_block_chunks, N_chunks - chunk_start);
+                const Q8_1Block *aq0 = A_q8_all + static_cast<size_t>(m) * K_blocks;
+                const Q8_1Block *aq1 = A_q8_all + static_cast<size_t>(m + 1) * K_blocks;
 
-                for (int kt = 0; kt < num_k_tiles; ++kt)
+                for (int ci = 0; ci < chunk_count; ++ci)
                 {
-                    int kb_start = kt * k_tile_blocks;
-                    int kb_end = std::min(kb_start + k_tile_blocks, K_blocks);
-                    bool accum = (kt > 0);
-
-                    int m = 0;
-                    for (; m + 1 < M; m += 2)
-                    {
-                        const Q8_1Block *aq0 = A_q8_all + static_cast<size_t>(m) * K_blocks;
-                        const Q8_1Block *aq1 = A_q8_all + static_cast<size_t>(m + 1) * K_blocks;
-
-                        for (int ci = 0; ci < chunk_count; ++ci)
-                        {
-                            int chunk = chunk_start + ci;
-                            int n_start = chunk * 64;
-                            float *c0 = C + m * ldc + n_start;
-                            float *c1 = C + (m + 1) * ldc + n_start;
+                    int chunk = chunk_start + ci;
+                    int n_start = chunk * 64;
+                    float *c0 = C + m * ldc + n_start;
+                    float *c1 = C + (m + 1) * ldc + n_start;
 
 #if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                            if (packed.is_nibble_lut)
-                                gemm_2row_native_chunk(packed, aq0, aq1, c0, c1,
-                                                       chunk, kb_start, kb_end,
-                                                       decode_lut, accum);
-                            else
-                                gemm_2row_int8_chunk(packed, aq0, aq1, c0, c1,
-                                                     chunk, kb_start, kb_end, accum);
+                    if (packed.is_nibble_lut)
+                        gemm_2row_native_chunk(packed, aq0, aq1, c0, c1,
+                                               chunk, kb_start, kb_end,
+                                               decode_lut, accum);
+                    else
+                        gemm_2row_int8_chunk(packed, aq0, aq1, c0, c1,
+                                             chunk, kb_start, kb_end, accum);
 #else
-                            int n_cols = std::min(64, N - n_start);
-                            if (!accum)
-                            {
-                                std::memset(c0, 0, 64 * sizeof(float));
-                                std::memset(c1, 0, 64 * sizeof(float));
-                            }
-                            if (kt == 0)
-                            {
-                                gemv_native_vnni_scalar(packed, aq0, c0, n_cols, K_blocks);
-                                gemv_native_vnni_scalar(packed, aq1, c1, n_cols, K_blocks);
-                            }
-#endif
-                        }
-                    }
-
-                    if (m < M)
+                    int n_cols = std::min(64, N - n_start);
+                    if (!accum)
                     {
-                        const Q8_1Block *aq = A_q8_all + static_cast<size_t>(m) * K_blocks;
-                        for (int ci = 0; ci < chunk_count; ++ci)
-                        {
-                            int chunk = chunk_start + ci;
-                            int n_start = chunk * 64;
-                            float *c_row = C + m * ldc + n_start;
-
-#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
-                            if (accum)
-                            {
-                                alignas(64) float tmp[64] = {};
-                                if (packed.is_nibble_lut)
-                                    gemv_native_vnni_avx512_chunk_native(packed, aq, tmp, chunk, kb_start, kb_end, decode_lut);
-                                else
-                                    gemv_native_vnni_avx512_chunk_int8(packed, aq, tmp, chunk, kb_start, kb_end);
-                                __m512 s0 = _mm512_add_ps(_mm512_loadu_ps(c_row), _mm512_load_ps(tmp));
-                                __m512 s1 = _mm512_add_ps(_mm512_loadu_ps(c_row + 16), _mm512_load_ps(tmp + 16));
-                                __m512 s2 = _mm512_add_ps(_mm512_loadu_ps(c_row + 32), _mm512_load_ps(tmp + 32));
-                                __m512 s3 = _mm512_add_ps(_mm512_loadu_ps(c_row + 48), _mm512_load_ps(tmp + 48));
-                                _mm512_storeu_ps(c_row, s0);
-                                _mm512_storeu_ps(c_row + 16, s1);
-                                _mm512_storeu_ps(c_row + 32, s2);
-                                _mm512_storeu_ps(c_row + 48, s3);
-                            }
-                            else
-                            {
-                                if (packed.is_nibble_lut)
-                                    gemv_native_vnni_avx512_chunk_native(packed, aq, c_row, chunk, kb_start, kb_end, decode_lut);
-                                else
-                                    gemv_native_vnni_avx512_chunk_int8(packed, aq, c_row, chunk, kb_start, kb_end);
-                            }
-#else
-                            int n_cols = std::min(64, N - n_start);
-                            if (!accum && kt == 0)
-                            {
-                                gemv_native_vnni_scalar(packed, aq, c_row, n_cols, K_blocks);
-                            }
-#endif
-                        }
+                        std::memset(c0, 0, 64 * sizeof(float));
+                        std::memset(c1, 0, 64 * sizeof(float));
                     }
-                }
-
-                int last_chunk_start = (chunk_start + chunk_count - 1) * 64;
-                int last_n_cols = std::min(64, N - last_chunk_start);
-                if (last_n_cols < 64)
-                {
-                    for (int m_row = 0; m_row < M; ++m_row)
+                    if (kt == 0)
                     {
-                        for (int i = last_n_cols; i < 64; ++i)
-                            C[m_row * ldc + last_chunk_start + i] = 0.0f;
+                        gemv_native_vnni_scalar(packed, aq0, c0, n_cols, K_blocks);
+                        gemv_native_vnni_scalar(packed, aq1, c1, n_cols, K_blocks);
                     }
+#endif
                 }
             }
-        };
 
-        OMP_WORKSHARE_REGION(do_compute);
-    }
+            if (m < M)
+            {
+                const Q8_1Block *aq = A_q8_all + static_cast<size_t>(m) * K_blocks;
+                for (int ci = 0; ci < chunk_count; ++ci)
+                {
+                    int chunk = chunk_start + ci;
+                    int n_start = chunk * 64;
+                    float *c_row = C + m * ldc + n_start;
 
-    // =========================================================================
-    // Full GEMM dispatcher (M>1) — quantizes then delegates to preq path
-    // =========================================================================
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                    if (accum)
+                    {
+                        alignas(64) float tmp[64] = {};
+                        if (packed.is_nibble_lut)
+                            gemv_native_vnni_avx512_chunk_native(packed, aq, tmp, chunk, kb_start, kb_end, decode_lut);
+                        else
+                            gemv_native_vnni_avx512_chunk_int8(packed, aq, tmp, chunk, kb_start, kb_end);
+                        __m512 s0 = _mm512_add_ps(_mm512_loadu_ps(c_row), _mm512_load_ps(tmp));
+                        __m512 s1 = _mm512_add_ps(_mm512_loadu_ps(c_row + 16), _mm512_load_ps(tmp + 16));
+                        __m512 s2 = _mm512_add_ps(_mm512_loadu_ps(c_row + 32), _mm512_load_ps(tmp + 32));
+                        __m512 s3 = _mm512_add_ps(_mm512_loadu_ps(c_row + 48), _mm512_load_ps(tmp + 48));
+                        _mm512_storeu_ps(c_row, s0);
+                        _mm512_storeu_ps(c_row + 16, s1);
+                        _mm512_storeu_ps(c_row + 32, s2);
+                        _mm512_storeu_ps(c_row + 48, s3);
+                    }
+                    else
+                    {
+                        if (packed.is_nibble_lut)
+                            gemv_native_vnni_avx512_chunk_native(packed, aq, c_row, chunk, kb_start, kb_end, decode_lut);
+                        else
+                            gemv_native_vnni_avx512_chunk_int8(packed, aq, c_row, chunk, kb_start, kb_end);
+                    }
+#else
+                    int n_cols = std::min(64, N - n_start);
+                    if (!accum && kt == 0)
+                    {
+                        gemv_native_vnni_scalar(packed, aq, c_row, n_cols, K_blocks);
+                    }
+#endif
+                }
+            }
+        }
 
-    inline void gemm_native_vnni(
-        const CPUNativeVNNIPackedWeights &packed,
-        const float *A_fp32,
-        float *C,
-        int M,
-        int ldc)
-    {
-        const int K = packed.K;
-        const int K_blocks = packed.blocks_per_row;
-
-        // Pre-quantize all M rows of A
-        std::vector<Q8_1Block> all_A_q8(static_cast<size_t>(M) * K_blocks);
-        quantize_activations_to_q8_1(A_fp32, all_A_q8.data(), M, K, K_blocks);
-
-        // Delegate to pre-quantized compute path
-        gemm_native_vnni_preq(packed, all_A_q8.data(), C, M, ldc);
-    }
-
-    // =========================================================================
-    // Bias epilogue: C[m, j] += bias[j] for all M rows
-    // =========================================================================
-
-    inline void apply_bias_epilogue(float *C, const float *bias, int M, int N, int ldc)
-    {
-        for (int m = 0; m < M; ++m)
+        int last_chunk_start = (chunk_start + chunk_count - 1) * 64;
+        int last_n_cols = std::min(64, N - last_chunk_start);
+        if (last_n_cols < 64)
         {
-            float *row = C + m * ldc;
-            int j = 0;
+            for (int m_row = 0; m_row < M; ++m_row)
+            {
+                for (int i = last_n_cols; i < 64; ++i)
+                    C[m_row * ldc + last_chunk_start + i] = 0.0f;
+            }
+        }
+    }
+};
+
+OMP_WORKSHARE_REGION(do_compute);
+}
+
+// =========================================================================
+// Full GEMM dispatcher (M>1) — quantizes then delegates to preq path
+// =========================================================================
+
+inline void gemm_native_vnni(
+    const CPUNativeVNNIPackedWeights &packed,
+    const float *A_fp32,
+    float *C,
+    int M,
+    int ldc)
+{
+    const int K = packed.K;
+    const int K_blocks = packed.blocks_per_row;
+
+    // Pre-quantize all M rows of A
+    std::vector<Q8_1Block> all_A_q8(static_cast<size_t>(M) * K_blocks);
+    quantize_activations_to_q8_1(A_fp32, all_A_q8.data(), M, K, K_blocks);
+
+    // Delegate to pre-quantized compute path
+    gemm_native_vnni_preq(packed, all_A_q8.data(), C, M, ldc);
+}
+
+// =========================================================================
+// Bias epilogue: C[m, j] += bias[j] for all M rows
+// =========================================================================
+
+inline void apply_bias_epilogue(float *C, const float *bias, int M, int N, int ldc)
+{
+    for (int m = 0; m < M; ++m)
+    {
+        float *row = C + m * ldc;
+        int j = 0;
 #if defined(__AVX512F__)
-            for (; j + 15 < N; j += 16)
-            {
-                __m512 c = _mm512_loadu_ps(row + j);
-                __m512 b = _mm512_loadu_ps(bias + j);
-                _mm512_storeu_ps(row + j, _mm512_add_ps(c, b));
-            }
-#endif
-            for (; j < N; ++j)
-                row[j] += bias[j];
+        for (; j + 15 < N; j += 16)
+        {
+            __m512 c = _mm512_loadu_ps(row + j);
+            __m512 b = _mm512_loadu_ps(bias + j);
+            _mm512_storeu_ps(row + j, _mm512_add_ps(c, b));
         }
+#endif
+        for (; j < N; ++j)
+            row[j] += bias[j];
     }
+}
 
 } // namespace llaminar2::cpu::native_vnni

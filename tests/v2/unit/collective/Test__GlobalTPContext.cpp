@@ -106,17 +106,20 @@ TEST_F(Test__GlobalTPContext, CreateForTest_NullComm)
 }
 
 /**
- * @test Verify isLocal()==false, isGlobal()==true for GlobalTPContext
+ * @test Verify scope is NODE_LOCAL for single-rank auto-detected context
  *
- * GlobalTPContext is for cross-MPI-rank TP, so it's NOT local.
+ * A single-rank GlobalTPContext auto-detects all ranks on the same node
+ * (trivially true for 1 rank), so scope() returns NODE_LOCAL.
  */
-TEST_F(Test__GlobalTPContext, IsGlobalNotLocal)
+TEST_F(Test__GlobalTPContext, SingleRank_IsNodeLocal)
 {
     auto ctx = createSingleRankContext();
 
     ASSERT_NE(ctx, nullptr);
-    EXPECT_FALSE(ctx->isLocal()) << "GlobalTPContext should NOT be local";
-    EXPECT_TRUE(ctx->isGlobal()) << "GlobalTPContext should be global";
+    EXPECT_FALSE(ctx->isLocal()) << "GlobalTPContext should NOT be local (intra-rank)";
+    EXPECT_TRUE(ctx->isNodeLocal()) << "Single-rank context should be node-local";
+    EXPECT_FALSE(ctx->isGlobal()) << "Single-rank context should not be global";
+    EXPECT_EQ(ctx->scope(), TPScope::NODE_LOCAL);
 }
 
 /**
@@ -616,3 +619,224 @@ TEST_F(Test__GlobalTPContext, CreateForTest_MismatchedWorldRanksSize)
     EXPECT_EQ(ctx->worldRanks().size(), 3) << "worldRanks reflects what was passed";
 }
 
+// =============================================================================
+// Node Awareness Tests
+// =============================================================================
+
+/**
+ * @test All ranks on same node → isAllRanksOnSameNode() true, scope() NODE_LOCAL
+ *
+ * When all ranks share the same node_id, the context is conceptually
+ * NodeLocalTP and scope() reflects this.
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_AllSameNode)
+{
+    // Simulate 2 ranks on same node (node_id=0 for both)
+    std::vector<int> world_ranks = {0};
+    std::vector<int> node_ids = {0};
+    auto ctx = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, world_ranks, node_ids);
+
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_TRUE(ctx->isAllRanksOnSameNode())
+        << "Single rank with node_id=0 should be same-node";
+    EXPECT_EQ(ctx->scope(), TPScope::NODE_LOCAL)
+        << "All ranks on same node should report NODE_LOCAL scope";
+    EXPECT_TRUE(ctx->isNodeLocal())
+        << "isNodeLocal() should be true when all ranks on same node";
+    EXPECT_FALSE(ctx->isGlobal())
+        << "isGlobal() should be false when all ranks on same node";
+    EXPECT_EQ(ctx->nodeCount(), 1)
+        << "Should have exactly 1 unique node";
+}
+
+/**
+ * @test Ranks on different nodes → isAllRanksOnSameNode() false, scope() GLOBAL
+ *
+ * When ranks have different node_ids, this is true cross-node GlobalTP.
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_DifferentNodes)
+{
+    // Simulate 1 rank but pretend it's on node 0 while others are elsewhere
+    // With MPI_COMM_SELF we can only have 1 rank, but we can pass node_ids
+    // that suggest multi-node (though MPI_COMM_SELF has size=1)
+    //
+    // For a proper multi-node test we'd need MPI_COMM_WORLD with np>1.
+    // Here we test the node_ids plumbing with a single rank on its own node.
+    std::vector<int> world_ranks = {0};
+    std::vector<int> node_ids = {5}; // arbitrary node
+    auto ctx = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, world_ranks, node_ids);
+
+    ASSERT_NE(ctx, nullptr);
+    // Single rank is always "all same node"
+    EXPECT_TRUE(ctx->isAllRanksOnSameNode());
+    EXPECT_EQ(ctx->nodeId(0), 5) << "nodeId should return the assigned value";
+    EXPECT_EQ(ctx->nodeCount(), 1);
+}
+
+/**
+ * @test Explicit multi-rank node_ids with mixed placement
+ *
+ * Even though MPI_COMM_SELF has size=1, we verify the node_ids storage
+ * and query logic with a mismatched but valid node_ids vector (like
+ * CreateForTest_MismatchedWorldRanksSize, allowed with a warning).
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_MixedNodeIds)
+{
+    // Pass world_ranks + node_ids for 3 ranks spanning 2 nodes
+    std::vector<int> world_ranks = {0, 1, 2};
+    std::vector<int> node_ids = {0, 0, 1}; // ranks 0,1 on node 0; rank 2 on node 1
+    auto ctx = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, world_ranks, node_ids);
+
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_FALSE(ctx->isAllRanksOnSameNode())
+        << "Ranks spanning 2 nodes should not be same-node";
+    EXPECT_EQ(ctx->scope(), TPScope::GLOBAL)
+        << "Cross-node ranks should report GLOBAL scope";
+    EXPECT_TRUE(ctx->isGlobal());
+    EXPECT_FALSE(ctx->isNodeLocal());
+    EXPECT_EQ(ctx->nodeCount(), 2)
+        << "Should have 2 unique nodes";
+
+    // Verify per-rank node IDs
+    EXPECT_EQ(ctx->nodeId(0), 0);
+    EXPECT_EQ(ctx->nodeId(1), 0);
+    EXPECT_EQ(ctx->nodeId(2), 1);
+}
+
+/**
+ * @test nodeId() returns -1 for out-of-range indices
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_NodeIdOutOfRange)
+{
+    std::vector<int> world_ranks = {0};
+    std::vector<int> node_ids = {0};
+    auto ctx = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, world_ranks, node_ids);
+
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_EQ(ctx->nodeId(-1), -1) << "Negative index should return -1";
+    EXPECT_EQ(ctx->nodeId(1), -1) << "Index beyond node_ids size should return -1";
+    EXPECT_EQ(ctx->nodeId(100), -1) << "Large index should return -1";
+}
+
+/**
+ * @test nodeIds() returns the full vector
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_NodeIdsAccessor)
+{
+    std::vector<int> world_ranks = {10, 20, 30};
+    std::vector<int> node_ids = {2, 2, 3};
+    auto ctx = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, world_ranks, node_ids);
+
+    ASSERT_NE(ctx, nullptr);
+    const auto &ids = ctx->nodeIds();
+    ASSERT_EQ(ids.size(), 3);
+    EXPECT_EQ(ids[0], 2);
+    EXPECT_EQ(ids[1], 2);
+    EXPECT_EQ(ids[2], 3);
+}
+
+/**
+ * @test Auto-detection without explicit node_ids (uses hostname gathering)
+ *
+ * With MPI_COMM_SELF (1 rank), auto-detection gathers a single hostname
+ * and assigns node_id=0. Result: isAllRanksOnSameNode()=true.
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_AutoDetect_SingleRank)
+{
+    // No node_ids passed → auto-detect via MPI_Get_processor_name
+    auto ctx = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, {0});
+
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_TRUE(ctx->isAllRanksOnSameNode())
+        << "Auto-detected single rank should be same-node";
+    EXPECT_EQ(ctx->scope(), TPScope::NODE_LOCAL)
+        << "Single-rank auto-detect should report NODE_LOCAL";
+    EXPECT_EQ(ctx->nodeCount(), 1);
+
+    // nodeIds should have been populated by auto-detection
+    EXPECT_EQ(ctx->nodeIds().size(), 1)
+        << "Auto-detection should populate node_ids for all ranks";
+    EXPECT_EQ(ctx->nodeId(0), 0)
+        << "First (only) rank should have node_id=0";
+}
+
+/**
+ * @test All ranks on same node with larger domain
+ *
+ * Tests with 4 ranks all having the same node_id.
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_FourRanksSameNode)
+{
+    std::vector<int> world_ranks = {0, 1, 2, 3};
+    std::vector<int> node_ids = {0, 0, 0, 0};
+    auto ctx = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, world_ranks, node_ids);
+
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_TRUE(ctx->isAllRanksOnSameNode());
+    EXPECT_EQ(ctx->scope(), TPScope::NODE_LOCAL);
+    EXPECT_EQ(ctx->nodeCount(), 1);
+}
+
+/**
+ * @test Four ranks across three nodes
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_FourRanksThreeNodes)
+{
+    std::vector<int> world_ranks = {0, 1, 2, 3};
+    std::vector<int> node_ids = {0, 1, 2, 0}; // rank 0 and 3 co-located
+    auto ctx = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, world_ranks, node_ids);
+
+    ASSERT_NE(ctx, nullptr);
+    EXPECT_FALSE(ctx->isAllRanksOnSameNode());
+    EXPECT_EQ(ctx->scope(), TPScope::GLOBAL);
+    EXPECT_EQ(ctx->nodeCount(), 3);
+}
+
+/**
+ * @test Move construct preserves node awareness data
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_MoveConstruct_Preserved)
+{
+    std::vector<int> world_ranks = {0, 1};
+    std::vector<int> node_ids = {0, 0};
+    auto original = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, world_ranks, node_ids);
+    ASSERT_NE(original, nullptr);
+    ASSERT_TRUE(original->isAllRanksOnSameNode());
+
+    // Move construct
+    GlobalTPContext moved(std::move(*original));
+
+    EXPECT_TRUE(moved.isAllRanksOnSameNode())
+        << "Moved-to should preserve same-node status";
+    EXPECT_EQ(moved.scope(), TPScope::NODE_LOCAL);
+    EXPECT_EQ(moved.nodeCount(), 1);
+    EXPECT_EQ(moved.nodeIds().size(), 2);
+    EXPECT_EQ(moved.nodeId(0), 0);
+    EXPECT_EQ(moved.nodeId(1), 0);
+}
+
+/**
+ * @test Move assign preserves node awareness data
+ */
+TEST_F(Test__GlobalTPContext, NodeAwareness_MoveAssign_Preserved)
+{
+    std::vector<int> world_ranks_a = {0, 1, 2};
+    std::vector<int> node_ids_a = {0, 1, 2}; // 3 nodes
+    auto a = GlobalTPContext::createForTest(MPI_COMM_SELF, 0, world_ranks_a, node_ids_a);
+
+    std::vector<int> world_ranks_b = {0};
+    std::vector<int> node_ids_b = {0}; // 1 node
+    auto b = GlobalTPContext::createForTest(MPI_COMM_SELF, 1, world_ranks_b, node_ids_b);
+
+    ASSERT_NE(a, nullptr);
+    ASSERT_NE(b, nullptr);
+    ASSERT_FALSE(a->isAllRanksOnSameNode());
+    ASSERT_TRUE(b->isAllRanksOnSameNode());
+
+    // Move-assign a into b → b should now have a's multi-node data
+    *b = std::move(*a);
+
+    EXPECT_FALSE(b->isAllRanksOnSameNode());
+    EXPECT_EQ(b->scope(), TPScope::GLOBAL);
+    EXPECT_EQ(b->nodeCount(), 3);
+}

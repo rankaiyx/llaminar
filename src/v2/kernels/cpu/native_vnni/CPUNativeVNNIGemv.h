@@ -1246,7 +1246,10 @@ namespace llaminar2::cpu::native_vnni
             decode_lut_256 = build_decode_lut_avx2_for_codebook(packed.codebook_id);
 
         // Small-N dispatch: M×N 2D parallel grid
-        if (total_n_blocks <= num_threads / 4 && M >= 2)
+        // Also forced when ldc < 64: the 2-row tiled microkernel always stores
+        // 64 floats per row via _mm512_storeu_ps, which overflows into adjacent
+        // rows when the output stride is narrower than one VNNI chunk.
+        if ((total_n_blocks <= num_threads / 4 && M >= 2) || ldc < 64)
         {
             auto do_compute = [&]()
             {

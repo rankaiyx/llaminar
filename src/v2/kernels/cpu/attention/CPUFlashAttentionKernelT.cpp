@@ -29,10 +29,10 @@ namespace llaminar2
     /** @brief FP32 instantiation — the fully-optimised flash-attention path. */
     template class CPUFlashAttentionKernelT<ActivationPrecision::FP32>;
 
-    /** @brief BF16 instantiation — delegates to CPUAttentionKernelT fallback. */
+    /** @brief BF16 instantiation — returns false for non-FP32 operations. */
     template class CPUFlashAttentionKernelT<ActivationPrecision::BF16>;
 
-    /** @brief FP16 instantiation — delegates to CPUAttentionKernelT fallback. */
+    /** @brief FP16 instantiation — returns false for non-FP32 operations. */
     template class CPUFlashAttentionKernelT<ActivationPrecision::FP16>;
 
 } // namespace llaminar2

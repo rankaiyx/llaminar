@@ -421,6 +421,14 @@ namespace llaminar2
         if (SchemaFactoryRegistry::isSupported(arch))
         {
             stage_sharding_map_ = SchemaFactoryRegistry::getStageShardingConfig(arch);
+
+            // GQA-aware override: replicate K/V snapshot modes when n_kv_heads < tp_degree
+            if (tp_ctx_ && model_ctx_->headCountKV() < tp_ctx_->degree())
+            {
+                stage_sharding_map_["K_PROJECTION"] = SnapshotShardingMode::REPLICATED;
+                stage_sharding_map_["V_PROJECTION"] = SnapshotShardingMode::REPLICATED;
+                stage_sharding_map_["K_ROPE"] = SnapshotShardingMode::REPLICATED;
+            }
         }
 
         LOG_DEBUG("MultiDeviceOrchestrator: Created via createForTest with "
@@ -544,6 +552,19 @@ namespace llaminar2
                         LOG_WARN("MultiDeviceOrchestrator: Device " << dev_idx << " (" << dev_id.to_string() << ") NOT in TensorParallelConfig!");
                     }
                 }
+
+                // GQA-aware stage sharding override: when n_kv_heads < tp_degree,
+                // K/V are replicated (not column-parallel). Override the snapshot
+                // sharding map so parity tests compare K/V outputs correctly.
+                if (n_kv_heads < tp_ctx_->degree())
+                {
+                    stage_sharding_map_["K_PROJECTION"] = SnapshotShardingMode::REPLICATED;
+                    stage_sharding_map_["V_PROJECTION"] = SnapshotShardingMode::REPLICATED;
+                    stage_sharding_map_["K_ROPE"] = SnapshotShardingMode::REPLICATED;
+                    LOG_INFO("MultiDeviceOrchestrator: GQA override: K/V stages set to REPLICATED "
+                             "(n_kv_heads="
+                             << n_kv_heads << " < tp_degree=" << tp_ctx_->degree() << ")");
+                }
             }
         }
 
@@ -597,14 +618,14 @@ namespace llaminar2
                 device_ids.push_back(device_addr.toLocalDeviceId());
             }
 
-            // Pre-load all weights for all devices
+            // Finalize weights for all devices: clone + upload + GEMM pack + release
             auto weight_mgr = model_ctx_->weightManager();
             if (weight_mgr)
             {
-                LOG_INFO("MultiDeviceOrchestrator: Pre-loading weights for " << device_ids.size() << " devices");
-                if (!weight_mgr->preloadForDevices(device_ids))
+                LOG_INFO("MultiDeviceOrchestrator: Finalizing weights for " << device_ids.size() << " devices");
+                if (!weight_mgr->finalizeForDevices(device_ids))
                 {
-                    LOG_WARN("MultiDeviceOrchestrator: Weight preloading failed, may encounter race conditions");
+                    LOG_WARN("MultiDeviceOrchestrator: Weight finalization failed, will use lazy packing");
                 }
             }
         }
@@ -1485,6 +1506,18 @@ namespace llaminar2
             current_position_ += seq_len;
             current_padded_seq_len_ = seq_len;
             stats_dirty_ = true;
+
+            // After first prefill, release host-resident weight data.
+            // GPU kernels (e.g., embedding repack) have now uploaded their own
+            // device copies, so the host data is no longer needed.
+            if (!host_resident_released_ && seq_len > 1 && model_ctx_)
+            {
+                host_resident_released_ = true;
+                if (auto wm = model_ctx_->weightManager())
+                {
+                    wm->releaseHostResidentWeightData();
+                }
+            }
         }
 
         if (collect_timing)

@@ -18,6 +18,7 @@
  */
 
 #include "ComputeBackend.h"
+#include "HardwareInventory.h"
 #include "GPUEnumeration.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
@@ -26,11 +27,16 @@
 #include "../kernels/cpu/ops/CPURoPEKernelT.h"
 #include "../kernels/cpu/ops/CPUSwiGLUKernelT.h"
 #include "../kernels/cpu/ops/CPUSoftmaxKernelT.h"
+#include "fort.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <set>
 #include <sstream>
+#include <sys/stat.h>
 #include <numa.h>
 
 // ============================================================================
@@ -290,7 +296,242 @@ namespace llaminar2
     // DeviceManager Implementation
     // ============================================================================
 
-    void DeviceManager::initialize(int local_numa_node)
+    namespace
+    {
+        // Read CPU model name per socket from /proc/cpuinfo
+        // Returns socket_id -> model name (different sockets may have different CPUs)
+        std::map<int, std::string> read_cpu_model_names_per_socket()
+        {
+            std::map<int, std::string> result;
+            std::ifstream cpuinfo("/proc/cpuinfo");
+            if (!cpuinfo.is_open())
+                return result;
+
+            int current_physical_id = -1;
+            std::string current_model;
+            std::string line;
+            while (std::getline(cpuinfo, line))
+            {
+                if (line.compare(0, 11, "physical id") == 0)
+                {
+                    auto pos = line.find(':');
+                    if (pos != std::string::npos)
+                        current_physical_id = std::atoi(line.c_str() + pos + 1);
+                }
+                else if (line.compare(0, 10, "model name") == 0)
+                {
+                    auto pos = line.find(':');
+                    if (pos != std::string::npos)
+                    {
+                        std::string name = line.substr(pos + 1);
+                        auto start = name.find_first_not_of(" \t");
+                        if (start != std::string::npos)
+                            name = name.substr(start);
+                        current_model = name;
+                    }
+                }
+                else if (line.empty() || line[0] == '\n')
+                {
+                    // End of a CPU block
+                    if (current_physical_id >= 0 && !current_model.empty())
+                        result[current_physical_id] = current_model;
+                    current_physical_id = -1;
+                    current_model.clear();
+                }
+            }
+            // Handle last block (file may not end with blank line)
+            if (current_physical_id >= 0 && !current_model.empty())
+                result[current_physical_id] = current_model;
+
+            return result;
+        }
+
+        // Format memory size as "XX GB"
+        std::string format_memory_gb(size_t bytes)
+        {
+            return std::to_string(bytes / (1024ULL * 1024 * 1024)) + " GB";
+        }
+
+        // Format PCIe link info as "GenX xY ZZ GB/s"
+        std::string format_pcie_link(const PCIeLinkInfo &pcie)
+        {
+            if (pcie.link_speed_gts <= 0)
+                return "N/A";
+            char buf[64];
+            snprintf(buf, sizeof(buf), "Gen%d x%d %.0f GB/s",
+                     pcie.pcie_gen, pcie.link_width, pcie.bandwidth_gbps());
+            return buf;
+        }
+
+        // Format NUMA node(s) as a string
+        std::string format_numa(int numa_node)
+        {
+            if (numa_node < 0)
+                return "-";
+            return std::to_string(numa_node);
+        }
+
+        // Strip vendor prefix from GPU name for cleaner display
+        std::string strip_vendor_prefix(const std::string &name)
+        {
+            // Remove "NVIDIA " prefix
+            if (name.compare(0, 7, "NVIDIA ") == 0)
+                return name.substr(7);
+            // Remove "AMD " prefix
+            if (name.compare(0, 4, "AMD ") == 0)
+                return name.substr(4);
+            return name;
+        }
+
+        // Log a libfort table through the Logger (line by line)
+        void log_table(const std::string &table_str)
+        {
+            std::istringstream stream(table_str);
+            std::string line;
+            while (std::getline(stream, line))
+            {
+                if (!line.empty())
+                    LOG_INFO(line);
+            }
+        }
+
+        // Build and log a GPU table for a given backend
+        void log_gpu_table(const char *title,
+                           const std::vector<ComputeDevice> &devices)
+        {
+            if (devices.empty())
+                return;
+
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+
+            // Title row spanning all columns
+            table << title << "" << "" << "" << "" << fort::endr;
+            table[0][0].set_cell_span(5);
+            table[0][0].set_cell_text_align(fort::text_align::center);
+            table.row(0).set_cell_row_type(fort::row_type::header);
+
+            // Header row
+            table << "ID" << "Name" << "VRAM" << "PCIe Link" << "NUMA" << fort::endr;
+            table.row(1).set_cell_row_type(fort::row_type::header);
+
+            table.column(0).set_cell_text_align(fort::text_align::center);
+            table.column(1).set_cell_text_align(fort::text_align::left);
+            table.column(2).set_cell_text_align(fort::text_align::right);
+            table.column(3).set_cell_text_align(fort::text_align::left);
+            table.column(4).set_cell_text_align(fort::text_align::center);
+
+            for (const auto &dev : devices)
+            {
+                // Build name with arch info embedded
+                std::string display_name = strip_vendor_prefix(dev.name);
+
+                // For CUDA devices, append SM version if not already in name
+                if (dev.type == ComputeBackendType::GPU_CUDA)
+                {
+                    std::string sm = "SM " + std::to_string(dev.compute_capability / 10) + "." + std::to_string(dev.compute_capability % 10);
+                    if (display_name.find("SM") == std::string::npos)
+                        display_name += " (" + sm + ")";
+                }
+
+                table << std::to_string(dev.device_id)
+                      << display_name
+                      << format_memory_gb(dev.total_memory_bytes)
+                      << format_pcie_link(dev.pcie)
+                      << format_numa(dev.numa_node)
+                      << fort::endr;
+            }
+
+            log_table(table.to_string());
+
+            // Print degraded link warnings after the table
+            for (const auto &dev : devices)
+            {
+                if (dev.pcie.degraded)
+                {
+                    int max_gen = (dev.pcie.max_speed_gts >= 64.0)   ? 6
+                                  : (dev.pcie.max_speed_gts >= 32.0) ? 5
+                                  : (dev.pcie.max_speed_gts >= 16.0) ? 4
+                                  : (dev.pcie.max_speed_gts >= 8.0)  ? 3
+                                  : (dev.pcie.max_speed_gts >= 5.0)  ? 2
+                                                                     : 1;
+                    char cap_buf[64];
+                    snprintf(cap_buf, sizeof(cap_buf), "Gen%d x%d (%.1f GB/s)",
+                             max_gen, dev.pcie.max_width,
+                             // Compute max bandwidth
+                             dev.pcie.max_speed_gts * dev.pcie.max_width * ((max_gen >= 3) ? (128.0 / 130.0) : 0.8) / 8.0);
+
+                    const char *type_prefix = (dev.type == ComputeBackendType::GPU_CUDA) ? "cuda" : "rocm";
+                    LOG_WARN("  ⚠ " << type_prefix << ":" << dev.device_id
+                                    << " link degraded: " << format_pcie_link(dev.pcie)
+                                    << " — capable of " << cap_buf);
+                }
+            }
+        }
+
+        // Build and log a P2P access matrix table
+        void log_p2p_table(const char *backend_name, const P2PMatrix &matrix)
+        {
+            const int n = matrix.device_count();
+            if (n < 2)
+                return;
+
+            // Count P2P-enabled pairs
+            int p2p_pairs = 0;
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < n; ++j)
+                    if (i != j && matrix.can_access[i][j])
+                        ++p2p_pairs;
+            const int total_pairs = n * (n - 1);
+
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+
+            // Title row
+            std::ostringstream title;
+            title << backend_name << " P2P Access (" << p2p_pairs << "/" << total_pairs << " pairs)";
+            // First cell + N GPU columns
+            table << title.str();
+            for (int j = 0; j < n; ++j)
+                table << "";
+            table << fort::endr;
+            table[0][0].set_cell_span(n + 1);
+            table[0][0].set_cell_text_align(fort::text_align::center);
+            table.row(0).set_cell_row_type(fort::row_type::header);
+
+            // Header row: empty + GPU0, GPU1, ...
+            table << "";
+            for (int j = 0; j < n; ++j)
+                table << ("GPU" + std::to_string(matrix.device_ids[j]));
+            table << fort::endr;
+            table.row(1).set_cell_row_type(fort::row_type::header);
+
+            // Set all columns to center
+            for (int c = 0; c <= n; ++c)
+                table.column(c).set_cell_text_align(fort::text_align::center);
+
+            // Data rows
+            for (int i = 0; i < n; ++i)
+            {
+                table << ("GPU" + std::to_string(matrix.device_ids[i]));
+                for (int j = 0; j < n; ++j)
+                {
+                    if (i == j)
+                        table << "-";
+                    else
+                        table << (matrix.can_access[i][j] ? "✓" : "✗");
+                }
+                table << fort::endr;
+            }
+
+            log_table(table.to_string());
+        }
+    } // anonymous namespace
+
+    DeviceManager::DeviceManager() = default;
+    DeviceManager::~DeviceManager() = default;
+
+    void DeviceManager::initialize(int local_numa_node, bool log_inventory)
     {
         devices_.clear();
         contexts_.clear();
@@ -426,23 +667,295 @@ namespace llaminar2
         // Resize contexts_ vector to match devices
         contexts_.resize(devices_.size(), nullptr);
 
-        // Log discovered devices (all available for heterogeneous tensor-parallel execution)
-        LOG_INFO("[DeviceManager] Available compute backends (" << devices_.size() << " total):");
-        for (size_t i = 0; i < devices_.size(); ++i)
+        // ====================================================================
+        // Device inventory tables (libfort) — print once on first init
+        // ====================================================================
+        if (log_inventory && !inventory_logged_)
         {
-            const auto &dev = devices_[i];
-            std::string device_info = "  [" + std::to_string(i) + "] " + dev.name + " (" + std::to_string(dev.total_memory_bytes / (1024 * 1024 * 1024)) + " GB";
-            if (dev.type != ComputeBackendType::CPU)
+            inventory_logged_ = true;
+
+            // --- CPU table (per-socket detail) ---
             {
-                device_info += ", SM " + std::to_string(dev.compute_capability / 10) + "." + std::to_string(dev.compute_capability % 10);
+                auto cpu_models = read_cpu_model_names_per_socket();
+
+                // Per-socket info
+                struct SocketInfo
+                {
+                    int socket_id = -1;
+                    int numa_node = -1;
+                    std::string model_name = "Unknown CPU";
+                    std::vector<int> physical_cores; // First thread of each core
+                    std::vector<int> ht_threads;     // Sibling threads (HT)
+                    size_t memory_bytes = 0;
+                };
+                std::vector<SocketInfo> sockets;
+
+                int num_numa = (numa_available() >= 0) ? numa_num_configured_nodes() : 1;
+                int total_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+
+                // Map each CPU to its socket and detect HT siblings
+                // socket_id -> { core_id -> vector<cpu_id> }
+                std::map<int, std::map<int, std::vector<int>>> socket_core_map;
+                std::map<int, int> socket_to_numa; // socket -> NUMA node
+
+                for (int cpu = 0; cpu < total_cpus; ++cpu)
+                {
+                    char path[256];
+                    int pkg = 0, core = 0;
+
+                    snprintf(path, sizeof(path),
+                             "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+                    FILE *f = fopen(path, "r");
+                    if (f)
+                    {
+                        if (fscanf(f, "%d", &pkg) != 1)
+                            pkg = 0;
+                        fclose(f);
+                    }
+
+                    snprintf(path, sizeof(path),
+                             "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+                    f = fopen(path, "r");
+                    if (f)
+                    {
+                        if (fscanf(f, "%d", &core) != 1)
+                            core = 0;
+                        fclose(f);
+                    }
+
+                    socket_core_map[pkg][core].push_back(cpu);
+
+                    // Detect NUMA node for this CPU
+                    if (socket_to_numa.find(pkg) == socket_to_numa.end())
+                    {
+                        for (int n = 0; n < num_numa; ++n)
+                        {
+                            char numa_path[256];
+                            snprintf(numa_path, sizeof(numa_path),
+                                     "/sys/devices/system/cpu/cpu%d/node%d", cpu, n);
+                            struct stat st;
+                            if (stat(numa_path, &st) == 0)
+                            {
+                                socket_to_numa[pkg] = n;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // Build SocketInfo for each socket
+                for (auto &[pkg, cores] : socket_core_map)
+                {
+                    SocketInfo si;
+                    si.socket_id = pkg;
+                    si.numa_node = (socket_to_numa.count(pkg) > 0) ? socket_to_numa[pkg] : pkg;
+                    if (cpu_models.count(pkg) > 0)
+                        si.model_name = cpu_models[pkg];
+
+                    for (auto &[core_id, cpus] : cores)
+                    {
+                        // Sort CPUs: lowest is the physical core, rest are HT siblings
+                        std::sort(cpus.begin(), cpus.end());
+                        si.physical_cores.push_back(cpus[0]);
+                        for (size_t i = 1; i < cpus.size(); ++i)
+                            si.ht_threads.push_back(cpus[i]);
+                    }
+                    std::sort(si.physical_cores.begin(), si.physical_cores.end());
+                    std::sort(si.ht_threads.begin(), si.ht_threads.end());
+
+                    // Per-NUMA memory
+                    if (numa_available() >= 0 && si.numa_node >= 0)
+                    {
+                        long long sz = numa_node_size64(si.numa_node, nullptr);
+                        if (sz > 0)
+                            si.memory_bytes = static_cast<size_t>(sz);
+                    }
+
+                    sockets.push_back(std::move(si));
+                }
+
+                // Sort sockets by ID
+                std::sort(sockets.begin(), sockets.end(),
+                          [](const SocketInfo &a, const SocketInfo &b)
+                          { return a.socket_id < b.socket_id; });
+
+                // Fallback: if no sockets detected, create a single entry
+                if (sockets.empty())
+                {
+                    SocketInfo si;
+                    si.socket_id = 0;
+                    si.numa_node = 0;
+
+                    for (const auto &dev : devices_)
+                        if (dev.type == ComputeBackendType::CPU)
+                        {
+                            si.memory_bytes = dev.total_memory_bytes;
+                            break;
+                        }
+
+                    sockets.push_back(si);
+                }
+
+                // Helper: format a sorted vector of ints as compact ranges (e.g., "0-27, 56-83")
+                auto format_cpu_ranges = [](const std::vector<int> &cpus) -> std::string
+                {
+                    if (cpus.empty())
+                        return "-";
+                    std::ostringstream oss;
+                    int start = cpus[0], prev = cpus[0];
+                    for (size_t i = 1; i <= cpus.size(); ++i)
+                    {
+                        if (i < cpus.size() && cpus[i] == prev + 1)
+                        {
+                            prev = cpus[i];
+                        }
+                        else
+                        {
+                            if (oss.tellp() > 0)
+                                oss << ", ";
+                            if (start == prev)
+                                oss << start;
+                            else
+                                oss << start << "-" << prev;
+                            if (i < cpus.size())
+                            {
+                                start = cpus[i];
+                                prev = cpus[i];
+                            }
+                        }
+                    }
+                    return oss.str();
+                };
+
+                // Compute total memory for title
+                size_t total_mem = 0;
+                for (const auto &s : sockets)
+                    total_mem += s.memory_bytes;
+
+                // Build table
+                const bool has_ht = !sockets.empty() && !sockets[0].ht_threads.empty();
+                const int num_cols = has_ht ? 7 : 6;
+
+                fort::utf8_table cpu_table;
+                cpu_table.set_border_style(FT_DOUBLE2_STYLE);
+
+                // Title row
+                cpu_table << "CPU";
+                for (int c = 1; c < num_cols; ++c)
+                    cpu_table << "";
+                cpu_table << fort::endr;
+                cpu_table[0][0].set_cell_span(num_cols);
+                cpu_table[0][0].set_cell_text_align(fort::text_align::center);
+                cpu_table.row(0).set_cell_row_type(fort::row_type::header);
+
+                // Header row
+                if (has_ht)
+                    cpu_table << "Socket" << "Processor" << "NUMA" << "Physical Cores" << "HT Threads" << "Cores" << "Memory" << fort::endr;
+                else
+                    cpu_table << "Socket" << "Processor" << "NUMA" << "Cores" << "Core Count" << "Memory" << fort::endr;
+                cpu_table.row(1).set_cell_row_type(fort::row_type::header);
+
+                // Column alignments
+                cpu_table.column(0).set_cell_text_align(fort::text_align::center);
+                cpu_table.column(1).set_cell_text_align(fort::text_align::left);
+                cpu_table.column(2).set_cell_text_align(fort::text_align::center);
+                if (has_ht)
+                {
+                    cpu_table.column(3).set_cell_text_align(fort::text_align::left);
+                    cpu_table.column(4).set_cell_text_align(fort::text_align::left);
+                    cpu_table.column(5).set_cell_text_align(fort::text_align::center);
+                    cpu_table.column(6).set_cell_text_align(fort::text_align::right);
+                }
+                else
+                {
+                    cpu_table.column(3).set_cell_text_align(fort::text_align::left);
+                    cpu_table.column(4).set_cell_text_align(fort::text_align::center);
+                    cpu_table.column(5).set_cell_text_align(fort::text_align::right);
+                }
+
+                // Data rows
+                for (const auto &s : sockets)
+                {
+                    std::string cores_str = std::to_string(s.physical_cores.size()) + "c/" + std::to_string(s.physical_cores.size() + s.ht_threads.size()) + "t";
+
+                    if (has_ht)
+                    {
+                        cpu_table << std::to_string(s.socket_id)
+                                  << s.model_name
+                                  << std::to_string(s.numa_node)
+                                  << format_cpu_ranges(s.physical_cores)
+                                  << format_cpu_ranges(s.ht_threads)
+                                  << cores_str
+                                  << format_memory_gb(s.memory_bytes)
+                                  << fort::endr;
+                    }
+                    else
+                    {
+                        cpu_table << std::to_string(s.socket_id)
+                                  << s.model_name
+                                  << std::to_string(s.numa_node)
+                                  << format_cpu_ranges(s.physical_cores)
+                                  << cores_str
+                                  << format_memory_gb(s.memory_bytes)
+                                  << fort::endr;
+                    }
+                }
+
+                // Total row
+                if (sockets.size() > 1)
+                {
+                    int total_phys = 0, total_threads = 0;
+                    for (const auto &s : sockets)
+                    {
+                        total_phys += static_cast<int>(s.physical_cores.size());
+                        total_threads += static_cast<int>(s.physical_cores.size() + s.ht_threads.size());
+                    }
+                    std::string total_cores_str = std::to_string(total_phys) + "c/" + std::to_string(total_threads) + "t total";
+
+                    cpu_table << fort::separator;
+                    if (has_ht)
+                        cpu_table << "" << "Total" << "" << "" << "" << total_cores_str << format_memory_gb(total_mem) << fort::endr;
+                    else
+                        cpu_table << "" << "Total" << "" << "" << total_cores_str << format_memory_gb(total_mem) << fort::endr;
+                }
+
+                log_table(cpu_table.to_string());
             }
-            if (dev.numa_node >= 0)
+
+            // --- NVIDIA CUDA GPU table ---
+            if (!cuda_devices.empty())
             {
-                device_info += ", NUMA node " + std::to_string(dev.numa_node);
+                log_gpu_table("NVIDIA CUDA GPUs", cuda_devices);
             }
-            device_info += ")";
-            LOG_INFO(device_info);
-        }
+
+            // --- AMD ROCm GPU table ---
+            if (!rocm_devices.empty())
+            {
+                log_gpu_table("AMD ROCm GPUs", rocm_devices);
+            }
+
+            // --- P2P access matrices ---
+            p2p_matrices_.clear();
+
+#ifdef HAVE_CUDA
+            if (cuda_devices.size() > 1)
+            {
+                auto cuda_p2p = cuda_enumeration::query_p2p_matrix(cuda_devices);
+                log_p2p_table("CUDA", cuda_p2p);
+                p2p_matrices_.push_back(std::move(cuda_p2p));
+            }
+#endif
+
+#ifdef HAVE_ROCM
+            if (rocm_devices.size() > 1)
+            {
+                auto rocm_p2p = rocm_enumeration::query_p2p_matrix(rocm_devices);
+                log_p2p_table("ROCm", rocm_p2p);
+                p2p_matrices_.push_back(std::move(rocm_p2p));
+            }
+#endif
+
+        } // end if (!inventory_logged_)
 
         // Note: All devices are available for heterogeneous work distribution.
         // CPU may get 0% prefill but significant decode work due to memory bandwidth.

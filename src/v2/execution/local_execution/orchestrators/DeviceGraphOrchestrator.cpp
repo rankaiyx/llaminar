@@ -374,6 +374,25 @@ namespace llaminar2
                     continue;
                 }
             }
+
+            // Skip GPU-unused attention workspace buffers to save VRAM.
+            // GPU flash attention kernels don't use these O(S²) buffers.
+            if (state_.device_id.is_gpu() &&
+                (id == BufferId::ATTN_SCORES_WORKSPACE || id == BufferId::ATTN_CONTEXT_WORKSPACE))
+            {
+                LOG_INFO("[DeviceGraphOrchestrator] Skipping GPU-unused buffer: " << bufferIdName(id));
+                continue;
+            }
+
+            // Skip GPU-unused attention workspace buffers to save VRAM.
+            // GPU flash attention kernels don't use these O(S²) buffers.
+            if (state_.device_id.is_gpu() &&
+                (id == BufferId::ATTN_SCORES_WORKSPACE || id == BufferId::ATTN_CONTEXT_WORKSPACE))
+            {
+                LOG_INFO("[DeviceGraphOrchestrator] Skipping GPU-unused buffer: " << bufferIdName(id));
+                continue;
+            }
+
             size_t rows = desc.shape.size() >= 1 ? desc.shape[0] : 0;
             size_t cols = desc.shape.size() >= 2 ? desc.shape[1] : 0;
             const char *dtype = BufferArena::bufferTensorTypeToStr(desc.tensor_type);
@@ -1829,6 +1848,15 @@ namespace llaminar2
         {
             LOG_ERROR("[DeviceGraphOrchestrator] forward() execution failed");
             return nullptr;
+        }
+
+        // After first prefill, release host-resident weight data.
+        // GPU kernels (e.g., embedding) have now uploaded their own device copies,
+        // so the host data is no longer needed.
+        if (!host_resident_released_ && seq_len > 1 && weight_manager_)
+        {
+            host_resident_released_ = true;
+            weight_manager_->releaseHostResidentWeightData();
         }
 
         // Update positions

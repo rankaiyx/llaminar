@@ -580,12 +580,12 @@ namespace llaminar2
                     throw std::invalid_argument("Invalid mpi-procs value: '" + value + "'");
                 }
             }
-            else if (matchesFlag(arg, "", "--hostfile"))
+            else if (matchesFlag(arg, "", "--mpi-hostfile"))
             {
                 std::string value = getFlagValue(args, i);
                 if (value.empty())
                 {
-                    throw std::invalid_argument("--hostfile requires a path");
+                    throw std::invalid_argument("--mpi-mpi-hostfile requires a path");
                 }
                 config.hostfile = value;
             }
@@ -1324,7 +1324,7 @@ Fused Attention:
 
 MPI Bootstrap:
   --mpi-procs <n>        Number of MPI processes (0 = auto)
-  --hostfile <path>      MPI hostfile path
+  --mpi-hostfile <path>  MPI hostfile path (also used for node detection) (also used for node detection)
   --mpi-dry-run          Print MPI launch command and exit
   --mpi-verbose          Verbose MPI output
   --no-mpi-bootstrap     Disable automatic MPI bootstrap

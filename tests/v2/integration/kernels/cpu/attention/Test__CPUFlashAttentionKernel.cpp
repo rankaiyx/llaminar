@@ -5,7 +5,7 @@
 
 #include <gtest/gtest.h>
 
-#include "kernels/cpu/attention/CPUAttentionKernelT.h"
+#include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "tensors/Tensors.h"
 
@@ -104,7 +104,7 @@ TEST(Test__CPUFlashAttentionKernel, ComputeTensor_Prefill_FP32Q_Q81KV_MatchesRef
         head_dim,
         causal));
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> ref_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> ref_kernel;
     const float *k_deq = k_q81->fp32_data();
     const float *v_deq = v_q81->fp32_data();
     ASSERT_NE(k_deq, nullptr);
@@ -170,7 +170,7 @@ TEST(Test__CPUFlashAttentionKernel, ComputeTensor_Decode_FP32Q_Q81KV_MatchesRefe
         head_dim,
         causal));
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> ref_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> ref_kernel;
     const float *k_deq = k_q81->fp32_data();
     const float *v_deq = v_q81->fp32_data();
     ASSERT_NE(k_deq, nullptr);

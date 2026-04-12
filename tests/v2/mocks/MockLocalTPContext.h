@@ -239,6 +239,9 @@ namespace llaminar2::test
             const GlobalDeviceAddress &device, int total_rows) const override
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (total_rows <= 0 || devices_.empty())
+                return {0, 0};
+
             int idx = -1;
             for (size_t i = 0; i < devices_.size(); ++i)
             {
@@ -248,14 +251,11 @@ namespace llaminar2::test
                     break;
                 }
             }
-            if (idx < 0 || devices_.empty())
+            if (idx < 0)
                 return {0, 0};
 
-            int rows_per_device = total_rows / static_cast<int>(devices_.size());
-            int remainder = total_rows % static_cast<int>(devices_.size());
-            int start = idx * rows_per_device + std::min(idx, remainder);
-            int end = start + rows_per_device + (idx < remainder ? 1 : 0);
-            return {start, end};
+            auto cumulative = computeCumulativeCounts(total_rows);
+            return {cumulative[idx], cumulative[idx + 1]};
         }
 
         std::pair<int, int> colRangeForDevice(
@@ -335,6 +335,60 @@ namespace llaminar2::test
         std::vector<GlobalDeviceAddress> devices_;
         std::vector<float> weights_;
         CollectiveBackendType backend_ = CollectiveBackendType::AUTO;
+
+        /**
+         * @brief Proportional distribution matching LocalTPContext::computeCumulativeCounts
+         *
+         * When weights_ is empty, distributes equally. Otherwise distributes
+         * proportionally with proper rounding to ensure exact total.
+         */
+        std::vector<int> computeCumulativeCounts(int total) const
+        {
+            // Build normalized weights
+            std::vector<float> norm_weights;
+            if (weights_.empty())
+            {
+                float eq = 1.0f / static_cast<float>(devices_.size());
+                norm_weights.assign(devices_.size(), eq);
+            }
+            else
+            {
+                float sum = 0.0f;
+                for (float w : weights_)
+                    sum += w;
+                norm_weights.resize(weights_.size());
+                for (size_t i = 0; i < weights_.size(); ++i)
+                    norm_weights[i] = weights_[i] / sum;
+            }
+
+            std::vector<int> cumulative(norm_weights.size() + 1);
+            cumulative[0] = 0;
+
+            int remaining = total;
+            float remaining_weight = 1.0f;
+
+            for (size_t i = 0; i < norm_weights.size(); ++i)
+            {
+                if (i == norm_weights.size() - 1)
+                {
+                    cumulative[i + 1] = total;
+                }
+                else
+                {
+                    float proportion = norm_weights[i] / remaining_weight;
+                    int count = static_cast<int>(std::round(proportion * remaining));
+                    if (count == 0 && remaining > 0)
+                        count = 1;
+                    count = std::min(count, remaining);
+
+                    cumulative[i + 1] = cumulative[i] + count;
+                    remaining -= count;
+                    remaining_weight -= norm_weights[i];
+                }
+            }
+
+            return cumulative;
+        }
 
         std::vector<AllreduceCall> allreduce_calls_;
         std::atomic<int> allreduce_call_count_{0};

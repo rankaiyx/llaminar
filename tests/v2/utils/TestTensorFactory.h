@@ -1480,6 +1480,79 @@ namespace llaminar2::test
             }
         }
 
+        /**
+         * @brief Fill FP32 tensor with alternating row values
+         *
+         * Even-indexed rows are filled with val_even, odd with val_odd.
+         * Requires shape to have ≥2 dimensions (rows × cols).
+         *
+         * Primary use: set val_odd=0 to create zero rows that act as
+         * corruption sentinels. In C = A × B^T, a zero row in A must
+         * produce a zero row in C. Any non-zero output in that row
+         * indicates cross-row buffer contamination (e.g., ldc overflow).
+         */
+        static void fillAlternatingRows(FP32Tensor *tensor,
+                                        float val_even = 1.0f,
+                                        float val_odd = 0.0f)
+        {
+            if (!tensor || tensor->shape().size() < 2)
+                return;
+            float *data = tensor->mutable_data();
+            size_t rows = tensor->shape()[0];
+            size_t cols = tensor->shape()[1];
+            for (size_t r = 0; r < rows; ++r)
+            {
+                float val = (r % 2 == 0) ? val_even : val_odd;
+                for (size_t c = 0; c < cols; ++c)
+                    data[r * cols + c] = val;
+            }
+        }
+
+        /**
+         * @brief Create FP32 tensor with alternating row values
+         * @see fillAlternatingRows
+         */
+        static std::unique_ptr<FP32Tensor> createFP32AlternatingRows(
+            const std::vector<size_t> &shape,
+            float val_even = 1.0f,
+            float val_odd = 0.0f)
+        {
+            auto tensor = createFP32(shape);
+            fillAlternatingRows(tensor.get(), val_even, val_odd);
+            return tensor;
+        }
+
+        /**
+         * @brief Fill FP32 tensor with a checkerboard pattern (+val, -val)
+         *
+         * Element [r][c] = ((r + c) % 2 == 0) ? +val : -val.
+         * Tests sign handling in quantized GEMM accumulation.
+         */
+        static void fillCheckerboard(FP32Tensor *tensor, float val = 1.0f)
+        {
+            if (!tensor || tensor->shape().size() < 2)
+                return;
+            float *data = tensor->mutable_data();
+            size_t rows = tensor->shape()[0];
+            size_t cols = tensor->shape()[1];
+            for (size_t r = 0; r < rows; ++r)
+                for (size_t c = 0; c < cols; ++c)
+                    data[r * cols + c] = ((r + c) % 2 == 0) ? val : -val;
+        }
+
+        /**
+         * @brief Create FP32 tensor with checkerboard pattern
+         * @see fillCheckerboard
+         */
+        static std::unique_ptr<FP32Tensor> createFP32Checkerboard(
+            const std::vector<size_t> &shape,
+            float val = 1.0f)
+        {
+            auto tensor = createFP32(shape);
+            fillCheckerboard(tensor.get(), val);
+            return tensor;
+        }
+
         // =========================================================================
         // Comparison Utilities
         // =========================================================================

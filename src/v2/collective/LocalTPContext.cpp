@@ -427,9 +427,12 @@ namespace llaminar2
         {
             if (!initializeBackend())
             {
-                LOG_WARN("LocalTPContext: Failed to initialize backend "
-                         << collectiveBackendTypeToString(backend_)
-                         << ", collectives will be no-ops");
+                throw std::runtime_error(
+                    std::string("LocalTPContext: Failed to initialize collective backend ") +
+                    collectiveBackendTypeToString(backend_) +
+                    ". Tensor parallelism requires a working collective backend. "
+                    "Check GPU availability and driver status. "
+                    "Run with NCCL_DEBUG=INFO for details.");
             }
         }
     }

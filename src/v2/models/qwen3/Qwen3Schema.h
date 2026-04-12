@@ -72,6 +72,10 @@ namespace llaminar2
             config.exact_matches["output.weight"] = WeightShardingMode::ColumnParallel;
             config.exact_dimension_matches["output.weight"] = WeightDimensionType::Vocab;
 
+            // Vocab-parallel embedding: each device holds vocab_size/tp_degree rows
+            config.exact_matches["token_embd.weight"] = WeightShardingMode::ColumnParallel;
+            config.exact_dimension_matches["token_embd.weight"] = WeightDimensionType::Vocab;
+
             // Pattern rules (evaluated in order, first match wins)
             config.patterns = {
                 // ===== Attention Weights =====
@@ -133,6 +137,7 @@ namespace llaminar2
                     {"token_ids", BufferSemantic::Input},
                     {"weights.embedding_table", BufferSemantic::Input}},
                 .outputs = {{"hidden", BufferSemantic::Output}},
+                .tp_mode = TPMode::RowParallel,
                 .is_optional = true,
                 .exec_policy_key = "exec_embedding"};
 

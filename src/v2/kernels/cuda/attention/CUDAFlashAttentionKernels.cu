@@ -342,7 +342,9 @@ namespace
         int tile_q,
         int tile_kv,
         int qkv_pad,
-        int scores_pad)
+        int scores_pad,
+        int head_start = 0,
+        int gqa_n_rep = 0)
     {
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
@@ -363,8 +365,9 @@ namespace
         const int warp_id = threadIdx.x / WARP_SIZE;
         const int lane_id = threadIdx.x % WARP_SIZE;
 
-        // GQA mapping
-        const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx : (head_idx / (n_heads / n_kv_heads));
+        // GQA mapping (TP-aware: use global head position when gqa_n_rep provided)
+        const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
+        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx : ((head_start + head_idx) / effective_gqa);
 
         // Q row range
         const int q_block_start = q_tile_idx * tile_q;
@@ -759,97 +762,97 @@ namespace
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<6, 64, 32, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<6, 64, 64, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     // head_dim=128: 4 consumer warps, tile_q=64
     template __global__ void flash_attention_2_pipelined_kernel<4, 128, 16, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<4, 128, 32, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<4, 128, 64, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     // head_dim=256: 2 consumer warps, tile_q=32
     template __global__ void flash_attention_2_pipelined_kernel<2, 256, 16, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<2, 256, 32, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<2, 256, 64, false>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
 
     // KV_FP16=true (FP16 K/V from KV cache — eliminates FP16→FP32→FP16 round-trip)
     template __global__ void flash_attention_2_pipelined_kernel<6, 64, 16, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<6, 64, 32, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<6, 64, 64, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<4, 128, 16, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<4, 128, 32, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<4, 128, 64, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     // head_dim=256: 2 consumer warps, tile_q=32
     template __global__ void flash_attention_2_pipelined_kernel<2, 256, 16, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<2, 256, 32, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
     template __global__ void flash_attention_2_pipelined_kernel<2, 256, 64, true>(
         const float *, const void *, const void *, float *,
         int, int, int, int, int, int, float, bool, int, int,
         const llaminar2::attention::AttentionDeviceParams *, const float *,
-        int, int, int, int);
+        int, int, int, int, int, int);
 
     // =========================================================================
     // Flash Decoding - Split-K Kernel (FP32)
@@ -903,7 +906,9 @@ namespace
         int head_dim,
         int num_splits,
         float softmax_scale,
-        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        int head_start = 0,
+        int gqa_n_rep = 0)
     {
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
@@ -916,7 +921,8 @@ namespace
         const int split_idx = blockIdx.y;
         const int batch_idx = blockIdx.z;
 
-        const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx : (head_idx / (n_heads / n_kv_heads));
+        const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
+        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx : ((head_start + head_idx) / effective_gqa);
 
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
@@ -1156,7 +1162,9 @@ namespace
         int head_dim,
         int num_splits,
         float softmax_scale,
-        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        int head_start = 0,
+        int gqa_n_rep = 0)
     {
         int kv_stride = kv_len;
         int kv_len_runtime = kv_len;
@@ -1169,7 +1177,8 @@ namespace
         const int split_idx = blockIdx.y;
         const int batch_idx = blockIdx.z;
 
-        const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx : (head_idx / (n_heads / n_kv_heads));
+        const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
+        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx : ((head_start + head_idx) / effective_gqa);
 
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
@@ -1342,7 +1351,9 @@ namespace
         int head_dim,
         int num_splits,
         float softmax_scale,
-        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        int head_start = 0,
+        int gqa_n_rep = 0)
     {
         // Q8_1 block addressing constants
         constexpr int Q8_BS = 32;
@@ -1358,7 +1369,8 @@ namespace
         const int split_idx = blockIdx.y;
         const int batch_idx = blockIdx.z;
 
-        const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx : (head_idx / (n_heads / n_kv_heads));
+        const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
+        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx : ((head_start + head_idx) / effective_gqa);
 
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
@@ -1618,14 +1630,17 @@ namespace
         int tail,         // ring buffer tail position
         int k_block_size, // sizeof(TQ8Block<D>)
         int v_block_size, // sizeof(TQ4Block<D>)
-        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params)
+        const llaminar2::attention::AttentionDeviceParams *__restrict__ device_params,
+        int head_start = 0,
+        int gqa_n_rep = 0)
     {
         const int head_idx = blockIdx.x;
         const int split_idx = blockIdx.y;
         const int batch_idx = blockIdx.z;
 
-        const int kv_head_idx = (n_heads == n_kv_heads) ? head_idx
-                                                        : (head_idx / (n_heads / n_kv_heads));
+        const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
+        const int kv_head_idx = (n_heads == n_kv_heads && gqa_n_rep == 0) ? head_idx
+                                                                          : ((head_start + head_idx) / effective_gqa);
 
         int kv_count_rt = kv_count;
         if (device_params)
@@ -2009,7 +2024,9 @@ static int fa2_prefill_launch(
     const llaminar2::attention::AttentionDeviceParams *device_params,
     const float *mask,
     cudaStream_t cuda_stream,
-    int device_idx)
+    int device_idx,
+    int head_start,
+    int gqa_n_rep)
 {
     float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
@@ -2052,7 +2069,8 @@ static int fa2_prefill_launch(
             Q, K, V, O,                                                                                    \
             batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,                                    \
             softmax_scale, causal, window_size, position_offset,                                           \
-            device_params, mask, cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad);                    \
+            device_params, mask, cfg.tile_q, cfg.tile_kv, cfg.qkv_pad, cfg.scores_pad,                     \
+            head_start, gqa_n_rep);                                                                        \
     } while (0)
 
     if (cfg.num_consumer_warps == 6)
@@ -2111,13 +2129,16 @@ extern "C"
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
         void *stream,
-        int device_idx)
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
     {
         return fa2_prefill_launch<false>(
             Q, static_cast<const void *>(K), static_cast<const void *>(V), O,
             batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
             causal, window_size, position_offset, device_params, mask,
-            static_cast<cudaStream_t>(stream), device_idx);
+            static_cast<cudaStream_t>(stream), device_idx,
+            head_start, gqa_n_rep);
     }
 
     /**
@@ -2135,13 +2156,16 @@ extern "C"
         const llaminar2::attention::AttentionDeviceParams *device_params,
         const float *mask,
         void *stream,
-        int device_idx)
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
     {
         return fa2_prefill_launch<true>(
             Q, K_fp16, V_fp16, O,
             batch_size, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
             causal, window_size, position_offset, device_params, mask,
-            static_cast<cudaStream_t>(stream), device_idx);
+            static_cast<cudaStream_t>(stream), device_idx,
+            head_start, gqa_n_rep);
     }
 
     /**
@@ -2160,7 +2184,9 @@ extern "C"
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream,
-        int device_idx)
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
     {
         // Ensure correct device is active for kernel launch and any implicit allocations
         cudaSetDevice(device_idx);
@@ -2179,7 +2205,8 @@ extern "C"
                 Q, K_cache, V_cache,
                 O_partial, m_partial, l_partial,
                 kv_len, n_heads, n_kv_heads, head_dim,
-                num_splits, softmax_scale, device_params);
+                num_splits, softmax_scale, device_params,
+                head_start, gqa_n_rep);
         }
 
         // Phase 2: Reduce partials to final output
@@ -2210,7 +2237,9 @@ extern "C"
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream,
-        int device_idx)
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
     {
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -2229,7 +2258,8 @@ extern "C"
                 static_cast<const half *>(V_cache_fp16),
                 O_partial, m_partial, l_partial,
                 kv_len, n_heads, n_kv_heads, head_dim,
-                num_splits, softmax_scale, device_params);
+                num_splits, softmax_scale, device_params,
+                head_start, gqa_n_rep);
         }
 
         // Phase 2: Reduce partials (same as FP32 — operates on FP32 partials)
@@ -2260,7 +2290,9 @@ extern "C"
         int num_splits,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream,
-        int device_idx)
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
     {
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -2277,7 +2309,8 @@ extern "C"
                 Q, K_cache_q8, V_cache_q8,
                 O_partial, m_partial, l_partial,
                 kv_len, n_heads, n_kv_heads, head_dim,
-                num_splits, softmax_scale, device_params);
+                num_splits, softmax_scale, device_params,
+                head_start, gqa_n_rep);
         }
 
         // Phase 2: Reduce partials (same as FP32 — operates on FP32 partials)
@@ -2311,7 +2344,9 @@ extern "C"
         int k_block_size, int v_block_size,
         const llaminar2::attention::AttentionDeviceParams *device_params,
         void *stream,
-        int device_idx)
+        int device_idx,
+        int head_start,
+        int gqa_n_rep)
     {
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -2339,7 +2374,8 @@ extern "C"
                 num_splits, softmax_scale,
                 max_seq_len, tail,
                 k_block_size, v_block_size,
-                device_params);
+                device_params,
+                head_start, gqa_n_rep);
         }
 
         // Phase 2: Reduce partials (same reduce kernel as FP32/Q8_1)

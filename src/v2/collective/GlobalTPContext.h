@@ -62,13 +62,15 @@ namespace llaminar2
          * @param domain_id Identifier for this global TP domain
          * @param color MPI_Comm_split color (ranks with same color form domain)
          * @param key MPI_Comm_split key (determines ordering within domain)
+         * @param hostfile_path Optional MPI hostfile for node detection ordering
          * @return Unique pointer to GlobalTPContext, or nullptr on error
          */
         static std::unique_ptr<GlobalTPContext> createWithSplit(
             MPI_Comm base_comm,
             int domain_id,
             int color,
-            int key);
+            int key,
+            const std::string &hostfile_path = "");
 
         /**
          * @brief Create for testing (uses existing communicator directly)
@@ -76,12 +78,16 @@ namespace llaminar2
          * @param comm Pre-created domain communicator
          * @param domain_id Domain identifier
          * @param world_ranks Vector of world ranks in this domain
+         * @param node_ids Optional per-rank node IDs. If empty, auto-detected via
+         *                 hostname gathering over the domain communicator. Ranks with
+         *                 the same node_id are on the same physical node.
          * @return Unique pointer to GlobalTPContext
          */
         static std::unique_ptr<GlobalTPContext> createForTest(
             MPI_Comm comm,
             int domain_id,
-            std::vector<int> world_ranks);
+            std::vector<int> world_ranks,
+            std::vector<int> node_ids = {});
 
         ~GlobalTPContext() override;
 
@@ -99,7 +105,18 @@ namespace llaminar2
 
         int degree() const override;
         int myIndex() const override;
-        // scope() is provided by IGlobalTPContext (returns TPScope::GLOBAL)
+
+        /**
+         * @brief Dynamic scope based on node placement
+         *
+         * Returns NODE_LOCAL if all participating ranks are on the same physical
+         * node, GLOBAL otherwise. This replaces the hardcoded GLOBAL from
+         * IGlobalTPContext, enabling the same GlobalTPContext class to serve
+         * both NodeLocalTP (cross-socket, same machine) and true GlobalTP
+         * (cross-machine) use cases.
+         */
+        TPScope scope() const override;
+
         CollectiveBackendType backend() const override { return backend_type_; }
         bool allreduce(TensorBase *tensor) override;
         bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override;
@@ -128,6 +145,45 @@ namespace llaminar2
          */
         bool isValid() const;
 
+        // =========================================================================
+        // Node Awareness
+        // =========================================================================
+
+        /**
+         * @brief Check if all domain ranks are on the same physical node
+         *
+         * When true, this GlobalTPContext is conceptually a NodeLocalTP context:
+         * all participants share the same machine and communicate via UPI or
+         * shared memory rather than cross-node networking.
+         *
+         * @return true if all ranks have the same node_id
+         */
+        bool isAllRanksOnSameNode() const;
+
+        /**
+         * @brief Get the node ID for a specific domain rank
+         *
+         * @param domain_index Index within this TP domain (0 to degree()-1)
+         * @return Node ID, or -1 if domain_index is out of range
+         */
+        int nodeId(int domain_index) const;
+
+        /**
+         * @brief Get node IDs for all ranks in this domain
+         *
+         * Each element corresponds to the physical node of the rank at that
+         * domain index. Ranks with the same node_id are co-located.
+         *
+         * @return Vector of node IDs (size == degree())
+         */
+        const std::vector<int> &nodeIds() const;
+
+        /**
+         * @brief Get the number of distinct physical nodes in this domain
+         * @return Number of unique node IDs (1 if all same node)
+         */
+        int nodeCount() const;
+
     private:
         // Private constructor - use factory methods
         GlobalTPContext(
@@ -137,13 +193,20 @@ namespace llaminar2
             int domain_size,
             std::vector<int> world_ranks,
             bool owns_communicator,
-            CollectiveBackendType backend_type = CollectiveBackendType::UPI);
+            CollectiveBackendType backend_type = CollectiveBackendType::UPI,
+            std::vector<int> node_ids = {});
+
+        /// Auto-detect node IDs by gathering hostnames over domain_comm_
+        void detectNodeIds();
 
         MPI_Comm domain_comm_;                          ///< Domain-specific MPI communicator
         int domain_id_;                                 ///< Domain identifier
         int my_rank_in_domain_;                         ///< Our rank within domain (0 to size-1)
         int domain_size_;                               ///< Number of participants
         std::vector<int> world_ranks_;                  ///< World ranks of all domain members
+        std::vector<int> node_ids_;                     ///< Per-rank node ID (same ID = same physical node)
+        bool all_same_node_;                            ///< Cached: all ranks on same node?
+        int node_count_;                                ///< Cached: number of distinct nodes
         bool owns_communicator_;                        ///< Whether we created the communicator
         CollectiveBackendType backend_type_;            ///< Backend type for this context
         std::unique_ptr<UPICollectiveBackend> backend_; ///< Backend for collective operations

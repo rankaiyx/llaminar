@@ -36,7 +36,7 @@
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
-#include "kernels/cpu/attention/CPUAttentionKernelT.h"
+#include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #endif
 
@@ -362,7 +362,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Small)
     std::vector<float> rocm_output(out_size, 0.0f);
 
     // CPU reference
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -461,7 +461,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Medium_GQA)
     std::vector<float> rocm_output(out_size, 0.0f);
 
     // CPU reference
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -537,7 +537,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim)
     std::vector<float> rocm_output(out_size, 0.0f);
 
     // CPU reference
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -612,7 +612,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_LargerSeq)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> rocm_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -686,7 +686,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_GQA)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> rocm_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -765,7 +765,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_SmallKVLen)
 
     // CPU reference - for decode with seq_len=1, use compute_decode
     // The CPU kernel expects Q[seq_len, n_heads, head_dim], K[kv_len, n_kv_heads, head_dim]
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
@@ -848,7 +848,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_LargeKVLen_GQA)
     std::vector<float> rocm_output(out_size, 0.0f);
 
     // CPU reference
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
@@ -931,7 +931,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
     std::vector<float> cpu_q81_output(out_size, 0.0f);
     std::vector<float> rocm_q81_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
 
     // Baseline decode with original FP32 K/V
     ASSERT_TRUE(cpu_kernel.compute_decode(
@@ -1061,7 +1061,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_NonCaus
     std::vector<float> cpu_q81_output(out_size, 0.0f);
     std::vector<float> rocm_q81_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
 
     ASSERT_TRUE(cpu_kernel.compute_decode(
         Q_data.data(), K_data_fp32.data(), V_data_fp32.data(), cpu_baseline_output.data(),
@@ -1174,7 +1174,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_NonCausal)
     std::vector<float> rocm_output(out_size, 0.0f);
 
     // CPU reference
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -1253,7 +1253,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Large)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> rocm_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -1334,7 +1334,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeFP16KV_Qwen2ScaleStress)
     dequantizeFP16(V_data_fp16.data(), V_ref_fp32.data(), kv_size);
 
     std::vector<float> cpu_output(out_size, 0.0f);
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     ASSERT_TRUE(cpu_kernel.compute(
         Q_data.data(), K_ref_fp32.data(), V_ref_fp32.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -1415,7 +1415,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeQ81KV_Qwen2ScaleStress)
     ASSERT_NE(V_ref_fp32, nullptr);
 
     std::vector<float> cpu_output(out_size, 0.0f);
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     ASSERT_TRUE(cpu_kernel.compute(
         Q_data.data(), K_ref_fp32, V_ref_fp32, cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -1518,7 +1518,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3ContextParity)
     ASSERT_EQ(v_data.size(), kv_size);
 
     std::vector<float> cpu_output(q_size, 0.0f);
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     ASSERT_TRUE(cpu_kernel.compute(
         q_data.data(), k_data.data(), v_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
@@ -1645,7 +1645,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_RealQwen2Layer3InputSensitivit
                                const std::vector<float> &v) -> std::vector<float>
     {
         std::vector<float> output(q_size, 0.0f);
-        CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+        CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
         EXPECT_TRUE(cpu_kernel.compute(
             q.data(), k.data(), v.data(), output.data(),
             seq_len, n_heads, n_kv_heads, head_dim,
@@ -1698,8 +1698,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> rocm_output(out_size, 0.0f);
 
-    // CPU reference using production CPUAttentionKernelT::compute_decode()
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, kv_len, n_heads, n_kv_heads, head_dim, true);
@@ -1778,8 +1778,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> rocm_output(out_size, 0.0f);
 
-    // CPU reference using production CPUAttentionKernelT::compute_decode()
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, kv_len, n_heads, n_kv_heads, head_dim, true);
@@ -1855,8 +1855,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> rocm_output(out_size, 0.0f);
 
-    // CPU reference using production CPUAttentionKernelT::compute_decode()
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, kv_len, n_heads, n_kv_heads, head_dim, true);
@@ -1932,8 +1932,8 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> rocm_output(out_size, 0.0f);
 
-    // CPU reference using production CPUAttentionKernelT::compute_decode()
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    // CPU reference using production CPUFlashAttentionKernelT::compute_decode()
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute_decode(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, kv_len, n_heads, n_kv_heads, head_dim, false); // non-causal
@@ -2172,7 +2172,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_CausalMasking)
     std::vector<float> cpu_output(out_size, 0.0f);
     std::vector<float> rocm_output(out_size, 0.0f);
 
-    CPUAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
+    CPUFlashAttentionKernelT<ActivationPrecision::FP32> cpu_kernel;
     bool cpu_success = cpu_kernel.compute(
         Q_data.data(), K_data.data(), V_data.data(), cpu_output.data(),
         seq_len, n_heads, n_kv_heads, head_dim,
