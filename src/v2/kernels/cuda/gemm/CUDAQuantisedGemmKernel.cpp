@@ -389,7 +389,14 @@ namespace llaminar2
                                                            ? 1
                                                            : static_cast<int>(kTensorCoreBlockwisePartialScratchBudgetBytes / partial_plane_bytes);
                 const size_t max_chunk_count = static_cast<size_t>(std::max(1, std::min(kTensorCoreBlockwiseMaxPartialChunkBlocks, budget_limited_chunk_count)));
+                const int deepk_grid_blocks = ((m + 64 - 1) / 64) * ((n + 128 - 1) / 128);
+                const int balanced_grid_blocks = ((m + 128 - 1) / 128) * ((n + 128 - 1) / 128);
+                const int effective_grid_blocks = std::min(deepk_grid_blocks, balanced_grid_blocks);
+                const bool k_rich = k > 2 * n;
+                const bool recover_underfill = effective_grid_blocks < 64;
                 const uint64_t total_output_elements = static_cast<uint64_t>(m) * static_cast<uint64_t>(n);
+                if (num_k_blocks >= 64 && (k_rich || recover_underfill))
+                    return std::min(static_cast<size_t>(num_k_blocks), max_chunk_count);
                 if (m >= 64 || n >= 16384 || total_output_elements >= (1ull << 20))
                     return std::min(static_cast<size_t>(num_k_blocks), max_chunk_count);
                 if (total_output_elements >= (1ull << 18))
@@ -582,7 +589,7 @@ namespace llaminar2
                 void *stream,
                 CUDARowMajorWeights **rm_slot = nullptr)
             {
-                if (!canUseNativeVNNIBlockwise(impl, m, k))
+                if (!impl || m <= 0 || k <= 0 || (k % 32) != 0)
                 {
                     return false;
                 }
@@ -611,7 +618,10 @@ namespace llaminar2
                     }
                 }
 
-                if (m == 1)
+                if (g_native_vnni_enabled &&
+                    impl->d_weights_native_vnni &&
+                    impl->d_weights_native_scales &&
+                    m == 1)
                 {
                     static std::once_flag native_vnni_decode_once;
                     std::call_once(native_vnni_decode_once, [&]()
@@ -641,7 +651,10 @@ namespace llaminar2
                 }
 
                 // Unified native VNNI prefill for all supported codebooks
-                if (nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id))
+                if (g_native_vnni_enabled &&
+                    impl->d_weights_native_vnni &&
+                    impl->d_weights_native_scales &&
+                    nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id))
                 {
                     static std::once_flag native_vnni_prefill_once;
                     std::call_once(native_vnni_prefill_once, [&]()
@@ -676,7 +689,7 @@ namespace llaminar2
                              << ", falling back to tensor-core expanded path");
                 }
 
-                if (impl->d_weights_int8_tc_blocked && impl->d_scales_B)
+                if (!g_force_cutlass_fallback && impl->d_weights_int8_tc_blocked && impl->d_scales_B)
                 {
                     // Try V2 fused TC GEMM first (mma.sync m16n8k32, sm_80+)
                     if (cudaFusedTCGemmV2_blockwiseGemm(

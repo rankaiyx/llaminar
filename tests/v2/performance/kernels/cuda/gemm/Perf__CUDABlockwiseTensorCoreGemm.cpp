@@ -41,6 +41,8 @@ using llaminar::v2::kernels::KernelFactory;
 extern "C"
 {
     void cudaTCGemm_setTuningOverrides(int force_small_m, int force_wide_n, int force_balanced, int unused0, int unused1);
+    const char *cudaFusedTCGemmV2_lastSelectedFamily();
+    int cudaFusedTCGemmV2_lastSelectedSplitK();
 }
 
 namespace
@@ -193,7 +195,28 @@ namespace
         bool smoke = false;
         bool gemv_only = false;
         bool tuned_gemv_enabled = true;
+        bool native_vnni_enabled = true;
         std::string gemm_dispatch = "auto";
+    };
+
+    struct KernelModeGuard
+    {
+        KernelModeGuard(bool native_vnni_enabled, bool force_cutlass_fallback)
+            : native_vnni_enabled_(CUDAQuantisedGemmKernel::isNativeVNNIEnabled()),
+              force_cutlass_fallback_(CUDAQuantisedGemmKernel::isForceCutlassFallback())
+        {
+            CUDAQuantisedGemmKernel::setNativeVNNIEnabled(native_vnni_enabled);
+            CUDAQuantisedGemmKernel::setForceCutlassFallback(force_cutlass_fallback);
+        }
+
+        ~KernelModeGuard()
+        {
+            CUDAQuantisedGemmKernel::setNativeVNNIEnabled(native_vnni_enabled_);
+            CUDAQuantisedGemmKernel::setForceCutlassFallback(force_cutlass_fallback_);
+        }
+
+        bool native_vnni_enabled_;
+        bool force_cutlass_fallback_;
     };
 
     std::string toLower(std::string value)
@@ -305,6 +328,8 @@ namespace
         cfg.gemv_only = getEnvFlag("LLAMINAR_CUDA_TC_GEMV_ONLY");
         if (const auto value = getEnvInt("LLAMINAR_CUDA_TC_TUNED_GEMV"))
             cfg.tuned_gemv_enabled = (*value != 0);
+        if (const auto value = getEnvInt("LLAMINAR_CUDA_TC_NATIVE_VNNI"))
+            cfg.native_vnni_enabled = (*value != 0);
 
         const auto format_filters = getEnvCsvSet("LLAMINAR_CUDA_TC_FORMATS");
         if (!format_filters.empty())
@@ -413,6 +438,8 @@ namespace
         std::vector<float> output;
         double min_us = 0.0;
         double mean_us = 0.0;
+        std::string backend_family;
+        int split_k = 1;
     };
 
     float cosineSimilarity(const std::vector<float> &a, const std::vector<float> &b)
@@ -458,6 +485,7 @@ namespace
             const SweepConfig &cfg)
         {
             applyGemmTuningOverride(cfg, m);
+            KernelModeGuard mode_guard(cfg.native_vnni_enabled, false);
 
             // Create kernel via KernelFactory (same path as parity tests)
             EXPECT_TRUE(weights->ensureOnDevice(device_));
@@ -546,6 +574,12 @@ namespace
 
             result.min_us = *std::min_element(times_us.begin(), times_us.end());
             result.mean_us = std::accumulate(times_us.begin(), times_us.end(), 0.0) / static_cast<double>(times_us.size());
+            if (!cfg.native_vnni_enabled)
+            {
+                const char *family = cudaFusedTCGemmV2_lastSelectedFamily();
+                result.backend_family = family ? family : "unknown";
+                result.split_k = cudaFusedTCGemmV2_lastSelectedSplitK();
+            }
             return result;
         }
 
@@ -640,8 +674,6 @@ namespace
                 auto weights_gemv = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
                 const size_t weight_bytes = weights_gemv->size_bytes();
 
-                // NativeVNNI tuned GEMV (default path)
-                CUDAQuantisedGemmKernel::setNativeVNNIEnabled(true);
                 const RunResult np_tuned_gemv = runKernel(weights_gemv.get(), 1, shape.n, shape.k, cfg);
 
                 // -- HBM bandwidth metrics --
@@ -695,10 +727,13 @@ namespace
 
                     std::fprintf(stderr,
                                  "[CUDABlockwiseTC][GEMM] format=%s shape=%s M=%d N=%d K=%d warmup=%d bench=%d "
-                                 "gemm_dispatch=%s "
+                                 "gemm_dispatch=%s native_vnni=%d backend=%s split_k=%d "
                                  "min_us=%.3f\n",
                                  format.name.c_str(), shape.name.c_str(), m, shape.n, shape.k,
                                  cfg.warmup_runs, cfg.bench_runs, cfg.gemm_dispatch.c_str(),
+                                 cfg.native_vnni_enabled ? 1 : 0,
+                                 gemm_result.backend_family.empty() ? "native_vnni" : gemm_result.backend_family.c_str(),
+                                 gemm_result.split_k,
                                  gemm_result.min_us);
                 }
 

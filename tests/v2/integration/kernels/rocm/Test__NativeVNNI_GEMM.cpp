@@ -41,6 +41,7 @@
 #include <gtest/gtest.h>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -86,6 +87,21 @@ namespace
         for (size_t i = 0; i < n; ++i)
             max_err = std::max(max_err, std::fabs(a[i] - b[i]));
         return max_err;
+    }
+
+    size_t firstBitwiseMismatchIndex(const std::vector<float> &lhs,
+                                     const std::vector<float> &rhs)
+    {
+        const size_t count = std::min(lhs.size(), rhs.size());
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (std::memcmp(&lhs[i], &rhs[i], sizeof(float)) != 0)
+            {
+                return i;
+            }
+        }
+
+        return (lhs.size() == rhs.size()) ? lhs.size() : count;
     }
 
     /// CPU FP32 reference GEMM: C[i,j] = sum_k(A[i,k] * W[j,k])
@@ -319,6 +335,103 @@ namespace
             << " (row " << worst_row << ")";
 
         cleanupWorkspace(kernel);
+#endif
+    }
+
+    /**
+     * @test Representative native-VNNI GEMM dispatches are bitwise stable.
+     *
+     * Guards against the CUDA-style failure modes we just fixed there:
+     * repeated-run drift from split-K atomics or shared scratch reuse.
+     * Native ROCm GEMM should be deterministic because each output element is
+     * written exactly once, but this test keeps that property under CI.
+     */
+    TEST_F(NativeVNNIGEMMTest, Q4_0_RepeatedRuns_AreBitwiseStable_AcrossDispatchFamilies)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_gpu_)
+        {
+            GTEST_SKIP() << "No ROCm device";
+        }
+
+        struct DeterminismShape
+        {
+            const char *name;
+            int M;
+            int N;
+            int K;
+        };
+
+        const std::vector<DeterminismShape> shapes = {
+            {"streaming_lm_head_proxy", 16, 20480, 896},
+            {"n128_cooperative_ffn_up", 16, 4864, 896},
+            {"n64_cooperative_ffn_down", 128, 896, 4864},
+        };
+        constexpr int kRepeatRuns = 4;
+
+        for (const auto &shape : shapes)
+        {
+            LOG_INFO("[NativeVNNI_GEMM] Determinism check " << shape.name
+                                                            << " M=" << shape.M
+                                                            << " N=" << shape.N
+                                                            << " K=" << shape.K);
+
+            auto weights = TestTensorFactory::createQ4_0Random(
+                {static_cast<size_t>(shape.N), static_cast<size_t>(shape.K)});
+            ASSERT_NE(weights, nullptr) << shape.name;
+
+            ROCmPackedWeights packed;
+            ASSERT_TRUE(packWeightsToROCm(weights.get(), packed)) << shape.name;
+            ASSERT_FALSE(packed.native_vnni_payload.empty()) << shape.name;
+
+            ROCmQuantisedGemmKernel kernel(&packed, 0);
+            ASSERT_TRUE(setupWorkspace(kernel, shape.M, shape.N, shape.K)) << shape.name;
+
+            auto input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(shape.M), static_cast<size_t>(shape.K)});
+            auto output_gpu = TestTensorFactory::createFP32(
+                {static_cast<size_t>(shape.M), static_cast<size_t>(shape.N)});
+
+            ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0))) << shape.name;
+            ASSERT_TRUE(output_gpu->allocateOnDevice(DeviceId::rocm(0))) << shape.name;
+
+            std::vector<float> reference;
+            for (int run = 0; run < kRepeatRuns; ++run)
+            {
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_gpu.get(),
+                                                   shape.M, shape.N, shape.K))
+                    << shape.name << " run=" << run;
+                (void)hipDeviceSynchronize();
+                output_gpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+                const float *gpu = output_gpu->data();
+                std::vector<float> snapshot(
+                    gpu, gpu + static_cast<size_t>(shape.M) * shape.N);
+
+                if (run == 0)
+                {
+                    reference = std::move(snapshot);
+                    continue;
+                }
+
+                const size_t mismatch = firstBitwiseMismatchIndex(reference, snapshot);
+                EXPECT_EQ(mismatch, reference.size())
+                    << shape.name
+                    << " run=" << run
+                    << " first_mismatch=" << mismatch
+                    << " reference=" << reference[mismatch]
+                    << " candidate=" << snapshot[mismatch];
+
+                if (mismatch != reference.size())
+                {
+                    break;
+                }
+            }
+
+            cleanupWorkspace(kernel);
+        }
 #endif
     }
 

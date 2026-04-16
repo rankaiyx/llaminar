@@ -23,8 +23,9 @@
  *
  *   4. Split-K (SPLIT_K > 1)
  *      — K-dimension partitioned across CTAs via grid.z
- *      — Each CTA computes partial sum, accumulated via atomicAdd
- *      — Host zero-inits C before launch for correctness
+ *      — Each CTA writes its FP32 partial into a dedicated scratch plane
+ *      — A fixed-order reduction kernel combines split-K planes into C
+ *      — Avoids FP32 atomicAdd non-determinism while preserving the fast path
  *      — Useful for tall-K bandwidth-bound shapes (e.g., FFN_Down)
  *
  * Falls back gracefully on SM75 (Turing) — returns false, V1 handles it.
@@ -40,7 +41,7 @@
  *   BM, BN:            CTA tile dimensions (output rows × cols)
  *   WARPS_M, WARPS_N:  Warp grid layout within the CTA
  *   STAGES:            Pipeline depth (2=double buffer; 3+=multi-stage)
- *   SPLIT_K:           K-partitions (1=standard; >1=split-K with atomicAdd)
+ *   SPLIT_K:           K-partitions (1=standard; >1=split-K partial reduction)
  *
  * Per-warp tile (m16n8k32 units):
  *   WARP_M = BM / WARPS_M,   WARP_N = BN / WARPS_N
@@ -63,6 +64,8 @@ namespace
     constexpr int BK = 32;                     // quantisation block size (fixed)
     constexpr int SMEM_PAD = 16;               // padding bytes per row
     constexpr int SMEM_STRIDE = BK + SMEM_PAD; // = 48
+    constexpr int MAX_SPLIT_K_PARTITIONS = 8;
+    constexpr size_t SPLIT_K_PARTIAL_SCRATCH_BUDGET_BYTES = 256ull * 1024ull * 1024ull;
 
     // ─── mma.sync.m16n8k32 output fragment mapping (PTX ISA §9.7.13.4.10) ───
     //
@@ -178,7 +181,7 @@ namespace
     //
     // One mma.sync.m16n8k32 per K=32 quantisation block per (wi,wj) tile.
     // STAGES-deep shared memory pipeline with cp.async transfers.
-    // Optional split-K via grid.z partitioning + atomicAdd epilogue.
+    // Optional split-K via grid.z partitioning + fixed-order reduction epilogue.
     // ════════════════════════════════════════════════════════════════════════
 
     template <int BM, int BN, int WARPS_M, int WARPS_N,
@@ -189,6 +192,7 @@ namespace
             const int8_t *__restrict__ A,
             const int8_t *__restrict__ B_tc,
             float *__restrict__ C,
+            float *__restrict__ splitk_partials,
             const float *__restrict__ scales_A,
             const float *__restrict__ scales_B,
             const float *__restrict__ C_existing,
@@ -221,6 +225,12 @@ namespace
 
         const int block_m = blockIdx.x * BM;
         const int block_n = blockIdx.y * BN;
+        const size_t splitk_plane_stride = static_cast<size_t>(M) * static_cast<size_t>(N);
+        float *splitk_plane = nullptr;
+        if constexpr (SPLIT_K > 1)
+        {
+            splitk_plane = splitk_partials + static_cast<size_t>(blockIdx.z) * splitk_plane_stride;
+        }
 
         // ─── K-dimension range (split-K partitioning) ───
         const int num_k_blocks_total = K / BK;
@@ -453,8 +463,8 @@ namespace
         //   row = (elem / 2) * 8 + groupID
         //   col = tid_in_group * 2 + (elem % 2)
         //
-        // SPLIT_K > 1: all partitions atomicAdd into C (host zero-inits C).
-        //   Only partition 0 applies beta*C_existing and bias.
+        // SPLIT_K > 1: each partition writes into its own FP32 scratch plane.
+        //   A follow-up reduction kernel applies beta*C_existing and bias once.
         // SPLIT_K = 1: direct store (standard path).
 
         const bool simple_epilogue = (beta == 0.0f) && (bias == nullptr);
@@ -487,10 +497,10 @@ namespace
 
                     if constexpr (SPLIT_K > 1)
                     {
-                        atomicAdd(&C[out_idx0], acc[wi][wj][0] * scale0);
-                        atomicAdd(&C[out_idx1], acc[wi][wj][1] * scale1);
-                        atomicAdd(&C[out_idx2], acc[wi][wj][2] * scale0);
-                        atomicAdd(&C[out_idx3], acc[wi][wj][3] * scale1);
+                        splitk_plane[out_idx0] = acc[wi][wj][0] * scale0;
+                        splitk_plane[out_idx1] = acc[wi][wj][1] * scale1;
+                        splitk_plane[out_idx2] = acc[wi][wj][2] * scale0;
+                        splitk_plane[out_idx3] = acc[wi][wj][3] * scale1;
                     }
                     else
                     {
@@ -515,14 +525,7 @@ namespace
 
                         if constexpr (SPLIT_K > 1)
                         {
-                            if (blockIdx.z == 0)
-                            {
-                                if (beta != 0.0f && C_existing)
-                                    val += beta * C_existing[out_idx];
-                                if (bias)
-                                    val += (e & 1) ? bias1 : bias0;
-                            }
-                            atomicAdd(&C[out_idx], val);
+                            splitk_plane[out_idx] = val;
                         }
                         else
                         {
@@ -552,6 +555,34 @@ namespace
         (void)alpha;
         (void)beta;
 #endif // __CUDA_ARCH__ >= 800
+    }
+
+    template <int SPLIT_K, bool APPLY_BETA, bool APPLY_BIAS>
+    __global__ void reduceSplitKPartialsKernel(
+        const float *__restrict__ splitk_partials,
+        float *__restrict__ C,
+        const float *__restrict__ C_existing,
+        const float *__restrict__ bias,
+        int total,
+        int N,
+        float beta)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total)
+            return;
+
+        const size_t plane_stride = static_cast<size_t>(total);
+        float sum = 0.0f;
+#pragma unroll
+        for (int part = 0; part < SPLIT_K; ++part)
+            sum += splitk_partials[static_cast<size_t>(part) * plane_stride + idx];
+
+        if constexpr (APPLY_BETA)
+            sum += beta * C_existing[idx];
+        if constexpr (APPLY_BIAS)
+            sum += bias[idx % N];
+
+        C[idx] = sum;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -620,6 +651,33 @@ namespace
     static thread_local int g_last_family_v2 = 4; // Balanced
 
     static constexpr int MIN_GRID_BLOCKS = 64;
+    static thread_local int g_last_split_k_v2 = 1;
+
+    static int getSplitKScratchPlanesForWorkspace(int M, int N, int K)
+    {
+        const int num_k_blocks = K / BK;
+        if (num_k_blocks <= 1)
+            return 1;
+
+        const size_t partial_plane_bytes = static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float);
+        const int budget_limited_chunk_count = (partial_plane_bytes == 0)
+                                                   ? 1
+                                                   : static_cast<int>(SPLIT_K_PARTIAL_SCRATCH_BUDGET_BYTES / partial_plane_bytes);
+        const int max_chunk_count = std::max(1, std::min(MAX_SPLIT_K_PARTITIONS, budget_limited_chunk_count));
+        const int deepk_grid_blocks = ((M + 64 - 1) / 64) * ((N + 128 - 1) / 128);
+        const int balanced_grid_blocks = ((M + 128 - 1) / 128) * ((N + 128 - 1) / 128);
+        const int effective_grid_blocks = min(deepk_grid_blocks, balanced_grid_blocks);
+        const bool k_rich = K > 2 * N;
+        const bool recover_underfill = effective_grid_blocks < MIN_GRID_BLOCKS;
+        const uint64_t total_output_elements = static_cast<uint64_t>(M) * static_cast<uint64_t>(N);
+        if (num_k_blocks >= 64 && (k_rich || recover_underfill))
+            return min(num_k_blocks, max_chunk_count);
+        if (M >= 64 || N >= 16384 || total_output_elements >= (1ull << 20))
+            return std::min(num_k_blocks, max_chunk_count);
+        if (total_output_elements >= (1ull << 18))
+            return std::min(4, max_chunk_count);
+        return 1;
+    }
 
     static int roundUpPow2Clamped(int value, int max_value)
     {
@@ -629,15 +687,16 @@ namespace
         return out;
     }
 
-    static int chooseSplitK(ShapeFamily family, int M, int N, int K, int bm, int bn)
+    static int chooseSplitK(ShapeFamily family, int M, int N, int K, int bm, int bn, int max_available_split_k)
     {
-        // Deterministic mode: split-K uses FP32 atomicAdd, always return 1
+        // Deterministic mode still forces split_k=1 to preserve the strictest
+        // parity behavior even though the split-K path is now reduction-based.
         static const bool s_deterministic = []()
         {
             const char *env = std::getenv("LLAMINAR_DETERMINISTIC");
             return env && std::atoi(env) != 0;
         }();
-        if (s_deterministic)
+        if (s_deterministic || max_available_split_k <= 1)
             return 1;
 
         const int grid_blocks = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
@@ -658,6 +717,8 @@ namespace
 
         const int needed = (MIN_GRID_BLOCKS + grid_blocks - 1) / grid_blocks;
         int split_k = roundUpPow2Clamped(needed, 8);
+        while (split_k > max_available_split_k)
+            split_k >>= 1;
 
         const int min_k_blocks_per_partition = k_rich ? 2 : 8;
         while (split_k > 1 && (num_k_blocks / split_k) < min_k_blocks_per_partition)
@@ -668,6 +729,9 @@ namespace
 
     static ShapeFamily classifyShape(int M, int N, int K)
     {
+        const int num_k_blocks = K / BK;
+        if (K > 2 * N && num_k_blocks >= 64)
+            return ShapeFamily::DeepK;
         if (M <= 32)
             return ShapeFamily::SkinnyM;
 
@@ -707,7 +771,6 @@ namespace
             break;
         }
         int grid_blocks = ((M + bm - 1) / bm) * ((N + bn - 1) / bn);
-        const int num_k_blocks = K / BK;
         const bool preserve_family_with_splitk =
             family != ShapeFamily::NarrowN &&
             family != ShapeFamily::SkinnyM &&
@@ -740,7 +803,7 @@ namespace
     template <int BM, int BN, int WM, int WN, int STAGES = 2, int SPLIT_K = 1>
     static bool launchV2Kernel(
         const int8_t *A, const int8_t *B_tc,
-        float *C, const float *scales_A, const float *scales_B,
+        float *C, float *splitk_partials, const float *scales_A, const float *scales_B,
         const float *C_existing, const float *bias,
         int M, int N, int K, float alpha, float beta,
         cudaStream_t stream)
@@ -750,14 +813,37 @@ namespace
 
         if constexpr (SPLIT_K > 1)
         {
-            // Split-K requires C to be zeroed before atomic accumulation
-            cudaMemsetAsync(C, 0, static_cast<size_t>(M) * N * sizeof(float), stream);
+            if (!splitk_partials)
+                return false;
         }
 
         fusedTCGemmV2Kernel<BM, BN, WM, WN, STAGES, SPLIT_K><<<grid, block, 0, stream>>>(
-            A, B_tc, C, scales_A, scales_B, C_existing, bias,
+            A, B_tc, C, splitk_partials, scales_A, scales_B, C_existing, bias,
             M, N, K, alpha, beta);
-        return cudaGetLastError() == cudaSuccess;
+        if (cudaGetLastError() != cudaSuccess)
+            return false;
+
+        if constexpr (SPLIT_K > 1)
+        {
+            constexpr int THREADS = 256;
+            const int total = M * N;
+            const dim3 reduce_grid((total + THREADS - 1) / THREADS);
+            const bool apply_beta = (beta != 0.0f) && (C_existing != nullptr);
+            const bool apply_bias = (bias != nullptr);
+
+            if (apply_beta && apply_bias)
+                reduceSplitKPartialsKernel<SPLIT_K, true, true><<<reduce_grid, THREADS, 0, stream>>>(splitk_partials, C, C_existing, bias, total, N, beta);
+            else if (apply_beta)
+                reduceSplitKPartialsKernel<SPLIT_K, true, false><<<reduce_grid, THREADS, 0, stream>>>(splitk_partials, C, C_existing, bias, total, N, beta);
+            else if (apply_bias)
+                reduceSplitKPartialsKernel<SPLIT_K, false, true><<<reduce_grid, THREADS, 0, stream>>>(splitk_partials, C, C_existing, bias, total, N, beta);
+            else
+                reduceSplitKPartialsKernel<SPLIT_K, false, false><<<reduce_grid, THREADS, 0, stream>>>(splitk_partials, C, C_existing, bias, total, N, beta);
+
+            return cudaGetLastError() == cudaSuccess;
+        }
+
+        return true;
     }
 
 } // anonymous namespace
@@ -771,7 +857,7 @@ extern "C"
     bool cudaFusedTCGemmV2_blockwiseGemm(
         const int8_t *d_A_int8,
         const int8_t *d_weights_int8_tc_blocked,
-        int32_t * /* d_partial_int32 — unused, kept for API compat */,
+        int32_t *d_partial_int32,
         float *d_C_fp32,
         const float *d_scales_A_block,
         const float *d_scales_B,
@@ -793,106 +879,113 @@ extern "C"
         if (cudaSetDevice(cuda_device_id) != cudaSuccess)
             return false;
 
+        float *d_splitk_partials = reinterpret_cast<float *>(d_partial_int32);
+        const int max_split_k = d_splitk_partials ? getSplitKScratchPlanesForWorkspace(M, N, K) : 1;
+
         ShapeFamily family = classifyShape(M, N, K);
         ShapeFamily forced_family;
         if (getForcedShapeFamily(forced_family))
             family = forced_family;
         g_last_family_v2 = static_cast<int>(family);
+        g_last_split_k_v2 = 1;
 
         switch (family)
         {
         case ShapeFamily::SkinnyM:
             return launchV2Kernel<32, 128, 1, 2>(
                 d_A_int8, d_weights_int8_tc_blocked,
-                d_C_fp32, d_scales_A_block, d_scales_B,
+                d_C_fp32, nullptr, d_scales_A_block, d_scales_B,
                 d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
 
         case ShapeFamily::NarrowN:
             return launchV2Kernel<128, 64, 2, 1>(
                 d_A_int8, d_weights_int8_tc_blocked,
-                d_C_fp32, d_scales_A_block, d_scales_B,
+                d_C_fp32, nullptr, d_scales_A_block, d_scales_B,
                 d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
 
         case ShapeFamily::DeepK:
         {
-            const int split_k = chooseSplitK(family, M, N, K, 64, 128);
+            const int split_k = chooseSplitK(family, M, N, K, 64, 128, max_split_k);
+            g_last_split_k_v2 = split_k;
             switch (split_k)
             {
             case 8:
                 return launchV2Kernel<64, 128, 2, 2, 2, 8>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, d_splitk_partials, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             case 4:
                 return launchV2Kernel<64, 128, 2, 2, 2, 4>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, d_splitk_partials, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             case 2:
                 return launchV2Kernel<64, 128, 2, 2, 2, 2>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, d_splitk_partials, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             default:
                 return launchV2Kernel<64, 128, 2, 2>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, nullptr, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             }
         }
 
         case ShapeFamily::WideN:
         {
-            const int split_k = chooseSplitK(family, M, N, K, 64, 128);
+            const int split_k = chooseSplitK(family, M, N, K, 64, 128, max_split_k);
+            g_last_split_k_v2 = split_k;
             switch (split_k)
             {
             case 8:
                 return launchV2Kernel<64, 128, 2, 2, 2, 8>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, d_splitk_partials, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             case 4:
                 return launchV2Kernel<64, 128, 2, 2, 2, 4>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, d_splitk_partials, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             case 2:
                 return launchV2Kernel<64, 128, 2, 2, 2, 2>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, d_splitk_partials, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             default:
                 return launchV2Kernel<64, 128, 2, 2>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, nullptr, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             }
         }
 
         case ShapeFamily::Balanced:
         {
-            const int split_k = chooseSplitK(family, M, N, K, 128, 128);
+            const int split_k = chooseSplitK(family, M, N, K, 128, 128, max_split_k);
+            g_last_split_k_v2 = split_k;
             switch (split_k)
             {
             case 8:
                 return launchV2Kernel<128, 128, 2, 2, 2, 8>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, d_splitk_partials, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             case 4:
                 return launchV2Kernel<128, 128, 2, 2, 2, 4>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, d_splitk_partials, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             case 2:
                 return launchV2Kernel<128, 128, 2, 2, 2, 2>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, d_splitk_partials, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             default:
                 return launchV2Kernel<128, 128, 2, 2>(
                     d_A_int8, d_weights_int8_tc_blocked,
-                    d_C_fp32, d_scales_A_block, d_scales_B,
+                    d_C_fp32, nullptr, d_scales_A_block, d_scales_B,
                     d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
             }
         }
@@ -900,7 +993,7 @@ extern "C"
         case ShapeFamily::Compact:
             return launchV2Kernel<32, 64, 1, 1>(
                 d_A_int8, d_weights_int8_tc_blocked,
-                d_C_fp32, d_scales_A_block, d_scales_B,
+                d_C_fp32, nullptr, d_scales_A_block, d_scales_B,
                 d_C_existing, d_bias, M, N, K, alpha, beta, cuda_stream);
         }
 
@@ -910,5 +1003,10 @@ extern "C"
     const char *cudaFusedTCGemmV2_lastSelectedFamily()
     {
         return shapeFamilyName(static_cast<ShapeFamily>(g_last_family_v2));
+    }
+
+    int cudaFusedTCGemmV2_lastSelectedSplitK()
+    {
+        return g_last_split_k_v2;
     }
 }

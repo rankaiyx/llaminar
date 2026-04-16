@@ -19,6 +19,7 @@
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "kernels/KernelFactory.h"
+#include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
@@ -53,6 +54,8 @@ using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 #ifdef HAVE_CUDA
 extern "C"
 {
+    const char *cudaFusedTCGemmV2_lastSelectedFamily();
+    int cudaFusedTCGemmV2_lastSelectedSplitK();
     void cudaNativeVNNIPrefill_setStreamKMode(int mode);
     int cudaNativeVNNIPrefill_getStreamKMode();
     void cudaNativeVNNIPrefill_setBK256Mode(int mode);
@@ -878,6 +881,127 @@ TEST_F(Test__CUDAGemmNonDeterminism, DISABLED_FFNDown_SplitKComparison)
     SplitKComparisonResult result;
     ASSERT_TRUE(compareSplitKForWeight("blk.0.ffn_down.weight", result));
     printSplitKComparison(result);
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, AmpereV2_DeepKSplitK_SelfConsistency)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    cudaDeviceProp prop{};
+    ASSERT_EQ(cudaGetDeviceProperties(&prop, gpu_device_.cuda_ordinal()), cudaSuccess);
+    if (prop.major < 8)
+        GTEST_SKIP() << "Ampere+ GPU required for CUDAFusedTCGemmV2";
+
+    const bool saved_native = llaminar2::cuda::CUDAQuantisedGemmKernel::isNativeVNNIEnabled();
+    const bool saved_cutlass = llaminar2::cuda::CUDAQuantisedGemmKernel::isForceCutlassFallback();
+    const char *saved_family = std::getenv("LLAMINAR_CUDA_FUSEDTC_V2_FORCE_FAMILY");
+    const std::string saved_family_value = saved_family ? saved_family : "";
+    const char *saved_det = std::getenv("LLAMINAR_DETERMINISTIC");
+    const std::string saved_det_value = saved_det ? saved_det : "";
+
+    auto restore = [&]()
+    {
+        llaminar2::cuda::CUDAQuantisedGemmKernel::setNativeVNNIEnabled(saved_native);
+        llaminar2::cuda::CUDAQuantisedGemmKernel::setForceCutlassFallback(saved_cutlass);
+        if (saved_family)
+            setenv("LLAMINAR_CUDA_FUSEDTC_V2_FORCE_FAMILY", saved_family_value.c_str(), 1);
+        else
+            unsetenv("LLAMINAR_CUDA_FUSEDTC_V2_FORCE_FAMILY");
+        if (saved_det)
+            setenv("LLAMINAR_DETERMINISTIC", saved_det_value.c_str(), 1);
+        else
+            unsetenv("LLAMINAR_DETERMINISTIC");
+    };
+    const auto restore_guard = std::unique_ptr<void, std::function<void(void *)>>(
+        nullptr,
+        [&](void *)
+        {
+            restore();
+        });
+
+    llaminar2::cuda::CUDAQuantisedGemmKernel::setNativeVNNIEnabled(false);
+    llaminar2::cuda::CUDAQuantisedGemmKernel::setForceCutlassFallback(false);
+    setenv("LLAMINAR_CUDA_FUSEDTC_V2_FORCE_FAMILY", "deep_k", 1);
+    setenv("LLAMINAR_DETERMINISTIC", "0", 1);
+
+    const int M = 9;
+    const int N = 896;
+    const int K = 4864;
+
+    auto weight = TestTensorFactory::createQ4_0Random(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 17);
+    auto *w_down = dynamic_cast<Q4_0Tensor *>(weight.get());
+    ASSERT_NE(w_down, nullptr);
+    ASSERT_TRUE(w_down->ensureOnDevice(gpu_device_));
+
+    auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(w_down, KernelDeviceType::CUDA);
+    ASSERT_NE(kernel, nullptr);
+
+    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+    ASSERT_NE(ws, nullptr);
+    auto reqs = ws->getWorkspaceRequirements(M, N, K);
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    ws->bindWorkspace(workspace_.get());
+
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    for (int i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = dist_(rng_);
+
+    std::vector<float> ref(M * N);
+    size_t max_diffs = 0;
+    float max_abs = 0.0f;
+    double min_cos = 1.0;
+
+    for (int rep = 0; rep < 4; ++rep)
+    {
+        auto output = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {output.get()},
+            [&]
+            {
+                return kernel->multiply_tensor(
+                    input.get(), output.get(), M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+            }));
+
+        const char *family = cudaFusedTCGemmV2_lastSelectedFamily();
+        ASSERT_NE(family, nullptr);
+        EXPECT_EQ(std::strncmp(family, "v2_", 3), 0) << "Expected Ampere V2 fused path, got " << family;
+
+        const int split_k = cudaFusedTCGemmV2_lastSelectedSplitK();
+        EXPECT_GT(split_k, 1) << "Expected split-K > 1 for the forced deep-K shape";
+
+        const float *data = output->data();
+        if (rep == 0)
+        {
+            std::memcpy(ref.data(), data, ref.size() * sizeof(float));
+        }
+        else
+        {
+            max_diffs = std::max(max_diffs, countDiffs(data, ref.data(), ref.size()));
+            max_abs = std::max(max_abs, maxAbsDiff(data, ref.data(), ref.size()));
+            min_cos = std::min(min_cos, cosineSimilarity(data, ref.data(), ref.size()));
+        }
+    }
+
+    std::cout << "AmpereV2 deep-k split-K summary: min_cos=" << std::fixed << std::setprecision(6) << min_cos
+              << " max_diffs=" << max_diffs
+              << " max_abs=" << std::scientific << max_abs
+              << " split_k=" << cudaFusedTCGemmV2_lastSelectedSplitK() << "\n";
+
+    EXPECT_EQ(max_diffs, 0u) << "Ampere V2 split-K path changed bitwise across repeats";
+    EXPECT_FLOAT_EQ(max_abs, 0.0f) << "Ampere V2 split-K path drift should be zero";
+    EXPECT_GE(min_cos, 0.999999) << "Ampere V2 split-K path should be deterministic";
+
+    ws->unbindWorkspace();
+    workspace_.reset();
 #endif
 }
 

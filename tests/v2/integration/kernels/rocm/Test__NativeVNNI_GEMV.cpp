@@ -25,6 +25,7 @@
 #include <gtest/gtest.h>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <numeric>
@@ -74,6 +75,21 @@ namespace
             max_err = std::max(max_err, std::fabs(a[i] - b[i]));
         }
         return max_err;
+    }
+
+    size_t firstBitwiseMismatchIndex(const std::vector<float> &lhs,
+                                     const std::vector<float> &rhs)
+    {
+        const size_t count = std::min(lhs.size(), rhs.size());
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (std::memcmp(&lhs[i], &rhs[i], sizeof(float)) != 0)
+            {
+                return i;
+            }
+        }
+
+        return (lhs.size() == rhs.size()) ? lhs.size() : count;
     }
 
     /// CPU FP32 reference GEMV: output[j] = sum_k(input[k] * W_dequant[j][k])
@@ -437,6 +453,70 @@ namespace
         float cos = cosineSimilarity(gpu_ptr, ref.data(), static_cast<size_t>(N));
         LOG_INFO("[NativeVNNI_GEMV] Q6_K model-dim 3584×3584 cosine=" << cos);
         EXPECT_GT(cos, 0.99f);
+
+        cleanupWorkspace(kernel);
+    }
+
+    /**
+     * @test Native-VNNI GEMV is bitwise stable across repeated runs.
+     *
+     * Guards against the CUDA-style failure mode where split-K atomics or
+     * shared scratch make repeated runs diverge. This shape is large enough
+     * to exercise the GEMV scatter+reduce path (KB > 1) on ROCm.
+     */
+    TEST_F(NativeVNNIGEMVTest, Q4_0_RepeatedRuns_AreBitwiseStable_OnScatterReduceShape)
+    {
+        if (!has_rocm_device_)
+        {
+            GTEST_SKIP() << "No ROCm device available";
+        }
+
+        const int M = 1;
+        const int N = 3584;
+        const int K = 3584;
+        constexpr int kRepeatRuns = 5;
+
+        auto weights = TestTensorFactory::createQ4_0Random(
+            {static_cast<size_t>(N), static_cast<size_t>(K)});
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        ASSERT_FALSE(packed.native_vnni_payload.empty());
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)});
+        auto output_gpu = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        std::vector<float> reference;
+        for (int run = 0; run < kRepeatRuns; ++run)
+        {
+            ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K))
+                << "run=" << run;
+
+            const float *gpu_ptr = output_gpu->data();
+            std::vector<float> snapshot(gpu_ptr, gpu_ptr + static_cast<size_t>(N));
+
+            if (run == 0)
+            {
+                reference = std::move(snapshot);
+                continue;
+            }
+
+            const size_t mismatch = firstBitwiseMismatchIndex(reference, snapshot);
+            EXPECT_EQ(mismatch, reference.size())
+                << "run=" << run
+                << " first_mismatch=" << mismatch
+                << " reference=" << reference[mismatch]
+                << " candidate=" << snapshot[mismatch];
+
+            if (mismatch != reference.size())
+            {
+                break;
+            }
+        }
 
         cleanupWorkspace(kernel);
     }
