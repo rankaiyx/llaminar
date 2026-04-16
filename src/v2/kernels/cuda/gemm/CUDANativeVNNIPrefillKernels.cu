@@ -18,6 +18,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <vector>
+
+struct CUDAPrefillStreamScratch_
+{
+    cudaStream_t stream = nullptr;
+    float *fixup_buf = nullptr;
+    size_t fixup_buf_size = 0; // in bytes
+    float *splitk_partials = nullptr;
+    size_t splitk_partials_size = 0; // in bytes
+};
 
 // =========================================================================
 // Per-device prefill context — replaces process-global statics for SM count
@@ -27,17 +37,32 @@ struct CUDAPrefillContext_
 {
     int sm_count = 0;
     int device_id = -1;
-
-    // Stream-K two-pass fixup buffer
-    float *fixup_buf = nullptr;
-    size_t fixup_buf_size = 0; // in bytes
-
-    // Split-K two-phase partials buffer: each z-slice writes its partial
-    // result to partials[z * M * N], then a reduce kernel sums them into C.
-    // This replaces the non-deterministic FP32 atomicAdd accumulation pattern.
-    float *splitk_partials = nullptr;
-    size_t splitk_partials_size = 0; // in bytes
+    std::vector<CUDAPrefillStreamScratch_> stream_scratch;
 };
+
+struct LastLaunchSelection_
+{
+    int tile_id = -1;
+    int split_k = 1;
+    int used_bk256 = 0;
+    int used_streamk = 0;
+};
+
+// Thread-local because tile sweep benchmarks can launch from multiple worker
+// threads. Diagnostics read back the selection on the same thread.
+static thread_local LastLaunchSelection_ g_last_launch_selection;
+
+static inline void recordLastLaunchSelection(
+    int tile_id,
+    int split_k,
+    bool used_bk256,
+    int used_streamk)
+{
+    g_last_launch_selection.tile_id = tile_id;
+    g_last_launch_selection.split_k = split_k;
+    g_last_launch_selection.used_bk256 = used_bk256 ? 1 : 0;
+    g_last_launch_selection.used_streamk = used_streamk;
+}
 
 static int querySmCount(CUDAPrefillContext_ *ctx)
 {
@@ -51,37 +76,51 @@ static int querySmCount(CUDAPrefillContext_ *ctx)
     return ctx->sm_count;
 }
 
-static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
+static CUDAPrefillStreamScratch_ *getOrCreateStreamScratch(CUDAPrefillContext_ *ctx, cudaStream_t stream)
 {
-    if (ctx->fixup_buf_size < required_bytes)
+    for (auto &scratch : ctx->stream_scratch)
     {
-        if (ctx->fixup_buf)
-            cudaFree(ctx->fixup_buf);
-        ctx->fixup_buf = nullptr;
-        ctx->fixup_buf_size = 0;
-        cudaSetDevice(ctx->device_id);
-        if (cudaMalloc(&ctx->fixup_buf, required_bytes) != cudaSuccess)
-            return nullptr;
-        ctx->fixup_buf_size = required_bytes;
+        if (scratch.stream == stream)
+            return &scratch;
     }
-    cudaMemsetAsync(ctx->fixup_buf, 0, required_bytes, stream);
-    return ctx->fixup_buf;
+
+    ctx->stream_scratch.push_back({stream});
+    return &ctx->stream_scratch.back();
 }
 
-static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required_bytes)
+static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
 {
-    if (ctx->splitk_partials_size < required_bytes)
+    auto *scratch = getOrCreateStreamScratch(ctx, stream);
+    if (scratch->fixup_buf_size < required_bytes)
     {
-        if (ctx->splitk_partials)
-            cudaFree(ctx->splitk_partials);
-        ctx->splitk_partials = nullptr;
-        ctx->splitk_partials_size = 0;
+        if (scratch->fixup_buf)
+            cudaFree(scratch->fixup_buf);
+        scratch->fixup_buf = nullptr;
+        scratch->fixup_buf_size = 0;
         cudaSetDevice(ctx->device_id);
-        if (cudaMalloc(&ctx->splitk_partials, required_bytes) != cudaSuccess)
+        if (cudaMalloc(&scratch->fixup_buf, required_bytes) != cudaSuccess)
             return nullptr;
-        ctx->splitk_partials_size = required_bytes;
+        scratch->fixup_buf_size = required_bytes;
     }
-    return ctx->splitk_partials;
+    cudaMemsetAsync(scratch->fixup_buf, 0, required_bytes, stream);
+    return scratch->fixup_buf;
+}
+
+static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
+{
+    auto *scratch = getOrCreateStreamScratch(ctx, stream);
+    if (scratch->splitk_partials_size < required_bytes)
+    {
+        if (scratch->splitk_partials)
+            cudaFree(scratch->splitk_partials);
+        scratch->splitk_partials = nullptr;
+        scratch->splitk_partials_size = 0;
+        cudaSetDevice(ctx->device_id);
+        if (cudaMalloc(&scratch->splitk_partials, required_bytes) != cudaSuccess)
+            return nullptr;
+        scratch->splitk_partials_size = required_bytes;
+    }
+    return scratch->splitk_partials;
 }
 
 namespace
@@ -2075,21 +2114,21 @@ namespace
     constexpr int BK128_STRIDE = BK128 + BK128_PAD; // 144, 16-byte aligned
 
     template <int BM, int BN, int WARPS_M, int WARPS_N, int SPLIT_K = 1,
-              int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32>
-    __global__ __launch_bounds__(BLOCK_SIZE_, 1) // 1 block/SM: max register budget
-        void nativeVnniTC_BK256(
-            const int8_t *__restrict__ A,
-            const uint8_t *__restrict__ payload,
-            const uint16_t *__restrict__ scales_B,
-            float *__restrict__ C,
-            const float *__restrict__ scales_A,
-            const float *__restrict__ C_existing,
-            const float *__restrict__ bias,
-            int M,
-            int N,
-            int K,
-            float alpha,
-            float beta)
+              int BLOCK_SIZE_ = WARPS_M * WARPS_N * 32,
+              int MIN_BLOCKS_HINT = (BLOCK_SIZE_ >= 512 ? 1 : 2)>
+    __global__ __launch_bounds__(BLOCK_SIZE_, MIN_BLOCKS_HINT) void nativeVnniTC_BK256(
+        const int8_t *__restrict__ A,
+        const uint8_t *__restrict__ payload,
+        const uint16_t *__restrict__ scales_B,
+        float *__restrict__ C,
+        const float *__restrict__ scales_A,
+        const float *__restrict__ C_existing,
+        const float *__restrict__ bias,
+        int M,
+        int N,
+        int K,
+        float alpha,
+        float beta)
     {
 #if __CUDA_ARCH__ >= 800
         constexpr int NUM_WARPS = WARPS_M * WARPS_N;
@@ -2416,9 +2455,11 @@ namespace
     static int g_force_tile_id = -1;
     static int g_force_split_k = 0;
 
-    // Deterministic mode: disables stream-K (which still uses FP32 atomicAdd).
-    // Standard split-K paths use deterministic two-phase reduction and are
-    // unaffected by this flag.
+    // Deterministic mode: disables stream-K and caps BK64 split-K to 1 on
+    // shapes where split-K rounding drift is known to affect parity.
+    // BK256 stays enabled: on the FFN-down parity shapes we measured, BK256
+    // split-K is bitwise identical to split_k=1 while preserving more of the
+    // native path's throughput.
     // Set via LLAMINAR_DETERMINISTIC=1 env var.
     static bool g_deterministic_mode = []()
     {
@@ -2735,7 +2776,7 @@ namespace
         if constexpr (SPLIT_K > 1)
         {
             const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
-            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes) : nullptr;
+            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes, cuda_stream) : nullptr;
             if (!partials)
                 return false;
             d_kernel_C = partials;
@@ -2805,7 +2846,7 @@ namespace
         if constexpr (SPLIT_K > 1)
         {
             const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
-            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes) : nullptr;
+            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes, cuda_stream) : nullptr;
             if (!partials)
                 return false;
             d_kernel_C = partials;
@@ -2883,7 +2924,7 @@ namespace
         if constexpr (SPLIT_K > 1)
         {
             const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
-            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes) : nullptr;
+            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes, cuda_stream) : nullptr;
             if (!partials)
                 return false;
             d_kernel_C = partials;
@@ -3288,7 +3329,7 @@ namespace
         if constexpr (SPLIT_K > 1)
         {
             const size_t partials_bytes = static_cast<size_t>(SPLIT_K) * M * N * sizeof(float);
-            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes) : nullptr;
+            float *partials = prefill_ctx ? getOrAllocSplitkPartials(prefill_ctx, partials_bytes, cuda_stream) : nullptr;
             if (!partials)
                 return false;
             d_kernel_C = partials;
@@ -3382,19 +3423,44 @@ namespace
             const bool bk256_auto = !bk256_disabled && (K > 2 * N) && (t64x128_check < SM);
             if (bk256_forced || bk256_auto)
             {
-                int sk = chooseSplitK_BK256(M, N, K, 128, 128, prefill_ctx);
-                // Deterministic mode: cap split_k for PyTorch numerical parity
-                if (g_deterministic_mode && sk > 1)
-                    sk = 1;
+                const bool use_narrow_bn64 = (M <= 32) && (N <= 1024);
+                const int bk256_bn = use_narrow_bn64 ? 64 : 128;
+                int sk = chooseSplitK_BK256(M, N, K, 128, bk256_bn, prefill_ctx);
                 bool ok = false;
-                if (sk >= 2)
-                    ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 2>(
-                        d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+                if (use_narrow_bn64)
+                {
+                    if (sk >= 2)
+                    {
+                        recordLastLaunchSelection(-3, 2, true, 0);
+                        ok = launchNativeVNNITC_BK256<128, 64, 4, 2, 2>(
+                            d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
+                            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+                    }
+                    else
+                    {
+                        recordLastLaunchSelection(-3, 1, true, 0);
+                        ok = launchNativeVNNITC_BK256<128, 64, 4, 2, 1>(
+                            d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
+                            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+                    }
+                }
                 else
-                    ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 1>(
-                        d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
-                        M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+                {
+                    if (sk >= 2)
+                    {
+                        recordLastLaunchSelection(-2, 2, true, 0);
+                        ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 2>(
+                            d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
+                            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+                    }
+                    else
+                    {
+                        recordLastLaunchSelection(-2, 1, true, 0);
+                        ok = launchNativeVNNITC_BK256<128, 128, 4, 4, 1>(
+                            d_A_int8, d_payload, d_scales, d_C_fp32, d_scales_A_block,
+                            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+                    }
+                }
                 if (ok)
                     return true;
                 // Fall through to BK64 dispatch if BK256 failed
@@ -3426,10 +3492,10 @@ namespace
             }
         }
 
-        // Deterministic mode: cap split_k to 1 for maximum numerical parity
-        // with PyTorch's single-pass FP32 matmul. Two-phase split-K is
-        // deterministic by design, but split-K introduces FP32 rounding
-        // differences vs single-pass that compound through transformer layers.
+        // Deterministic mode: cap BK64 split_k to 1 for maximum numerical
+        // parity with PyTorch's single-pass FP32 matmul. Two-phase split-K is
+        // deterministic by design, but BK64 split-K still introduces FP32
+        // accumulation-order drift that compounds through attention layers.
         if (g_deterministic_mode && tc.split_k > 1)
             tc.split_k = 1;
 
@@ -3442,36 +3508,46 @@ namespace
         if constexpr (CB == 0)                                                          \
         {                                                                               \
             if (tc.split_k == 1 && g_stream_k_force_mode == 2)                          \
+            {                                                                           \
+                recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 2);      \
                 return launchNativeVNNITC_BK64_StreamK_TwoPass<CB, BM_, BN_, WM_, WN_>( \
                     d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
                     d_C_fp32, d_scales_A_block,                                         \
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
                     prefill_ctx);                                                       \
+            }                                                                           \
             if (tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_, prefill_ctx))    \
+            {                                                                           \
+                recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 1);      \
                 return launchNativeVNNITC_BK64_StreamK<CB, BM_, BN_, WM_, WN_>(         \
                     d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
                     d_C_fp32, d_scales_A_block,                                         \
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
                     prefill_ctx);                                                       \
+            }                                                                           \
         }                                                                               \
         switch (tc.split_k)                                                             \
         {                                                                               \
         case 8:                                                                         \
+            recordLastLaunchSelection(static_cast<int>(tc.tile), 8, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
                 cuda_stream, prefill_ctx);                                              \
         case 4:                                                                         \
+            recordLastLaunchSelection(static_cast<int>(tc.tile), 4, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
                 cuda_stream, prefill_ctx);                                              \
         case 2:                                                                         \
+            recordLastLaunchSelection(static_cast<int>(tc.tile), 2, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
                 cuda_stream, prefill_ctx);                                              \
         default:                                                                        \
+            recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
                 d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
@@ -3530,7 +3606,8 @@ extern "C"
         // This function is kept for backward compatibility but is a no-op.
     }
 
-    // Deterministic mode API: disables all FP32 atomicAdd paths (split-K, stream-K)
+    // Deterministic mode API: disables stream-K and enables parity-preserving
+    // dispatch rules in the BK64 prefill path.
     void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled)
     {
         g_deterministic_mode = enabled;
@@ -3539,6 +3616,22 @@ extern "C"
     bool cudaNativeVNNIPrefill_getDeterministicMode()
     {
         return g_deterministic_mode;
+    }
+
+    void cudaNativeVNNIPrefill_getLastLaunchSelection(
+        int *tile_id,
+        int *split_k,
+        int *used_bk256,
+        int *used_streamk)
+    {
+        if (tile_id)
+            *tile_id = g_last_launch_selection.tile_id;
+        if (split_k)
+            *split_k = g_last_launch_selection.split_k;
+        if (used_bk256)
+            *used_bk256 = g_last_launch_selection.used_bk256;
+        if (used_streamk)
+            *used_streamk = g_last_launch_selection.used_streamk;
     }
 
     // Force-tile/split-k override for sweep benchmarks.
@@ -3598,15 +3691,13 @@ extern "C"
     {
         if (!ctx)
             return;
-        if (ctx->fixup_buf)
+        cudaSetDevice(ctx->device_id);
+        for (auto &scratch : ctx->stream_scratch)
         {
-            cudaSetDevice(ctx->device_id);
-            cudaFree(ctx->fixup_buf);
-        }
-        if (ctx->splitk_partials)
-        {
-            cudaSetDevice(ctx->device_id);
-            cudaFree(ctx->splitk_partials);
+            if (scratch.fixup_buf)
+                cudaFree(scratch.fixup_buf);
+            if (scratch.splitk_partials)
+                cudaFree(scratch.splitk_partials);
         }
         delete ctx;
     }

@@ -1746,14 +1746,10 @@ namespace llaminar2::test::parity
         void SetUp() override
         {
             // Enable deterministic CUDA GEMM for reproducible parity results.
-            // Split-K and stream-K use FP32 atomicAdd whose non-associative
-            // accumulation order varies with CTA scheduling, causing run-to-run
-            // cosine similarity variance that can cross parity thresholds.
-            // For M=9 (typical parity prompt), all GEMM shapes except LM_head
-            // use split_k=2..8 with atomicAdd. CTA scheduling variance from
-            // concurrent prefill pool causes cross-run divergence that compounds
-            // through transformer layers into massive LM_HEAD cosine variance
-            // (observed 0.60-0.99 in PP HOST_CUDA_CPU without this flag).
+            // Stream-K is disabled, and BK64 split-K is capped to 1 because
+            // that path's FP32 accumulation-order drift compounds through the
+            // attention stack. BK256 remains enabled for FFN-down shapes where
+            // the current parity diagnostics show split_k>1 is bitwise-stable.
             setenv("LLAMINAR_DETERMINISTIC", "1", 1);
 #ifdef HAVE_CUDA
             cudaNativeVNNIPrefill_setDeterministicMode(true);

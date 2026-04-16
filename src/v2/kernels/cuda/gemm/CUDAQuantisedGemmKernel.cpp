@@ -42,6 +42,7 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <mutex>
@@ -60,6 +61,8 @@ namespace llaminar2
         // These functions are implemented in CUDAQuantisedGemmKernel_CUTLASS.cu
         extern "C"
         {
+            bool cudaNativeVNNIPrefill_getDeterministicMode();
+
             // Upload converted INT8 weights to device
             bool cudaQuantGemm_uploadWeights(
                 const int8_t *h_weights_int8, // [K x N] ColumnMajor
@@ -1608,9 +1611,21 @@ namespace llaminar2
             }
 
             // Step 4: Try concurrent multi-stream dispatch for prefill
-            const bool concurrent_eligible = use_blockwise && m > 1 &&
+            // Deterministic parity mode intentionally disables this path. We
+            // also avoid it for very small prefill M, which is the regime where
+            // the multi-stream fused path still proved unstable in local-PP
+            // parity runs. Keep the fast path for larger prompt lengths where
+            // concurrent projection dispatch is most useful.
+            const char *deterministic_env = std::getenv("LLAMINAR_DETERMINISTIC");
+            const bool deterministic_prefill = cudaNativeVNNIPrefill_getDeterministicMode() ||
+                                               (deterministic_env && std::atoi(deterministic_env) != 0);
+            const bool small_m_stage_stream = (gpu_stream_ != nullptr) && (m <= 16);
+
+            const bool concurrent_eligible = use_blockwise && m > 16 &&
                                              projections.size() >= 2 &&
-                                             debugEnv().gemm.cuda_concurrent_prefill;
+                                             debugEnv().gemm.cuda_concurrent_prefill &&
+                                             !deterministic_prefill &&
+                                             !small_m_stage_stream;
 
             if (concurrent_eligible)
             {

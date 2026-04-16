@@ -35,6 +35,7 @@
 #include "../../../utils/TestTensorFactory.h"
 
 #include <vector>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <random>
@@ -48,6 +49,21 @@ using namespace llaminar2::test;
 
 using KernelDeviceType = llaminar::v2::kernels::DeviceType;
 using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
+
+#ifdef HAVE_CUDA
+extern "C"
+{
+    void cudaNativeVNNIPrefill_setStreamKMode(int mode);
+    int cudaNativeVNNIPrefill_getStreamKMode();
+    void cudaNativeVNNIPrefill_setBK256Mode(int mode);
+    int cudaNativeVNNIPrefill_getBK256Mode();
+    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
+    bool cudaNativeVNNIPrefill_getDeterministicMode();
+    void cudaNativeVNNIPrefill_setForceTile(int tile_id, int split_k);
+    void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k);
+    void cudaNativeVNNIPrefill_getLastLaunchSelection(int *tile_id, int *split_k, int *used_bk256, int *used_streamk);
+}
+#endif
 
 namespace
 {
@@ -86,6 +102,79 @@ namespace
         return m;
     }
 
+    int32_t orderedFloatBits(float value)
+    {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        if (bits & 0x80000000u)
+            return static_cast<int32_t>(0x80000000u - bits);
+        return static_cast<int32_t>(bits);
+    }
+
+    uint32_t ulpDiff(float a, float b)
+    {
+        const int64_t ia = static_cast<int64_t>(orderedFloatBits(a));
+        const int64_t ib = static_cast<int64_t>(orderedFloatBits(b));
+        return static_cast<uint32_t>(std::llabs(ia - ib));
+    }
+
+    struct DiffSummary
+    {
+        size_t diff_count = 0;
+        float max_abs = 0.0f;
+        uint32_t max_ulp = 0;
+        std::array<size_t, 8> bins = {};
+    };
+
+    DiffSummary summarizeDiffs(const float *a, const float *b, size_t count)
+    {
+        DiffSummary summary;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const float abs_diff = std::abs(a[i] - b[i]);
+            summary.max_abs = std::max(summary.max_abs, abs_diff);
+
+            const uint32_t ulp = ulpDiff(a[i], b[i]);
+            summary.max_ulp = std::max(summary.max_ulp, ulp);
+            if (ulp != 0)
+                ++summary.diff_count;
+
+            if (ulp == 0)
+                ++summary.bins[0];
+            else if (ulp == 1)
+                ++summary.bins[1];
+            else if (ulp <= 2)
+                ++summary.bins[2];
+            else if (ulp <= 4)
+                ++summary.bins[3];
+            else if (ulp <= 8)
+                ++summary.bins[4];
+            else if (ulp <= 16)
+                ++summary.bins[5];
+            else if (ulp <= 64)
+                ++summary.bins[6];
+            else
+                ++summary.bins[7];
+        }
+        return summary;
+    }
+
+    void printDiffSummary(const char *label, const DiffSummary &summary)
+    {
+        std::cout << label
+                  << ": diffs=" << summary.diff_count
+                  << " max_abs=" << std::scientific << summary.max_abs
+                  << " max_ulp=" << std::dec << summary.max_ulp
+                  << " bins=[0:" << summary.bins[0]
+                  << " 1:" << summary.bins[1]
+                  << " 2:" << summary.bins[2]
+                  << " <=4:" << summary.bins[3]
+                  << " <=8:" << summary.bins[4]
+                  << " <=16:" << summary.bins[5]
+                  << " <=64:" << summary.bins[6]
+                  << " >64:" << summary.bins[7] << "]\n";
+    }
+
 } // anonymous namespace
 
 // ============================================================================
@@ -98,6 +187,25 @@ protected:
     std::mt19937 rng_{42};
     std::uniform_real_distribution<float> dist_{-1.0f, 1.0f};
     std::unique_ptr<DeviceWorkspaceManager> workspace_;
+
+    struct SplitKComparisonResult
+    {
+        std::string weight_name;
+        int m = 0;
+        int n = 0;
+        int k = 0;
+        int auto_tile = -1;
+        int auto_split_k = 0;
+        int auto_bk256 = 0;
+        int auto_streamk = 0;
+        DiffSummary sk1_repeat;
+        DiffSummary sk2_repeat;
+        DiffSummary skauto_repeat;
+        DiffSummary sk1_vs_sk2;
+        DiffSummary sk1_vs_skauto;
+        double cosine_sk1_vs_sk2 = 0.0;
+        double cosine_sk1_vs_skauto = 0.0;
+    };
 
     bool setupSharedWorkspace(
         const std::vector<ITensorGemm *> &kernels,
@@ -154,6 +262,171 @@ protected:
         }
         workspace_.reset();
     }
+
+#ifdef HAVE_CUDA
+    bool compareSplitKForWeight(const std::string &weight_name, SplitKComparisonResult &result)
+    {
+        auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
+        TensorFactory factory(*mpi_ctx);
+        ModelLoader loader(&factory);
+        if (!loader.loadModel(MODEL_PATH))
+            return false;
+
+        auto weight_base = loader.loadTensor(weight_name, DeviceId::cpu());
+        auto *weight = dynamic_cast<Q4_0Tensor *>(weight_base.get());
+        if (!weight)
+            return false;
+
+        const int M = 9;
+        const int N = static_cast<int>(weight->shape()[0]);
+        const int K = static_cast<int>(weight->shape()[1]);
+
+        if (!weight->ensureOnDevice(gpu_device_))
+            return false;
+
+        auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+            weight, KernelDeviceType::CUDA);
+        if (!kernel)
+            return false;
+
+        auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+        if (!ws)
+            return false;
+
+        auto reqs = ws->getWorkspaceRequirements(M, N, K);
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 64 * 1024 * 1024);
+        if (!workspace_->allocate(reqs))
+            return false;
+        ws->bindWorkspace(workspace_.get());
+
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+        for (int i = 0; i < M * K; ++i)
+            input->mutable_data()[i] = dist_(rng_);
+
+        const int saved_streamk = cudaNativeVNNIPrefill_getStreamKMode();
+        const int saved_bk256 = cudaNativeVNNIPrefill_getBK256Mode();
+        const bool saved_det = cudaNativeVNNIPrefill_getDeterministicMode();
+        int saved_force_tile = -1;
+        int saved_force_sk = 0;
+        cudaNativeVNNIPrefill_getForceTile(&saved_force_tile, &saved_force_sk);
+
+        auto restore_modes = [&]()
+        {
+            cudaNativeVNNIPrefill_setForceTile(saved_force_tile, saved_force_sk);
+            cudaNativeVNNIPrefill_setStreamKMode(saved_streamk);
+            cudaNativeVNNIPrefill_setBK256Mode(saved_bk256);
+            cudaNativeVNNIPrefill_setDeterministicMode(saved_det);
+        };
+
+        auto cleanup = [&]()
+        {
+            ws->unbindWorkspace();
+            workspace_.reset();
+        };
+
+        auto run_projection = [&](int bk256_mode, int tile_id, int split_k, bool deterministic, std::vector<float> &out) -> bool
+        {
+            cudaNativeVNNIPrefill_setBK256Mode(bk256_mode);
+            cudaNativeVNNIPrefill_setStreamKMode(-1);
+            cudaNativeVNNIPrefill_setDeterministicMode(deterministic);
+            cudaNativeVNNIPrefill_setForceTile(tile_id, split_k);
+
+            auto output = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+            if (!with_gpu_coherence(
+                    gpu_device_,
+                    {input.get()},
+                    {output.get()},
+                    [&]
+                    {
+                        return kernel->multiply_tensor(
+                            input.get(), output.get(), M, N, K,
+                            true, 1.0f, 0.0f, nullptr, nullptr, -1);
+                    }))
+            {
+                return false;
+            }
+
+            const float *data = output->data();
+            out.assign(data, data + static_cast<size_t>(M) * N);
+            return true;
+        };
+
+        std::vector<float> auto_out;
+        if (!run_projection(/*bk256_mode=*/0, /*tile_id=*/-1, /*split_k=*/0, /*deterministic=*/false, auto_out))
+        {
+            restore_modes();
+            cleanup();
+            return false;
+        }
+
+        int auto_tile = -1;
+        int auto_sk = 0;
+        int auto_bk256 = 0;
+        int auto_streamk = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(&auto_tile, &auto_sk, &auto_bk256, &auto_streamk);
+
+        const int forced_bk256_mode = auto_bk256 ? 1 : -1;
+        const int forced_tile_id = auto_bk256 ? -1 : auto_tile;
+        const int auto_forced_sk = (auto_sk > 1) ? auto_sk : 2;
+
+        std::vector<float> sk1_a, sk1_b, sk2_a, sk2_b, skauto_a, skauto_b;
+        const bool ok = run_projection(forced_bk256_mode, forced_tile_id, 1, false, sk1_a) &&
+                        run_projection(forced_bk256_mode, forced_tile_id, 1, false, sk1_b) &&
+                        run_projection(forced_bk256_mode, forced_tile_id, 2, false, sk2_a) &&
+                        run_projection(forced_bk256_mode, forced_tile_id, 2, false, sk2_b) &&
+                        run_projection(forced_bk256_mode, forced_tile_id, auto_forced_sk, false, skauto_a) &&
+                        run_projection(forced_bk256_mode, forced_tile_id, auto_forced_sk, false, skauto_b);
+
+        restore_modes();
+
+        if (!ok)
+        {
+            cleanup();
+            return false;
+        }
+
+        result.weight_name = weight_name;
+        result.m = M;
+        result.n = N;
+        result.k = K;
+        result.auto_tile = auto_tile;
+        result.auto_split_k = auto_sk;
+        result.auto_bk256 = auto_bk256;
+        result.auto_streamk = auto_streamk;
+        result.sk1_repeat = summarizeDiffs(sk1_a.data(), sk1_b.data(), sk1_a.size());
+        result.sk2_repeat = summarizeDiffs(sk2_a.data(), sk2_b.data(), sk2_a.size());
+        result.skauto_repeat = summarizeDiffs(skauto_a.data(), skauto_b.data(), skauto_a.size());
+        result.sk1_vs_sk2 = summarizeDiffs(sk1_a.data(), sk2_a.data(), sk1_a.size());
+        result.sk1_vs_skauto = summarizeDiffs(sk1_a.data(), skauto_a.data(), sk1_a.size());
+        result.cosine_sk1_vs_sk2 = cosineSimilarity(sk1_a.data(), sk2_a.data(), sk1_a.size());
+        result.cosine_sk1_vs_skauto = cosineSimilarity(sk1_a.data(), skauto_a.data(), sk1_a.size());
+
+        cleanup();
+        return true;
+    }
+
+    void printSplitKComparison(const SplitKComparisonResult &result)
+    {
+        std::cout << "Split-K comparison for " << result.weight_name
+                  << " shape=(M=" << result.m << ",N=" << result.n << ",K=" << result.k << ")"
+                  << " auto_tile=" << result.auto_tile
+                  << " auto_split_k=" << result.auto_split_k
+                  << " auto_bk256=" << result.auto_bk256
+                  << " auto_streamk=" << result.auto_streamk << "\n";
+        printDiffSummary("split_k=1 repeat", result.sk1_repeat);
+        printDiffSummary("split_k=2 repeat", result.sk2_repeat);
+        printDiffSummary("split_k=auto repeat", result.skauto_repeat);
+        printDiffSummary("split_k=1 vs split_k=2", result.sk1_vs_sk2);
+        printDiffSummary("split_k=1 vs split_k=auto", result.sk1_vs_skauto);
+        std::cout << "split_k=1 vs split_k=2 cosine="
+                  << std::fixed << std::setprecision(9) << result.cosine_sk1_vs_sk2 << "\n";
+        std::cout << "split_k=1 vs split_k=auto cosine="
+                  << std::fixed << std::setprecision(9) << result.cosine_sk1_vs_skauto << "\n";
+    }
+#endif
 };
 
 // ============================================================================
@@ -370,6 +643,8 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
 
     std::vector<float> ref_q(M * N_q), ref_k(M * N_k), ref_v(M * N_v);
     double min_q_cos = 1.0, min_k_cos = 1.0, min_v_cos = 1.0;
+    size_t max_q_diffs = 0, max_k_diffs = 0, max_v_diffs = 0;
+    float max_q_abs = 0.0f, max_k_abs = 0.0f, max_v_abs = 0.0f;
 
     for (int rep = 0; rep < NUM_REPETITIONS; ++rep)
     {
@@ -414,26 +689,50 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
             size_t q_diffs = countDiffs(q_data, ref_q.data(), ref_q.size());
             size_t k_diffs = countDiffs(k_data, ref_k.data(), ref_k.size());
             size_t v_diffs = countDiffs(v_data, ref_v.data(), ref_v.size());
+            float q_max = maxAbsDiff(q_data, ref_q.data(), ref_q.size());
+            float k_max = maxAbsDiff(k_data, ref_k.data(), ref_k.size());
+            float v_max = maxAbsDiff(v_data, ref_v.data(), ref_v.size());
 
             min_q_cos = std::min(min_q_cos, q_cos);
             min_k_cos = std::min(min_k_cos, k_cos);
             min_v_cos = std::min(min_v_cos, v_cos);
+            max_q_diffs = std::max(max_q_diffs, q_diffs);
+            max_k_diffs = std::max(max_k_diffs, k_diffs);
+            max_v_diffs = std::max(max_v_diffs, v_diffs);
+            max_q_abs = std::max(max_q_abs, q_max);
+            max_k_abs = std::max(max_k_abs, k_max);
+            max_v_abs = std::max(max_v_abs, v_max);
 
             std::cout << "  Rep " << rep
                       << ": Q diffs=" << q_diffs << " cos=" << std::fixed << std::setprecision(6) << q_cos
-                      << " | K diffs=" << k_diffs << " cos=" << k_cos
-                      << " | V diffs=" << v_diffs << " cos=" << v_cos << "\n";
+                      << " max_abs=" << std::scientific << q_max
+                      << " | K diffs=" << k_diffs << " cos=" << std::fixed << k_cos
+                      << " max_abs=" << std::scientific << k_max
+                      << " | V diffs=" << v_diffs << " cos=" << std::fixed << v_cos
+                      << " max_abs=" << std::scientific << v_max << "\n";
         }
     }
 
     std::cout << "\n=== SUMMARY ===\n"
-              << "  Q: min_cos=" << std::fixed << std::setprecision(6) << min_q_cos << "\n"
-              << "  K: min_cos=" << min_k_cos << "\n"
-              << "  V: min_cos=" << min_v_cos << "\n";
+              << "  Q: min_cos=" << std::fixed << std::setprecision(6) << min_q_cos
+              << " max_diffs=" << max_q_diffs
+              << " max_abs=" << std::scientific << max_q_abs << "\n"
+              << "  K: min_cos=" << std::fixed << min_k_cos
+              << " max_diffs=" << max_k_diffs
+              << " max_abs=" << std::scientific << max_k_abs << "\n"
+              << "  V: min_cos=" << std::fixed << min_v_cos
+              << " max_diffs=" << max_v_diffs
+              << " max_abs=" << std::scientific << max_v_abs << "\n";
 
     EXPECT_GE(min_q_cos, 0.9999) << "Q projection non-deterministic";
     EXPECT_GE(min_k_cos, 0.9999) << "K projection non-deterministic";
     EXPECT_GE(min_v_cos, 0.9999) << "V projection non-deterministic";
+    EXPECT_EQ(max_q_diffs, 0u) << "Q projection changed bitwise across repeated calls";
+    EXPECT_EQ(max_k_diffs, 0u) << "K projection changed bitwise across repeated calls";
+    EXPECT_EQ(max_v_diffs, 0u) << "V projection changed bitwise across repeated calls";
+    EXPECT_FLOAT_EQ(max_q_abs, 0.0f) << "Q projection max_abs drift should be zero";
+    EXPECT_FLOAT_EQ(max_k_abs, 0.0f) << "K projection max_abs drift should be zero";
+    EXPECT_FLOAT_EQ(max_v_abs, 0.0f) << "V projection max_abs drift should be zero";
 
     cleanupSharedWorkspace({k_q.get(), k_k.get(), k_v.get()});
 }
@@ -546,6 +845,40 @@ TEST_F(Test__CUDAGemmNonDeterminism, SingleKernel_SelfConsistency)
         ws->unbindWorkspace();
         workspace_.reset();
     }
+}
+
+// ============================================================================
+// Diagnostic: compare Q-projection split_k=1 vs split_k=2 on the same tile.
+// Disabled by default because this is an investigation aid, not a stable CI test.
+// Run manually with --gtest_also_run_disabled_tests.
+// ============================================================================
+
+TEST_F(Test__CUDAGemmNonDeterminism, DISABLED_QProjection_SplitKComparison)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    if (!std::filesystem::exists(MODEL_PATH))
+        GTEST_SKIP() << "Model not found: " << MODEL_PATH;
+
+    SplitKComparisonResult result;
+    ASSERT_TRUE(compareSplitKForWeight("blk.0.attn_q.weight", result));
+    printSplitKComparison(result);
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, DISABLED_FFNDown_SplitKComparison)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    if (!std::filesystem::exists(MODEL_PATH))
+        GTEST_SKIP() << "Model not found: " << MODEL_PATH;
+
+    SplitKComparisonResult result;
+    ASSERT_TRUE(compareSplitKForWeight("blk.0.ffn_down.weight", result));
+    printSplitKComparison(result);
+#endif
 }
 
 // ============================================================================
