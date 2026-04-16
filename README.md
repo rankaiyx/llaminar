@@ -1,5 +1,5 @@
 # llaminar
-The LLM inferencing engine.
+An LLM inferencing engine.
 
 Llaminar tries to solve a variety of problems encountered in other projects:
 
