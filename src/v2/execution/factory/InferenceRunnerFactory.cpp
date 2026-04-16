@@ -1056,12 +1056,23 @@ namespace llaminar2
             return false;
         }
 
+        // =====================================================================
+        // Use the shared ModelContext's WeightManager (single WM per model).
+        // PP layer-range filtering is handled by prepareWeightsForDevice().
+        // =====================================================================
         auto weight_mgr = model_ctx->concreteWeightManager();
         if (!weight_mgr)
         {
             LOG_ERROR("[PPStageRunner] No weight manager in model context");
             return false;
         }
+
+        // Apply architecture-specific weight sharding config.
+        // setWeightShardingConfig is idempotent and does NOT clear the weight cache
+        // (unlike configure() which clears cache_ unconditionally).
+        const std::string arch = model_ctx->architecture();
+        weight_mgr->setWeightShardingConfig(
+            SchemaFactoryRegistry::getWeightShardingConfig(arch));
 
         // =====================================================================
         // Set WeightManager and PlacementMap for phase-aware weight access
@@ -1073,63 +1084,9 @@ namespace llaminar2
             LOG_DEBUG("[PPStageRunner] Phase-aware weight access configured with placement map");
         }
 
-        // Build ModelWeights for this PP stage
-        ModelWeights weights;
-
-        // =====================================================================
-        // Global weights: Only load if this stage owns them
-        // =====================================================================
-        if (pp_config.has_embedding)
-        {
-            auto embedding = weight_mgr->getWeightForDevice("token_embd.weight");
-            if (!embedding)
-            {
-                LOG_ERROR("[PPStageRunner] Stage has_embedding=true but token_embd.weight missing");
-                return false;
-            }
-            weights.embedding_table = embedding.get();
-            LOG_DEBUG("[PPStageRunner] Loaded embedding table for stage");
-        }
-        else
-        {
-            weights.embedding_table = nullptr;
-            LOG_DEBUG("[PPStageRunner] Stage does not own embedding (has_embedding=false)");
-        }
-
-        if (pp_config.has_lm_head)
-        {
-            auto final_norm = weight_mgr->getWeightForDevice("output_norm.weight");
-            auto lm_head = weight_mgr->getWeightForDevice("output.weight");
-            // Tied embeddings fallback
-            if (!lm_head)
-            {
-                auto embedding_fallback = weight_mgr->getWeightForDevice("token_embd.weight");
-                if (embedding_fallback)
-                {
-                    LOG_INFO("[PPStageRunner] output.weight not found, using tied embeddings");
-                    lm_head = embedding_fallback;
-                }
-            }
-            if (!final_norm || !lm_head)
-            {
-                LOG_ERROR("[PPStageRunner] Stage has_lm_head=true but output_norm/output weights missing");
-                return false;
-            }
-            weights.final_norm = final_norm.get();
-            weights.lm_head = lm_head.get();
-            LOG_DEBUG("[PPStageRunner] Loaded final_norm and lm_head for stage");
-        }
-        else
-        {
-            weights.final_norm = nullptr;
-            weights.lm_head = nullptr;
-            LOG_DEBUG("[PPStageRunner] Stage does not own lm_head (has_lm_head=false)");
-        }
-
         // =====================================================================
         // Eagerly load ONLY this stage's layer weights into cache
         // =====================================================================
-        const std::string arch = model_ctx->architecture();
         auto schema_factory = SchemaFactoryRegistry::getFactory(arch);
 
         const int first_layer = pp_config.first_layer;
@@ -1140,7 +1097,7 @@ namespace llaminar2
 
         // Validate layer weights against schema before loading.
         auto pp_validation = validateLayerWeights(
-            *schema_factory, model_ctx->blockCount(),
+            *schema_factory, model_ctx->totalBlockCount(),
             [&](const std::string &name)
             { return model_ctx->hasTensor(name); },
             first_layer, last_layer);
@@ -1151,6 +1108,39 @@ namespace llaminar2
             return false;
         }
 
+        // Load global weights this stage owns
+        if (pp_config.has_embedding)
+        {
+            auto embedding = weight_mgr->getWeightForDevice("token_embd.weight");
+            if (!embedding)
+            {
+                LOG_ERROR("[PPStageRunner] Stage has_embedding=true but token_embd.weight missing");
+                return false;
+            }
+            LOG_DEBUG("[PPStageRunner] Loaded embedding table for stage");
+        }
+
+        if (pp_config.has_lm_head)
+        {
+            auto final_norm = weight_mgr->getWeightForDevice("output_norm.weight");
+            auto lm_head = weight_mgr->getWeightForDevice("output.weight");
+            if (!lm_head)
+            {
+                auto embedding_fallback = weight_mgr->getWeightForDevice("token_embd.weight");
+                if (embedding_fallback)
+                {
+                    LOG_INFO("[PPStageRunner] output.weight not found, using tied embeddings");
+                }
+            }
+            if (!final_norm)
+            {
+                LOG_ERROR("[PPStageRunner] Stage has_lm_head=true but output_norm weight missing");
+                return false;
+            }
+            LOG_DEBUG("[PPStageRunner] Loaded final_norm and lm_head for stage");
+        }
+
+        // Load layer weights
         for (const auto &[weight_name, is_optional] : pp_validation.weights_to_load)
         {
             auto weight = weight_mgr->getWeightForDevice(weight_name);
@@ -1171,31 +1161,50 @@ namespace llaminar2
         LOG_DEBUG("[PPStageRunner] All layer weights for stage loaded into cache");
 
         // =====================================================================
-        // Finalize weights: GEMM pack → upload → release host copies
+        // Prepare weights: GEMM pack + upload (layer-filtered, no host release)
+        // Host copies are released by the caller after ALL PP stages are prepared.
         // =====================================================================
-        weight_mgr->finalizeForDevice(device);
+        bool prepare_ok = weight_mgr->prepareWeightsForDevice(
+            device, first_layer, last_layer,
+            pp_config.has_embedding, pp_config.has_lm_head);
+
+        if (!prepare_ok)
+        {
+            LOG_WARN("[PPStageRunner] Weight preparation had issues for device "
+                     << device.to_string() << " layers [" << first_layer << ", " << last_layer << ")");
+        }
 
         // =====================================================================
-        // Layer weight accessor - returns weights ONLY for this stage's layers
-        // =====================================================================
-        // Layer weight accessor via polymorphic builder (handles GDN/FA layers)
+        // Build weights via polymorphic builder AFTER finalization
+        // (ensures getWeightForDevice returns per-device clones with stable pointers)
         // =====================================================================
         auto config_builder = createGraphConfigBuilder(arch);
         auto builder_weights = config_builder->buildWeights(
-            [weight_mgr](const std::string &name)
+            [weight_mgr, device](const std::string &name)
             {
-                return weight_mgr->getWeightForDevice(name);
+                return weight_mgr->getWeightForDevice(name, device);
             });
 
-        // Use the builder's model-aware get_layer_weights, augmented with
-        // PP layer-range validation
+        ModelWeights weights;
+
+        // Set global weight pointers from builder (post-finalization, stable pointers)
+        if (pp_config.has_embedding)
+        {
+            weights.embedding_table = builder_weights.embedding_table;
+        }
+        if (pp_config.has_lm_head)
+        {
+            weights.final_norm = builder_weights.final_norm;
+            weights.lm_head = builder_weights.lm_head;
+        }
+
+        // Layer weight accessor via polymorphic builder with PP layer-range validation
         const int stage_first_layer = first_layer;
         const int stage_last_layer = last_layer;
         auto builder_get_layer = builder_weights.get_layer_weights;
 
         weights.get_layer_weights = [builder_get_layer, stage_first_layer, stage_last_layer](int layer_idx) -> LayerWeights
         {
-            // Validate layer is within this stage's range
             if (layer_idx < stage_first_layer || layer_idx >= stage_last_layer)
             {
                 LOG_ERROR("[PPStageRunner] Layer " << layer_idx << " requested but stage only owns ["
@@ -1426,7 +1435,7 @@ namespace llaminar2
     // =========================================================================
 
     std::unique_ptr<IInferenceRunner> createPPStageRunner(
-        std::shared_ptr<ModelContext> stage_ctx,
+        std::shared_ptr<ModelContext> model_ctx,
         DeviceId device,
         const FactoryPPStageConfig &pp_config,
         const InferenceRunnerConfig &config)
@@ -1439,9 +1448,9 @@ namespace llaminar2
         // =====================================================================
         // Validate inputs
         // =====================================================================
-        if (!stage_ctx)
+        if (!model_ctx)
         {
-            LOG_ERROR("[PPStageRunner] stage_ctx is null");
+            LOG_ERROR("[PPStageRunner] model_ctx is null");
             return nullptr;
         }
 
@@ -1461,31 +1470,26 @@ namespace llaminar2
         // =====================================================================
         // Validate architecture
         // =====================================================================
-        std::string architecture = stage_ctx->architecture();
+        std::string architecture = model_ctx->architecture();
         if (!SchemaFactoryRegistry::isSupported(architecture))
         {
             LOG_ERROR("[PPStageRunner] Unsupported architecture: " << architecture);
             return nullptr;
         }
 
-        // =====================================================================
-        // Configure weight sharding from architecture-specific schema (model-agnostic)
-        // =====================================================================
-        auto weight_mgr = stage_ctx->concreteWeightManager();
-        if (weight_mgr)
-        {
-            WeightManagerConfig wm_config;
-            wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
-            weight_mgr->configure(wm_config);
-            LOG_DEBUG("[PPStageRunner] Applied " << architecture << " weight config to WeightManager");
-        }
+        // Weight sharding configuration is applied once via the shared WeightManager.
 
         // =====================================================================
         // Build GraphConfig via polymorphic builder
         // =====================================================================
         auto config_builder = createGraphConfigBuilder(architecture);
         GraphConfig graph_config;
-        config_builder->populateFromModelContext(*stage_ctx, graph_config);
+        config_builder->populateFromModelContext(*model_ctx, graph_config);
+
+        // Override n_layers for PP stage: graph builds only this stage's layers,
+        // not the full model. total_n_layers retains the full model count for
+        // GDN/FA pattern detection etc.
+        graph_config.n_layers = pp_config.layerCount();
 
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
@@ -1584,18 +1588,17 @@ namespace llaminar2
         // =====================================================================
         // Load weights for this PP stage (partial weight loading)
         // =====================================================================
-        if (!configurePPStageWeightsImpl(orchestrator.get(), stage_ctx, device, pp_config))
+        if (!configurePPStageWeightsImpl(orchestrator.get(), model_ctx, device, pp_config))
         {
             LOG_ERROR("[PPStageRunner] Failed to configure PP stage weights");
             return nullptr;
         }
 
         // =====================================================================
-        // Retain ModelContext to prevent dangling WeightManager::loader_ reference
-        // WeightManager stores IModelLoader& which is a member of ModelContext.
-        // Without this, stage_ctx goes out of scope and destroys the ModelLoader.
+        // Retain ModelContext to keep the shared ModelLoader and WeightManager
+        // alive for the lifetime of this PP stage runner.
         // =====================================================================
-        orchestrator->retainModelContext(stage_ctx);
+        orchestrator->retainModelContext(model_ctx);
 
         // =====================================================================
         // Note: No GPU collective setup for PP stages
@@ -1675,9 +1678,10 @@ namespace llaminar2
             graph_config.kv_rotation = kv_rotation.get();
         }
 
-        // PP layer offset for nested TP-in-PP (partial graph with layer offset)
+        // PP layer range for nested TP-in-PP (partial graph with layer offset)
         if (config.pp_stage_config.has_value())
         {
+            graph_config.n_layers = config.pp_stage_config->layerCount();
             graph_config.pp_layer_offset = config.pp_stage_config->first_layer;
         }
 

@@ -85,6 +85,8 @@ namespace llaminar2
          * - CUTLASS Tensor Core: 50-90 TFLOPS on RTX 3090
          * - Activation quantization: Per-row symmetric, fused with GEMM launch
          */
+        struct CUDAConcurrentPrefillPool; // Forward declaration (definition in .cpp)
+
         class CUDAQuantisedGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
@@ -469,6 +471,9 @@ namespace llaminar2
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;
+
+            // Per-kernel concurrent prefill stream pool (owns CUDA streams + scratch)
+            std::unique_ptr<CUDAConcurrentPrefillPool> prefill_pool_;
 
             // PIMPL for CUTLASS implementation (definition in .cpp)
             std::unique_ptr<Impl> impl_;

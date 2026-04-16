@@ -463,7 +463,6 @@ static const std::vector<TestConfig> kMyArchSingleDeviceConfigs = {
         .name = "MyArch_CPU_KV_FP16",
         .devices = {ParityDeviceType::CPU},
         .parallelism = Parallelism::None,
-        .collective = Collective::None,
         .thresholds = {
             .cosine_threshold = 0.999f,
             .decode_cosine_threshold = 0.99f,

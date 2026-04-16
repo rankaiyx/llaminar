@@ -20,7 +20,6 @@
 #include "../../loaders/ModelContext.h"
 #include "../../loaders/ModelContextConfig.h"
 #include "../../loaders/ModelLoader.h"
-#include "../../loaders/SharedWeightPool.h"
 #include "../local_execution/graph/SchemaFactoryRegistry.h"
 #include "../../backends/ComputeBackend.h"
 #include "../../tensors/TensorFactory.h"
@@ -1071,22 +1070,6 @@ namespace llaminar2
                                                 << ", embedding=" << weight_config.has_embedding
                                                 << ", lm_head=" << weight_config.has_lm_head << ")");
 
-        // For PP mode: create SharedWeightPool so stages share weight tensors
-        // instead of each stage independently re-parsing GGUF
-        if (plan_built_ && !plan_.local_pp_devices.empty() && plan_.local_pp_devices.size() > 1)
-        {
-            shared_pool_ = SharedWeightPool::create();
-            if (shared_pool_ && shared_pool_->loadFromGGUF(model_path))
-            {
-                LOG_INFO("SharedWeightPool created for PP mode (" << shared_pool_->tensorCount() << " tensors)");
-            }
-            else
-            {
-                LOG_WARN("Failed to create SharedWeightPool — PP stages will load weights independently");
-                shared_pool_.reset();
-            }
-        }
-
         return true;
     }
 
@@ -1296,14 +1279,7 @@ namespace llaminar2
         GlobalBackendRouter::initForTests();
 
         std::unique_ptr<MultiDeviceOrchestrator> orch;
-        if (shared_pool_)
-        {
-            orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, shared_pool_, mdo_config);
-        }
-        else
-        {
-            orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, mdo_config);
-        }
+        orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, mdo_config);
         runner_ = std::move(orch);
 
         LOG_INFO("Local PP compute graph built successfully");

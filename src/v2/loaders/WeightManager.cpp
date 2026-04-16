@@ -5,7 +5,6 @@
  */
 
 #include "WeightManager.h"
-#include "WeightViewSet.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
 #include "../utils/DebugEnv.h"
@@ -140,15 +139,42 @@ namespace llaminar2
         std::unordered_set<TensorBase *> released;
         bool found_any = false;
 
+        // Helper: safely release a tensor's host data only if it has a device
+        // copy (GPU upload or kernel-managed packed data). Floating-point CPU
+        // GEMM kernels (oneDNN) read weight_tensor_->data() live at every
+        // inference call, so host data must be retained for CPU-only weights.
+        auto safe_release = [&](TensorBase *ptr, const std::string &key)
+        {
+            if (!ptr || !released.insert(ptr).second)
+                return;
+
+            if (ptr->is_raw_data_released())
+                return; // Already released
+
+            // Same safety check as releaseAllHostWeightData: only release if
+            // the tensor has a valid GPU copy OR kernel-managed device data.
+            if (!ptr->deviceValid())
+            {
+                bool has_kernel_device_data =
+                    ptr->hasCachedDeviceData(DeviceType::CUDA) ||
+                    ptr->hasCachedDeviceData(DeviceType::ROCm);
+
+                if (!has_kernel_device_data)
+                {
+                    LOG_DEBUG("[WeightManager][Phase2] Skipped reclaim for host-only weight: " << key
+                                                                                               << " (no device copy)");
+                    return;
+                }
+            }
+
+            ptr->release_host_weight_data();
+            found_any = true;
+        };
+
         auto base_it = cache_.find(name);
         if (base_it != cache_.end() && base_it->second)
         {
-            TensorBase *ptr = base_it->second.get();
-            if (released.insert(ptr).second)
-            {
-                ptr->release_host_weight_data();
-                found_any = true;
-            }
+            safe_release(base_it->second.get(), name);
         }
 
         const std::string suffix = ":" + name;
@@ -161,18 +187,13 @@ namespace llaminar2
             if (key.size() >= suffix.size() &&
                 key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0)
             {
-                TensorBase *ptr = tensor.get();
-                if (released.insert(ptr).second)
-                {
-                    ptr->release_host_weight_data();
-                    found_any = true;
-                }
+                safe_release(tensor.get(), key);
             }
         }
 
         if (!found_any)
         {
-            LOG_WARN("[WeightManager][Phase2] Reclaim requested but no tensors found for: " << name);
+            LOG_DEBUG("[WeightManager][Phase2] Reclaim requested but no reclaimable tensors for: " << name);
         }
 
         return found_any;
@@ -2075,10 +2096,35 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Weight Lifecycle (single entry points)
+    // Weight Preparation (repack + upload, NO host release)
     // =========================================================================
 
-    bool WeightManager::finalizeForDevice(DeviceId device)
+    bool WeightManager::prepareWeightsForDevice(DeviceId device)
+    {
+        return prepareWeightsForDeviceImpl(device, nullptr);
+    }
+
+    bool WeightManager::prepareWeightsForDevice(
+        DeviceId device,
+        int first_layer, int last_layer,
+        bool has_embedding, bool has_lm_head)
+    {
+        auto layer_filter = [this, first_layer, last_layer, has_embedding, has_lm_head](
+                                const std::string &name) -> bool
+        {
+            return isWeightInLayerRange(name, first_layer, last_layer, has_embedding, has_lm_head);
+        };
+
+        LOG_INFO("[WeightManager] prepareWeightsForDevice(" << device.to_string()
+                                                            << " layers=[" << first_layer << ", " << last_layer << ")"
+                                                            << " embed=" << has_embedding << " lm_head=" << has_lm_head << ")");
+
+        return prepareWeightsForDeviceImpl(device, layer_filter);
+    }
+
+    bool WeightManager::prepareWeightsForDeviceImpl(
+        DeviceId device,
+        std::function<bool(const std::string &)> layer_filter)
     {
         const bool is_gpu = device.is_gpu();
         const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
@@ -2087,15 +2133,54 @@ namespace llaminar2
         std::future<bool> gemm_future;
         if (is_gpu)
         {
-            gemm_future = std::async(std::launch::async, [this, device]()
-                                     { return packGemmWeights(device, nullptr, /*release_raw_data=*/true); });
+            gemm_future = std::async(std::launch::async, [this, device, &layer_filter]()
+                                     { return packGemmWeights(device, nullptr, /*release_raw_data=*/false, layer_filter); });
         }
 
         // Step 2: Upload non-GEMM weights (norms, embeddings) to device
-        bool non_gemm_ok = uploadNonGemmWeights(device);
-        if (!non_gemm_ok)
+        bool non_gemm_ok = true;
+        if (is_gpu)
         {
-            LOG_WARN("[WeightManager] Non-GEMM weight upload failed for " << device_name);
+            non_gemm_ok = uploadNonGemmWeights(device, layer_filter);
+            if (!non_gemm_ok)
+            {
+                LOG_WARN("[WeightManager] Non-GEMM weight upload failed for " << device_name);
+            }
+        }
+
+        // Step 2b: Prepare embedding weights for GPU devices.
+        // Repacks from native quantized format (Q8_0, etc.) → EmbedQ8Block
+        // and uploads to GPU memory, following the PreparedGemmWeights pattern.
+        // Only if no layer_filter or if filter includes embedding.
+        if (is_gpu && (!layer_filter || layer_filter("token_embd.weight")))
+        {
+            using namespace llaminar::v2::kernels;
+            const int d_model = static_cast<int>(loader_.embeddingLength());
+
+            const TensorBase *embed_tensor = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                const std::string device_key = device.to_string() + ":token_embd.weight";
+                auto pdit = per_device_cache_.find(device_key);
+                if (pdit != per_device_cache_.end() && pdit->second)
+                    embed_tensor = pdit->second.get();
+                else
+                {
+                    auto it = cache_.find("token_embd.weight");
+                    if (it != cache_.end() && it->second)
+                        embed_tensor = it->second.get();
+                }
+            }
+
+            if (embed_tensor && d_model > 0)
+            {
+                auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
+                    embed_tensor, d_model, device, /*vocab_offset=*/0, /*total_vocab=*/0);
+                if (!handle)
+                    LOG_WARN("[WeightManager] Embedding preparation failed for " << device_name);
+                else
+                    LOG_DEBUG("[WeightManager] Embedding prepared for " << device_name);
+            }
         }
 
         // Step 3: Wait for GEMM pack (or do sync pack for CPU)
@@ -2106,7 +2191,7 @@ namespace llaminar2
         }
         else
         {
-            gemm_ok = packGemmWeights(device, nullptr, /*release_raw_data=*/true);
+            gemm_ok = packGemmWeights(device, nullptr, /*release_raw_data=*/false, layer_filter);
         }
 
         if (!gemm_ok)
@@ -2115,15 +2200,30 @@ namespace llaminar2
                                                                        << ", will use lazy kernel creation");
         }
 
-        // Step 4: Release host copies now that everything is on GPU
-        if (is_gpu && gemm_ok && non_gemm_ok)
+        return gemm_ok && non_gemm_ok;
+    }
+
+    // =========================================================================
+    // Weight Lifecycle (convenience entry points)
+    // =========================================================================
+
+    bool WeightManager::finalizeForDevice(DeviceId device)
+    {
+        const bool is_gpu = device.is_gpu();
+        const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
+
+        // Phase 1: Prepare (pack + upload, no release)
+        bool ok = prepareWeightsForDevice(device);
+
+        // Phase 2: Release host copies (only for GPU, since CPU reads from host)
+        if (is_gpu && ok)
         {
             size_t released = releaseAllHostWeightData();
             LOG_INFO("[WeightManager] finalizeForDevice(" << device_name
                                                           << "): released " << released << " host tensors");
         }
 
-        return gemm_ok && non_gemm_ok;
+        return ok;
     }
 
     bool WeightManager::finalizeForDevices(const std::vector<DeviceId> &devices)
@@ -2263,7 +2363,8 @@ namespace llaminar2
     bool WeightManager::packGemmWeights(
         DeviceId target_device,
         PreloadProgressCallback progress_cb,
-        bool release_raw_data)
+        bool release_raw_data,
+        std::function<bool(const std::string &)> layer_filter)
     {
         using namespace llaminar::v2::kernels;
         using Clock = std::chrono::high_resolution_clock;
@@ -2329,6 +2430,8 @@ namespace llaminar2
                     const std::string name = key.substr(device_prefix.size());
                     if (isGemmWeight(name) && tensor)
                     {
+                        if (layer_filter && !layer_filter(name))
+                            continue;
                         gemm_weights.emplace_back(name, tensor);
                     }
                 }
@@ -2341,6 +2444,8 @@ namespace llaminar2
                 {
                     if (isGemmWeight(name) && tensor)
                     {
+                        if (layer_filter && !layer_filter(name))
+                            continue;
                         gemm_weights.emplace_back(name, tensor);
                     }
                 }
@@ -2631,7 +2736,13 @@ namespace llaminar2
                     {
                         markPrepState(job.name, target_device, WeightPrepState::PACKED_HOST, true, "GEMM packed on CPU");
                         local_cpu_packed.fetch_add(1, std::memory_order_relaxed);
-                        if (release_raw_data && job.tensor)
+                        // Only release host data for quantized tensors on CPU.
+                        // Quantized GEMM kernels (VNNI) prepack data into their own buffers,
+                        // so the original host data is no longer needed.
+                        // Floating-point GEMM (oneDNN) reads weight_tensor_->data() live
+                        // at every inference call — releasing would cause a null dereference.
+                        if (release_raw_data && job.tensor &&
+                            dynamic_cast<IINT8Unpackable *>(job.tensor.get()))
                         {
                             job.tensor->release_host_weight_data();
                         }
@@ -2710,7 +2821,9 @@ namespace llaminar2
         return all_success.load(std::memory_order_relaxed);
     }
 
-    bool WeightManager::uploadNonGemmWeights(DeviceId target_device)
+    bool WeightManager::uploadNonGemmWeights(
+        DeviceId target_device,
+        std::function<bool(const std::string &)> layer_filter)
     {
         if (!target_device.is_gpu())
         {
@@ -2732,6 +2845,8 @@ namespace llaminar2
             {
                 if (!isGemmWeight(name) && tensor)
                 {
+                    if (layer_filter && !layer_filter(name))
+                        continue;
                     non_gemm_names.push_back(name);
                 }
             }
@@ -3770,18 +3885,33 @@ namespace llaminar2
         {
             return true;
         }
+        return isWeightInLayerRange(name, layer_first_, layer_last_, has_embedding_, has_lm_head_);
+    }
 
+    bool WeightManager::isWeightInLayerRange(const std::string &name,
+                                             int first_layer, int last_layer,
+                                             bool has_embedding, bool has_lm_head) const
+    {
         // Handle special weights (embedding, output norm, LM head)
         if (name == "token_embd.weight")
         {
-            // Allow embedding through if this stage owns the LM head too —
-            // tied-embedding models (e.g. Qwen3.5) have no output.weight and
-            // the LM head falls back to token_embd.weight.
-            return has_embedding_ || has_lm_head_;
+            if (has_embedding)
+            {
+                return true;
+            }
+            // Allow embedding through for the LM head stage ONLY if the model
+            // uses tied embeddings (no separate output.weight in GGUF).
+            if (has_lm_head)
+            {
+                auto output_shape = loader_.getTensorShape("output.weight");
+                bool tied = !output_shape || output_shape->empty();
+                return tied;
+            }
+            return false;
         }
         if (name == "output_norm.weight" || name == "output.weight")
         {
-            return has_lm_head_;
+            return has_lm_head;
         }
 
         // Extract layer index from "blk.N.xxx" pattern
@@ -3792,35 +3922,12 @@ namespace llaminar2
         {
             int layer_idx = std::stoi(match[1].str());
             // Layer range is [first, last) - first inclusive, last exclusive
-            return layer_idx >= layer_first_ && layer_idx < layer_last_;
+            return layer_idx >= first_layer && layer_idx < last_layer;
         }
 
         // Unknown weight pattern - include by default (e.g., custom weights)
         LOG_DEBUG("[WeightManager] Unknown weight pattern, including: " << name);
         return true;
-    }
-
-    // =========================================================================
-    // SharedWeightPool integration
-    // =========================================================================
-
-    void WeightManager::populateCacheFromPool(const WeightViewSet &views)
-    {
-        std::unique_lock<std::mutex> lock(cache_mutex_);
-
-        size_t populated = 0;
-        for (const auto &view : views)
-        {
-            if (view.tensor)
-            {
-                cache_[view.name] = view.tensor; // shared_ptr — no data copy
-                populated++;
-            }
-        }
-
-        LOG_INFO("[WeightManager] Pre-populated cache with " << populated
-                                                             << " tensors from SharedWeightPool"
-                                                             << " (layer range [" << layer_first_ << ", " << layer_last_ << "))");
     }
 
 } // namespace llaminar2

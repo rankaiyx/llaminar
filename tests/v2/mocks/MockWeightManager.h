@@ -161,7 +161,8 @@ namespace llaminar2::test
         bool packGemmWeights(
             DeviceId /* target_device */,
             PreloadProgressCallback /* progress_cb */ = nullptr,
-            bool /* release_raw_data */ = false) override
+            bool /* release_raw_data */ = false,
+            std::function<bool(const std::string &)> /* layer_filter */ = nullptr) override
         {
             return true; // Mock always succeeds
         }
@@ -169,7 +170,9 @@ namespace llaminar2::test
         /**
          * @brief Upload all non-GEMM weights to GPU (mock: no-op)
          */
-        bool uploadNonGemmWeights(DeviceId /* target_device */) override
+        bool uploadNonGemmWeights(
+            DeviceId /* target_device */,
+            std::function<bool(const std::string &)> /* layer_filter */ = nullptr) override
         {
             return true; // Mock always succeeds
         }

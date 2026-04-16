@@ -36,6 +36,7 @@
 #include <string>
 #include <vector>
 #include <cstddef>
+#include <functional>
 
 namespace llaminar2
 {
@@ -231,16 +232,49 @@ namespace llaminar2
         // Lifecycle (default no-ops — concrete WeightManager overrides these)
         // =========================================================================
 
+        // =========================================================================
+        // Weight Preparation (repack + upload, NO host release)
+        // =========================================================================
+
+        /**
+         * @brief Prepare weights for a single device (pack + upload, no release)
+         *
+         * Runs GEMM packing, non-GEMM upload, and embedding preparation.
+         * Does NOT release host copies — call releaseAllHostWeightData() separately
+         * after ALL devices are prepared.
+         *
+         * @param device Target device
+         * @return true on success
+         */
+        virtual bool prepareWeightsForDevice(DeviceId /*device*/) { return true; }
+
+        /**
+         * @brief Prepare weights for a single device, filtered to a layer range
+         *
+         * Same as prepareWeightsForDevice(device) but only processes weights
+         * belonging to the specified layer range. Used by Pipeline Parallelism.
+         *
+         * @param device Target device
+         * @param first_layer First layer index (inclusive)
+         * @param last_layer Last layer index (exclusive)
+         * @param has_embedding Whether this stage owns the embedding table
+         * @param has_lm_head Whether this stage owns the LM head
+         * @return true on success
+         */
+        virtual bool prepareWeightsForDevice(
+            DeviceId /*device*/,
+            int /*first_layer*/, int /*last_layer*/,
+            bool /*has_embedding*/, bool /*has_lm_head*/) { return true; }
+
+        // =========================================================================
+        // Weight Lifecycle (convenience entry points)
+        // =========================================================================
+
         /**
          * @brief Complete weight lifecycle for a single device
          *
-         * Runs the full pack → upload → release sequence:
-         * 1. Pack GEMM weights (prepareWeights + GPU upload)
-         * 2. Upload non-GEMM weights (norms, embeddings)
-         * 3. Release host weight data (if GPU device)
-         *
-         * Call ONCE per device, AFTER all weights are loaded and sharding
-         * is configured. Idempotent — second call is a no-op.
+         * Convenience: prepareWeightsForDevice() + releaseAllHostWeightData().
+         * Use when there is only ONE device and no PP sharing.
          *
          * @param device Target device
          * @return true on success
@@ -263,18 +297,21 @@ namespace llaminar2
         virtual bool finalizeForDevices(const std::vector<DeviceId> & /*devices*/) { return true; }
 
         // =========================================================================
-        // Internal Lifecycle (called by finalizeForDevice/finalizeForDevices)
+        // Internal Lifecycle (called by prepareWeightsForDevice/finalizeForDevice)
         // =========================================================================
         // These methods are public for testability but should NOT be called
-        // directly in production code. Use finalizeForDevice() or
-        // finalizeForDevices() instead.
+        // directly in production code. Use prepareWeightsForDevice() or
+        // finalizeForDevice() instead.
 
         virtual bool packGemmWeights(
             DeviceId /*target_device*/,
             PreloadProgressCallback /*progress_cb*/ = nullptr,
-            bool /*release_raw_data*/ = false) { return true; }
+            bool /*release_raw_data*/ = false,
+            std::function<bool(const std::string &)> /*layer_filter*/ = nullptr) { return true; }
 
-        virtual bool uploadNonGemmWeights(DeviceId /*target_device*/) { return true; }
+        virtual bool uploadNonGemmWeights(
+            DeviceId /*target_device*/,
+            std::function<bool(const std::string &)> /*layer_filter*/ = nullptr) { return true; }
 
         virtual bool preloadForDevices(const std::vector<DeviceId> & /*devices*/) { return true; }
 

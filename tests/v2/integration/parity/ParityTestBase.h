@@ -582,10 +582,16 @@ namespace llaminar2::test::parity
         std::string name;                      ///< Human-readable test name
         std::vector<ParityDeviceType> devices; ///< Device list (heterogeneous supported)
         Parallelism parallelism;               ///< Parallelism strategy
-        Collective collective;                 ///< Collective backend
-        BackendThresholds thresholds;          ///< Parity thresholds
-        std::string skip_reason;               ///< If non-empty, test will skip with this message
-        int mpi_ranks = 1;                     ///< Required MPI ranks for GlobalTP tests
+
+        /// Collective backend for TP modes (LocalTP, GlobalTP, NodeLocalTP).
+        /// PP modes should leave this as None — PP transfers are auto-selected
+        /// by LocalPPContext based on device vendor types. For hybrid PP+TP,
+        /// use tp_collective instead.
+        Collective collective = Collective::None;
+
+        BackendThresholds thresholds; ///< Parity thresholds
+        std::string skip_reason;      ///< If non-empty, test will skip with this message
+        int mpi_ranks = 1;            ///< Required MPI ranks for GlobalTP tests
 
         /// Model path override. If non-empty, overrides ParityConfig::model_path.
         /// Use this to test different quantization formats (e.g., Q4_0 vs Q8_0)
@@ -2489,11 +2495,8 @@ namespace llaminar2::test::parity
                 // If this is a TP domain (multiple devices), set TP backend
                 if (stage_config.isTPDomain())
                 {
-                    // Use tp_collective from config, falling back to the main collective
-                    Collective tp_backend = cfg().tp_collective != Collective::None
-                                                ? cfg().tp_collective
-                                                : cfg().collective;
-                    stage_config.tp_backend = toCollectiveBackend(tp_backend);
+                    // Use tp_collective for intra-stage TP backend
+                    stage_config.tp_backend = toCollectiveBackend(cfg().tp_collective);
 
                     // Equal TP weights for this domain
                     for (int d = 0; d < stage_device_count; ++d)

@@ -111,8 +111,9 @@ namespace llaminar2::test::parity::qwen2
     /**
      * @brief Extended hardware availability check for Qwen2 tests
      *
-     * Extends the base checkHardwareAvailability() with collective backend checks
-     * (NCCL, RCCL, HOST availability).
+     * Extends the base checkHardwareAvailability() with collective backend checks.
+     * For TP modes, checks cfg.collective. For hybrid PP+TP, checks cfg.tp_collective.
+     * For pure PP, no collective check needed (transfers are auto-selected).
      */
     inline std::optional<std::string> checkQwen2HardwareAvailability(const TestConfig &cfg)
     {
@@ -120,8 +121,15 @@ namespace llaminar2::test::parity::qwen2
         if (auto reason = checkHardwareAvailability(cfg))
             return reason;
 
-        // Additional checks for collective backends
-        switch (cfg.collective)
+        // Determine which collective to check:
+        // - TP modes use cfg.collective
+        // - Hybrid PP+TP uses cfg.tp_collective (intra-stage TP backend)
+        // - Pure PP has no collective to check
+        Collective effective_collective = cfg.collective;
+        if (cfg.is_local_pp() && cfg.is_hybrid_pp_tp())
+            effective_collective = cfg.tp_collective;
+
+        switch (effective_collective)
         {
         case Collective::NCCL:
             if (!isNcclAvailable())
@@ -234,10 +242,8 @@ namespace llaminar2::test::parity::qwen2
                             stage_devices.push_back(all_devices[device_offset++]);
                         }
 
-                        // Use tp_collective for intra-stage TP, fallback to main collective
-                        CollectiveBackendType tp_backend = cfg.tp_collective != Collective::None
-                                                               ? toCollectiveBackend(cfg.tp_collective)
-                                                               : toCollectiveBackend(cfg.collective);
+                        // Use tp_collective for intra-stage TP backend
+                        CollectiveBackendType tp_backend = toCollectiveBackend(cfg.tp_collective);
 
                         pp_children.push_back(
                             TP("stage" + std::to_string(s) + "_tp",
@@ -907,7 +913,16 @@ namespace llaminar2::test::parity::qwen2
             LOG_INFO("╠══════════════════════════════════════════════════════════════════╣");
             LOG_INFO("║  Devices: " << cfg().device_count() << "x " << deviceTypeName(cfg().primary_device()));
             LOG_INFO("║  Parallelism: " << parallelismName(cfg().parallelism));
-            LOG_INFO("║  Collective: " << collectiveName(cfg().collective));
+            if (cfg().is_local_pp())
+            {
+                if (cfg().is_hybrid_pp_tp())
+                    LOG_INFO("║  TP Collective: " << collectiveName(cfg().tp_collective));
+                // Pure PP: no collective to display (transfers auto-selected)
+            }
+            else
+            {
+                LOG_INFO("║  Collective: " << collectiveName(cfg().collective));
+            }
             if (!cfg().model_path.empty())
                 LOG_INFO("║  Model: " << cfg().model_path);
             LOG_INFO("╚══════════════════════════════════════════════════════════════════╝");

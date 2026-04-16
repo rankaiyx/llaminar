@@ -38,7 +38,6 @@
 
 namespace llaminar2
 {
-    class WeightViewSet; // Forward declaration for populateCacheFromPool()
 
     // WeightDistributionStrategy and ShardingMode are now in WeightTypes.h
     // (included transitively via WeightManagerConfig.h → WeightTypes.h)
@@ -73,7 +72,7 @@ namespace llaminar2
                       std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
                       std::shared_ptr<WeightPlacementMap> placement_map = nullptr,
                       WeightDistributionStrategy strategy = WeightDistributionStrategy::REPLICATED,
-                      WeightPrecision weight_precision = WeightPrecision::CONVERT_TO_FP32);
+                      WeightPrecision weight_precision = WeightPrecision::NATIVE);
 
         /**
          * @brief Get weight tensor for a specific device (device-isolated instance)
@@ -111,13 +110,50 @@ namespace llaminar2
         // Weight Lifecycle (single entry points)
         // =========================================================================
 
+        // =========================================================================
+        // Weight Preparation (repack + upload, NO host release)
+        // =========================================================================
+
+        /**
+         * @brief Prepare weights for a single device (pack + upload, no release)
+         *
+         * Runs GEMM packing, non-GEMM upload, and embedding preparation for
+         * all weights currently in cache. Does NOT release host copies.
+         * Call releaseAllHostWeightData() separately after ALL devices are prepared.
+         *
+         * @param device Target device
+         * @return true on success
+         */
+        bool prepareWeightsForDevice(DeviceId device) override;
+
+        /**
+         * @brief Prepare weights for a single device, filtered to a layer range
+         *
+         * Same as prepareWeightsForDevice(device) but only processes weights
+         * belonging to the specified layer range. Used by Pipeline Parallelism
+         * stages to avoid packing weights that belong to other stages.
+         *
+         * @param device Target device
+         * @param first_layer First layer index (inclusive)
+         * @param last_layer Last layer index (exclusive)
+         * @param has_embedding Whether this stage owns the embedding table
+         * @param has_lm_head Whether this stage owns the LM head
+         * @return true on success
+         */
+        bool prepareWeightsForDevice(
+            DeviceId device,
+            int first_layer, int last_layer,
+            bool has_embedding, bool has_lm_head) override;
+
+        // =========================================================================
+        // Weight Lifecycle (convenience entry points)
+        // =========================================================================
+
         /**
          * @brief Complete weight lifecycle for a single device
          *
-         * Runs the full pack → upload → release sequence:
-         * 1. Pack GEMM weights (async on GPU, sync on CPU)
-         * 2. Upload non-GEMM weights (norms, embeddings)
-         * 3. Release host weight data (GPU only, after successful pack+upload)
+         * Convenience method: prepareWeightsForDevice() + releaseAllHostWeightData().
+         * Use when there is only ONE device and no PP sharing.
          *
          * @param device Target device
          * @return true on success
@@ -156,7 +192,8 @@ namespace llaminar2
         bool packGemmWeights(
             DeviceId target_device,
             PreloadProgressCallback progress_cb = nullptr,
-            bool release_raw_data = false) override;
+            bool release_raw_data = false,
+            std::function<bool(const std::string &)> layer_filter = nullptr) override;
 
         /**
          * @brief Upload all non-GEMM weights to GPU
@@ -168,7 +205,9 @@ namespace llaminar2
          * @param target_device Target GPU device
          * @return true if all non-GEMM weights were uploaded successfully
          */
-        bool uploadNonGemmWeights(DeviceId target_device) override;
+        bool uploadNonGemmWeights(
+            DeviceId target_device,
+            std::function<bool(const std::string &)> layer_filter = nullptr) override;
 
         /**
          * @brief Release ALL host-side weight data after all GPU uploads are complete
@@ -269,9 +308,12 @@ namespace llaminar2
                 has_layer_range_ = true;
             }
 
-            // Single cache invalidation
+            // Invalidate sharding mode cache (sharding config may have changed).
+            // NOTE: We intentionally do NOT clear cache_ here. Sharding config
+            // changes affect how weights are SLICED, not the raw loaded data.
+            // Clearing cache_ would destroy weights loaded by previous PP stages
+            // when the shared WeightManager is configured multiple times.
             sharding_mode_cache_.clear();
-            cache_.clear();
         }
 
         /**
@@ -457,17 +499,6 @@ namespace llaminar2
 
         /**
          * @brief Pre-populate cache with shared tensors from a WeightViewSet
-         *
-         * Used by SharedWeightPool-based PP to avoid re-loading tensors from disk.
-         * The shared_ptr ownership is shared between the pool and this cache,
-         * so no tensor data is duplicated on host.
-         *
-         * Must be called BEFORE any getWeightForDevice() calls.
-         *
-         * @param views Weight view set containing shared tensors for this stage
-         */
-        void populateCacheFromPool(const WeightViewSet &views);
-
         // =========================================================================
         // Static utility methods (public for tensor slicing)
         // =========================================================================
@@ -666,6 +697,27 @@ namespace llaminar2
          * @return true if weight should be loaded, false if filtered out
          */
         bool isWeightInLayerRange(const std::string &name) const;
+
+        /**
+         * @brief Check if a weight belongs to a given layer range (explicit parameters)
+         *
+         * Same logic as isWeightInLayerRange(name) but uses explicit parameters
+         * instead of instance state. Used by prepareWeightsForDevice(layer_range)
+         * for layer-filtered preparation.
+         */
+        bool isWeightInLayerRange(const std::string &name,
+                                  int first_layer, int last_layer,
+                                  bool has_embedding, bool has_lm_head) const;
+
+        /**
+         * @brief Internal implementation of prepareWeightsForDevice
+         *
+         * Runs GEMM packing, non-GEMM upload, and embedding preparation.
+         * Optional layer_filter restricts which weights are processed.
+         */
+        bool prepareWeightsForDeviceImpl(
+            DeviceId device,
+            std::function<bool(const std::string &)> layer_filter);
 
         // =========================================================================
         // Per-device tensor cache for multi-device scenarios (LOCAL TP)

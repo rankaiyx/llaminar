@@ -288,7 +288,7 @@ namespace llaminar2
      * @endcode
      */
     std::unique_ptr<IInferenceRunner> createPPStageRunner(
-        std::shared_ptr<ModelContext> stage_ctx,
+        std::shared_ptr<ModelContext> model_ctx,
         DeviceId device,
         const FactoryPPStageConfig &pp_config,
         const InferenceRunnerConfig &config = {});

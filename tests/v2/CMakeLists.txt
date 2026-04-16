@@ -3577,30 +3577,12 @@ add_v2_test(V2_Unit_WeightSlicer
     MPI_PROCS 1
 )
 
-# Test: WeightViewSet (PP weight view accessor)
-add_executable(v2_unit_weight_view_set unit/loaders/Test__WeightViewSet.cpp)
-target_link_libraries(v2_unit_weight_view_set llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_WeightViewSet
-    COMMAND $<TARGET_FILE:v2_unit_weight_view_set>
-    LABELS "V2;Unit;PipelineParallelism;WeightSharding"
-    MPI_PROCS 1
-)
-
 # Test: PPActivationContract (PP inter-stage transfer contract)
 add_executable(v2_unit_pp_activation_contract unit/collective/Test__PPActivationContract.cpp)
 target_link_libraries(v2_unit_pp_activation_contract llaminar2_core GTest::gtest_main)
 add_v2_test(V2_Unit_PPActivationContract
     COMMAND $<TARGET_FILE:v2_unit_pp_activation_contract>
     LABELS "V2;Unit;PipelineParallelism;Collective"
-    MPI_PROCS 1
-)
-
-# Test: DeviceWeightPreparer (per-stage weight preparation for PP)
-add_executable(v2_unit_device_weight_preparer unit/kernels/Test__DeviceWeightPreparer.cpp)
-target_link_libraries(v2_unit_device_weight_preparer llaminar2_core GTest::gtest_main)
-add_v2_test(V2_Unit_DeviceWeightPreparer
-    COMMAND $<TARGET_FILE:v2_unit_device_weight_preparer>
-    LABELS "V2;Unit;PipelineParallelism;Kernels;WeightPreparation"
     MPI_PROCS 1
 )
 
@@ -9405,5 +9387,19 @@ target_include_directories(v2_test_vocab_parallel_embedding_sharding PRIVATE
 add_v2_test(V2_Unit_VocabParallelEmbeddingSharding
     COMMAND $<TARGET_FILE:v2_test_vocab_parallel_embedding_sharding>
     LABELS "V2;Unit;Loaders;WeightSharding;Embedding;VocabParallel;TensorParallelism"
+    MPI_PROCS 1
+)
+
+# Test: WeightManager_PPSafety — PP pipeline safety fixes:
+# isWeightInLayerRange tied embeddings check, tryReleaseReclaimHostRawData
+# CPU-only tensor safety, default WeightPrecision is NATIVE.
+add_executable(v2_test_weight_manager_pp_safety unit/loaders/Test__WeightManager_PPSafety.cpp)
+target_link_libraries(v2_test_weight_manager_pp_safety llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_weight_manager_pp_safety PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+add_v2_test(V2_Unit_WeightManagerPPSafety
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_pp_safety>
+    LABELS "V2;Unit;WeightManager;PipelineParallel;Safety;LayerRange"
     MPI_PROCS 1
 )

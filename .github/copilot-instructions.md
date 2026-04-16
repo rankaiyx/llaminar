@@ -1336,112 +1336,6 @@ auto do_attention_work = [&]() {
 OMP_WORKSHARE_REGION(do_attention_work);
 ```
 
-### JIT Register Guard System
-
-The JIT kernels (in `src/v2/kernels/cpu/attention/q8_1/jit/`) use Xbyak for runtime code generation. These kernels have **complex register allocation** across ZMM registers (zmm0-31) that are partitioned into zones.
-
-**Key Files** (all in `src/v2/kernels/cpu/jit/`):
-- `RegisterAllocation.h`: Zone definitions and typed register wrappers
-- `RegisterGuard.h`: RAII tracking and conflict detection
-- `RegisterEnforcement.h`: Compile-time concepts for typed access
-- `JitMicrokernelBase.h`: Base class with register accessors and tracking integration
-
-**CMake Enforcement** (`cmake/EnforceTypedRegisters.cmake`):
-- Build-time check that prevents bypassing the guard system
-- Fails cmake configure if raw Xbyak registers (`Zmm(5)`) or untracked accessors (`scratch0().zmm()`) are used
-- Enforced on all `/jit/` files except infrastructure and legacy files
-
-#### Register Zone Layout
-
-| Zone | Registers | Purpose |
-|------|-----------|---------|
-| **AccumulatorZone** | zmm0-7 | Context accumulators for attention output |
-| **QVectorZone** | zmm8-15 | Q vector data (also called Input zone) |
-| **StateZone** | zmm16-19 | Softmax state (max, sum, weight, corr) |
-| **ScratchZone** | zmm20-25 | Temporary computation |
-| **ReservedZone** | zmm26-31 | Preloaded constants (scale, log2e, etc.) |
-
-**Critical Aliasing**: XMM/YMM/ZMM registers share the same physical register file. `xmm20` aliases `zmm20`! The **ScoreZone** (xmm20-23) overlaps **ScratchZone** (zmm20-23).
-
-#### MANDATORY: Use borrow<>() for Register Access
-
-**All register access MUST use `borrow<RegType>()`** for RAII-tracked lifetime management. This is enforced at build time.
-
-```cpp
-// ❌ BAD - Raw Xbyak register (build will fail)
-Zmm zmm_temp(20);
-gen.vmovaps(Zmm(5), src);
-
-// ❌ BAD - Untracked accessor (build will fail)  
-gen.vmovaps(scratch0().zmm(), src);
-auto zmm = accum4().zmm();
-
-// ✅ GOOD - RAII tracked with borrow<>()
-auto guard = gen.borrow<Scratch0>();
-gen.vmovaps(guard.zmm(), src);
-// guard auto-releases at scope end
-```
-
-#### RAII Register Borrowing Pattern
-
-```cpp
-void emit_complex_operation(JitMicrokernelBase& gen) {
-    // Borrow registers - tracker ensures no conflicts
-    auto guard_score0 = gen.borrow<Score0>();  // xmm20
-    auto guard_score1 = gen.borrow<Score1>();  // xmm21
-    auto guard_scratch = gen.borrow<Scratch4>(); // zmm24 (safe, doesn't alias scores)
-    
-    gen.vmovss(guard_score0.xmm(), ...);
-    gen.vmovaps(guard_scratch.zmm(), ...);
-    
-    // Release score registers before reusing as scratch
-    guard_score0.release();
-    guard_score1.release();
-    
-    // Now safe to borrow Scratch0/1 (alias xmm20/21)
-    auto guard_weight0 = gen.borrow<Scratch0>(); // zmm20
-    // ... use for weights ...
-    
-    // Guards auto-release at scope end
-}
-```
-
-#### Available Register Types
-
-| Type | Zone | Physical Register |
-|------|------|-------------------|
-| `Accum0`-`Accum7` | Accumulator | zmm0-7 |
-| `Input0`-`Input7` | Input/Q | zmm8-15 |
-| `StateMax`, `StateSum`, `StateWeight`, `StateCorr` | State | zmm16-19 |
-| `Scratch0`-`Scratch5` | Scratch | zmm20-25 |
-| `Score0`-`Score3` | Score (aliases Scratch) | xmm20-23 |
-| `Const128`, `ConstScale`, `ConstNegInf`, etc. | Reserved | zmm26-31 |
-
-#### Conflict Detection
-
-If you attempt to borrow a register that's already borrowed, you get a detailed error:
-
-```
-╔══════════════════════════════════════════════════════════════════╗
-║              REGISTER BORROW CONFLICT DETECTED                    ║
-╠══════════════════════════════════════════════════════════════════╣
-║ Physical register: zmm/ymm/xmm20
-║ Currently borrowed by: 'Scratch0'
-║ New borrow attempted for: 'Score0'
-║
-║ FIX: Either:
-║   1. Release the existing borrow before this access
-║   2. Use a different register that isn't borrowed
-║   3. Restructure code to avoid the conflict
-╚══════════════════════════════════════════════════════════════════╝
-```
-
-**Note**: Register tracking runs only during JIT compilation (not at inference runtime), so there is zero performance overhead.
-
-**Note**: Register tracking is always enabled during JIT compilation with zero runtime overhead (the generated assembly is identical with or without tracking).
-
----
-
 ## Memory Management and Coherence
 
 ### Overview
@@ -2102,13 +1996,11 @@ LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
 | `src/v2/execution/local_execution/coherence/` | StageCoherence, GpuCoherence, CrossDomainTransfer |
 | `src/v2/models/` | Model-specific graph builders, schema factories, ModelRegistrations |
 | `src/v2/models/qwen/` | Qwen2Graph, Qwen2Schema, Qwen2BufferSpec, Qwen2GraphConfigBuilder |
-| `src/v2/models/qwen3/` | Qwen3Schema (extends Qwen2 with per-head norm) |
+| `src/v2/models/qwen3/` | Qwen3Schema (extends Qwen with per-head norm) |
 | `src/v2/memory/` | BufferArena, BufferId, CoherenceTracker, StageBoundBuffers, StageBufferContract |
 | `src/v2/transfer/` | TransferEngine, TransferMethod |
 | `src/v2/config/` | OrchestrationConfig, OrchestrationConfigParser (CLI/YAML parsing) |
 | `src/v2/kernels/cpu/` | CPU kernels (GEMM, attention, primitives) |
-| `src/v2/kernels/cpu/jit/` | JIT infrastructure (RegisterGuard, RegisterAllocation, JitMicrokernelBase) |
-| `src/v2/kernels/cpu/attention/q8_1/jit/` | JIT attention microkernels (Q8DotProduct, OnlineSoftmax, etc.) |
 | `src/v2/tensors/` | Tensor types (FP32, BF16, quantized), CoherenceState |
 | `src/v2/loaders/` | GGUF loading, WeightManager |
 | `src/v2/app/modes/` | ChatCompletionHandler, ServerMode, BenchmarkMode, InteractiveChatMode |

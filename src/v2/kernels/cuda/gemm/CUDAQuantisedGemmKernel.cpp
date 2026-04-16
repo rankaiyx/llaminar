@@ -295,6 +295,99 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // Concurrent prefill stream pool (per-kernel instance, not static)
+        // =====================================================================
+
+        struct CUDAConcurrentPrefillPool
+        {
+            static constexpr int MAX_STREAMS = 8;
+
+            void *streams[MAX_STREAMS] = {};
+            void *completion[MAX_STREAMS] = {};
+            void *quant_ready = nullptr;
+            int32_t *scratch[MAX_STREAMS] = {};        // Per-stream INT32 accumulator
+            size_t scratch_capacity[MAX_STREAMS] = {}; // In elements (M*N)
+            int count = 0;
+            int device_id = -1;
+            bool initialized = false;
+
+            void init(int dev_id, int num_streams)
+            {
+                if (initialized)
+                    return;
+                device_id = dev_id;
+                count = std::min(num_streams, MAX_STREAMS);
+                for (int i = 0; i < count; ++i)
+                {
+                    cudaQuantGemm_createStream(&streams[i], dev_id);
+                    cudaQuantGemm_createEvent(&completion[i], dev_id);
+                }
+                cudaQuantGemm_createEvent(&quant_ready, dev_id);
+                initialized = true;
+                LOG_INFO("[CUDAConcurrentPrefillPool] Initialized " << count
+                                                                    << " streams on device " << dev_id);
+            }
+
+            /// Ensure per-stream scratch buffer has at least `elements` int32s.
+            bool ensureScratch(int idx, size_t elements)
+            {
+                if (idx < 0 || idx >= count)
+                    return false;
+                if (scratch_capacity[idx] >= elements)
+                    return true;
+
+                // Free old
+                if (scratch[idx])
+                {
+                    cudaQuantGemm_freeDevice(scratch[idx]);
+                    scratch[idx] = nullptr;
+                    scratch_capacity[idx] = 0;
+                }
+
+                cudaQuantGemm_setDevice(device_id);
+                float *tmp = nullptr;
+                // Allocate int32 buffer via allocFloat (same underlying cudaMalloc)
+                size_t float_count = (elements * sizeof(int32_t) + sizeof(float) - 1) / sizeof(float);
+                if (!cudaQuantGemm_allocFloat(&tmp, float_count, device_id))
+                {
+                    LOG_ERROR("[CUDAConcurrentPrefillPool] Failed to allocate scratch["
+                              << idx << "] (" << (elements * 4 / 1024) << " KB)");
+                    return false;
+                }
+                scratch[idx] = reinterpret_cast<int32_t *>(tmp);
+                scratch_capacity[idx] = elements;
+                LOG_DEBUG("[CUDAConcurrentPrefillPool] Allocated scratch[" << idx
+                                                                           << "] = " << (elements * 4 / 1024) << " KB");
+                return true;
+            }
+
+            void destroy()
+            {
+                if (!initialized)
+                    return;
+                for (int i = 0; i < count; ++i)
+                {
+                    cudaQuantGemm_destroyStream(streams[i]);
+                    streams[i] = nullptr;
+                    cudaQuantGemm_destroyEvent(completion[i]);
+                    completion[i] = nullptr;
+                    if (scratch[i])
+                    {
+                        cudaQuantGemm_freeDevice(scratch[i]);
+                        scratch[i] = nullptr;
+                        scratch_capacity[i] = 0;
+                    }
+                }
+                cudaQuantGemm_destroyEvent(quant_ready);
+                quant_ready = nullptr;
+                initialized = false;
+                count = 0;
+            }
+
+            ~CUDAConcurrentPrefillPool() { destroy(); }
+        };
+
+        // =====================================================================
         // PIMPL implementation struct
         // =====================================================================
 
@@ -864,6 +957,7 @@ namespace llaminar2
               K_(other.K_),
               weights_converted_(other.weights_converted_),
               owns_weight_memory_(other.owns_weight_memory_),
+              prefill_pool_(std::move(other.prefill_pool_)),
               impl_(std::move(other.impl_))
         {
             other.weights_ = nullptr;
@@ -883,6 +977,7 @@ namespace llaminar2
                 K_ = other.K_;
                 weights_converted_ = other.weights_converted_;
                 owns_weight_memory_ = other.owns_weight_memory_;
+                prefill_pool_ = std::move(other.prefill_pool_);
                 impl_ = std::move(other.impl_);
 
                 other.weights_ = nullptr;
@@ -1407,106 +1502,6 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Concurrent prefill stream pool (ROCm-style multi-stream dispatch)
-        // =====================================================================
-
-        struct CUDAConcurrentPrefillPool
-        {
-            static constexpr int MAX_STREAMS = 8;
-
-            void *streams[MAX_STREAMS] = {};
-            void *completion[MAX_STREAMS] = {};
-            void *quant_ready = nullptr;
-            int32_t *scratch[MAX_STREAMS] = {};        // Per-stream INT32 accumulator
-            size_t scratch_capacity[MAX_STREAMS] = {}; // In elements (M*N)
-            int count = 0;
-            int device_id = -1;
-            bool initialized = false;
-
-            void init(int dev_id, int num_streams)
-            {
-                if (initialized)
-                    return;
-                device_id = dev_id;
-                count = std::min(num_streams, MAX_STREAMS);
-                for (int i = 0; i < count; ++i)
-                {
-                    cudaQuantGemm_createStream(&streams[i], dev_id);
-                    cudaQuantGemm_createEvent(&completion[i], dev_id);
-                }
-                cudaQuantGemm_createEvent(&quant_ready, dev_id);
-                initialized = true;
-                LOG_INFO("[CUDAConcurrentPrefillPool] Initialized " << count
-                                                                    << " streams on device " << dev_id);
-            }
-
-            /// Ensure per-stream scratch buffer has at least `elements` int32s.
-            bool ensureScratch(int idx, size_t elements)
-            {
-                if (idx < 0 || idx >= count)
-                    return false;
-                if (scratch_capacity[idx] >= elements)
-                    return true;
-
-                // Free old
-                if (scratch[idx])
-                {
-                    cudaQuantGemm_freeDevice(scratch[idx]);
-                    scratch[idx] = nullptr;
-                    scratch_capacity[idx] = 0;
-                }
-
-                cudaQuantGemm_setDevice(device_id);
-                float *tmp = nullptr;
-                // Allocate int32 buffer via allocFloat (same underlying cudaMalloc)
-                size_t float_count = (elements * sizeof(int32_t) + sizeof(float) - 1) / sizeof(float);
-                if (!cudaQuantGemm_allocFloat(&tmp, float_count, device_id))
-                {
-                    LOG_ERROR("[CUDAConcurrentPrefillPool] Failed to allocate scratch["
-                              << idx << "] (" << (elements * 4 / 1024) << " KB)");
-                    return false;
-                }
-                scratch[idx] = reinterpret_cast<int32_t *>(tmp);
-                scratch_capacity[idx] = elements;
-                LOG_DEBUG("[CUDAConcurrentPrefillPool] Allocated scratch[" << idx
-                                                                           << "] = " << (elements * 4 / 1024) << " KB");
-                return true;
-            }
-
-            void destroy()
-            {
-                if (!initialized)
-                    return;
-                for (int i = 0; i < count; ++i)
-                {
-                    cudaQuantGemm_destroyStream(streams[i]);
-                    streams[i] = nullptr;
-                    cudaQuantGemm_destroyEvent(completion[i]);
-                    completion[i] = nullptr;
-                    if (scratch[i])
-                    {
-                        cudaQuantGemm_freeDevice(scratch[i]);
-                        scratch[i] = nullptr;
-                        scratch_capacity[i] = 0;
-                    }
-                }
-                cudaQuantGemm_destroyEvent(quant_ready);
-                quant_ready = nullptr;
-                initialized = false;
-                count = 0;
-            }
-
-            ~CUDAConcurrentPrefillPool() { destroy(); }
-        };
-
-        static CUDAConcurrentPrefillPool &getConcurrentPrefillPool(int device_id)
-        {
-            static CUDAConcurrentPrefillPool pools[8];
-            int idx = std::clamp(device_id, 0, 7);
-            return pools[idx];
-        }
-
-        // =====================================================================
         // ITensorGemm interface - multiply_fused_tensor() for TensorBase API
         // =====================================================================
 
@@ -1643,7 +1638,9 @@ namespace llaminar2
             if (concurrent_eligible)
             {
                 const int num_proj = static_cast<int>(projections.size());
-                auto &pool = getConcurrentPrefillPool(cuda_device_id_);
+                if (!prefill_pool_)
+                    prefill_pool_ = std::make_unique<CUDAConcurrentPrefillPool>();
+                auto &pool = *prefill_pool_;
                 pool.init(cuda_device_id_, num_proj);
 
                 // Record event after quantization completes on main stream

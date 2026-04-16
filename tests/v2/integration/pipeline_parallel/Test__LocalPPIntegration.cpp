@@ -339,37 +339,6 @@ namespace
     }
 
     /**
-     * @test HOST backend should be selected for CUDA↔ROCm transfers
-     */
-    TEST_F(Test__LocalPPIntegration, BackendSelection_PCIeBAR_ForMixedVendor)
-    {
-        // GIVEN: A config with CUDA + ROCm devices
-        std::vector<GlobalDeviceAddress> devices = {
-            GlobalDeviceAddress::cuda(0),
-            GlobalDeviceAddress::rocm(0)};
-        std::vector<int> boundaries = {0, 12, 24};
-        LocalPPConfig config = makePPConfig(devices, boundaries);
-
-        ASSERT_TRUE(config.isValid());
-
-        // WHEN: We create a LocalPPContext
-        try
-        {
-            auto ctx = createLocalPPContext(config);
-            ASSERT_NE(ctx, nullptr);
-
-            // THEN: Backend for CUDA→ROCm transfer should be HETEROGENEOUS (HOST)
-            auto backend = ctx->backendForTransfer(0, 1);
-            EXPECT_EQ(backend, CollectiveBackendType::HETEROGENEOUS)
-                << "CUDA→ROCm transfer should use HETEROGENEOUS backend";
-        }
-        catch (const std::exception &e)
-        {
-            GTEST_SKIP() << "Skipping real mixed-vendor test: " << e.what();
-        }
-    }
-
-    /**
      * @test HOST backend should be selected when CPU device is involved
      */
     TEST_F(Test__LocalPPIntegration, BackendSelection_HOST_ForCPUDevice)

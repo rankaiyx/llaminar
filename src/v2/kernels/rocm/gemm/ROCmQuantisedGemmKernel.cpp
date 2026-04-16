@@ -841,162 +841,6 @@ namespace llaminar2
                 return true;
             }
 
-            // =================================================================
-            // ConcurrentPrefillPool: lightweight stream + scratch pool for
-            // overlapping fused GEMM projections during prefill (M>1).
-            //
-            // Each stream gets its own scratch buffer so blockwise GEMM kernels
-            // can write intermediate results without conflicting with projections
-            // on other streams.  The pool is lazily initialized on first use and
-            // persisted for the process lifetime (trivially small: 2-3 HIP streams
-            // + events + a few MB of scratch).
-            // =================================================================
-            struct ConcurrentPrefillPool
-            {
-                static constexpr int MAX_STREAMS = 8;
-
-                hipStream_t streams[MAX_STREAMS] = {};
-                hipEvent_t completion[MAX_STREAMS] = {};
-                hipEvent_t quant_ready = nullptr;
-                int32_t *scratch[MAX_STREAMS] = {};
-                size_t scratch_capacity[MAX_STREAMS] = {}; // in elements (M*N)
-                float *scatter_partial[MAX_STREAMS] = {};
-                size_t scatter_partial_capacity[MAX_STREAMS] = {}; // in elements (KB_MAX*N)
-                int count = 0;
-                int device_id = -1;
-                bool initialized = false;
-
-                void init(int dev_id, int num_streams)
-                {
-                    if (initialized)
-                        return;
-                    device_id = dev_id;
-                    count = std::min(num_streams, MAX_STREAMS);
-                    hipSetDevice(dev_id);
-                    for (int i = 0; i < count; ++i)
-                    {
-                        hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking);
-                        hipEventCreateWithFlags(&completion[i], hipEventDisableTiming);
-                    }
-                    hipEventCreateWithFlags(&quant_ready, hipEventDisableTiming);
-                    initialized = true;
-                    LOG_INFO("[ConcurrentPrefillPool] Initialized " << count
-                                                                    << " streams on device " << dev_id);
-                }
-
-                // Ensure scratch buffer i has at least `elements` int32s
-                bool ensureScratch(int idx, size_t elements)
-                {
-                    if (idx < 0 || idx >= count)
-                        return false;
-                    if (scratch_capacity[idx] >= elements)
-                        return true; // Already big enough
-
-                    // Free old
-                    if (scratch[idx])
-                    {
-                        hipSetDevice(device_id);
-                        hipFree(scratch[idx]);
-                        scratch[idx] = nullptr;
-                        scratch_capacity[idx] = 0;
-                    }
-
-                    hipSetDevice(device_id);
-                    hipError_t err = hipMalloc(&scratch[idx], elements * sizeof(int32_t));
-                    if (err != hipSuccess)
-                    {
-                        LOG_ERROR("[ConcurrentPrefillPool] Failed to allocate scratch["
-                                  << idx << "] (" << (elements * 4 / 1024) << " KB): "
-                                  << hipGetErrorString(err));
-                        return false;
-                    }
-                    scratch_capacity[idx] = elements;
-                    LOG_DEBUG("[ConcurrentPrefillPool] Allocated scratch[" << idx
-                                                                           << "] = " << (elements * 4 / 1024) << " KB");
-                    return true;
-                }
-
-                // Ensure scatter partial buffer i has at least `elements` floats
-                bool ensureScatterPartial(int idx, size_t elements)
-                {
-                    if (idx < 0 || idx >= count)
-                        return false;
-                    if (scatter_partial_capacity[idx] >= elements)
-                        return true;
-
-                    if (scatter_partial[idx])
-                    {
-                        hipSetDevice(device_id);
-                        hipFree(scatter_partial[idx]);
-                        scatter_partial[idx] = nullptr;
-                        scatter_partial_capacity[idx] = 0;
-                    }
-
-                    hipSetDevice(device_id);
-                    hipError_t err = hipMalloc(&scatter_partial[idx], elements * sizeof(float));
-                    if (err != hipSuccess)
-                    {
-                        LOG_ERROR("[ConcurrentPool] Failed to allocate scatter_partial["
-                                  << idx << "] (" << (elements * 4 / 1024) << " KB): "
-                                  << hipGetErrorString(err));
-                        return false;
-                    }
-                    scatter_partial_capacity[idx] = elements;
-                    LOG_DEBUG("[ConcurrentPool] Allocated scatter_partial[" << idx
-                                                                            << "] = " << (elements * 4 / 1024) << " KB");
-                    return true;
-                }
-
-                void destroy()
-                {
-                    if (!initialized)
-                        return;
-                    hipSetDevice(device_id);
-                    for (int i = 0; i < count; ++i)
-                    {
-                        if (streams[i])
-                        {
-                            hipStreamDestroy(streams[i]);
-                            streams[i] = nullptr;
-                        }
-                        if (completion[i])
-                        {
-                            hipEventDestroy(completion[i]);
-                            completion[i] = nullptr;
-                        }
-                        if (scratch[i])
-                        {
-                            hipFree(scratch[i]);
-                            scratch[i] = nullptr;
-                            scratch_capacity[i] = 0;
-                        }
-                        if (scatter_partial[i])
-                        {
-                            hipFree(scatter_partial[i]);
-                            scatter_partial[i] = nullptr;
-                            scatter_partial_capacity[i] = 0;
-                        }
-                    }
-                    if (quant_ready)
-                    {
-                        hipEventDestroy(quant_ready);
-                        quant_ready = nullptr;
-                    }
-                    initialized = false;
-                    count = 0;
-                }
-
-                ~ConcurrentPrefillPool() { destroy(); }
-            };
-
-            // Per-device singleton pool (indexed by device_id)
-            ConcurrentPrefillPool &getConcurrentPrefillPool(int device_id)
-            {
-                static ConcurrentPrefillPool pools[8]; // up to 8 devices
-                int idx = std::clamp(device_id, 0, 7);
-                return pools[idx];
-            }
-
             template <typename ImplT>
             inline bool waitForStartupRepackIfNeeded(
                 ImplT *impl,
@@ -1528,6 +1372,153 @@ namespace llaminar2
         // Weight packing: see ROCmWeightPacker.cpp
         // (packNativeVNNI, packWeightsToROCm_Q8_0_fast, packWeightsToROCm)
         // =====================================================================
+
+        // =================================================================
+        // ConcurrentPrefillPool: lightweight stream + scratch pool for
+        // overlapping fused GEMM projections during prefill (M>1).
+        //
+        // Each stream gets its own scratch buffer so blockwise GEMM kernels
+        // can write intermediate results without conflicting with projections
+        // on other streams.  The pool is lazily initialized on first use
+        // (per-kernel instance, not static).
+        // =================================================================
+        struct ConcurrentPrefillPool
+        {
+            static constexpr int MAX_STREAMS = 8;
+
+            hipStream_t streams[MAX_STREAMS] = {};
+            hipEvent_t completion[MAX_STREAMS] = {};
+            hipEvent_t quant_ready = nullptr;
+            int32_t *scratch[MAX_STREAMS] = {};
+            size_t scratch_capacity[MAX_STREAMS] = {}; // in elements (M*N)
+            float *scatter_partial[MAX_STREAMS] = {};
+            size_t scatter_partial_capacity[MAX_STREAMS] = {}; // in elements (KB_MAX*N)
+            int count = 0;
+            int device_id = -1;
+            bool initialized = false;
+
+            void init(int dev_id, int num_streams)
+            {
+                if (initialized)
+                    return;
+                device_id = dev_id;
+                count = std::min(num_streams, MAX_STREAMS);
+                hipSetDevice(dev_id);
+                for (int i = 0; i < count; ++i)
+                {
+                    hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking);
+                    hipEventCreateWithFlags(&completion[i], hipEventDisableTiming);
+                }
+                hipEventCreateWithFlags(&quant_ready, hipEventDisableTiming);
+                initialized = true;
+                LOG_INFO("[ConcurrentPrefillPool] Initialized " << count
+                                                                << " streams on device " << dev_id);
+            }
+
+            // Ensure scratch buffer i has at least `elements` int32s
+            bool ensureScratch(int idx, size_t elements)
+            {
+                if (idx < 0 || idx >= count)
+                    return false;
+                if (scratch_capacity[idx] >= elements)
+                    return true; // Already big enough
+
+                // Free old
+                if (scratch[idx])
+                {
+                    hipSetDevice(device_id);
+                    hipFree(scratch[idx]);
+                    scratch[idx] = nullptr;
+                    scratch_capacity[idx] = 0;
+                }
+
+                hipSetDevice(device_id);
+                hipError_t err = hipMalloc(&scratch[idx], elements * sizeof(int32_t));
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ConcurrentPrefillPool] Failed to allocate scratch["
+                              << idx << "] (" << (elements * 4 / 1024) << " KB): "
+                              << hipGetErrorString(err));
+                    return false;
+                }
+                scratch_capacity[idx] = elements;
+                LOG_DEBUG("[ConcurrentPrefillPool] Allocated scratch[" << idx
+                                                                       << "] = " << (elements * 4 / 1024) << " KB");
+                return true;
+            }
+
+            // Ensure scatter partial buffer i has at least `elements` floats
+            bool ensureScatterPartial(int idx, size_t elements)
+            {
+                if (idx < 0 || idx >= count)
+                    return false;
+                if (scatter_partial_capacity[idx] >= elements)
+                    return true;
+
+                if (scatter_partial[idx])
+                {
+                    hipSetDevice(device_id);
+                    hipFree(scatter_partial[idx]);
+                    scatter_partial[idx] = nullptr;
+                    scatter_partial_capacity[idx] = 0;
+                }
+
+                hipSetDevice(device_id);
+                hipError_t err = hipMalloc(&scatter_partial[idx], elements * sizeof(float));
+                if (err != hipSuccess)
+                {
+                    LOG_ERROR("[ConcurrentPool] Failed to allocate scatter_partial["
+                              << idx << "] (" << (elements * 4 / 1024) << " KB): "
+                              << hipGetErrorString(err));
+                    return false;
+                }
+                scatter_partial_capacity[idx] = elements;
+                LOG_DEBUG("[ConcurrentPool] Allocated scatter_partial[" << idx
+                                                                        << "] = " << (elements * 4 / 1024) << " KB");
+                return true;
+            }
+
+            void destroy()
+            {
+                if (!initialized)
+                    return;
+                hipSetDevice(device_id);
+                for (int i = 0; i < count; ++i)
+                {
+                    if (streams[i])
+                    {
+                        hipStreamDestroy(streams[i]);
+                        streams[i] = nullptr;
+                    }
+                    if (completion[i])
+                    {
+                        hipEventDestroy(completion[i]);
+                        completion[i] = nullptr;
+                    }
+                    if (scratch[i])
+                    {
+                        hipFree(scratch[i]);
+                        scratch[i] = nullptr;
+                        scratch_capacity[i] = 0;
+                    }
+                    if (scatter_partial[i])
+                    {
+                        hipFree(scatter_partial[i]);
+                        scatter_partial[i] = nullptr;
+                        scatter_partial_capacity[i] = 0;
+                    }
+                }
+                if (quant_ready)
+                {
+                    hipEventDestroy(quant_ready);
+                    quant_ready = nullptr;
+                }
+                initialized = false;
+                count = 0;
+            }
+
+            ~ConcurrentPrefillPool() { destroy(); }
+        };
 
         // =====================================================================
         // Constructor / Destructor
@@ -3864,7 +3855,9 @@ namespace llaminar2
                 if (concurrent_eligible)
                 {
                     const int num_proj = static_cast<int>(projections.size());
-                    auto &pool = getConcurrentPrefillPool(rocm_device_id_);
+                    if (!prefill_pool_)
+                        prefill_pool_ = std::make_unique<ConcurrentPrefillPool>();
+                    auto &pool = *prefill_pool_;
                     pool.init(rocm_device_id_, num_proj);
 
                     // Record event after quantization completes on main stream
@@ -4042,7 +4035,9 @@ namespace llaminar2
                 if (decode_concurrent_eligible)
                 {
                     const int num_proj = static_cast<int>(projections.size());
-                    auto &pool = getConcurrentPrefillPool(rocm_device_id_);
+                    if (!prefill_pool_)
+                        prefill_pool_ = std::make_unique<ConcurrentPrefillPool>();
+                    auto &pool = *prefill_pool_;
                     pool.init(rocm_device_id_, num_proj);
 
                     // Record event after quantization completes on main stream

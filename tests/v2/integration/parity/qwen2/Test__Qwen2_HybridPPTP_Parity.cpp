@@ -47,8 +47,7 @@ static const std::vector<TestConfig> kHybridPPTPConfigs = {
     {
         .name = "LocalPP_TP2xCUDA_ROCm",
         .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA, ParityDeviceType::ROCm},
-        .parallelism = Parallelism::LocalPP,     // PP between TP domain and ROCm
-        .collective = Collective::HETEROGENEOUS, // Cross-vendor transfer between stages
+        .parallelism = Parallelism::LocalPP, // PP between TP domain and ROCm
         .thresholds = {
             .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine
             .decode_cosine_threshold = 0.95f, // Observed: 0.984 avg decode cosine
@@ -64,8 +63,7 @@ static const std::vector<TestConfig> kHybridPPTPConfigs = {
     {
         .name = "LocalPP_TP2xROCm_CUDA",
         .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm, ParityDeviceType::CUDA},
-        .parallelism = Parallelism::LocalPP,     // PP between TP domain and CUDA
-        .collective = Collective::HETEROGENEOUS, // Cross-vendor transfer between stages
+        .parallelism = Parallelism::LocalPP, // PP between TP domain and CUDA
         .thresholds = {
             .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine
             .decode_cosine_threshold = 0.95f, // Observed: 0.984 avg decode cosine
@@ -82,7 +80,6 @@ static const std::vector<TestConfig> kHybridPPTPConfigs = {
         .name = "LocalPP_TP2xROCm_CPU",
         .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm, ParityDeviceType::CPU},
         .parallelism = Parallelism::LocalPP, // PP between TP domain and CPU
-        .collective = Collective::None,      // HOST backend for GPU→CPU transfer
         .thresholds = {
             .cosine_threshold = 0.96f,        // Observed: 0.998 prefill cosine
             .decode_cosine_threshold = 0.95f, // Observed: 0.984 avg decode cosine

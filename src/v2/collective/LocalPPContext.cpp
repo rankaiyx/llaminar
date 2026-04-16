@@ -73,14 +73,8 @@ namespace llaminar2
             return CollectiveBackendType::RCCL;
         }
 
-        // Cross-vendor GPU → HOST (host-staged transfer)
-        if ((src == DeviceType::CUDA && dst == DeviceType::ROCm) ||
-            (src == DeviceType::ROCm && dst == DeviceType::CUDA))
-        {
-            return CollectiveBackendType::HOST;
-        }
-
-        // Any path involving CPU → HOST
+        // Cross-vendor GPU → HOST (host-staged transfer) or
+        // any path involving CPU → HOST
         return CollectiveBackendType::HOST;
     }
 

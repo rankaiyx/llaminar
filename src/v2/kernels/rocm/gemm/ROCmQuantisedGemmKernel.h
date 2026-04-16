@@ -371,6 +371,8 @@ namespace llaminar2
          * The DL (Data-Level) kernels use 4-way INT8 dot product instructions.
          * Future: DeviceGemmXdl for gfx908+ (MFMA instructions).
          */
+        struct ConcurrentPrefillPool;
+
         class ROCmQuantisedGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
@@ -786,6 +788,9 @@ namespace llaminar2
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;
+
+            // Per-instance concurrent prefill pool (HIP streams + scratch buffers)
+            std::unique_ptr<ConcurrentPrefillPool> prefill_pool_;
 
             // Per-instance synchronization/logging state (no process-global mutable statics)
             std::unique_ptr<std::mutex> ck_dispatch_mutex_;
