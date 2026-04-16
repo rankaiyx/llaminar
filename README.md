@@ -12,4 +12,4 @@ Llaminar tries to solve a variety of problems encountered in other projects:
 
 * Tensors want to be open and free: so is Llaminar.
 * Tensors want to be sliced, sharded, and pipelined: Llaminar lets them be.
-* Tensors want to run on a variety of hardware types without artificial handicaps: Llaminar helps them do so.
+* Tensors want to run on a variety of hardware types without artificial handicaps: Llaminar helps them to do so.
