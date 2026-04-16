@@ -3,10 +3,10 @@ An LLM inferencing engine in C++.
 
 Llaminar tries to solve a variety of problems encountered in other projects:
 
-* Tensor and Pipeline Parallelism: natively supported, mix and match heterogenous domains.
-* Multiple vendors: Mix and match CPU, ROCm and CUDA, simultaneously and natively.
-* Easy scaling: Built from the ground-up on OpenMPI so you can scale out across clusters. NUMA-aware by default. 
-* An IaC-like experience: plan, then deploy.
+* **Tensor and Pipeline Parallelism:** natively supported, mix and match heterogenous domains.
+* **Multiple vendors:** Mix and match CPU, ROCm and CUDA, simultaneously and natively.
+* **Easy scaling:** Built from the ground-up on OpenMPI so you can scale out across clusters. NUMA-aware by default. 
+* **IaC-like experience:** Plan, then deploy.
 
 ## The Llaminar Philosophy
 
