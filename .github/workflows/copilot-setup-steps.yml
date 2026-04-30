@@ -92,13 +92,16 @@ jobs:
 
           sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${GCC_VERSION} 150
           sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-${GCC_VERSION} 150
-          sudo update-alternatives --install /usr/bin/cpp cpp /usr/bin/cpp-${GCC_VERSION} 150
           sudo update-alternatives --install /usr/bin/gfortran gfortran /usr/bin/gfortran-${GCC_VERSION} 150
 
           sudo update-alternatives --set gcc /usr/bin/gcc-${GCC_VERSION}
           sudo update-alternatives --set g++ /usr/bin/g++-${GCC_VERSION}
-          sudo update-alternatives --set cpp /usr/bin/cpp-${GCC_VERSION}
           sudo update-alternatives --set gfortran /usr/bin/gfortran-${GCC_VERSION}
+
+          echo "CC=/usr/bin/gcc-${GCC_VERSION}" >> "$GITHUB_ENV"
+          echo "CXX=/usr/bin/g++-${GCC_VERSION}" >> "$GITHUB_ENV"
+          echo "FC=/usr/bin/gfortran-${GCC_VERSION}" >> "$GITHUB_ENV"
+          echo "CPP=/usr/bin/cpp-${GCC_VERSION}" >> "$GITHUB_ENV"
 
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
