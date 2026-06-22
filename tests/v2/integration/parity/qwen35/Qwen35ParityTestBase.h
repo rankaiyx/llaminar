@@ -56,6 +56,42 @@ namespace llaminar2::test::parity::qwen35
             // Qwen3.5 uses a different tokenizer (vocab_size=248320) than Qwen2/3
             // (vocab_size=151936), so the default hardcoded token_ids are wrong.
             // Read the actual token_ids used by the PyTorch reference generator.
+            //
+            // CRITICAL: metadata.txt is only written by the snapshot generator,
+            // which normally runs later in the test body. On a fresh checkout
+            // (e.g. CI) the metadata file does not exist yet and we would silently
+            // fall back to Qwen2's default token IDs, embedding the wrong tokens
+            // and producing catastrophic cosine drops (~0.18) at every stage.
+            //
+            // Trigger snapshot regeneration here if metadata is missing or stale
+            // (wrong snapshot_version), so token IDs are always consistent with
+            // what PyTorch will emit. Skip if the model file is missing (the test
+            // will GTEST_SKIP later in ParityTestBase::SetUp).
+            const auto metadata_path = std::filesystem::path(Base::config_.snapshot_dir) /
+                                       "metadata.txt";
+            bool needs_regen = !std::filesystem::exists(metadata_path);
+            if (!needs_regen)
+            {
+                int disk_ver = Base::readSnapshotVersion(metadata_path);
+                if (disk_ver < Base::kRequiredSnapshotVersion)
+                {
+                    LOG_INFO("[Qwen3.5 Parity] Stale snapshots (v" << disk_ver
+                             << " < required v" << Base::kRequiredSnapshotVersion
+                             << ") — regenerating");
+                    needs_regen = true;
+                }
+            }
+            if (needs_regen && std::filesystem::exists(Base::config_.model_path))
+            {
+                LOG_INFO("[Qwen3.5 Parity] Running PyTorch snapshot generator "
+                         "to obtain consistent prefill tokens and up-to-date snapshots");
+                if (!regeneratePyTorchSnapshots())
+                {
+                    LOG_ERROR("[Qwen3.5 Parity] Early snapshot regeneration failed; "
+                              "test will likely fail with stale Qwen2 token IDs");
+                }
+            }
+
             auto prefill_tokens = Base::readPrefillTokensFromMetadata();
             if (!prefill_tokens.empty())
             {
@@ -92,7 +128,17 @@ namespace llaminar2::test::parity::qwen35
                          << Base::config_.model_path);
 
             std::ostringstream cmd;
-            cmd << "bash -c 'source /workspaces/llaminar/.venv/bin/activate && python3"
+            // Source devcontainer venv if present, else fall back to system
+            // python3 (CI builder image installs deps to system site-packages).
+            //
+            // IMPORTANT: CTest sets OMP_NUM_THREADS=1 and MKL_NUM_THREADS=1 for the
+            // Llaminar test process (intentional: mpirun -np 1 handles affinity itself).
+            // Those env vars are inherited by this python3 subprocess, which would pin
+            // PyTorch's CPU forward pass to a single thread — catastrophic for large
+            // models (e.g., 27B Qwen3.5 prefill takes ~14 min on 1 thread). We unset
+            // them and let PyTorch/OpenMP/MKL use all available cores.
+            cmd << "bash -c 'unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
+                << "[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
                 << " python/reference/generate_qwen35_pipeline_snapshots.py"
                 << " --model " << Base::config_.model_path
                 << " --prompt \"" << Base::config_.prompt << "\""

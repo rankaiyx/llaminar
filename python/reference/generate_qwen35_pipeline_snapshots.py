@@ -58,24 +58,42 @@ def save_snapshots_as_npy(
       - Decode steps: decode_step{S}_{key}.npy
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
+
+    # Build (path, data) pairs first so the parallel save loop has nothing
+    # to compute beyond filesystem writes.
+    items: list = []
     for (stage, layer_idx), data in snapshots.items():
         stage_name = stage_to_string(stage)
         if layer_idx >= 0:
             key = f"layer{layer_idx}_{stage_name}"
         else:
             key = stage_name
-
         if prefix:
             key = f"{prefix}_{key}"
+        items.append((output_dir / f"{key}.npy", key, data))
 
-        npy_path = output_dir / f"{key}.npy"
-        np.save(npy_path, data)
-        count += 1
-        if verbose:
-            print(f"  Saved {key}: shape={list(data.shape)}")
+    # PERF: ``np.save`` releases the GIL during the actual write, and on
+    # NVMe the bottleneck is per-file syscall latency rather than
+    # bandwidth. A small thread pool overlaps those syscalls and cuts the
+    # snapshot save phase by ~Nx for large layer counts (27B → 64 layers ×
+    # ~12 stages = 770 files).
+    from concurrent.futures import ThreadPoolExecutor
+    n_workers = min(os.cpu_count() or 4, 16)
 
-    return count
+    def _save_one(item):
+        npy_path, _key, payload = item
+        np.save(npy_path, payload)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        # Drain to surface any exception.
+        for _ in ex.map(_save_one, items):
+            pass
+
+    if verbose:
+        for _path, key, payload in items:
+            print(f"  Saved {key}: shape={list(payload.shape)}")
+
+    return len(items)
 
 
 def write_metadata(
@@ -89,8 +107,17 @@ def write_metadata(
 ):
     """Write metadata.txt compatible with parity test loader."""
     config = model.hf_model.config
+    output_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = output_dir / "metadata.txt"
     with open(metadata_path, "w") as f:
+        # Snapshot version: bumped when the snapshot format or V-head
+        # reversal semantics change. The C++ parity test framework checks
+        # this version and regenerates snapshots automatically when stale.
+        #   v1: original format
+        #   v2: MoE-only V-head reversal (dense models skip reversal)
+        #   v3: Qwen3.5 prefill GDN conv and Q/K norm snapshots match C++ layout
+        #   v4: GDN alpha/beta projection snapshots are emitted for recurrence debugging
+        f.write(f"snapshot_version: 4\n")
         f.write(f"Model: {model_path}\n")
         arch = getattr(config, "architectures", [config.__class__.__name__])
         f.write(f"Architecture: {arch[0] if arch else config.__class__.__name__}\n")
@@ -101,7 +128,9 @@ def write_metadata(
         f.write(f"d_model: {config.hidden_size}\n")
         head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         f.write(f"d_head: {head_dim}\n")
-        f.write(f"d_ff: {config.intermediate_size}\n")
+        # MoE configs use moe_intermediate_size instead of intermediate_size
+        d_ff = getattr(config, "intermediate_size", None) or getattr(config, "moe_intermediate_size", 0)
+        f.write(f"d_ff: {d_ff}\n")
         f.write(f"vocab_size: {config.vocab_size}\n")
         f.write(f"prompt: {prompt}\n")
         f.write(f"token_ids: {','.join(map(str, token_ids))}\n")
@@ -116,6 +145,10 @@ def run_prefill_and_decode(
     decode_steps: int,
     output_dir: Path,
     verbose: bool = False,
+    save_snapshots: bool = True,
+    save_prefill_snapshots: bool = True,
+    save_decode_snapshots: bool = True,
+    snapshot_decode_steps: Optional[Set[int]] = None,
 ):
     """
     Run prefill + optional decode steps with snapshot capture.
@@ -132,10 +165,26 @@ def run_prefill_and_decode(
 
     # ---- Prefill ----
     print("\n[Prefill] Running forward pass...")
-    result = model.forward(token_ids, clear_snapshots=True)
-    prefill_snaps = model.get_snapshots()
-    total = save_snapshots_as_npy(prefill_snaps, output_dir, prefix="", verbose=verbose)
-    print(f"  Captured {total} prefill snapshots")
+    # PERF: Run prefill with use_cache=True so subsequent decode steps only
+    # need to forward the new token through cached K/V (and GDN recurrent
+    # state). Without this, each decode step re-runs the full prompt + all
+    # prior decoded tokens — O(S²) attention work that produces snapshots
+    # we then throw away (the C++ parity test only compares the LAST row).
+    capture_prefill_stages = None if save_snapshots and save_prefill_snapshots else []
+    result = model.forward(
+        token_ids,
+        clear_snapshots=True,
+        use_cache=True,
+        capture_stages=capture_prefill_stages,
+    )
+    total = 0
+    if save_snapshots and save_prefill_snapshots:
+        prefill_snaps = model.get_snapshots()
+        total = save_snapshots_as_npy(prefill_snaps, output_dir, prefix="", verbose=verbose)
+        print(f"  Captured {total} prefill snapshots")
+    else:
+        model.clear_snapshots()
+        print("  Prefill snapshot capture disabled")
 
     # Get next token (greedy)
     logits = result["logits"]
@@ -147,25 +196,41 @@ def run_prefill_and_decode(
         return total, token_ids, decode_tokens
 
     # ---- Decode steps ----
-    # Build the full input so far
-    all_tokens = list(token_ids) + [next_token]
+    # Cache from prefill carries K/V for the prompt + GDN recurrent state.
+    cache = result.get("past_key_values")
     decode_tokens.append(next_token)
 
     for step in range(decode_steps):
         prefix = f"decode_step{step}"
-        print(f"\n[Decode step {step}] token={all_tokens[-1]}")
+        print(f"\n[Decode step {step}] token={next_token}")
+        capture_this_decode_step = (
+            snapshot_decode_steps is None or step in snapshot_decode_steps
+        )
 
-        # Run full forward on all tokens so far (no KV cache — matches C++ test)
-        result = model.forward(all_tokens, clear_snapshots=True)
-        step_snaps = model.get_snapshots()
-        n = save_snapshots_as_npy(step_snaps, output_dir, prefix=prefix, verbose=verbose)
-        total += n
-        print(f"  Captured {n} decode snapshots for step {step}")
+        # Single-token forward using cache. Snapshots from this step have
+        # shape [1, 1, H] (one new position), matching what Llaminar's
+        # incremental decode produces.
+        result = model.forward(
+            [next_token],
+            clear_snapshots=True,
+            past_key_values=cache,
+            use_cache=True,
+            capture_stages=None
+            if save_snapshots and save_decode_snapshots and capture_this_decode_step
+            else [],
+        )
+        cache = result.get("past_key_values")
+        if save_snapshots and save_decode_snapshots and capture_this_decode_step:
+            step_snaps = model.get_snapshots()
+            n = save_snapshots_as_npy(step_snaps, output_dir, prefix=prefix, verbose=verbose)
+            total += n
+            print(f"  Captured {n} decode snapshots for step {step}")
+        else:
+            model.clear_snapshots()
 
         # Pick next token
         logits = result["logits"]
         next_token = int(np.argmax(logits[0, -1, :]))
-        all_tokens.append(next_token)
         decode_tokens.append(next_token)
         print(f"  Next token (greedy): {next_token}")
 
@@ -219,6 +284,26 @@ Examples:
         action="store_true",
         help="Verbose logging",
     )
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Write metadata.txt with prompt/decode tokens without saving .npy snapshots",
+    )
+    parser.add_argument(
+        "--decode-snapshots-only",
+        action="store_true",
+        help="Save decode-step snapshots but skip prefill snapshots",
+    )
+    parser.add_argument(
+        "--snapshot-decode-steps",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated decode step indices to save when decode snapshots "
+            "are enabled. Forward still runs through all decode steps so cache "
+            "state is correct, but only selected steps are written."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -230,6 +315,29 @@ Examples:
     print(f"  Prompt: '{args.prompt}'")
     print(f"  Output: {args.output}")
     print(f"  Decode steps: {args.decode_steps}")
+    print(f"  Metadata only: {args.metadata_only}")
+    print(f"  Decode snapshots only: {args.decode_snapshots_only}")
+    print(f"  Snapshot decode steps: {args.snapshot_decode_steps or '<all>'}")
+
+    snapshot_decode_steps: Optional[Set[int]] = None
+    if args.snapshot_decode_steps:
+        snapshot_decode_steps = set()
+        for raw_part in args.snapshot_decode_steps.split(","):
+            part = raw_part.strip()
+            if not part:
+                continue
+            try:
+                step = int(part)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid --snapshot-decode-steps entry: {part!r}"
+                ) from exc
+            if step < 0 or step >= args.decode_steps:
+                raise ValueError(
+                    f"Snapshot decode step {step} is outside decode range "
+                    f"[0, {args.decode_steps})"
+                )
+            snapshot_decode_steps.add(step)
 
     # Create and load model via registry
     print("\nLoading model...")
@@ -243,6 +351,10 @@ Examples:
         args.decode_steps,
         args.output,
         verbose=args.verbose,
+        save_snapshots=not args.metadata_only,
+        save_prefill_snapshots=not args.decode_snapshots_only,
+        save_decode_snapshots=True,
+        snapshot_decode_steps=snapshot_decode_steps,
     )
 
     # Write metadata

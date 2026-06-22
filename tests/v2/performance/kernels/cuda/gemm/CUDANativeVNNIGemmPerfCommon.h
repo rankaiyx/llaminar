@@ -12,6 +12,10 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#include "kernels/cuda/gemm/CuBLASGemmKernel.h"
+#include "utils/PrefillGraphBucketDefaults.h"
+#include "../../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../../utils/PreparedWeightTestHarness.h"
 #include "../../../../utils/TestTensorFactory.h"
 
 #include <algorithm>
@@ -35,8 +39,6 @@ namespace llaminar2::test::native_vnni_gemm_perf
 {
     using llaminar::v2::kernels::KernelFactory;
 
-    extern "C" const char *cudaFusedTCGemm_lastSelectedFamily();
-    extern "C" const char *cudaFusedTCGemmV2_lastSelectedFamily();
 
     constexpr int kDefaultWarmupRuns = 3;
     constexpr int kDefaultBenchRuns = 10;
@@ -54,12 +56,18 @@ namespace llaminar2::test::native_vnni_gemm_perf
          { return TestTensorFactory::createQ4_0Random({n, k}); }},
         {"IQ4_NL", 4, [](size_t n, size_t k)
          { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+        {"IQ4_XS", 4, [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ4_XSRandom({n, k}); }},
         {"Q4_1", 5, [](size_t n, size_t k)
          { return TestTensorFactory::createQ4_1Random({n, k}); }},
+        {"Q4_K", 5, [](size_t n, size_t k)
+         { return TestTensorFactory::createQ4_KRandom({n, k}); }},
         {"Q5_0", 6, [](size_t n, size_t k)
          { return TestTensorFactory::createQ5_0Random({n, k}); }},
         {"Q5_1", 7, [](size_t n, size_t k)
          { return TestTensorFactory::createQ5_1Random({n, k}); }},
+        {"Q5_K", 7, [](size_t n, size_t k)
+         { return TestTensorFactory::createQ5_KRandom({n, k}); }},
         {"Q6_K", 8, [](size_t n, size_t k)
          { return TestTensorFactory::createQ6_KRandom({n, k}); }},
         {"Q3_K", 9, [](size_t n, size_t k)
@@ -92,6 +100,19 @@ namespace llaminar2::test::native_vnni_gemm_perf
     };
 
     inline const std::vector<Shape> kQwenShapes = {
+        // Qwen3.5-35B-A3B MoE expert FFN shapes (d_model=2048, expert_intermediate=512).
+        // These are the production hot-path GEMMs for the grouped MoE prefill/decode
+        // kernels (gate/up: N=512,K=2048; down: N=2048,K=512). The dense NativeVNNI
+        // kernel exercised here shares the same per-codebook decode_groups helpers as
+        // the grouped MoE kernel, so this is a valid A/B harness for decode tuning.
+        {"35BMoE_Expert_GateUp", 512, 2048},
+        {"35BMoE_Expert_Down", 2048, 512},
+        // Qwen3.6 MoE hybrid GDN verifier projections (hidden=2048).
+        // These buckets are distinct from the dense 27B GDN shapes and must be
+        // trained explicitly so M=2..4 verifier rows do not inherit dense-only
+        // dispatch decisions.
+        {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},
+        {"Qwen36MoE_GDN_ZProjection", 4096, 2048},
         {"0.5B_Attn", 896, 896},
         {"0.5B_FFN_Up", 4864, 896},
         {"0.5B_FFN_Down", 896, 4864},
@@ -134,6 +155,20 @@ namespace llaminar2::test::native_vnni_gemm_perf
         {"7B_TP4_FFN_Up", 4736, 3584},
         {"7B_TP4_FFN_Down", 3584, 4736},
         {"7B_TP4_LM_Head", 38016, 3584},
+        {"9B_Attn", 4096, 4096},
+        {"9B_FFN_Up", 12288, 4096},
+        {"9B_FFN_Down", 4096, 12288},
+        {"9B_LM_Head", 248320, 4096},
+        {"Qwen36_Attn_Q", 5120, 5120},
+        {"Qwen36_Attn_KV", 1024, 5120},
+        {"Qwen36_Attn_Wo", 5120, 5120},
+        {"Qwen36_FFN_GateUp", 17408, 5120},
+        {"Qwen36_FFN_Down", 5120, 17408},
+        {"Qwen36_GDN_Inner", 10240, 5120},
+        {"Qwen36_GDN_Z", 6144, 5120},
+        {"Qwen36_GDN_Time", 1024, 5120},
+        {"Qwen36_GDN_Out", 5120, 6144},
+        {"Qwen36_LM_Head", 248320, 5120},
         {"14B_Attn", 5120, 5120},
         {"14B_FFN_Up", 13824, 5120},
         {"14B_FFN_Down", 5120, 13824},
@@ -150,7 +185,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
         {"14B_TP4_LM_Head", 38016, 5120},
     };
 
-    inline const std::vector<int> kPrefillMValues = {32, 64, 128};
+    inline const std::vector<int> kPrefillMValues = defaultNativeVNNIDispatchTrainingRows();
 
     struct RunConfig
     {
@@ -177,27 +212,16 @@ namespace llaminar2::test::native_vnni_gemm_perf
     enum class RunPath
     {
         NativeVNNITensorCore,
-        CutlassFallback,
+        // CutlassFallback removed — NativeVNNI is the sole CUDA GEMM path.
     };
 
+    // KernelModeGuard is no longer needed — NativeVNNI is always enabled
+    // and CUTLASS fallback no longer exists. Kept as a no-op struct for
+    // compatibility with test call sites.
     struct KernelModeGuard
     {
-        KernelModeGuard(bool native_vnni_enabled, bool force_cutlass_fallback)
-            : native_vnni_enabled_(llaminar2::cuda::CUDAQuantisedGemmKernel::isNativeVNNIEnabled()),
-              force_cutlass_fallback_(llaminar2::cuda::CUDAQuantisedGemmKernel::isForceCutlassFallback())
-        {
-            llaminar2::cuda::CUDAQuantisedGemmKernel::setNativeVNNIEnabled(native_vnni_enabled);
-            llaminar2::cuda::CUDAQuantisedGemmKernel::setForceCutlassFallback(force_cutlass_fallback);
-        }
-
-        ~KernelModeGuard()
-        {
-            llaminar2::cuda::CUDAQuantisedGemmKernel::setNativeVNNIEnabled(native_vnni_enabled_);
-            llaminar2::cuda::CUDAQuantisedGemmKernel::setForceCutlassFallback(force_cutlass_fallback_);
-        }
-
-        bool native_vnni_enabled_;
-        bool force_cutlass_fallback_;
+        KernelModeGuard(bool /*native_vnni_enabled*/, bool /*force_cutlass_fallback*/) {}
+        ~KernelModeGuard() = default;
     };
 
     inline std::string toLower(std::string value)
@@ -403,24 +427,131 @@ namespace llaminar2::test::native_vnni_gemm_perf
         return static_cast<float>(dot / (std::sqrt(norm_a) * std::sqrt(norm_b)));
     }
 
-    inline RunResult runKernel(TensorBase *weights, int m, int n, int k, RunPath path, int warmup_runs, int bench_runs, int cuda_device_id = 0)
+    /**
+     * @brief Run cuBLAS FP32 GEMM as a ground-truth reference.
+     *
+     * Dequantizes quantized weights to FP32 on host, uploads A and B_dequant
+     * to GPU, then runs cuBLAS sgemm. The result serves as a numerically
+     * exact (FP32) reference for validating quantized NativeVNNI output.
+     *
+     * Weight layout: quantized tensors store weights as [N × K] (row per
+     * output neuron). cuBLAS expects B in row-major [N × K] with transB=true,
+     * which matches the dequantized layout directly.
+     *
+     * @param weights     Quantized weight tensor (any supported format)
+     * @param h_input     Host FP32 input tensor [M × K] (shared with NativeVNNI run)
+     * @param m           Number of input rows (sequence length)
+     * @param n           Output columns (hidden dim)
+     * @param k           Inner dimension
+     * @param cuda_device_id  CUDA device ordinal
+     * @return RunResult with FP32 output vector (timing fields unused)
+     */
+    inline RunResult runCuBLASReference(TensorBase *weights, const float *h_input, int m, int n, int k, int cuda_device_id = 0)
     {
-        const bool native_vnni_enabled = (path == RunPath::NativeVNNITensorCore);
-        const bool force_cutlass_fallback = (path == RunPath::CutlassFallback);
-        KernelModeGuard mode_guard(native_vnni_enabled, force_cutlass_fallback);
+        if (cudaSetDevice(cuda_device_id) != cudaSuccess)
+            throw std::runtime_error("cudaSetDevice failed");
 
+        // Dequantize weights to FP32 on host — data() returns [N × K] row-major
+        const float *h_weights_fp32 = weights->data();
+        if (!h_weights_fp32)
+            throw std::runtime_error("Failed to dequantize weights to FP32");
+
+        // Allocate GPU buffers
+        float *d_A = nullptr;
+        float *d_B = nullptr;
+        float *d_C = nullptr;
+        const size_t a_bytes = static_cast<size_t>(m) * k * sizeof(float);
+        const size_t b_bytes = static_cast<size_t>(n) * k * sizeof(float);
+        const size_t c_bytes = static_cast<size_t>(m) * n * sizeof(float);
+
+        if (cudaMalloc(&d_A, a_bytes) != cudaSuccess)
+            throw std::runtime_error("cudaMalloc d_A failed");
+        if (cudaMalloc(&d_B, b_bytes) != cudaSuccess)
+        {
+            cudaFree(d_A);
+            throw std::runtime_error("cudaMalloc d_B failed");
+        }
+        if (cudaMalloc(&d_C, c_bytes) != cudaSuccess)
+        {
+            cudaFree(d_A);
+            cudaFree(d_B);
+            throw std::runtime_error("cudaMalloc d_C failed");
+        }
+
+        // Upload A [M×K] and B [N×K] to GPU
+        cudaMemcpy(d_A, h_input, a_bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_B, h_weights_fp32, b_bytes, cudaMemcpyHostToDevice);
+        cudaMemset(d_C, 0, c_bytes);
+
+        // Run cuBLAS sgemm: C[M×N] = A[M×K] × B^T[K×N]  (B stored as [N×K], transB=true)
+        auto cublas_kernel = llaminar2::cuda::createCuBLASGemm(cuda_device_id);
+        if (!cublas_kernel)
+        {
+            cudaFree(d_A);
+            cudaFree(d_B);
+            cudaFree(d_C);
+            throw std::runtime_error("createCuBLASGemm returned null");
+        }
+
+        bool ok = cublas_kernel->execute(d_A, d_B, d_C, m, n, k,
+                                         /*transA=*/false, /*transB=*/true);
+        if (!ok)
+        {
+            cudaFree(d_A);
+            cudaFree(d_B);
+            cudaFree(d_C);
+            throw std::runtime_error("cuBLAS GEMM execute failed");
+        }
+
+        cudaDeviceSynchronize();
+
+        // Download result
+        RunResult result;
+        result.output.resize(static_cast<size_t>(m) * n);
+        cudaMemcpy(result.output.data(), d_C, c_bytes, cudaMemcpyDeviceToHost);
+
+        cudaFree(d_A);
+        cudaFree(d_B);
+        cudaFree(d_C);
+
+        result.native_family = "cublas_fp32";
+        return result;
+    }
+
+    /**
+     * @brief Run NativeVNNI quantized GEMM kernel.
+     *
+     * @param weights       Quantized weight tensor
+     * @param m,n,k         GEMM dimensions
+     * @param path          RunPath (only NativeVNNITensorCore supported)
+     * @param warmup_runs   Number of warmup iterations
+     * @param bench_runs    Number of timed iterations
+     * @param cuda_device_id CUDA device ordinal
+     * @param shared_input  Optional pre-created FP32 input [M×K] for deterministic
+     *                      comparison with cuBLAS reference. If nullptr, creates
+     *                      random input internally (seed 7).
+     */
+    inline RunResult runKernel(TensorBase *weights, int m, int n, int k, RunPath path, int warmup_runs, int bench_runs, int cuda_device_id = 0, const float *shared_input = nullptr)
+    {
         if (cudaSetDevice(cuda_device_id) != cudaSuccess)
             throw std::runtime_error("cudaSetDevice failed");
 
         DeviceId device = DeviceId::cuda(cuda_device_id);
-        if (!weights->ensureOnDevice(device))
-            throw std::runtime_error("Failed to upload weights to CUDA device");
 
-        auto kernel = KernelFactory::createGemm(weights, DeviceType::CUDA);
-        if (!kernel)
-            throw std::runtime_error("KernelFactory::createGemm returned null");
+        // Build the GEMM kernel via the production GPU weight load pipeline.
+        //
+        // NOTE on the API: KernelFactory::prepareGemmHandleLocal() (and therefore
+        // PreparedWeightStore::prepareGemm()) intentionally REJECT GPU INT8-packed
+        // weights — those device kernels must be constructed from VRAM-resident,
+        // VNNI-repacked payloads owned by a WeightVRAMPool. The shared helper
+        // makeGpuPreparedGemm() drives that exact pipeline (upload + GPU repack +
+        // pool-slot kernel construction) and registers the handle through the
+        // un-guarded registerPreparedGemmHandle() path. The returned struct owns
+        // the orchestrator + store and must stay alive while `kernel` is used.
+        auto prepared = makeGpuPreparedGemm(weights, device, "perf.cuda_native_vnni_gemm.weight");
+        ITensorGemm *kernel = prepared.kernel;
 
-        auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+        auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
         std::unique_ptr<DeviceWorkspaceManager> workspace;
         if (workspace_consumer)
         {
@@ -440,14 +571,21 @@ namespace llaminar2::test::native_vnni_gemm_perf
             workspace_consumer->bindWorkspace(workspace.get());
         }
 
-        auto h_input = TestTensorFactory::createFP32Random({static_cast<size_t>(m), static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
+        // Use shared input if provided, otherwise create random input
+        std::unique_ptr<FP32Tensor> h_input;
+        const float *input_ptr = shared_input;
+        if (!input_ptr)
+        {
+            h_input = TestTensorFactory::createFP32Random({static_cast<size_t>(m), static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
+            input_ptr = h_input->data();
+        }
 
         // Create tensor wrappers and upload to GPU
         auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(k)});
-        std::memcpy(A_tensor->mutable_data(), h_input->data(), static_cast<size_t>(m) * k * sizeof(float));
+        std::memcpy(A_tensor->mutable_data(), input_ptr, static_cast<size_t>(m) * k * sizeof(float));
         auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
 
-        DeviceId gpu_device(DeviceType::CUDA, 0);
+        DeviceId gpu_device = DeviceId::cuda(cuda_device_id);
         if (!A_tensor->ensureOnDevice(gpu_device))
             throw std::runtime_error("ensureOnDevice A failed");
         if (!C_tensor->ensureOnDevice(gpu_device))
@@ -462,6 +600,13 @@ namespace llaminar2::test::native_vnni_gemm_perf
             {
                 throw std::runtime_error("CUDA native-vnni GEMM warmup failed");
             }
+        }
+
+        // Surface any sticky CUDA error from warmup before timing so that an
+        // illegal access cannot silently serialize as a 0.000 us row.
+        if (cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess)
+        {
+            throw std::runtime_error(std::string("CUDA error after warmup: ") + cudaGetErrorString(err));
         }
 
         for (int i = 0; i < bench_runs; ++i)
@@ -488,6 +633,13 @@ namespace llaminar2::test::native_vnni_gemm_perf
                 throw std::runtime_error("CUDA native-vnni GEMM bench run failed");
             }
 
+            // Detect kernel launch / execution errors that would otherwise produce
+            // a bogus ~0 us timing instead of a hard failure.
+            if (cudaError_t err = cudaGetLastError(); err != cudaSuccess)
+            {
+                throw std::runtime_error(std::string("CUDA error during bench run: ") + cudaGetErrorString(err));
+            }
+
             times_us.push_back(static_cast<double>(elapsed_ms) * 1000.0);
         }
 
@@ -503,15 +655,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
         result.mean_us = std::accumulate(times_us.begin(), times_us.end(), 0.0) / static_cast<double>(times_us.size());
         if (path == RunPath::NativeVNNITensorCore)
         {
-            // Prefer V2 fused TC → V1 fused TC
-            const char *fused_v2 = cudaFusedTCGemmV2_lastSelectedFamily();
-            const char *fused_v1 = cudaFusedTCGemm_lastSelectedFamily();
-            if (fused_v2 && std::string(fused_v2).substr(0, 2) == "v2")
-                result.native_family = fused_v2;
-            else if (fused_v1 && std::string(fused_v1) != "unknown")
-                result.native_family = fused_v1;
-            else
-                result.native_family = "native_vnni_tc";
+            result.native_family = "native_vnni_tc";
         }
         return result;
     }

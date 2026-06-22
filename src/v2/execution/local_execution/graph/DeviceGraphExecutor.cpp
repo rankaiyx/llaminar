@@ -8,6 +8,7 @@
 #include "DeviceGraphExecutor.h"
 #include "StageVerifier.h"
 #include "DeviceGraphCaptureController.h"
+#include "GraphCaptureGuard.h"
 #include "../../debug/StageDumper.h"
 #include "../../debug/AsyncStageDumper.h"
 #include "../coherence/StageCoherence.h"
@@ -19,12 +20,15 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <optional>
 #include <print>
@@ -115,11 +119,11 @@ namespace llaminar2
             return false;
         }
 
-        void ensureStageGPUStreamBound(ComputeNode &node, IDeviceContext *ctx)
+        bool ensureStageGPUStreamBound(ComputeNode &node, IDeviceContext *ctx)
         {
             if (!node.stage || node.stage->gpuStream() != nullptr)
             {
-                return;
+                return true;
             }
 
             DeviceId device = node.device.is_valid() ? node.device : node.stage->device();
@@ -128,11 +132,166 @@ namespace llaminar2
                 device = ctx->deviceId();
             }
 
+            if (!device.is_gpu())
+            {
+                return true;
+            }
+
             void *stream = resolveWorkerDefaultStream(device);
             if (stream)
             {
                 node.stage->setGPUStream(stream);
+                return true;
             }
+
+            LOG_ERROR("[DeviceGraphExecutor] GPU stage '" << node.name
+                                                         << "' has no explicit stream for device "
+                                                         << device.to_string());
+            return false;
+        }
+
+        /**
+         * @brief Ensure GPU stages have explicit streams for normal eager passes.
+         *
+         * Null stage streams are dangerous because CUDA/HIP will otherwise fall
+         * back to the backend's implicit default stream.  This helper fills
+         * missing streams with the owning worker stream while preserving any
+         * stream a caller already bound deliberately, such as a graph-capture
+         * stream.  Preserving explicit ownership is what keeps handoff rules
+         * understandable: callers that bind a stream remain responsible for
+         * ordering it, while unbound stages get the executor-owned stream.
+         */
+        bool bindScheduleToWorkerStreams(
+            const std::vector<ComputeGraph::FastScheduleEntry> &schedule,
+            IDeviceContext *ctx)
+        {
+            if (!ctx || !ctx->isGPU())
+            {
+                return true;
+            }
+
+            struct PendingDependency
+            {
+                IWorkerGPUContext *gpu_ctx = nullptr;
+                void *worker_stream = nullptr;
+                void *old_stream = nullptr;
+            };
+
+            std::vector<PendingDependency> pending_dependencies;
+
+            auto rememberDependency = [&](IWorkerGPUContext *gpu_ctx, void *worker_stream, void *old_stream)
+            {
+                if (!gpu_ctx || !worker_stream || !old_stream || old_stream == worker_stream)
+                {
+                    return;
+                }
+                const auto already_present = std::any_of(
+                    pending_dependencies.begin(),
+                    pending_dependencies.end(),
+                    [&](const PendingDependency &dep)
+                    {
+                        return dep.gpu_ctx == gpu_ctx &&
+                               dep.worker_stream == worker_stream &&
+                               dep.old_stream == old_stream;
+                    });
+                if (!already_present)
+                {
+                    pending_dependencies.push_back({gpu_ctx, worker_stream, old_stream});
+                }
+            };
+
+            for (const auto &entry : schedule)
+            {
+                auto *node = entry.node;
+                if (!node || !node->stage)
+                {
+                    continue;
+                }
+
+                DeviceId device = node->device.is_valid() ? node->device : node->stage->device();
+                if (!device.is_valid() && ctx)
+                {
+                    device = ctx->deviceId();
+                }
+                if (!device.is_gpu())
+                {
+                    continue;
+                }
+
+                auto *gpu_ctx = tryGetWorkerContext(device);
+                if (!gpu_ctx)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] Could not resolve GPU context while binding stage '"
+                              << node->name << "' to " << device.to_string());
+                    return false;
+                }
+
+                void *worker_stream = gpu_ctx->defaultStream();
+                if (!worker_stream)
+                {
+                    LOG_ERROR("[DeviceGraphExecutor] GPU context for " << device.to_string()
+                                                                       << " has no explicit worker stream");
+                    return false;
+                }
+
+                void *stage_stream = node->stage->gpuStream();
+                if (stage_stream)
+                {
+                    continue;
+                }
+
+                rememberDependency(gpu_ctx, worker_stream, stage_stream);
+                node->stage->setGPUStream(worker_stream);
+            }
+
+            for (const auto &dep : pending_dependencies)
+            {
+                dep.gpu_ctx->insertStreamDependency(dep.worker_stream, dep.old_stream);
+            }
+
+            return true;
+        }
+
+        bool contractReadsNeedTransfer(
+            BufferArena *arena,
+            const StageBufferContract &contract,
+            DeviceId target_device)
+        {
+            if (!arena || contract.empty())
+                return false;
+
+            for (const auto &binding : contract.allArenaReads())
+            {
+                if (!arena->isRegistered(binding.id))
+                    continue;
+
+                auto *tensor = dynamic_cast<TensorBase *>(arena->getTensor(binding.id));
+                if (!tensor)
+                    continue;
+
+                const CoherenceState state = arena->getCoherenceState(binding.id);
+                if (state.needsTransferTo(target_device, tensor->coherenceState()))
+                    return true;
+            }
+
+            return false;
+        }
+
+        bool fastPolicyRequiresContractCoherence(
+            const StageRunPolicy &policy,
+            BufferArena *arena,
+            const StageBufferContract &contract,
+            DeviceId target_device)
+        {
+            if (policy.coherence || !arena || contract.empty())
+                return false;
+
+            // Host-staged graph-native collectives must always honor arena
+            // contracts in decode: they are exactly the CPU bridges between
+            // device-resident graph stages. GPU stages also need coherence when
+            // a prior host bridge made one of their inputs CPU-authoritative.
+            return target_device.is_cpu() ||
+                   contractReadsNeedTransfer(arena, contract, target_device);
         }
     }
 
@@ -142,7 +301,13 @@ namespace llaminar2
     // =========================================================================
 
     // Forward declarations for static helpers used by runStage()
+    static bool stageChecksumTraceEnabled();
+    static bool stageChecksumTraceMatches(const std::string &stage_name);
     static void printStageOutputs(const std::string &stage_name, const StageDumpInfo &dump_info);
+    static void traceStageOutputChecksums(
+        const std::string &stage_name,
+        const IComputeStage *stage,
+        const StageDumpInfo &dump_info);
     static void logWatchedPointerProducer(
         const std::string &stage_name,
         const StageDumpInfo &dump_info,
@@ -258,8 +423,8 @@ namespace llaminar2
     void GraphExecutorStats::printProfilingSummary(size_t prefill_tokens, size_t decode_tokens) const
     {
         // Print per-phase tables first (the useful ones)
-        printPhaseTable("EXECUTOR STAGE PROFILING — PREFILL", prefill, prefill_tokens);
-        printPhaseTable("EXECUTOR STAGE PROFILING — DECODE", decode, decode_tokens);
+        printPhaseTable("HOST EXECUTOR STAGE PROFILING — PREFILL", prefill, prefill_tokens);
+        printPhaseTable("HOST EXECUTOR STAGE PROFILING — DECODE", decode, decode_tokens);
 
         // Calculate totals for overhead summary
         double total_overhead = overhead.total();
@@ -374,6 +539,78 @@ namespace llaminar2
         std::print("\n{}", table.to_string());
     }
 
+    void GraphExecutorStats::recordPerfStats(const std::string &device_name) const
+    {
+        if (!PerfStatsCollector::isEnabled())
+            return;
+
+        auto record_phase = [&](const char *phase_name, const PhaseStats &phase)
+        {
+            if (!phase_name || phase.total_stages_executed == 0)
+                return;
+
+            const PerfStatsCollector::Tags base_tags{
+                {"attribution", "host"},
+                {"source", "device_graph_executor"},
+                {"graph_capture_scope", "eager_or_capture_setup"},
+                {"note", "host_executor_timing_not_gpu_stage_time"}};
+
+            PerfStatsCollector::recordTimingNs(
+                "stage_executor_cpu",
+                "execute_total",
+                static_cast<uint64_t>(phase.total_execute_ms * 1.0e6),
+                phase_name,
+                device_name,
+                base_tags);
+
+            if (phase.total_collective_ms > 0.0)
+            {
+                auto collective_tags = base_tags;
+                collective_tags.emplace("calls", std::to_string(phase.total_collective_calls));
+                PerfStatsCollector::recordTimingNs(
+                    "stage_executor_cpu",
+                    "collective_total",
+                    static_cast<uint64_t>(phase.total_collective_ms * 1.0e6),
+                    phase_name,
+                    device_name,
+                    std::move(collective_tags));
+            }
+
+            const double overhead_ms = phase.overhead.total();
+            if (overhead_ms > 0.0)
+            {
+                PerfStatsCollector::recordTimingNs(
+                    "stage_executor_cpu",
+                    "overhead_total",
+                    static_cast<uint64_t>(overhead_ms * 1.0e6),
+                    phase_name,
+                    device_name,
+                    base_tags);
+            }
+
+            for (const auto &[stage_type, ms] : phase.stage_type_execute_ms)
+            {
+                auto tags = base_tags;
+                const auto count_it = phase.stage_type_counts.find(stage_type);
+                tags.emplace("stage_type", stage_type);
+                tags.emplace("stage_count",
+                             count_it == phase.stage_type_counts.end()
+                                 ? "0"
+                                 : std::to_string(count_it->second));
+                PerfStatsCollector::recordTimingNs(
+                    "stage_executor_cpu",
+                    std::string("type.") + stage_type,
+                    static_cast<uint64_t>(ms * 1.0e6),
+                    phase_name,
+                    device_name,
+                    std::move(tags));
+            }
+        };
+
+        record_phase("prefill", prefill);
+        record_phase("decode", decode);
+    }
+
     // =============================================================================
     // DeviceGraphExecutor Implementation
     // =============================================================================
@@ -441,6 +678,21 @@ namespace llaminar2
     // code paths where one path does coherence/validation and another skips it.
     // =========================================================================
 
+    bool DeviceGraphExecutor::cancellationRequested(const std::string &node_name) const
+    {
+        if (!config_.cancellation_requested || !config_.cancellation_requested())
+            return false;
+
+        LOG_WARN("[DeviceGraphExecutor] Execution canceled before stage: " << node_name);
+        return true;
+    }
+
+    void DeviceGraphExecutor::notifyStageFailure(const std::string &node_name, const std::string &reason) const
+    {
+        if (config_.stage_failure_callback)
+            config_.stage_failure_callback(node_name, reason);
+    }
+
     bool DeviceGraphExecutor::runStages(
         ComputeGraph &graph,
         IDeviceContext *ctx,
@@ -463,6 +715,12 @@ namespace llaminar2
         if (schedule.empty())
             return true;
 
+        if (!policy.preserve_gpu_streams &&
+            !bindScheduleToWorkerStreams(schedule, ctx))
+        {
+            return false;
+        }
+
         // Ensure last stage is marked for event-based dirty marking
         schedule.back().node->is_final_output = true;
 
@@ -470,28 +728,27 @@ namespace llaminar2
         // GPU Stage Timing: event-based per-stage profiling
         // Gated by policy AND env var. ~1μs CPU overhead per event record.
         // =====================================================================
-        const bool timeline_active = policy.timeline && debugEnv().gpu_stage_timing && ctx->isGPU();
+        const bool timeline_requested = PerfStatsCollector::gpuStageEventTimingEnabled();
+        const bool timeline_active = policy.timeline && timeline_requested && ctx->isGPU() && !isGraphCaptureActive();
+        const bool cpu_stage_timing_active =
+            PerfStatsCollector::isEnabled() && ctx && !ctx->isGPU();
         IWorkerGPUContext *timeline_gpu_ctx = nullptr;
-        void *timeline_stream = nullptr;
         if (timeline_active)
         {
             timeline_gpu_ctx = tryGetWorkerContext(ctx->deviceId());
             if (timeline_gpu_ctx)
             {
-                timeline_stream = timeline_gpu_ctx->defaultStream();
                 stage_timeline_.ensureCapacity(timeline_gpu_ctx, schedule.size());
+                stage_timeline_.resetTimings();
 
-                // Pre-populate stage metadata once — names/types never change
-                if (!stage_timeline_info_populated_)
+                // Stage metadata is graph-shape specific; refresh it for each profiled execution.
+                for (size_t i = 0; i < schedule.size(); ++i)
                 {
-                    for (size_t i = 0; i < schedule.size(); ++i)
-                    {
-                        auto *node = schedule[i].node;
-                        if (node && node->stage)
-                            stage_timeline_.setStageInfo(i, node->name, node->stage->type());
-                    }
-                    stage_timeline_info_populated_ = true;
+                    auto *node = schedule[i].node;
+                    if (node && node->stage)
+                        stage_timeline_.setStageInfo(i, node->name, node->stage->type());
                 }
+                stage_timeline_info_populated_ = true;
             }
         }
 
@@ -508,25 +765,98 @@ namespace llaminar2
             if (!node || !node->stage)
             {
                 LOG_ERROR("[DeviceGraphExecutor] Invalid node at schedule index " << i);
+                notifyStageFailure("(invalid)", "invalid node in execution schedule");
                 return false;
             }
 
-            ensureStageGPUStreamBound(*node, ctx);
+            if (cancellationRequested(node->name))
+                return false;
+
+            if (!ensureStageGPUStreamBound(*node, ctx))
+            {
+                notifyStageFailure(node->name, "GPU stage has no explicit stream");
+                return false;
+            }
+            void *stage_timeline_stream = nullptr;
+            if (timeline_active && timeline_gpu_ctx)
+            {
+                stage_timeline_stream = node->stage->gpuStream();
+                if (!stage_timeline_stream)
+                    stage_timeline_stream = timeline_gpu_ctx->defaultStream();
+            }
 
             if (timeline_active && timeline_gpu_ctx)
-                stage_timeline_.recordStart(i, timeline_gpu_ctx, timeline_stream);
+                stage_timeline_.recordStart(i, timeline_gpu_ctx, stage_timeline_stream);
 
+            if (debugEnv().vram_trace && ctx->isGPU())
+            {
+                const DeviceId stage_device = node->device.is_valid() ? node->device : node->stage->device();
+                LOG_TRACE("[VRAM_TRACE] stage.before index=" << i
+                                                            << " name=" << node->name
+                                                            << " type=" << computeStageTypeName(node->stage->type())
+                                                            << " device=" << stage_device.toString());
+            }
+
+            const auto cpu_stage_start =
+                cpu_stage_timing_active ? PerfStatsCollector::Clock::now()
+                                        : PerfStatsCollector::Clock::time_point{};
             if (!runStage(*node, ctx, policy, is_coll))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << node->name);
+                notifyStageFailure(node->name, "stage execution returned false");
                 return false;
+            }
+            if (cpu_stage_timing_active)
+            {
+                const auto cpu_stage_end = PerfStatsCollector::Clock::now();
+                const auto ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_stage_end - cpu_stage_start).count();
+                const std::string stage_type_name = computeStageTypeName(node->stage->type());
+
+                // Keep the coarse aggregate stable for existing dashboards, then
+                // add a node-level record so verifier tuning can identify the
+                // exact graph stage that dominates an M=2..4 replay.
+                PerfStatsCollector::recordTimingNs(
+                    "stage_cpu",
+                    std::string("type.") + stage_type_name,
+                    ns > 0 ? static_cast<uint64_t>(ns) : 0,
+                    "execute",
+                    ctx->deviceId().to_string(),
+                    PerfStatsCollector::Tags{
+                        {"attribution", "cpu_wall"},
+                        {"source", "device_graph_executor"}});
+                PerfStatsCollector::recordTimingNs(
+                    "stage_cpu_detail",
+                    node->name,
+                    ns > 0 ? static_cast<uint64_t>(ns) : 0,
+                    "execute",
+                    ctx->deviceId().to_string(),
+                    PerfStatsCollector::Tags{
+                        {"attribution", "cpu_wall"},
+                        {"source", "device_graph_executor"},
+                        {"stage_type", stage_type_name}});
+            }
+
+            if (debugEnv().vram_trace && ctx->isGPU())
+            {
+                const DeviceId stage_device = node->device.is_valid() ? node->device : node->stage->device();
+                LOG_TRACE("[VRAM_TRACE] stage.after index=" << i
+                                                           << " name=" << node->name
+                                                           << " type=" << computeStageTypeName(node->stage->type())
+                                                           << " device=" << stage_device.toString());
+            }
+
+            if (ctx->isGPU() && debugEnv().runtime_debug.sync_after_stage)
+            {
+                LOG_DEBUG("[DeviceGraphExecutor] sync after stage: " << node->name);
+                ctx->synchronize();
             }
 
             // Mark stage completed for graph dependency tracking
             graph.markCompleted(node->name);
 
             if (timeline_active && timeline_gpu_ctx)
-                stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
+                stage_timeline_.recordStop(i, timeline_gpu_ctx, stage_timeline_stream);
         }
 
         // =====================================================================
@@ -537,7 +867,7 @@ namespace llaminar2
             size_t pending = AsyncStageDumper::pendingTasks();
             if (pending > 0)
             {
-                LOG_INFO("[DeviceGraphExecutor] Waiting for " << pending << " pending async dumps...");
+                LOG_DEBUG("[DeviceGraphExecutor] Waiting for " << pending << " pending async dumps...");
                 AsyncStageDumper::waitForCompletion();
             }
         }
@@ -614,12 +944,100 @@ namespace llaminar2
                 }
             }
 
-            // LOCAL TP: collective_ctx_ is nullptr, stage handles collective internally
-            // In fast decode mode (no coherence), just execute and return
-            if (!policy.coherence)
+            // LOCAL TP / GLOBAL TP: collective_ctx_ is nullptr, stage handles
+            // collective internally.  In fast-decode mode (no coherence) we can
+            // skip the full coherence/validation pipeline, but we must still
+            // accumulate profiling stats so ALLREDUCE/ALLGATHER appear in the
+            // executor timing tables.
+            const StageBufferContract contract = arena_ ? node.stage->bufferContract() : StageBufferContract{};
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+            const bool force_contract_coherence =
+                fastPolicyRequiresContractCoherence(policy, arena_, contract, target_device);
+
+            if (!policy.coherence && !force_contract_coherence)
             {
-                ensureStageGPUStreamBound(node, ctx);
-                return node.stage->execute(ctx);
+                if (!ensureStageGPUStreamBound(node, ctx))
+                    return false;
+
+                const bool profiling_fast = policy.profiling && config_.enable_profiling;
+                std::chrono::high_resolution_clock::time_point t0{};
+                if (profiling_fast)
+                    t0 = std::chrono::high_resolution_clock::now();
+
+                if (debugEnv().execution.trace_stages)
+                {
+                    LOG_DEBUG("[StageTrace] begin stage='" << node.name
+                                                          << "' type=" << static_cast<int>(node.stage->type())
+                                                          << " device=" << target_device.to_string());
+                }
+                bool ok = node.stage->execute(ctx);
+                if (debugEnv().execution.trace_stages)
+                {
+                    LOG_DEBUG("[StageTrace] end stage='" << node.name
+                                                        << "' ok=" << (ok ? "true" : "false")
+                                                        << " device=" << target_device.to_string());
+                }
+
+                if (ok && debugEnv().validation.sync_each_stage)
+                {
+                    DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+                    if (target_device.is_gpu())
+                    {
+                        if (auto *gpu_ctx = tryGetWorkerContext(target_device); gpu_ctx && !gpu_ctx->debugSynchronize())
+                        {
+                            LOG_ERROR("[SYNC_EACH_STAGE] stage='" << node.name
+                                                                  << "' device=" << target_device.to_string()
+                                                                  << " device debug synchronization failed");
+                            ok = false;
+                        }
+                    }
+                }
+
+                if (profiling_fast)
+                {
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    double exec_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+                    const std::string stage_type_name = computeStageTypeName(node.stage->type());
+                    stats_.stage_times_ms[node.name] = exec_ms;
+                    stats_.total_execute_ms += exec_ms;
+                    stats_.total_stages_executed++;
+                    stats_.stage_type_execute_ms[stage_type_name] += exec_ms;
+                    stats_.stage_type_counts[stage_type_name]++;
+
+                    const auto stype = node.stage->type();
+                    if (stype == ComputeStageType::ALLREDUCE ||
+                        stype == ComputeStageType::ALLGATHER ||
+                        stype == ComputeStageType::ALLGATHER_V)
+                    {
+                        stats_.total_collective_ms += exec_ms;
+                        stats_.total_collective_calls++;
+                    }
+
+                    const auto phase = GraphExecutorStats::currentPhase();
+                    PhaseStats *phase_stats = nullptr;
+                    if (phase == ExecutionPhase::PREFILL)
+                        phase_stats = &stats_.prefill;
+                    else if (phase == ExecutionPhase::DECODE)
+                        phase_stats = &stats_.decode;
+
+                    if (phase_stats)
+                    {
+                        phase_stats->total_execute_ms += exec_ms;
+                        phase_stats->total_stages_executed++;
+                        phase_stats->stage_type_execute_ms[stage_type_name] += exec_ms;
+                        phase_stats->stage_type_counts[stage_type_name]++;
+                        if (stype == ComputeStageType::ALLREDUCE ||
+                            stype == ComputeStageType::ALLGATHER ||
+                            stype == ComputeStageType::ALLGATHER_V)
+                        {
+                            phase_stats->total_collective_ms += exec_ms;
+                            phase_stats->total_collective_calls++;
+                        }
+                    }
+                }
+
+                return ok;
             }
         }
 
@@ -665,20 +1083,24 @@ namespace llaminar2
         // The coherence flag controls whether prepareForRead/Write are called.
         const StageBufferContract contract = arena_ ? node.stage->bufferContract() : StageBufferContract{};
         const bool use_contract = !contract.empty() && arena_ != nullptr;
+        DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+        const bool force_contract_coherence =
+            use_contract && fastPolicyRequiresContractCoherence(policy, arena_, contract, target_device);
 
         // Bind GPU stream early so coherence operations (H2D/D2H) run on
         // the same stream as the stage's compute kernels.
-        ensureStageGPUStreamBound(node, ctx);
+        if (!ensureStageGPUStreamBound(node, ctx))
+            return false;
         void *stage_stream = node.stage ? node.stage->gpuStream() : nullptr;
 
-        if (policy.coherence)
+        if (policy.coherence || force_contract_coherence)
         {
             auto coh_policy = node.stage->coherencePolicy();
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
 
             LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' coherencePolicy=" << toString(coh_policy)
                                                       << " target_device=" << target_device.to_string()
-                                                      << " use_contract=" << use_contract);
+                                                      << " use_contract=" << use_contract
+                                                      << " forced_contract=" << force_contract_coherence);
 
             if (use_contract)
             {
@@ -707,10 +1129,12 @@ namespace llaminar2
                 // dump_info.weights duplicates these, and dump_info.inputs are activation
                 // tensors already handled by arena coherence above.
                 //
-                // Session-level fast path: after the first successful forward pass,
-                // all weights are known to be on-device. Skip the per-node check
-                // since weight tensors don't move between forwards.
-                if (policy.weight_coherence && !node.weights_cohered && !weights_session_cohered_)
+                // Per-node fast path: a cached graph node only needs weight
+                // coherence once. Do not use a session-wide shortcut here:
+                // prefill and decode use distinct cached graph shapes, so a
+                // later decode graph may contain nodes whose weights have never
+                // been prepared for this device.
+                if (policy.weight_coherence && !node.weights_cohered)
                 {
                     if (profiling)
                         phase_start = std::chrono::high_resolution_clock::now();
@@ -719,11 +1143,22 @@ namespace llaminar2
                     {
                         if (auto *tb = dynamic_cast<TensorBase *>(weight))
                         {
+                            // Skip weights whose GEMM representation is managed by the
+                            // PreparedWeightStore-backed GPU pipeline.
+                            // The kernel owns its device copy in pooled VRAM — calling
+                            // ensureOnDevice would fail because the host data may have
+                            // been released after pipeline upload.
+                            if (tb->hasPreparedDeviceState())
+                            {
+                                continue;
+                            }
                             if (!tb->ensureOnDevice(target_device, stage_stream))
                             {
                                 LOG_ERROR("[DeviceGraphExecutor] Weight upload failed for stage '"
                                           << node.name << "'"
                                           << " tensor=" << static_cast<void *>(tb)
+                                          << " name=" << (tb->debugName().empty() ? "(unnamed)" : tb->debugName())
+                                          << " shape=[" << tb->rows() << "," << tb->cols() << "]"
                                           << " type=" << static_cast<int>(tb->native_type())
                                           << " device=" << target_device.toString());
                                 return false;
@@ -774,6 +1209,14 @@ namespace llaminar2
         // =====================================================================
         // ENTRY Verification (Debug/Integration only)
         // =====================================================================
+        std::string prepared_error;
+        if (!node.stage->validatePreparedWeights(&prepared_error))
+        {
+            LOG_ERROR("[DeviceGraphExecutor] Prepared weight validation failed for stage '"
+                      << node.name << "': " << prepared_error);
+            return false;
+        }
+
 #if LLAMINAR_ASSERTIONS_ACTIVE
         if (policy.validation && debugEnv().validation.validate_inputs)
         {
@@ -794,6 +1237,14 @@ namespace llaminar2
 
         if (should_dump)
         {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Stage dump requested during GPU graph capture for stage '"
+                          << node.name
+                          << "'. Stage dumps materialize tensor payloads on host and are not graph-capturable.");
+                return false;
+            }
+
             const auto &dump_cfg = debugEnv().stage_dump;
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
@@ -865,7 +1316,19 @@ namespace llaminar2
             phase_start = std::chrono::high_resolution_clock::now();
 
         // Stream already bound above (before coherence section)
+        if (debugEnv().execution.trace_stages)
+        {
+            LOG_DEBUG("[StageTrace] begin stage='" << node.name
+                                                  << "' type=" << static_cast<int>(node.stage->type())
+                                                  << " device=" << target_device.to_string());
+        }
         bool success = node.stage->execute(ctx);
+        if (debugEnv().execution.trace_stages)
+        {
+            LOG_DEBUG("[StageTrace] end stage='" << node.name
+                                                << "' ok=" << (success ? "true" : "false")
+                                                << " device=" << target_device.to_string());
+        }
 
         if (success && debugEnv().validation.sync_each_stage)
         {
@@ -900,7 +1363,7 @@ namespace llaminar2
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
 
-            const bool need_event = node.is_final_output || policy.snapshot_callback
+            const bool need_event = node.is_final_output || (policy.snapshot_callback && config_.snapshot_callback)
 #if LLAMINAR_ASSERTIONS_ACTIVE
                                     || debugEnv().validation.validate_buffers
 #endif
@@ -927,6 +1390,12 @@ namespace llaminar2
             printStageOutputs(node.name, cached_dump_info);
         }
 
+        if (success && stageChecksumTraceEnabled() && stageChecksumTraceMatches(node.name))
+        {
+            node.stage->invalidateDumpInfoCache();
+            traceStageOutputChecksums(node.name, node.stage.get(), node.stage->getDumpInfo());
+        }
+
         // =====================================================================
         // Stage Dump: output snapshots
         // =====================================================================
@@ -936,9 +1405,16 @@ namespace llaminar2
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
 
+            // Rebuild post-execute dump info before output dumping. Some stages
+            // populate diagnostic outputs during execute(), and async dumping
+            // consumes the StageDumpInfo passed here rather than re-fetching
+            // through StageDumper::dumpOutputs().
+            node.stage->invalidateDumpInfoCache();
+            const StageDumpInfo &output_dump_info = node.stage->getDumpInfo();
+
             if (dump_cfg.async_dump)
             {
-                AsyncStageDumper::enqueueOutputs(dump_ctx, cached_dump_info);
+                AsyncStageDumper::enqueueOutputs(dump_ctx, output_dump_info);
             }
             else
             {
@@ -977,9 +1453,14 @@ namespace llaminar2
         {
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
-            cached_dump_info.ensureOutputsOnHost();
+            // Rebuild dump info post-execute. Snapshot consumers need the
+            // runtime output metadata, and stages should not have to self-
+            // invalidate just to make callback snapshots trustworthy.
+            node.stage->invalidateDumpInfoCache();
+            const StageDumpInfo &snapshot_dump_info = node.stage->getDumpInfo();
+            snapshot_dump_info.ensureOutputsOnHost();
             LOG_DEBUG("[DeviceGraphExecutor::runStage] Invoking callback for " << node.name);
-            config_.snapshot_callback(node.name, cached_dump_info);
+            config_.snapshot_callback(node.name, snapshot_dump_info);
             if (profiling)
             {
                 phase_end = std::chrono::high_resolution_clock::now();
@@ -1114,6 +1595,9 @@ namespace llaminar2
             if (!node || !node->stage)
                 continue;
 
+            if (cancellationRequested(name))
+                return false;
+
             // Find appropriate context for this node's device
             IDeviceContext *ctx = default_ctx;
             if (node->device.is_gpu())
@@ -1128,6 +1612,7 @@ namespace llaminar2
             if (!executeNode(*node, ctx))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << name << " on device " << node->device.to_string());
+                notifyStageFailure(name, "stage execution returned false");
                 return false;
             }
 
@@ -1140,6 +1625,101 @@ namespace llaminar2
     // =========================================================================
     // Stage Output Debug Printing
     // =========================================================================
+
+    static bool stageChecksumTraceEnabled()
+    {
+        return debugEnv().runtime_debug.stage_checksum_trace;
+    }
+
+    static bool stageChecksumTraceMatches(const std::string &stage_name)
+    {
+        const auto &filter = debugEnv().runtime_debug.stage_checksum_filter;
+        return filter.empty() || stage_name.find(filter) != std::string::npos;
+    }
+
+    static uint64_t fnv1a64(const uint8_t *data, size_t size)
+    {
+        uint64_t hash = 1469598103934665603ULL;
+        for (size_t i = 0; i < size; ++i)
+        {
+            hash ^= static_cast<uint64_t>(data[i]);
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    static void traceStageOutputChecksums(
+        const std::string &stage_name,
+        const IComputeStage *stage,
+        const StageDumpInfo &dump_info)
+    {
+        if (!stageChecksumTraceEnabled() || !stageChecksumTraceMatches(stage_name))
+            return;
+
+        if (dump_info.outputs.empty())
+        {
+            LOG_DEBUG("[StageChecksum] stage='" << stage_name
+                                               << "' type=" << (stage ? computeStageTypeName(stage->type()) : "(unknown)")
+                                               << " outputs=0");
+            return;
+        }
+
+        dump_info.ensureOutputsOnHost();
+        for (const auto &output : dump_info.outputs)
+        {
+            if (!output.data)
+            {
+                LOG_DEBUG("[StageChecksum] stage='" << stage_name
+                                                   << "' output='" << (output.name ? output.name : "(unnamed)")
+                                                   << "' data=null");
+                continue;
+            }
+
+            const size_t logical_elements = output.rows * output.cols;
+            const size_t byte_size = output.byte_size ? output.byte_size : logical_elements * output.element_size;
+            const auto *bytes = static_cast<const uint8_t *>(output.data);
+            const uint64_t hash = fnv1a64(bytes, byte_size);
+
+            std::ostringstream oss;
+            oss << "[StageChecksum] stage='" << stage_name
+                << "' type=" << (stage ? computeStageTypeName(stage->type()) : "(unknown)")
+                << " output='" << (output.name ? output.name : "(unnamed)")
+                << "' shape=[" << output.rows << "x" << output.cols << "]"
+                << " dtype=" << (output.dtype ? output.dtype : "(unknown)")
+                << " bytes=" << byte_size
+                << " hash=0x" << std::hex << hash << std::dec;
+
+            if (output.dtype && std::strcmp(output.dtype, "FP32") == 0 && output.element_size == sizeof(float))
+            {
+                const auto *fp = static_cast<const float *>(output.data);
+                double sum = 0.0;
+                double abs_sum = 0.0;
+                double max_abs = 0.0;
+                for (size_t i = 0; i < logical_elements; ++i)
+                {
+                    const double v = static_cast<double>(fp[i]);
+                    sum += v;
+                    const double av = std::fabs(v);
+                    abs_sum += av;
+                    max_abs = std::max(max_abs, av);
+                }
+                oss << " sum=" << std::setprecision(12) << sum
+                    << " abs_sum=" << abs_sum
+                    << " max_abs=" << max_abs;
+                const size_t sample_count = std::min<size_t>(logical_elements, 4);
+                oss << " first=[";
+                for (size_t i = 0; i < sample_count; ++i)
+                {
+                    if (i)
+                        oss << ",";
+                    oss << fp[i];
+                }
+                oss << "]";
+            }
+
+            LOG_DEBUG(oss.str());
+        }
+    }
 
     /**
      * @brief Print first N elements of stage outputs for debugging
@@ -1218,8 +1798,8 @@ namespace llaminar2
                     last_row << "...";
             }
 
-            // Use stream directly with LOG_INFO
-            LOG_INFO(header.str() << first_row.str() << last_row.str());
+            // Use stream directly with LOG_DEBUG
+            LOG_DEBUG(header.str() << first_row.str() << last_row.str());
         }
     }
 

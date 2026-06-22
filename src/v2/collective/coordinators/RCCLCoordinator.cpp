@@ -182,7 +182,7 @@ namespace llaminar2
     RCCLCoordinator::~RCCLCoordinator()
     {
         LOG_DEBUG("[RCCLCoordinator] Destroying");
-        if (initialized_.load())
+        if (initialized_.load() || running_.load() || coordinator_thread_.joinable())
         {
             shutdown();
         }
@@ -260,7 +260,7 @@ namespace llaminar2
         }
 
         initialized_.store(true);
-        LOG_INFO("[RCCLCoordinator] Initialized with " << num_devices_ << " ROCm GPU(s)");
+        LOG_DEBUG("[RCCLCoordinator] Initialized with " << num_devices_ << " ROCm GPU(s)");
         return true;
 #else
         last_error_ = "RCCL not available (HAVE_RCCL not defined)";
@@ -271,7 +271,7 @@ namespace llaminar2
 
     void RCCLCoordinator::shutdown()
     {
-        if (!initialized_.load() && !running_.load())
+        if (!initialized_.load() && !running_.load() && !coordinator_thread_.joinable())
         {
             return;
         }
@@ -292,7 +292,7 @@ namespace llaminar2
         }
 
         initialized_.store(false);
-        LOG_INFO("[RCCLCoordinator] Shutdown complete");
+        LOG_DEBUG("[RCCLCoordinator] Shutdown complete");
     }
 
     void RCCLCoordinator::abortCommunicators()
@@ -307,7 +307,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    hipSetDevice(device_ordinals_[i]);
+                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
                 }
                 rccl::ncclResult_t r = rccl::ncclCommAbort(
                     static_cast<rccl::ncclComm_t>(comms_[i]));
@@ -424,8 +424,20 @@ namespace llaminar2
             compute_events_[i] = static_cast<void *>(ev);
         }
 
-        LOG_INFO("[RCCLCoordinator] Compute streams registered for " << num_devices_
+        LOG_DEBUG("[RCCLCoordinator] Compute streams registered for " << num_devices_
                                                                      << " devices — using stream-level pre-sync");
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=rccl_compute_stream"
+                         << " coordinator=" << static_cast<const void *>(this)
+                         << " slot=" << i
+                         << " ordinal=" << device_ordinals_[i]
+                         << " compute_stream=" << compute_streams_[i]
+                         << " compute_event=" << compute_events_[i]);
+            }
+        }
 #else
         (void)compute_streams;
 #endif
@@ -614,7 +626,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    hipSetDevice(device_ordinals_[i]);
+                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
                 }
                 HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
             }
@@ -640,7 +652,7 @@ namespace llaminar2
             bool alloc_ok = true;
             for (int i = 0; i < num_devices_ && alloc_ok; ++i)
             {
-                hipSetDevice(device_ordinals_[i]);
+                HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
                 if (hipMalloc(&prime_bufs[i], sizeof(float)) != hipSuccess)
                 {
                     LOG_WARN("[RCCLCoordinator] hipMalloc for prime buffer failed on device "
@@ -658,7 +670,7 @@ namespace llaminar2
                     bool ops_ok = true;
                     for (int i = 0; i < num_devices_ && ops_ok; ++i)
                     {
-                        hipSetDevice(device_ordinals_[i]);
+                        HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
                         r = rccl::ncclAllReduce(
                             prime_bufs[i], prime_bufs[i], 1,
                             rccl::ncclFloat, rccl::ncclSum,
@@ -678,8 +690,8 @@ namespace llaminar2
                         // Synchronize all streams to ensure the trivial op completes
                         for (int i = 0; i < num_devices_; ++i)
                         {
-                            hipSetDevice(device_ordinals_[i]);
-                            hipStreamSynchronize(static_cast<hipStream_t>(streams_[i]));
+                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                            HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
                         }
                         collective_performed_.store(true);
                         LOG_DEBUG("[RCCLCoordinator] Communicators primed successfully");
@@ -692,8 +704,8 @@ namespace llaminar2
             {
                 if (prime_bufs[i] != nullptr)
                 {
-                    hipSetDevice(device_ordinals_[i]);
-                    hipFree(prime_bufs[i]);
+                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(hipFree(prime_bufs[i]));
                 }
             }
         }
@@ -723,7 +735,7 @@ namespace llaminar2
                     {
                         if (i < static_cast<int>(device_ordinals_.size()))
                         {
-                            hipSetDevice(device_ordinals_[i]);
+                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
                         }
                         rccl::ncclResult_t r = rccl::ncclCommFinalize(static_cast<rccl::ncclComm_t>(comms_[i]));
                         if (r != rccl::ncclSuccess)
@@ -742,9 +754,9 @@ namespace llaminar2
                     {
                         if (i < static_cast<int>(device_ordinals_.size()))
                         {
-                            hipSetDevice(device_ordinals_[i]);
+                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
                         }
-                        hipStreamSynchronize(static_cast<hipStream_t>(streams_[i]));
+                        HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
                     }
                 }
 
@@ -755,7 +767,7 @@ namespace llaminar2
                     {
                         if (i < static_cast<int>(device_ordinals_.size()))
                         {
-                            hipSetDevice(device_ordinals_[i]);
+                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
                         }
                         rccl::ncclResult_t r = rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comms_[i]));
                         if (r != rccl::ncclSuccess)
@@ -798,7 +810,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    hipSetDevice(device_ordinals_[i]);
+                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
                 }
                 HIP_CHECK_VOID(hipEventDestroy(static_cast<hipEvent_t>(completion_events_[i])));
                 completion_events_[i] = nullptr;
@@ -813,7 +825,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    hipSetDevice(device_ordinals_[i]);
+                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
                 }
                 HIP_CHECK_VOID(hipStreamDestroy(static_cast<hipStream_t>(streams_[i])));
                 streams_[i] = nullptr;
@@ -1005,6 +1017,7 @@ namespace llaminar2
             last_error_ = std::string("rcclAllReduce failed: ") + rccl::ncclGetErrorString(r);
             return false;
         }
+        collective_performed_.store(true);
 
         // 4. Post-sync: record completion on RCCL stream, compute stream waits
         err = hipEventRecord(completion_event, rccl_stream);
@@ -1082,6 +1095,19 @@ namespace llaminar2
         // 2. Launch allreduce directly on the caller's stream.
         //    No cross-stream event sync needed — the caller's stream provides
         //    ordering (prior compute → allreduce → subsequent compute).
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_onstream_launch"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " buffer=" << buffer
+                     << " count=" << count
+                     << " dtype=" << static_cast<int>(dtype)
+                     << " op=" << static_cast<int>(op)
+                     << " stream=" << stream
+                     << " comm=" << comm);
+        }
         rccl::ncclResult_t r = rccl::ncclAllReduce(
             buffer, buffer, count,
             toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
@@ -1090,6 +1116,16 @@ namespace llaminar2
         {
             last_error_ = std::string("rcclAllReduce(on-stream) failed: ") + rccl::ncclGetErrorString(r);
             return false;
+        }
+        collective_performed_.store(true);
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_onstream_enqueued"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " stream=" << stream);
         }
 
         return true;
@@ -1225,6 +1261,7 @@ namespace llaminar2
             last_error_ = std::string("rcclAllReduce failed: ") + rccl::ncclGetErrorString(r);
             return false;
         }
+        collective_performed_.store(true);
 
         // Record completion event
         err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[device_idx]), stream);
@@ -2123,12 +2160,20 @@ namespace llaminar2
         err = hipSetDevice(device_ordinals_[src_device_idx]);
         if (err == hipSuccess)
         {
-            hipEventRecord(static_cast<hipEvent_t>(completion_events_[src_device_idx]), src_stream);
+            hipError_t evt_err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[src_device_idx]), src_stream);
+            if (evt_err != hipSuccess)
+            {
+                LOG_WARN("[RCCLCoordinator] hipEventRecord (src) failed: " << hipGetErrorString(evt_err));
+            }
         }
         err = hipSetDevice(device_ordinals_[dst_device_idx]);
         if (err == hipSuccess)
         {
-            hipEventRecord(static_cast<hipEvent_t>(completion_events_[dst_device_idx]), dst_stream);
+            hipError_t evt_err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[dst_device_idx]), dst_stream);
+            if (evt_err != hipSuccess)
+            {
+                LOG_WARN("[RCCLCoordinator] hipEventRecord (dst) failed: " << hipGetErrorString(evt_err));
+            }
         }
 
         LOG_DEBUG("[RCCLCoordinator] Copy " << (wait_for_completion ? "completed" : "enqueued")

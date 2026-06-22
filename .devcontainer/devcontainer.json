@@ -1,18 +1,27 @@
 {
     "name": "Llaminar CMake Development",
     "build": {
-        "dockerfile": ".devcontainer/Dockerfile",
+        "dockerfile": "Dockerfile",
         "context": "..",
         "args": {
             "INSTALL_CUDA": "true",
             "INSTALL_ROCM": "true"
         }
     },
+    "workspaceFolder": "/workspaces/llaminar",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/llaminar,type=bind,consistency=cached",
     "features": {
         "ghcr.io/devcontainers/features/git:1": {},
         "ghcr.io/devcontainers/features/github-cli:1": {},
+        "ghcr.io/devcontainers/features/azure-cli:1": {},
+        "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+            "version": "latest",
+            "moby": true,
+            "installDockerBuildx": true,
+            "dockerDashComposeVersion": "v2"
+        },
         "ghcr.io/devcontainers/features/node:1": {
-            "version": "20"
+            "version": "22"
         }
     },
     "customizations": {
@@ -25,13 +34,12 @@
                 "ms-python.python",
                 "ms-python.pylint",
                 "ms-python.debugpy",
-                "GitHub.copilot",
+                "openai.chatgpt",
                 "GitHub.copilot-chat",
                 "redhat.vscode-yaml",
                 "ms-vscode.vscode-json",
                 "bradlc.vscode-tailwindcss",
-                "esbenp.prettier-vscode",
-                "jacqueslucke.gcov-viewer"
+                "esbenp.prettier-vscode"
             ],
             "settings": {
                 "cmake.configureOnOpen": true,
@@ -78,8 +86,8 @@
         3000,
         5000
     ],
-    "postCreateCommand": "bash -c 'sudo chmod 666 /dev/dri/render* 2>/dev/null || true && sudo chown -R vscode:vscode /workspace || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && bash /workspaces/llaminar/.devcontainer/setup-pcie-bar-caps.sh && git config --global user.name 'David Sanftenberg' && git config --global user.email 'david.sanftenberg@gmail.com' && cmake --version && gcc --version'",
-    "postStartCommand": "bash /workspaces/llaminar/.devcontainer/onstart.sh && bash /workspaces/llaminar/.devcontainer/setup-pcie-bar-caps.sh",
+    "postCreateCommand": "bash -c 'sudo chmod 666 /dev/dri/render* 2>/dev/null || true && sudo chown -R vscode:vscode /workspaces/llaminar || true && git config --global --add safe.directory /workspaces/llaminar && bash /workspaces/llaminar/.devcontainer/setup-ccache.sh && bash /workspaces/llaminar/.devcontainer/setup-python-env.sh && gh auth login && GH_USER=$(gh api user --jq .login) && GH_NAME=$(gh api user --jq .name) && GH_ID=$(gh api user --jq .id) && git config --global user.name \"${GH_NAME:-$GH_USER}\" && git config --global user.email \"${GH_ID}+${GH_USER}@users.noreply.github.com\" && cmake --version && gcc --version'",
+    "postStartCommand": "bash /workspaces/llaminar/.devcontainer/onstart.sh",
     "postAttachCommand": "bash /workspaces/llaminar/.devcontainer/onstart.sh",
     "remoteUser": "vscode",
     "overrideCommand": false,
@@ -101,6 +109,6 @@
         "HSA_OVERRIDE_GFX_VERSION": "9.0.6"
     },
     "mounts": [
-        "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached"
+        "source=/opt/llaminar-models,target=/opt/llaminar-models,type=bind,consistency=cached"
     ]
 }

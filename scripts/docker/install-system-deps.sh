@@ -11,9 +11,9 @@
 #   * .devcontainer/Dockerfile  (development image)
 #   * Dockerfile (builder stage + runtime stage)
 #
-# The nvidia/cuda and rocm base images ship without Ubuntu's `universe`
-# repository enabled, so most of these packages are invisible without the
-# explicit `add-apt-repository universe` below.
+# The nvidia/cuda and rocm base images ship without Ubuntu's `universe` and
+# `multiverse` repositories enabled, so some build packages are invisible
+# without the explicit `add-apt-repository` calls below.
 set -euo pipefail
 
 MODE="${MODE:-build}"
@@ -31,17 +31,21 @@ APT_OPTS=(
 # --- Bootstrap: packages required to enable `universe` --------------------
 apt-get "${APT_OPTS[@]}" update
 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
+    --allow-change-held-packages \
     ca-certificates \
     gnupg \
     software-properties-common \
     curl \
     wget
 add-apt-repository -y universe
+add-apt-repository -y multiverse
 apt-get "${APT_OPTS[@]}" update
 
 if [[ "${MODE}" == "build" ]]; then
     # --- Full build toolchain --------------------------------------------
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
+        --allow-change-held-packages \
+        bc \
         build-essential \
         ccache \
         cmake \
@@ -87,6 +91,7 @@ else
     # Only what the compiled binary needs at process start. No compilers, no
     # -dev packages, no GTest. Keeps the runtime image as small as possible.
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
+        --allow-change-held-packages \
         libgomp1 \
         libhwloc15 \
         libnuma1 \

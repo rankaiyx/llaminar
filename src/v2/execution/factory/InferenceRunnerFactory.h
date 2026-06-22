@@ -62,15 +62,18 @@
 #include "../../loaders/ModelContext.h"
 #include "../../interfaces/IModelContext.h"
 #include "../config/RuntimeConfig.h"
-#include "../local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../../backends/DeviceId.h"
 #include "../../utils/MPIContext.h"
 #include "../mpi_orchestration/PlacementPlan.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../config/PipelineConfig.h"
 #include "FactoryPPStageConfig.h"
+#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace llaminar2
 {
@@ -78,10 +81,18 @@ namespace llaminar2
     class DeviceGraphOrchestrator;
     class ITPContext;
     class ILocalTPContext;
-    class IMultiDeviceOrchestrator;
+    class IRankOrchestrator;
+    class MoERebalanceController;
+    class PreparedWeightStore;
+    class MoEExpertOverlayRuntimePlan;
+    struct GraphConfig;
+    struct MoEExpertOverlayExecutionPlan;
+    struct MoEExpertParallelPlan;
+
+    using DomainTPContextMap = std::map<std::string, std::shared_ptr<ITPContext>>;
 
     // Note: FactoryPPStageConfig is now defined in FactoryPPStageConfig.h
-    // to avoid circular dependencies with MultiDeviceOrchestrator.h
+    // to avoid circular dependencies with RankOrchestrator.h
 
     /**
      * @brief Configuration for inference runner creation
@@ -89,6 +100,7 @@ namespace llaminar2
     struct InferenceRunnerConfig
     {
         int max_seq_len = 4096;
+        int activation_seq_len = 0;
         int batch_size = 1;
 
         // Explicit graph path selection (only graph path is supported)
@@ -112,6 +124,21 @@ namespace llaminar2
         // Explicit KV cache precision control.
         // AUTO preserves legacy behavior (derived from activation precision mode).
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
+
+        /// Prefix-state cache feature gates and storage limits.
+        PrefixCacheRuntimeConfig prefix_cache;
+
+        /// Multi-token prediction feature gates and verification mode.
+        MTPRuntimeConfig mtp;
+
+        /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
+        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+        /// Bounded hot remote expert cache for dynamic expert-parallel execution.
+        MoEHotExpertCacheConfig moe_hot_expert_cache;
+
+        /// Decode histogram / dynamic rebalance settings.
+        MoERebalanceRuntimeConfig moe_rebalance;
 
         // Use mapped memory for GPU tensor allocation (zero-copy host access)
         // When true, FP32 activation buffers are allocated using cudaHostAllocMapped /
@@ -155,6 +182,24 @@ namespace llaminar2
         /// instead of relying purely on first-appearance ordering from MPI_Allgather.
         std::string hostfile;
 
+        /// Optional stage-local prepared store. When supplied, concrete factory
+        /// paths install this store before materializing/preparing weights.
+        std::shared_ptr<PreparedWeightStore> prepared_weight_store;
+
+        /// Optional same-layer MoE expert overlay plan propagated into GraphConfig.
+        std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+
+        /// Optional MPI context used by MoE overlay domain-worker commands.
+        std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
+
+        /// Optional graph-level cancellation hook. Queried before each stage,
+        /// usually backed by a TP collective abort flag.
+        std::function<bool()> cancellation_requested;
+
+        /// Optional stage failure hook. Invoked as soon as a graph stage fails,
+        /// before the device runner unwinds back to RankOrchestrator.
+        std::function<void(const std::string &, const std::string &)> stage_failure_callback;
+
         /**
          * @brief Canonical factory: build InferenceRunnerConfig from a RankExecutionPlan
          *
@@ -174,6 +219,11 @@ namespace llaminar2
             config.fused_attention_backend = plan.runtime.fused_attention_backend;
             config.kv_cache_scale_k = plan.runtime.kv_cache_scale_k;
             config.kv_cache_scale_v = plan.runtime.kv_cache_scale_v;
+            config.moe_expert_mode = plan.runtime.moe_expert_mode;
+            config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
+            config.moe_rebalance = plan.runtime.moe_rebalance;
+            config.prefix_cache = plan.runtime.prefix_cache;
+            config.mtp = plan.runtime.mtp;
             return config;
         }
     };
@@ -218,6 +268,29 @@ namespace llaminar2
         std::shared_ptr<IModelContext> model_ctx,
         DeviceId device,
         const InferenceRunnerConfig &config = {});
+
+    std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
+        IModelContext &model_ctx,
+        const InferenceRunnerConfig &config);
+
+    bool applyMoEExpertOverlayConfigToGraphForTesting(
+        IModelContext &model_ctx,
+        const InferenceRunnerConfig &config,
+        const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+        GraphConfig &graph_config,
+        DomainTPContextMap &owned_domain_tp_contexts,
+        const std::string &log_prefix = "[InferenceRunnerTest]");
+
+    DeviceId resolveMoEExpertOverlayExecutionDeviceForGraph(
+        GraphConfig &graph_config,
+        const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+        DeviceId requested_device,
+        const std::string &log_prefix = "[InferenceRunner]");
+
+    std::vector<std::unique_ptr<MoERebalanceController>> createMoERebalanceControllersForGraph(
+        const GraphConfig &graph_config,
+        const ILocalTPContext *local_tp_ctx,
+        const ITPContext *tp_ctx);
 
     /**
      * @brief Factory function to create a unified LOCAL PP runner
@@ -294,15 +367,15 @@ namespace llaminar2
         const InferenceRunnerConfig &config = {});
 
     /**
-     * @brief Factory function to create MultiDeviceOrchestrator for LOCAL TP
+     * @brief Factory function to create RankOrchestrator for LOCAL TP
      *
-     * Creates a MultiDeviceOrchestrator that coordinates multiple devices within
+     * Creates a RankOrchestrator that coordinates multiple devices within
      * a single MPI rank. Use this when LOCAL TP is configured via --tp-scope local.
      *
      * @param model_ctx Model context with weights
      * @param tp_ctx Pre-constructed LOCAL TP context (ownership transferred)
      * @param config Multi-device configuration
-     * @return Unique pointer to IMultiDeviceOrchestrator (extends IInferenceRunner)
+     * @return Unique pointer to IRankOrchestrator (extends IInferenceRunner)
      *
      * @code
      * // Create LOCAL TP context
@@ -312,22 +385,22 @@ namespace llaminar2
      *     CollectiveBackendType::NCCL);
      *
      * // Create multi-device config
-     * MultiDeviceOrchestrator::Config config;
+     * RankOrchestrator::Config config;
      * config.devices = tp_ctx->devices();
      * config.weights = tp_ctx->weights();
      * config.backend = CollectiveBackendType::NCCL;
      *
      * // Create orchestrator (returns IInferenceRunner-compatible)
-     * auto runner = createMultiDeviceOrchestrator(model_ctx, std::move(tp_ctx), config);
+     * auto runner = createRankOrchestrator(model_ctx, std::move(tp_ctx), config);
      * @endcode
      */
-    std::unique_ptr<IMultiDeviceOrchestrator> createMultiDeviceOrchestrator(
+    std::unique_ptr<IRankOrchestrator> createRankOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         std::unique_ptr<ILocalTPContext> tp_ctx,
-        const MultiDeviceOrchestrator::Config &config);
+        const RankOrchestrator::Config &config);
 
     /**
-     * @brief Factory function to create MultiDeviceOrchestrator with testable dependencies
+     * @brief Factory function to create RankOrchestrator with testable dependencies
      *
      * For unit testing: allows injecting mock device runners and TP context.
      *
@@ -335,12 +408,12 @@ namespace llaminar2
      * @param device_runners Pre-constructed per-device runners (ownership transferred)
      * @param tp_ctx Pre-constructed LOCAL TP context (can be mock)
      * @param config Multi-device configuration
-     * @return Unique pointer to IMultiDeviceOrchestrator
+     * @return Unique pointer to IRankOrchestrator
      */
-    std::unique_ptr<IMultiDeviceOrchestrator> createTestableMultiDeviceOrchestrator(
+    std::unique_ptr<IRankOrchestrator> createTestableRankOrchestrator(
         std::shared_ptr<IModelContext> model_ctx,
         std::vector<std::unique_ptr<IInferenceRunner>> device_runners,
         std::unique_ptr<ILocalTPContext> tp_ctx,
-        const MultiDeviceOrchestrator::Config &config);
+        const RankOrchestrator::Config &config);
 
 } // namespace llaminar2

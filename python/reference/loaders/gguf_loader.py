@@ -26,8 +26,10 @@ Author: David Sanftenberg
 
 from pathlib import Path
 from typing import Dict, Tuple, Any, Optional, Union
+import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -216,62 +218,81 @@ class GGUFLoader:
                 'other': 0
             }
             
-            for i, tensor_info in enumerate(parser.tensors):
-                # Progress message
-                if show_progress and (i % 50 == 0 or i == total_tensors - 1):
-                    print(f"  Loading tensor {i+1}/{total_tensors}: {tensor_info.name}")
-                
-                # Read raw tensor data
-                raw_data = parser.read_tensor_data(tensor_info)
-                
-                # Dequantize to FP32
-                fp32_array = dequantize.dequantize(
-                    raw_data, 
-                    tensor_info.type, 
-                    tensor_info.shape
-                )
-                
-                # Track dequantization stats
-                type_name = tensor_info.type.name
-                if type_name in dequant_stats:
-                    dequant_stats[type_name] += 1
-                else:
-                    dequant_stats['other'] += 1
-                
-                # Map GGUF name to HuggingFace name
+            # PERF: Parallelize raw-read + dequantize + name-mapping +
+            # qwen35-transforms + torch.from_numpy across CPU cores. All of
+            # these steps either release the GIL (numpy dequant kernels,
+            # torch.from_numpy share-memory path) or are pure Python that
+            # is short enough to overlap with bandwidth-bound work in other
+            # threads. By moving them into the worker we keep the serial
+            # consumer loop down to a single dict insert per tensor.
+            #
+            # We also stream the iterator (no list(...)) so the consumer
+            # runs concurrently with workers and peak FP32 memory is
+            # bounded by ``n_workers × largest_tensor`` instead of the
+            # full materialized 110 GB on a 27B Q8_0 model.
+            n_workers = min(os.cpu_count() or 4, 16)
+            tensors_list = list(parser.tensors)
+
+            def _process_tensor(tensor_info):
+                raw = parser.read_tensor_data(tensor_info)
+                fp32 = dequantize.dequantize(raw, tensor_info.type, tensor_info.shape)
+                # mmap-backed views are read-only; torch.from_numpy needs a
+                # writable buffer. ``.copy()`` releases the GIL for the
+                # actual memcpy.
+                if not fp32.flags.writeable:
+                    fp32 = fp32.copy()
+                # Explicitly drop the memoryview so the mmap can be closed
+                # cleanly later (memoryviews hold exported pointers into
+                # the mmap; any live view blocks ``mmap.close()``).
+                if isinstance(raw, memoryview):
+                    raw.release()
+
                 hf_name = mapper.map_name(tensor_info.name)
-                
-                # Track unmapped tensors
-                if hf_name == tensor_info.name:
-                    # Name unchanged - possibly unmapped
-                    if not any(hf_name.startswith(p) for p in ['model.', 'lm_head']):
-                        unmapped_count += 1
-                        if self.verbose:
-                            print(f"  WARNING: Tensor may be unmapped: {tensor_info.name}")
-                
-                # Convert to PyTorch tensor if requested
+                local_unmapped = (
+                    hf_name == tensor_info.name
+                    and not any(hf_name.startswith(p) for p in ('model.', 'lm_head'))
+                )
+
                 if as_torch:
                     if not HAS_TORCH:
                         raise RuntimeError("PyTorch not available but as_torch=True")
-                    # Make a writable copy to avoid PyTorch warning about read-only arrays
-                    # (memory-mapped arrays from GGUF files are read-only)
-                    if not fp32_array.flags.writeable:
-                        fp32_array = fp32_array.copy()
-                    tensor = torch.from_numpy(fp32_array)
+                    tensor = torch.from_numpy(fp32)
+                    if model_type in ('qwen35', 'qwen35moe'):
+                        tensor = self._apply_qwen35_transforms(
+                            tensor, tensor_info.name, hf_name,
+                            metadata=parser.metadata,
+                        )
                 else:
-                    tensor = fp32_array
-                
-                # Qwen 3.5 transforms for directly-mapped tensors
-                if model_type == 'qwen35' and as_torch:
-                    tensor = self._apply_qwen35_transforms(
-                        tensor, tensor_info.name, hf_name
-                    )
-                
-                # NOTE: As of the dimension reversal fix in gguf_parser.py, dimensions are now
-                # in standard row-major order (matching PyTorch/NumPy conventions).
-                # No additional transposition is needed.
-                
-                state_dict[hf_name] = tensor
+                    tensor = fp32
+
+                return tensor_info, hf_name, tensor, local_unmapped
+
+            if show_progress:
+                print(f"  Dequantizing {total_tensors} tensors with {n_workers} threads...")
+
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                # Stream results so the consumer overlaps with worker pool.
+                # ``ex.map`` preserves input order; results are yielded as
+                # the next-in-order future completes.
+                for tensor_info, hf_name, tensor, was_unmapped in ex.map(
+                    _process_tensor, tensors_list
+                ):
+                    type_name = tensor_info.type.name
+                    if type_name in dequant_stats:
+                        dequant_stats[type_name] += 1
+                    else:
+                        dequant_stats['other'] += 1
+
+                    if was_unmapped:
+                        unmapped_count += 1
+                        if self.verbose:
+                            print(f"  WARNING: Tensor may be unmapped: {tensor_info.name}")
+
+                    # NOTE: As of the dimension reversal fix in gguf_parser.py,
+                    # dimensions are now in standard row-major order
+                    # (matching PyTorch/NumPy conventions). No additional
+                    # transposition is needed.
+                    state_dict[hf_name] = tensor
             
             # Handle tied embeddings: if lm_head.weight is missing, copy from embeddings
             if 'lm_head.weight' not in state_dict:
@@ -305,6 +326,7 @@ class GGUFLoader:
         tensor: 'torch.Tensor',
         gguf_name: str,
         hf_name: str,
+        metadata: Dict[str, Any] = None,
     ) -> 'torch.Tensor':
         """
         Apply Qwen 3.5 specific transforms to directly-mapped tensors.
@@ -314,6 +336,7 @@ class GGUFLoader:
           - norm weights (except linear_attn.norm): GGUF stores w+1 → subtract 1
           - ssm_a → A_log: GGUF stores -exp(A_log) → apply log(-x)
           - ssm_conv1d: GGUF squeezes dim-1 → unsqueeze back
+          - V-head reorder: GGUF stores V heads in tiled order → reverse to grouped
         """
         # Norm weights: reverse the +1 from pre_rmsnorm_1p convention
         # "linear_attn.norm.weight" is excluded (not pre_rmsnorm_1p)
@@ -324,11 +347,130 @@ class GGUFLoader:
         if hf_name.endswith('.A_log'):
             tensor = torch.log(-tensor)
 
+        # V-head reorder reversal: the converter reorders V heads from
+        # grouped (by K head) to tiled order for ggml broadcast.
+        # We reverse this to get back to HF's grouped order.
+        # See _LinearAttentionVReorderBase in convert_hf_to_gguf.py.
+        # NOTE: For conv1d, this also handles the unsqueeze.
+        v_head_reordered = False
+        if metadata is not None and 'linear_attn.' in hf_name:
+            tensor, v_head_reordered = self._reverse_v_head_reorder(
+                tensor, hf_name, metadata)
+
         # conv1d: converter squeezed (out, 1, kernel) → (out, kernel); unsqueeze back
-        if hf_name.endswith('conv1d.weight'):
+        # Skip if V-head reorder already handled the unsqueeze.
+        if hf_name.endswith('conv1d.weight') and not v_head_reordered:
             tensor = tensor.unsqueeze(1)  # (out, kernel) → (out, 1, kernel)
 
         return tensor
+
+    @staticmethod
+    def _reorder_v_heads(
+        tensor: 'torch.Tensor', dim: int,
+        num_k_heads: int, num_v_per_k: int, head_dim: int,
+    ) -> 'torch.Tensor':
+        """Reorder V heads along given dimension (mirrors converter's _reorder_v_heads)."""
+        shape = list(tensor.shape)
+        if dim < 0:
+            dim += len(shape)
+        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1:]
+        tensor = tensor.reshape(*new_shape)
+        perm = list(range(len(new_shape)))
+        perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+        return tensor.permute(*perm).contiguous().reshape(*shape)
+
+    def _reverse_v_head_reorder(
+        self,
+        tensor: 'torch.Tensor',
+        hf_name: str,
+        metadata: Dict[str, Any],
+    ) -> tuple:
+        """
+        Reverse the V-head tiled→grouped reordering applied by the converter.
+
+        Returns (tensor, was_reordered) where was_reordered indicates if any
+        reordering was applied (used to skip redundant conv1d unsqueeze).
+
+        The converter calls _reorder_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim)
+        which reshapes [num_k, num_v_per_k, head_dim] → swaps → [num_v_per_k, num_k, head_dim].
+
+        To reverse, we call the same function with num_k_heads and num_v_per_k swapped:
+        reshape [num_v_per_k, num_k, head_dim] → swaps → [num_k, num_v_per_k, head_dim].
+
+        NOTE: V-head reversal is only applied for MoE models (qwen35moe).
+        For dense Qwen3.5 models, both Llaminar and PyTorch use GGUF tiled
+        V-head order, so no reversal is needed. The MoE Llaminar GDN
+        implementation already handles grouped V-head order natively.
+        """
+        # Only apply V-head reversal for MoE models
+        is_moe = any(k.startswith('qwen35moe.') for k in metadata)
+        if not is_moe:
+            return tensor, False
+
+        # Extract GDN config from GGUF metadata
+        # Try model-prefixed keys first (e.g. qwen35moe.ssm.group_count),
+        # fall back to unprefixed
+        def _get(key):
+            for prefix in ('qwen35moe.', 'qwen35.', ''):
+                full = prefix + key
+                if full in metadata:
+                    return metadata[full]
+            return None
+
+        num_k_heads = _get('ssm.group_count')
+        num_v_heads = _get('ssm.time_step_rank')
+        head_k_dim = _get('ssm.state_size')  # linear_key_head_dim
+        head_v_dim = head_k_dim  # same for this architecture
+
+        if num_k_heads is None or num_v_heads is None or head_k_dim is None:
+            return tensor, False
+        if num_k_heads == num_v_heads:
+            return tensor, False  # no reorder needed when k==v heads
+
+        num_v_per_k = num_v_heads // num_k_heads
+
+        # Reverse = call reorder with num_v_per_k and num_k_heads swapped
+        if '.in_proj_qkv.' in hf_name:
+            # Only the V portion was reordered; Q and K are unchanged
+            q_dim = head_k_dim * num_k_heads
+            k_dim = head_k_dim * num_k_heads
+            q = tensor[:q_dim]
+            k = tensor[q_dim:q_dim + k_dim]
+            v = tensor[q_dim + k_dim:]
+            v = self._reorder_v_heads(v, 0, num_v_per_k, num_k_heads, head_v_dim)
+            tensor = torch.cat([q, k, v], dim=0)
+
+        elif '.in_proj_z.' in hf_name:
+            tensor = self._reorder_v_heads(tensor, 0, num_v_per_k, num_k_heads, head_v_dim)
+
+        elif '.in_proj_a.' in hf_name or '.in_proj_b.' in hf_name:
+            tensor = self._reorder_v_heads(tensor, 0, num_v_per_k, num_k_heads, 1)
+
+        elif '.A_log' in hf_name or '.dt_bias' in hf_name:
+            if tensor.ndim == 1:
+                tensor = self._reorder_v_heads(
+                    tensor.unsqueeze(-1), 0, num_v_per_k, num_k_heads, 1
+                ).squeeze(-1)
+            else:
+                tensor = self._reorder_v_heads(tensor, -1, num_v_per_k, num_k_heads, 1)
+
+        elif '.conv1d' in hf_name:
+            # Conv1d: only the V channel portion was reordered
+            # After unsqueeze: shape is (channels, 1, kernel) — operate on dim 0
+            data = tensor.squeeze()  # (channels, kernel) or (channels,)
+            qk_channels = head_k_dim * num_k_heads * 2
+            qk_part = data[:qk_channels]
+            v_part = data[qk_channels:]
+            v_part = self._reorder_v_heads(v_part, 0, num_v_per_k, num_k_heads, head_v_dim)
+            tensor = torch.cat([qk_part, v_part], dim=0)
+            tensor = tensor.unsqueeze(1)  # restore (channels, 1, kernel)
+
+        elif '.out_proj.' in hf_name:
+            tensor = self._reorder_v_heads(tensor, 1, num_v_per_k, num_k_heads, head_v_dim)
+
+        # Return True for conv1d_handled so caller skips redundant unsqueeze
+        conv1d_handled = '.conv1d' in hf_name
+        return tensor, conv1d_handled
 
     def _reconstruct_qwen35_fused_tensors(
         self,

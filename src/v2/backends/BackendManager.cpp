@@ -17,8 +17,7 @@
 
 #ifdef HAVE_ROCM
 #include "rocm/ROCmBackend.h"
-#include "../kernels/rocm/gemm/HipBLASGemmKernel.h"       // For registerHipBLASGemmKernelFactory
-#include "../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h" // For rocmQuantGemm_warmupKernels
+#include "../kernels/rocm/gemm/HipBLASGemmKernel.h" // For registerHipBLASGemmKernelFactory
 #endif
 
 #include <mutex>
@@ -46,16 +45,16 @@ namespace llaminar2
         {
             int numa_node = g_cpu_numa_node.load();
             g_cpu_backend = new CPUBackend(numa_node);
-            LOG_INFO("[BackendManager] Initialized CPU backend (NUMA node: "
-                     << numa_node << ", memory: "
-                     << (g_cpu_backend->deviceMemoryTotal(0) / (1024 * 1024)) << " MB)");
+            LOG_DEBUG("[BackendManager] Initialized CPU backend (NUMA node: "
+                      << numa_node << ", memory: "
+                      << (g_cpu_backend->deviceMemoryTotal(0) / (1024 * 1024)) << " MB)");
         }
 
         void initCUDABackend()
         {
 #ifdef HAVE_CUDA
             g_cuda_backend = new CUDABackend();
-            LOG_INFO("[BackendManager] Initialized CUDA backend (" << g_cuda_backend->deviceCount() << " devices)");
+            LOG_DEBUG("[BackendManager] Initialized CUDA backend (" << g_cuda_backend->deviceCount() << " devices)");
 #else
             g_cuda_backend = nullptr;
             LOG_DEBUG("[BackendManager] CUDA backend not available (HAVE_CUDA not defined)");
@@ -66,14 +65,10 @@ namespace llaminar2
         {
 #ifdef HAVE_ROCM
             g_rocm_backend = new ROCmBackend();
-            LOG_INFO("[BackendManager] Initialized ROCm backend (" << g_rocm_backend->deviceCount() << " devices)");
+            LOG_DEBUG("[BackendManager] Initialized ROCm backend (" << g_rocm_backend->deviceCount() << " devices)");
 
             // Register hipBLAS GEMM kernel factory for DeviceKernelCache
             rocm::registerHipBLASGemmKernelFactory();
-
-            // Pre-initialize CK INT8 GEMM kernels to avoid first-call latency
-            // This takes ~15-20 seconds on gfx906 but happens at startup, not during inference
-            rocmQuantGemm_warmupKernels();
 #else
             g_rocm_backend = nullptr;
             LOG_DEBUG("[BackendManager] ROCm backend not available (HAVE_ROCM not defined)");

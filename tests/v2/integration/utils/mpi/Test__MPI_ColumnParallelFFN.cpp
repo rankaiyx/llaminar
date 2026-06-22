@@ -15,6 +15,7 @@
 #include <memory>
 #include <cmath>
 
+#include "../../../utils/TestModelHelper.h"
 #include "loaders/WeightManager.h"
 #include "loaders/ModelLoader.h"
 #include "models/qwen/Qwen2Schema.h"
@@ -31,12 +32,14 @@ namespace
 {
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
     {
-        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        static std::vector<std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>> handles;
+        auto prepared = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(tensor, device_id);
         if (!prepared)
         {
             return nullptr;
         }
-        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+        handles.push_back(std::move(prepared));
+        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(handles.back().get());
     }
 }
 
@@ -66,7 +69,7 @@ protected:
 
         // Load model
         loader_ = std::make_unique<ModelLoader>(factory_.get());
-        if (!loader_->loadModel(MODEL_PATH))
+        if (!tryLoadModel(*loader_, MODEL_PATH))
         {
             GTEST_SKIP() << "Model file not found: " << MODEL_PATH;
         }

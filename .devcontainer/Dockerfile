@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         grep \
         sed \
         sudo \
+        tini \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -38,6 +39,7 @@ RUN MODE=build /tmp/install-scripts/install-system-deps.sh
 # graphics libs for GPU debug, linux-tools for `perf`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bc \
+        ripgrep \
         bsdmainutils \
         htop \
         libcurl4-openssl-dev \
@@ -81,12 +83,8 @@ RUN if [ "$INSTALL_CUDA" = "true" ]; then \
     fi
 
 # Conditional ROCm 7.1.1 (gfx906 Tensile overlay handled inside script).
-# Also clones our P2P-fix amdgpu DKMS fork — used to rebuild the host driver
-# when PCIe-switch P2P is silently disabled on mainline kernels.
 RUN if [ "$INSTALL_ROCM" = "true" ]; then \
-        MODE=full /tmp/install-scripts/install-rocm.sh && \
-        git clone --depth 1 --branch fix/pex-pcie-switch-p2p-enable \
-            https://github.com/dbsanfte/amdgpu.git /opt/amdgpu-dkms; \
+        MODE=full /tmp/install-scripts/install-rocm.sh; \
     else \
         echo "Skipping ROCm installation"; \
     fi
@@ -103,17 +101,19 @@ RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/nul
 RUN rm -rf /tmp/install-scripts
 
 # --- Dev user --------------------------------------------------------------
-RUN groupadd -f render && \
+RUN if id -u ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi && \
+    if getent group ubuntu >/dev/null 2>&1; then groupdel ubuntu; fi && \
+    groupadd -f render && \
     groupadd -f video && \
     useradd -m -s /bin/bash vscode && \
     usermod -aG sudo vscode && \
     usermod -aG render,video vscode && \
     echo "vscode ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-RUN mkdir -p /workspace && chown vscode:vscode /workspace
+RUN mkdir -p /workspaces/llaminar && chown -R vscode:vscode /workspaces
 
 USER vscode
-WORKDIR /workspace
+WORKDIR /workspaces/llaminar
 
 # MPI, CUDA, ROCm env for vscode shells.
 ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
@@ -135,4 +135,5 @@ RUN echo 'alias ll="ls -la"' >> ~/.bashrc && \
     echo 'alias uvx="uv run --with"' >> ~/.bashrc
 
 EXPOSE 8080 3000 5000
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["sleep", "infinity"]

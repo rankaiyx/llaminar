@@ -8,7 +8,7 @@
  * - PP: sequential execution + transfer
  * - TP+PP: hybrid (sequential stages, parallel within stage)
  *
- * @see docs/v2/UNIFIED_MULTI_DEVICE_ORCHESTRATION_DESIGN.md
+ * @see docs/v2/projects/2026-02/UNIFIED_MULTI_DEVICE_ORCHESTRATION_DESIGN.md
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -78,7 +78,7 @@ namespace llaminar2
      * ## Usage
      *
      * ```cpp
-     * // In MultiDeviceOrchestrator
+     * // In RankOrchestrator
      * std::unique_ptr<IExecutionStrategy> strategy_;
      *
      * bool forward(const int* tokens, int seq_len) {

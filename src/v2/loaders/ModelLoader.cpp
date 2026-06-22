@@ -11,6 +11,7 @@
 #include "../utils/MPIContext.h"
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -365,8 +366,7 @@ namespace llaminar2
         file_stream_.open(file_path, std::ios::binary);
         if (!file_stream_)
         {
-            LOG_ERROR("[ModelLoader] Failed to open file: " << file_path);
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to open GGUF file: " + file_path);
         }
 
         file_path_ = file_path;
@@ -374,20 +374,17 @@ namespace llaminar2
         // Parse Model structure
         if (!parseHeader())
         {
-            LOG_ERROR("[ModelLoader] Failed to parse header");
-            return false;
+            throw std::runtime_error("[ModelLoader] Invalid GGUF header (corrupted or truncated): " + file_path);
         }
 
         if (!parseMetadata())
         {
-            LOG_ERROR("[ModelLoader] Failed to parse metadata");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to parse GGUF metadata (corrupted): " + file_path);
         }
 
         if (!parseTensorInfo())
         {
-            LOG_ERROR("[ModelLoader] Failed to parse tensor info");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to parse GGUF tensor directory (corrupted): " + file_path);
         }
 
         // Extract model hyperparameters from metadata
@@ -417,8 +414,7 @@ namespace llaminar2
             file_stream_.seekg(static_cast<std::streamoff>(aligned), std::ios::beg);
             if (!file_stream_)
             {
-                LOG_ERROR("[ModelLoader] Failed to seek to aligned data offset");
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to seek to aligned data offset (file corruption or disk error): " + file_path);
             }
         }
 
@@ -429,8 +425,7 @@ namespace llaminar2
         {
             if (!loadSplitFiles())
             {
-                LOG_ERROR("[ModelLoader] Failed to load split files");
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to load split files for multi-part GGUF: " + file_path);
             }
         }
 
@@ -449,14 +444,27 @@ namespace llaminar2
         // Memory-map the file for zero-syscall tensor loading.
         // Pass NUMA node so mmap pages are bound to the correct socket,
         // avoiding cross-NUMA bandwidth penalties during GEMV decode.
-        const int mmap_numa_node = factory_ ? factory_->getNumaNode() : -1;
+        // For GPU targets, skip NUMA binding and whole-file MAP_POPULATE:
+        // weights are uploaded to VRAM, so the host mapping is only staging.
+        // Demand paging avoids pathological cold-load stalls where the process
+        // blocks faulting the entire GGUF before the first upload starts.
+        const int mmap_numa_node = target_is_gpu_ ? -1 : (factory_ ? factory_->getNumaNode() : -1);
+        const MmapRegion::PrefaultPolicy mmap_prefault_policy =
+            target_is_gpu_ ? MmapRegion::PrefaultPolicy::DemandPaged
+                           : MmapRegion::PrefaultPolicy::Auto;
         if (use_mmap_)
         {
-            mmap_region_ = MmapRegion::create(file_path, mmap_numa_node);
+            mmap_region_ = MmapRegion::create(
+                file_path,
+                mmap_numa_node,
+                skip_mmap_cache_eviction_,
+                mmap_prefault_policy);
             if (mmap_region_)
             {
-                LOG_INFO("[ModelLoader] mmap enabled: " << file_path
-                                                        << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)");
+                LOG_DEBUG("[ModelLoader] mmap enabled: " << file_path
+                                                         << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)"
+                                                         << (skip_mmap_cache_eviction_ ? " [cache-warm]" : "")
+                                                         << (target_is_gpu_ ? " [gpu-target, demand-paged]" : ""));
 
                 // If multi-part, also mmap the split files
                 if (model_.split_count > 1)
@@ -464,9 +472,20 @@ namespace llaminar2
                     split_mmap_regions_.resize(model_.split_count - 1);
                     for (uint16_t idx = 1; idx < model_.split_count; ++idx)
                     {
-                        split_mmap_regions_[idx - 1] = MmapRegion::create(model_.split_paths[idx], mmap_numa_node);
+                        split_mmap_regions_[idx - 1] = MmapRegion::create(
+                            model_.split_paths[idx],
+                            mmap_numa_node,
+                            skip_mmap_cache_eviction_,
+                            mmap_prefault_policy);
                         if (!split_mmap_regions_[idx - 1])
                         {
+                            if (mmap_numa_node >= 0)
+                            {
+                                throw std::runtime_error(
+                                    "[ModelLoader] Required NUMA mmap failed for split file " +
+                                    std::to_string(idx) + " (" + model_.split_paths[idx] +
+                                    "); refusing to fall back to unbound stream loading");
+                            }
                             LOG_WARN("[ModelLoader] Failed to mmap split file " << idx
                                                                                 << ", falling back to ifstream for all files");
                             mmap_region_.reset();
@@ -478,12 +497,18 @@ namespace llaminar2
             }
             else
             {
+                if (mmap_numa_node >= 0)
+                {
+                    throw std::runtime_error(
+                        "[ModelLoader] Required NUMA mmap failed for " + file_path +
+                        "; refusing to fall back to unbound stream loading");
+                }
                 LOG_WARN("[ModelLoader] mmap failed, falling back to ifstream loading");
             }
         }
         else
         {
-            LOG_INFO("[ModelLoader] mmap disabled (--no-mmap), using ifstream loading");
+            LOG_DEBUG("[ModelLoader] mmap disabled (--no-mmap), using ifstream loading");
         }
 
         loaded_ = true;
@@ -1472,6 +1497,277 @@ namespace llaminar2
         return tensor;
     }
 
+    std::shared_ptr<TensorBase> ModelLoader::loadTensorExpertSlice(
+        const std::string &tensor_name,
+        size_t expert_start, size_t expert_end,
+        DeviceId device,
+        WeightPrecision weight_precision)
+    {
+        if (!loaded_)
+        {
+            LOG_ERROR("[ModelLoader] Model not loaded");
+            return nullptr;
+        }
+
+        // Find tensor metadata
+        const GGUFTensorInfo *info = model_.findTensor(tensor_name);
+        if (!info)
+        {
+            LOG_ERROR("[ModelLoader] Tensor not found: " << tensor_name);
+            return nullptr;
+        }
+
+        // Validate tensor is 3D (expert-packed: [cols, rows_per_expert, num_experts])
+        if (info->dimensions.size() != 3)
+        {
+            LOG_ERROR("[ModelLoader] Expert slicing requires 3D tensor, got "
+                      << info->dimensions.size() << "D for: " << tensor_name);
+            return nullptr;
+        }
+
+        size_t ne0 = info->dimensions[0]; // cols (fastest varying)
+        size_t ne1 = info->dimensions[1]; // rows per expert
+        size_t ne2 = info->dimensions[2]; // num_experts (slowest varying)
+
+        // Validate expert range
+        if (expert_start >= ne2 || expert_end > ne2 || expert_start >= expert_end)
+        {
+            LOG_ERROR("[ModelLoader] Invalid expert range [" << expert_start << ", " << expert_end
+                                                             << ") for tensor with " << ne2 << " experts: " << tensor_name);
+            return nullptr;
+        }
+
+        size_t local_count = expert_end - expert_start;
+
+        // Calculate bytes per expert: each expert has ne1 rows of ne0 columns
+        size_t bytes_per_row = 0;
+        size_t block_size = info->getBlockSize();
+        size_t type_size = info->getTypeSize();
+
+        if (block_size > 0)
+        {
+            if (ne0 % block_size != 0)
+            {
+                LOG_ERROR("[ModelLoader] Expert tensor columns (" << ne0 << ") not divisible by block size ("
+                                                                  << block_size << ") for: " << tensor_name);
+                return nullptr;
+            }
+            size_t blocks_per_row = ne0 / block_size;
+            bytes_per_row = blocks_per_row * type_size;
+        }
+        else
+        {
+            bytes_per_row = ne0 * type_size;
+        }
+
+        size_t bytes_per_expert = ne1 * bytes_per_row;
+        size_t slice_offset = expert_start * bytes_per_expert;
+        size_t slice_bytes = local_count * bytes_per_expert;
+
+        LOG_TRACE("[ModelLoader] Expert slice " << tensor_name << ": experts [" << expert_start << ", " << expert_end
+                                                << "), " << slice_bytes << " bytes (of " << info->size_bytes << " total)");
+
+        // Ensure NUMA binding before allocating the read buffer
+        if (factory_)
+        {
+            factory_->ensureNumaBinding();
+        }
+
+        // Read only the expert slice bytes
+        std::vector<uint8_t> raw;
+        if (mmap_region_)
+        {
+            const uint8_t *tensor_base = getMmapPtr(info);
+            const uint8_t *src = tensor_base + slice_offset;
+            raw.resize(slice_bytes);
+            std::memcpy(raw.data(), src, slice_bytes);
+        }
+        else
+        {
+            std::lock_guard<std::mutex> lock(file_mutex_);
+
+            std::ifstream *stream = &file_stream_;
+            uint64_t data_offset = model_.data_offset;
+
+            if (model_.split_count > 1)
+            {
+                if (info->split_idx == 0)
+                {
+                    stream = &file_stream_;
+                    data_offset = model_.split_data_offsets[0];
+                }
+                else if (info->split_idx < model_.split_count)
+                {
+                    stream = &split_streams_[info->split_idx - 1];
+                    data_offset = model_.split_data_offsets[info->split_idx];
+                }
+                else
+                {
+                    LOG_ERROR("[ModelLoader] Invalid split index for tensor: " << tensor_name);
+                    return nullptr;
+                }
+            }
+
+            stream->seekg(data_offset + info->offset + slice_offset, std::ios::beg);
+            if (!(*stream))
+            {
+                LOG_ERROR("[ModelLoader] Failed to seek to expert slice for: " << tensor_name);
+                return nullptr;
+            }
+
+            raw.resize(slice_bytes);
+            if (!stream->read(reinterpret_cast<char *>(raw.data()), raw.size()))
+            {
+                LOG_ERROR("[ModelLoader] Failed to read expert slice data for: " << tensor_name);
+                return nullptr;
+            }
+        }
+
+        // Create 3D shape for the sliced tensor
+        std::vector<size_t> slice_shape = {ne0, ne1, local_count};
+
+        // Handle weight precision conversion
+        bool should_convert = (weight_precision != WeightPrecision::NATIVE) && info->isQuantized();
+        if (should_convert)
+        {
+            switch (weight_precision)
+            {
+            case WeightPrecision::CONVERT_TO_FP32:
+                return dequantizeToFP32(info, slice_shape, raw);
+            case WeightPrecision::CONVERT_TO_INT8:
+                return dequantizeToINT8(info, slice_shape, raw);
+            default:
+                LOG_WARN("[ModelLoader] Unsupported conversion for expert slice, keeping native");
+                break;
+            }
+        }
+
+        // Create tensor using factory (NUMA-aware) or direct construction
+        std::shared_ptr<TensorBase> tensor;
+        TensorType ttype = ggufToTensorType(info->type);
+
+        if (info->isQuantized())
+        {
+            if (factory_)
+            {
+                tensor = factory_->createQuantized(ttype, slice_shape, raw);
+            }
+            else
+            {
+                // Non-factory path: use the same createTensorFromRawData pattern as WeightManager
+                // This handles all quantized types without a massive switch
+                switch (ttype)
+                {
+                case TensorType::Q4_0:
+                    tensor = std::make_shared<Q4_0Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q4_1:
+                    tensor = std::make_shared<Q4_1Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q5_0:
+                    tensor = std::make_shared<Q5_0Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q5_1:
+                    tensor = std::make_shared<Q5_1Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q8_0:
+                    tensor = std::make_shared<Q8_0Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q2_K:
+                    tensor = std::make_shared<Q2_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q3_K:
+                    tensor = std::make_shared<Q3_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q4_K:
+                    tensor = std::make_shared<Q4_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q5_K:
+                    tensor = std::make_shared<Q5_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q6_K:
+                    tensor = std::make_shared<Q6_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q8_K:
+                    tensor = std::make_shared<Q8_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ4_NL:
+                    tensor = std::make_shared<IQ4_NLTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ4_XS:
+                    tensor = std::make_shared<IQ4_XSTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ3_S:
+                    tensor = std::make_shared<IQ3_STensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ3_XXS:
+                    tensor = std::make_shared<IQ3_XXSTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ2_S:
+                    tensor = std::make_shared<IQ2_STensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ2_XS:
+                    tensor = std::make_shared<IQ2_XSTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ2_XXS:
+                    tensor = std::make_shared<IQ2_XXSTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ1_S:
+                    tensor = std::make_shared<IQ1_STensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ1_M:
+                    tensor = std::make_shared<IQ1_MTensor>(slice_shape, raw);
+                    break;
+                default:
+                    LOG_ERROR("[ModelLoader] Unsupported quantized type for expert slicing: " << static_cast<int>(ttype));
+                    return nullptr;
+                }
+            }
+        }
+        else
+        {
+            // Non-quantized: FP32, FP16, BF16
+            switch (info->type)
+            {
+            case GGUFTensorType::F32:
+                if (factory_)
+                {
+                    auto fp32_tensor = factory_->createFP32(slice_shape, device);
+                    TensorFactory::numaMemcpy(fp32_tensor->mutable_data(), raw.data(), raw.size());
+                    tensor = std::move(fp32_tensor);
+                }
+                else
+                {
+                    tensor = std::make_shared<FP32Tensor>(slice_shape);
+                    std::memcpy(tensor->mutable_data(), raw.data(), raw.size());
+                }
+                break;
+            case GGUFTensorType::F16:
+            {
+                std::vector<uint16_t> fp16_data(raw.size() / 2);
+                std::memcpy(fp16_data.data(), raw.data(), raw.size());
+                tensor = factory_ ? factory_->createFP16(slice_shape, fp16_data)
+                                  : std::make_shared<FP16Tensor>(slice_shape, fp16_data);
+                break;
+            }
+            case GGUFTensorType::BF16:
+            {
+                std::vector<uint16_t> bf16_data(raw.size() / 2);
+                std::memcpy(bf16_data.data(), raw.data(), raw.size());
+                tensor = factory_ ? factory_->createBF16(slice_shape, bf16_data)
+                                  : std::make_shared<BF16Tensor>(slice_shape, bf16_data);
+                break;
+            }
+            default:
+                LOG_ERROR("[ModelLoader] Unsupported tensor type for expert slicing: "
+                          << static_cast<int>(info->type));
+                return nullptr;
+            }
+        }
+
+        return tensor;
+    }
+
     std::shared_ptr<TensorBase> ModelLoader::loadTensorColumnSlice(
         const std::string &tensor_name,
         size_t col_start, size_t col_end,
@@ -1520,21 +1816,21 @@ namespace llaminar2
         {
             if (col_start % block_size != 0)
             {
-                LOG_ERROR("[ModelLoader] Column start (" << col_start
+                LOG_DEBUG("[ModelLoader] Column start (" << col_start
                                                          << ") must be aligned to block size (" << block_size
                                                          << ") for: " << tensor_name);
                 return nullptr;
             }
             if (col_end % block_size != 0)
             {
-                LOG_ERROR("[ModelLoader] Column end (" << col_end
+                LOG_DEBUG("[ModelLoader] Column end (" << col_end
                                                        << ") must be aligned to block size (" << block_size
                                                        << ") for: " << tensor_name);
                 return nullptr;
             }
             if (total_cols % block_size != 0)
             {
-                LOG_ERROR("[ModelLoader] Total columns (" << total_cols
+                LOG_DEBUG("[ModelLoader] Total columns (" << total_cols
                                                           << ") not divisible by block size (" << block_size
                                                           << ") for: " << tensor_name);
                 return nullptr;
@@ -1952,29 +2248,25 @@ namespace llaminar2
         char magic[4];
         if (!file_stream_.read(magic, 4) || std::string(magic, 4) != "GGUF")
         {
-            LOG_ERROR("[ModelLoader] Invalid magic number (not a GGUF file)");
-            return false;
+            throw std::runtime_error("[ModelLoader] Invalid magic number (not a GGUF file): " + file_path_);
         }
 
         // Read version
         if (!readValue(model_.version))
         {
-            LOG_ERROR("[ModelLoader] Failed to read version");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read GGUF version (truncated header)");
         }
 
         // Read tensor count
         if (!readValue(model_.tensor_count))
         {
-            LOG_ERROR("[ModelLoader] Failed to read tensor count");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read tensor count (truncated header)");
         }
 
         // Read metadata count
         if (!readValue(model_.metadata_kv_count))
         {
-            LOG_ERROR("[ModelLoader] Failed to read metadata count");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read metadata count (truncated header)");
         }
 
         LOG_DEBUG("[ModelLoader] Header: version=" << model_.version
@@ -1988,17 +2280,16 @@ namespace llaminar2
     {
         uint64_t len;
         if (!readValue(len))
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read string length (truncated)");
 
         if (len > 1000000)
         { // 1MB sanity check
-            LOG_ERROR("[ModelLoader] String length too large: " << len);
-            return false;
+            throw std::runtime_error("[ModelLoader] String length too large: " + std::to_string(len) + " bytes (>1MB)");
         }
 
         std::vector<char> buffer(len);
         if (!file_stream_.read(buffer.data(), len))
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read string data (" + std::to_string(len) + " bytes, truncated)");
 
         str.assign(buffer.data(), len);
         return true;
@@ -2009,18 +2300,17 @@ namespace llaminar2
         // Read array element type
         uint32_t elem_type;
         if (!readValue(elem_type))
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read array element type (truncated)");
 
         // Read array length
         uint64_t array_len;
         if (!readValue(array_len))
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read array length (truncated)");
 
         // Sanity check on array length
         if (array_len > 1000000)
         {
-            LOG_ERROR("[ModelLoader] Array length too large: " << array_len);
-            return false;
+            throw std::runtime_error("[ModelLoader] Array length too large: " + std::to_string(array_len) + " elements (>1M)");
         }
 
         // Actually read the array data (don't skip it!)
@@ -2060,13 +2350,12 @@ namespace llaminar2
             {
                 std::string str;
                 if (!readString(str))
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read string array element " + std::to_string(i) + " (truncated)");
                 value.string_array_value.push_back(std::move(str));
             }
             return true;
         default:
-            LOG_ERROR("[ModelLoader] Unknown array element type: " << elem_type);
-            return false;
+            throw std::runtime_error("[ModelLoader] Unsupported array element type: " + std::to_string(elem_type));
         }
 
         // Read fixed-size array elements
@@ -2074,8 +2363,7 @@ namespace llaminar2
         value.data.resize(total_bytes);
         if (!file_stream_.read(reinterpret_cast<char *>(value.data.data()), total_bytes))
         {
-            LOG_ERROR("[ModelLoader] Failed to read array data");
-            return false;
+            throw std::runtime_error("[ModelLoader] Failed to read array data (" + std::to_string(total_bytes) + " bytes, truncated or corrupted)");
         }
 
         return true;
@@ -2089,16 +2377,14 @@ namespace llaminar2
             std::string key;
             if (!readString(key))
             {
-                LOG_ERROR("[ModelLoader] Failed to read metadata key " << i);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read metadata key " + std::to_string(i) + " (truncated)");
             }
 
             // Read value type
             uint32_t value_type;
             if (!readValue(value_type))
             {
-                LOG_ERROR("[ModelLoader] Failed to read value type for key: " << key);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read metadata value type for key: " + key);
             }
 
             GGUFValue value;
@@ -2108,25 +2394,24 @@ namespace llaminar2
             if (value.type == GGUFValueType::ARRAY)
             {
                 if (!readArray(value))
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read metadata array value for key: " + key);
             }
             else if (value.type == GGUFValueType::STRING)
             {
                 uint64_t str_len;
                 if (!readValue(str_len))
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read metadata string length for key: " + key);
 
                 if (str_len > 1000000)
                 {
-                    LOG_ERROR("[ModelLoader] String value too large: " << str_len);
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Metadata string too large for key '" + key + "': " + std::to_string(str_len) + " bytes (>1MB)");
                 }
 
                 value.data.resize(8 + str_len);
                 std::memcpy(value.data.data(), &str_len, 8);
                 if (!file_stream_.read(reinterpret_cast<char *>(value.data.data() + 8), str_len))
                 {
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read metadata string data for key: " + key);
                 }
             }
             else
@@ -2155,14 +2440,13 @@ namespace llaminar2
                     value_size = 8;
                     break;
                 default:
-                    LOG_ERROR("[ModelLoader] Unknown value type: " << value_type);
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Unsupported metadata value type " + std::to_string(value_type) + " for key: " + key);
                 }
 
                 value.data.resize(value_size);
                 if (!file_stream_.read(reinterpret_cast<char *>(value.data.data()), value_size))
                 {
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read metadata value for key: " + key);
                 }
             }
 
@@ -2183,16 +2467,14 @@ namespace llaminar2
             // Read tensor name
             if (!readString(tensor.name))
             {
-                LOG_ERROR("[ModelLoader] Failed to read tensor name " << i);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read tensor name " + std::to_string(i) + " (truncated)");
             }
 
             // Read number of dimensions
             uint32_t n_dims;
             if (!readValue(n_dims))
             {
-                LOG_ERROR("[ModelLoader] Failed to read dimensions for: " << tensor.name);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read dimension count for tensor: " + tensor.name);
             }
 
             // Read dimensions
@@ -2201,9 +2483,7 @@ namespace llaminar2
             {
                 if (!readValue(tensor.dimensions[j]))
                 {
-                    LOG_ERROR("[ModelLoader] Failed to read dimension " << j
-                                                                        << " for: " << tensor.name);
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Failed to read dimension " + std::to_string(j) + " for tensor: " + tensor.name);
                 }
             }
 
@@ -2219,16 +2499,14 @@ namespace llaminar2
             uint32_t type_val;
             if (!readValue(type_val))
             {
-                LOG_ERROR("[ModelLoader] Failed to read type for: " << tensor.name);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read tensor type for: " + tensor.name);
             }
             tensor.type = static_cast<GGUFTensorType>(type_val);
 
             // Read tensor offset
             if (!readValue(tensor.offset))
             {
-                LOG_ERROR("[ModelLoader] Failed to read offset for: " << tensor.name);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to read tensor offset for: " + tensor.name);
             }
 
             // Calculate size in bytes
@@ -2257,9 +2535,7 @@ namespace llaminar2
             }
             else
             {
-                LOG_ERROR("[ModelLoader] Unknown tensor type: " << type_val
-                                                                << " for: " << tensor.name);
-                return false;
+                throw std::runtime_error("[ModelLoader] Unsupported tensor type " + std::to_string(type_val) + " for: " + tensor.name);
             }
 
             // Initialize split index to 0 (main file) - will be updated by loadSplitFiles() if needed
@@ -2455,8 +2731,7 @@ namespace llaminar2
         // Verify main file is split 0
         if (model_.split_no != 0)
         {
-            LOG_ERROR("[ModelLoader] Main file must be split 0, got split " << model_.split_no);
-            return false;
+            throw std::runtime_error("[ModelLoader] Main file must be split 0, got split " + std::to_string(model_.split_no) + " for: " + file_path_);
         }
 
         // Generate paths for all splits
@@ -2474,14 +2749,13 @@ namespace llaminar2
             std::string split_path = generateSplitPath(file_path_, idx, model_.split_count);
             model_.split_paths[idx] = split_path;
 
-            LOG_INFO("[ModelLoader] Loading split " << idx << ": " << split_path);
+            LOG_DEBUG("[ModelLoader] Loading split " << idx << ": " << split_path);
 
             // Open split file
             split_streams_[idx - 1].open(split_path, std::ios::binary);
             if (!split_streams_[idx - 1])
             {
-                LOG_ERROR("[ModelLoader] Failed to open split file: " << split_path);
-                return false;
+                throw std::runtime_error("[ModelLoader] Failed to open split file: " + split_path);
             }
 
             // Parse split header to get tensor info
@@ -2492,8 +2766,7 @@ namespace llaminar2
             stream.read(reinterpret_cast<char *>(&magic), sizeof(magic));
             if (magic != 0x46554747) // "GGUF"
             {
-                LOG_ERROR("[ModelLoader] Invalid GGUF magic in split " << idx);
-                return false;
+                throw std::runtime_error("[ModelLoader] Invalid GGUF magic in split " + std::to_string(idx) + ": " + split_path);
             }
 
             // Read version
@@ -2590,16 +2863,14 @@ namespace llaminar2
                             elem_size = 8;
                             break; // UINT64, INT64, FLOAT64
                         default:
-                            LOG_ERROR("[ModelLoader] Unknown array element type " << arr_type << " in split " << idx);
-                            return false;
+                            throw std::runtime_error("[ModelLoader] Unsupported array element type " + std::to_string(arr_type) + " in split " + std::to_string(idx));
                         }
                         stream.seekg(static_cast<std::streamoff>(elem_size * arr_len), std::ios::cur);
                     }
                     break;
                 }
                 default:
-                    LOG_ERROR("[ModelLoader] Unknown metadata value type " << value_type << " in split " << idx);
-                    return false;
+                    throw std::runtime_error("[ModelLoader] Unsupported metadata value type " + std::to_string(value_type) + " in split " + std::to_string(idx));
                 }
             }
 
@@ -2672,10 +2943,10 @@ namespace llaminar2
             uint64_t aligned = (cur + align - 1) / align * align;
             model_.split_data_offsets[idx] = aligned;
 
-            LOG_INFO("[ModelLoader] Split " << idx << " has " << tensor_count << " tensors");
+            LOG_DEBUG("[ModelLoader] Split " << idx << " has " << tensor_count << " tensors");
         }
 
-        LOG_INFO("[ModelLoader] Total tensors across all splits: " << model_.tensors.size());
+        LOG_DEBUG("[ModelLoader] Total tensors across all splits: " << model_.tensors.size());
         return true;
     }
 

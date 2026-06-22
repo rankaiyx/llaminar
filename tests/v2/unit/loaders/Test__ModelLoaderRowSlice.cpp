@@ -15,6 +15,7 @@
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
 #include "utils/MPIContext.h"
+#include "../../utils/TestModelHelper.h"
 #include "backends/DeviceId.h"
 #include <cmath>
 #include <numeric>
@@ -37,7 +38,7 @@ namespace llaminar2
                 factory_ = std::make_unique<TensorFactory>(*mpi_ctx_);
                 loader_ = std::make_unique<ModelLoader>(factory_.get());
 
-                if (!loader_->loadModel(model_path_))
+                if (!tryLoadModel(*loader_, model_path_))
                 {
                     GTEST_SKIP() << "Model file not found: " << model_path_;
                 }

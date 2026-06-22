@@ -2,7 +2,7 @@
  * @file Qwen35GraphConfigBuilder.h
  * @brief Qwen3.5-specific graph configuration builder
  *
- * Extends Qwen2GraphConfigBuilder with:
+ * Extends QwenStandardGraphConfigBuilder with:
  * - GDN-specific GGUF metadata parsing (ssm.*, full_attention_interval)
  * - Heterogeneous layer type assignment (GDN vs FA)
  * - GDN weight loading (attn_qkv, attn_gate, ssm_*)
@@ -12,7 +12,10 @@
 
 #pragma once
 
-#include "../qwen/Qwen2GraphConfigBuilder.h"
+#include "../qwen/QwenStandardGraphConfigBuilder.h"
+
+#include <optional>
+#include <string>
 
 namespace llaminar2
 {
@@ -20,12 +23,12 @@ namespace llaminar2
     /**
      * @brief Qwen3.5-specific implementation of IGraphConfigBuilder
      *
-     * Inherits all TP/PP/device configuration from Qwen2GraphConfigBuilder.
+     * Inherits all TP/PP/device configuration from QwenStandardGraphConfigBuilder.
      * Overrides only the methods that differ for Qwen3.5:
      * - populateFromModelContext: reads GDN/hybrid metadata
      * - buildWeights: handles per-layer GDN vs FA weights
      */
-    class Qwen35GraphConfigBuilder : public Qwen2GraphConfigBuilder
+    class Qwen35GraphConfigBuilder : public QwenStandardGraphConfigBuilder
     {
     public:
         Qwen35GraphConfigBuilder() = default;
@@ -58,6 +61,17 @@ namespace llaminar2
          * Both load:       attn_norm, post_attention_norm (as ffn_norm), ffn_gate/up/down
          */
         ModelWeights buildWeights(WeightAccessor get_weight) override;
+
+        /**
+         * @brief Returns the community-maintained Qwen 3.5 chat template.
+         *
+         * The template embedded in many Qwen 3.5 GGUF artifacts has been
+         * observed to leave the model in a degenerate repetition state after
+         * the `</think>` block closes. We replace it with a community-
+         * maintained variant (MIT licensed — see Qwen35ChatTemplate.h for
+         * full attribution and source URL).
+         */
+        std::optional<std::string> chatTemplateOverride() const override;
     };
 
 } // namespace llaminar2

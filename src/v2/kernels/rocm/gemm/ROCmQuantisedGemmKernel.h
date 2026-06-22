@@ -98,6 +98,7 @@
 
 #include <memory>
 #include <cstdint>
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <mutex>
@@ -114,30 +115,8 @@ namespace llaminar2
     {
 
         /**
-         * @brief Startup GPU repack pipeline configuration scaffold (Phase 4 Step 1)
-         *
-         * This struct is intentionally plumbing-only in Step 1 and does not alter
-         * current runtime behavior until the pipeline execution path is wired.
-         */
-        struct ROCmStartupRepackPipelineConfig
-        {
-            bool enabled = false;
-            int slots = 8;
-            int budget_mb = 1024;
-            int stream_count = 3;
-        };
-
-        /**
-         * @brief Build startup GPU repack pipeline configuration from DebugEnv
-         *
-         * Step 1 scope: expose env-driven configuration in one place, without
-         * activating a new execution path yet.
-         */
-        ROCmStartupRepackPipelineConfig getROCmStartupRepackPipelineConfig();
-
-        /**
          * @struct ROCmPackedWeights
-         * @brief Pre-packed INT8 weights for ROCm CK GEMM
+         * @brief Pre-packed INT8 weights for ROCm VNNI GEMM
          *
          * Stores weights converted from any quantized format to symmetric INT8 with per-column scales.
          *
@@ -177,7 +156,6 @@ namespace llaminar2
             struct DeviceUpload
             {
                 int8_t *d_int8_data_vnni = nullptr;
-                int8_t *d_int8_data_rowmajor = nullptr;
                 float *d_scales = nullptr;
                 void *startup_h2d_pinned_scales = nullptr;
                 void *startup_h2d_pinned_vnni = nullptr;
@@ -190,14 +168,6 @@ namespace llaminar2
                 void *startup_h2d_pinned_native_mins = nullptr;
                 void *startup_h2d_pinned_native_emins = nullptr;
                 void *startup_h2d_stream = nullptr;
-                void *startup_repack_stream = nullptr;
-                void *startup_commit_stream = nullptr;
-                void *startup_h2d_done_event = nullptr;
-                bool startup_h2d_event_pending = false;
-                void *startup_repack_ready_event = nullptr;
-                bool startup_repack_event_pending = false;
-                void *startup_commit_ready_event = nullptr;
-                bool startup_commit_event_pending = false;
             };
 
             std::vector<int8_t> int8_data;      ///< [K × N] RowMajor INT8 weights (host only, not uploaded to device)
@@ -210,7 +180,7 @@ namespace llaminar2
             std::vector<uint16_t> native_vnni_scales; ///< [blocks_per_row × N] FP16 per-block scales (raw uint16_t bits)
             std::vector<uint16_t> native_vnni_mins;   ///< [blocks_per_row × N] FP16 per-block mins (asymmetric formats only)
             std::vector<uint32_t> native_vnni_emins;  ///< [blocks_per_row × N] packed {lo,hi} emins (Q2_K only)
-            uint8_t native_vnni_codebook_id = 0;      ///< NativeVNNIFormat: 0=Q4_0, 4=IQ4_NL, 5=Q4_1, 6=Q5_0, 7=Q5_1
+            uint8_t native_vnni_codebook_id = 0;      ///< NativeVNNIFormat: 0=Q4_0, 4=IQ4_NL/IQ4_XS, 5=Q4_1/Q4_K, 6=Q5_0, 7=Q5_1/Q5_K, 8=Q6_K, 9=Q3_K, 10=Q2_K, 11=IQ3_S, 12=IQ3_XXS, 13=IQ2_S, 14=IQ2_XS, 15=IQ2_XXS, 16=IQ1_S, 17=IQ1_M
             uint32_t native_vnni_blocks_per_row = 0;  ///< K / 32
 
             int K = 0; ///< Input features (rows in CK B matrix)
@@ -221,22 +191,15 @@ namespace llaminar2
 
             // Device memory pointers (uploaded once, cached)
             // Legacy compatibility fields, mirrored from the active device upload.
-            // Option B: Only VNNI layout is uploaded to device. Row-major is repacked
-            // on-demand into a shared workspace scratch buffer for CK GEMM prefill.
-            // Phase 4 pilot: optional persistent row-major buffer precomputed on GPU at startup.
-            int8_t *d_int8_data_vnni = nullptr;         ///< Device pointer to VNNI-packed weights (sole device copy)
-            int8_t *d_int8_data_rowmajor = nullptr;     ///< Optional persistent row-major CK buffer (startup GPU repack)
-            float *d_scales = nullptr;                  ///< Device pointer to scales
-            uint8_t *d_native_vnni_payload = nullptr;   ///< Device pointer to native-VNNI payload
-            void *d_native_vnni_scales = nullptr;       ///< Device pointer to native-VNNI FP16 scales (__half*)
-            void *d_native_vnni_mins = nullptr;         ///< Device pointer to native-VNNI FP16 mins (__half*, NULL for symmetric)
-            void *d_native_vnni_emins = nullptr;        ///< Device pointer to native-VNNI packed emins (uint32_t*, Q2_K only)
-            void *startup_repack_ready_event = nullptr; ///< Optional startup repack completion event (hipEvent_t*)
-            bool startup_repack_event_pending = false;  ///< True until startup repack event is consumed by CK stream wait
-            void *startup_commit_ready_event = nullptr; ///< Optional startup commit completion event (hipEvent_t*)
-            bool startup_commit_event_pending = false;  ///< True until startup commit event is consumed by CK stream wait
-            int rocm_device_id = -1;                    ///< Device where data is uploaded
-            bool uploaded = false;                      ///< Whether device memory is allocated
+            // Only VNNI layout is uploaded to device.
+            int8_t *d_int8_data_vnni = nullptr;       ///< Device pointer to VNNI-packed weights (sole device copy)
+            float *d_scales = nullptr;                ///< Device pointer to scales
+            uint8_t *d_native_vnni_payload = nullptr; ///< Device pointer to native-VNNI payload
+            void *d_native_vnni_scales = nullptr;     ///< Device pointer to native-VNNI FP16 scales (__half*)
+            void *d_native_vnni_mins = nullptr;       ///< Device pointer to native-VNNI FP16 mins (__half*, NULL for symmetric)
+            void *d_native_vnni_emins = nullptr;      ///< Device pointer to native-VNNI packed emins (uint32_t*, Q2_K only)
+            int rocm_device_id = -1;                  ///< Device where data is uploaded
+            bool uploaded = false;                    ///< Whether device memory is allocated
 
             ROCmPackedWeights() = default;
             ROCmPackedWeights(const ROCmPackedWeights &) = delete;
@@ -265,21 +228,15 @@ namespace llaminar2
                     N = other.N;
                     device_uploads = std::move(other.device_uploads);
                     d_int8_data_vnni = other.d_int8_data_vnni;
-                    d_int8_data_rowmajor = other.d_int8_data_rowmajor;
                     d_scales = other.d_scales;
                     d_native_vnni_payload = other.d_native_vnni_payload;
                     d_native_vnni_scales = other.d_native_vnni_scales;
                     d_native_vnni_mins = other.d_native_vnni_mins;
                     d_native_vnni_emins = other.d_native_vnni_emins;
-                    startup_repack_ready_event = other.startup_repack_ready_event;
-                    startup_repack_event_pending = other.startup_repack_event_pending;
-                    startup_commit_ready_event = other.startup_commit_ready_event;
-                    startup_commit_event_pending = other.startup_commit_event_pending;
                     rocm_device_id = other.rocm_device_id;
                     uploaded = other.uploaded;
 
                     other.d_int8_data_vnni = nullptr;
-                    other.d_int8_data_rowmajor = nullptr;
                     other.d_scales = nullptr;
                     other.d_native_vnni_payload = nullptr;
                     other.d_native_vnni_scales = nullptr;
@@ -287,10 +244,6 @@ namespace llaminar2
                     other.d_native_vnni_emins = nullptr;
                     other.native_vnni_codebook_id = 0;
                     other.native_vnni_blocks_per_row = 0;
-                    other.startup_repack_ready_event = nullptr;
-                    other.startup_repack_event_pending = false;
-                    other.startup_commit_ready_event = nullptr;
-                    other.startup_commit_event_pending = false;
                     other.rocm_device_id = -1;
                     other.uploaded = false;
                     other.K = 0;
@@ -377,9 +330,19 @@ namespace llaminar2
         {
         public:
             /**
+             * @brief Release all per-device shared ConcurrentPrefillPool singletons.
+             *
+             * The pool holds HIP streams, events, and scratch/scatter buffers shared
+             * across kernel instances on the same device. It must be released when
+             * KernelFactory::clearCache() is invoked to avoid leaking static state
+             * (and to release GPU memory) between test runs or orchestrator resets.
+             */
+            static void clearSharedPrefillPools();
+
+            /**
              * @brief Construct kernel for quantized weight tensor (legacy lazy conversion)
              *
-             * Deprecated: use KernelFactory::getOrCreatePreparedGemmWeights() +
+             * Deprecated: use PreparedWeightStore or KernelFactory::prepareGemmHandleLocal() +
              * KernelFactory::getOrCreateGemmEngine(), or explicitly pre-pack via
              * ROCmPackedWeights and use the packed constructor below.
              *
@@ -388,7 +351,7 @@ namespace llaminar2
              *
              * @throws std::runtime_error if weight not quantized or not on GPU
              */
-            [[deprecated("Use KernelFactory::getOrCreatePreparedGemmWeights() + getOrCreateGemmEngine(), or pre-pack via ROCmPackedWeights.")]]
+            [[deprecated("Use PreparedWeightStore or prepareGemmHandleLocal() + getOrCreateGemmEngine(), or pre-pack via ROCmPackedWeights.")]]
             ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id);
 
             /**
@@ -404,6 +367,31 @@ namespace llaminar2
              */
             ROCmQuantisedGemmKernel(ROCmPackedWeights *packed, int rocm_device_id);
 
+            /**
+             * @brief Construct kernel from pre-uploaded device pointers (MoE batch path)
+             *
+             * Used for MoE expert weights that are batch-packed and uploaded as a single
+             * contiguous allocation. The kernel references device pointers at calculated
+             * offsets into the shared allocation.
+             *
+             * @param N Output features (rows per expert)
+             * @param K Input features (columns)
+             * @param rocm_device_id ROCm device ID
+             * @param d_native_vnni Device pointer to native-VNNI payload for this expert
+             * @param d_native_scales Device pointer to FP16 scales (void* for __half*)
+             * @param d_native_mins Device pointer to FP16 mins (nullptr if symmetric)
+             * @param d_native_emins Device pointer to extended mins (nullptr if not needed)
+             * @param codebook_id NativeVNNI codebook identifier
+             * @param blocks_per_row Number of 32-element blocks per row (K/32)
+             * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
+             */
+            ROCmQuantisedGemmKernel(
+                int N, int K, int rocm_device_id,
+                uint8_t *d_native_vnni, void *d_native_scales,
+                void *d_native_mins, void *d_native_emins,
+                uint8_t codebook_id, uint32_t blocks_per_row,
+                std::shared_ptr<void> lifetime_owner);
+
             ~ROCmQuantisedGemmKernel() override;
 
             // Non-copyable
@@ -417,6 +405,8 @@ namespace llaminar2
             // =========================================================================
             // ITensorGemm interface - Primary entry points
             // =========================================================================
+
+            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope() override;
 
             /**
              * @brief Tensor-based GEMM with type introspection (PRIMARY ENTRY POINT)
@@ -491,6 +481,15 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
+            bool multiply_fused_verifier_rows_decode_equivalent(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool supports_fused_projection() const override { return true; }
+
             /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
              *
@@ -525,9 +524,18 @@ namespace llaminar2
             bool multiply_tensor_with_fused_swiglu(
                 const TensorBase *gate,
                 const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha = 1.0f, float beta = 0.0f,
+            DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate,
+                const TensorBase *up,
                 TensorBase *output,
                 int m, int n, int k,
-                float alpha = 1.0f, float beta = 0.0f) override;
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             // =========================================================================
             // ITensorKernel interface
@@ -623,7 +631,8 @@ namespace llaminar2
             int rocm_device_id() const { return rocm_device_id_; }
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
-            bool weights_converted() const { return weights_converted_; }
+            bool weights_converted() const override;
+            bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
 
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)
@@ -639,14 +648,13 @@ namespace llaminar2
              *
              * This enum is intentionally small and explicit so logs, counters, and
              * future telemetry can categorize prefill routing decisions in a stable
-             * way. We keep `CK_FALLBACK` as an explicit value because fallback is a
-             * first-class execution mode, not an error condition.
+             * way. `UNSUPPORTED` indicates no viable prefill kernel path is available.
              */
             enum class PrefillDispatchPath
             {
                 NATIVE_VNNI,      ///< Native-VNNI path (lossless ≤6-bit decode, FP16 scales)
                 INT8_VNNI_NATIVE, ///< INT8-VNNI path (requantized 8-bit weights)
-                CK_FALLBACK       ///< CK ComposableKernel (debug override only)
+                UNSUPPORTED       ///< No viable prefill path (dimensions/weights unsupported)
             };
 
             // =========================================================================
@@ -658,8 +666,8 @@ namespace llaminar2
              *
              * The selection policy is deliberately conservative:
              * - Decode (`m == 1`) never calls this helper.
-             * - Unsupported metadata/shape immediately maps to `CK_FALLBACK`.
-             * - Feature flag disablement also maps to `CK_FALLBACK`.
+             * - Unsupported metadata/shape maps to `UNSUPPORTED`.
+             * - Missing VNNI weights also maps to `UNSUPPORTED`.
              *
              * @param m Number of rows in activation matrix.
              * @param n Number of output features.
@@ -768,8 +776,9 @@ namespace llaminar2
             // Member data
             // =========================================================================
 
-            const TensorBase *weights_ = nullptr; // Original weight tensor (null if using packed_)
-            ROCmPackedWeights *packed_ = nullptr; // Pre-packed weights (owned by tensor cache)
+            const TensorBase *weights_ = nullptr;  // Original weight tensor (null if using packed_)
+            ROCmPackedWeights *packed_ = nullptr;  // Pre-packed weights (owned by tensor cache)
+            std::shared_ptr<void> lifetime_owner_; // Keeps shared MoE batch allocation alive
             int rocm_device_id_;
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)
@@ -786,15 +795,33 @@ namespace llaminar2
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
 
+            // Historical per-kernel slice id. Scratch buffers are now declared
+            // under stable names so graph rebuilds do not force workspace
+            // reallocations solely because new kernel instances were created.
+            uint32_t slice_id_ = 0;
+
+            std::string scatterPartialBufferName() const
+            {
+                return GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL;
+            }
+
+            std::string scatterPartialBatchedBufferName() const
+            {
+                return GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED;
+            }
+
+            // TEMP_C_FP32 / TEMP_A_FP32 remain shared across ROCm GEMM kernels.
+            // Concurrent execution paths use their own pool scratch, while serial
+            // paths do not overlap the temp buffers.
+
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;
 
-            // Per-instance concurrent prefill pool (HIP streams + scratch buffers)
-            std::unique_ptr<ConcurrentPrefillPool> prefill_pool_;
+            // Concurrent prefill pool is now a per-device shared singleton
+            // (see getSharedPrefillPool in ROCmQuantisedGemmKernel.cpp) to avoid
+            // allocating duplicate scratch/scatter buffers per kernel instance.
 
-            // Per-instance synchronization/logging state (no process-global mutable statics)
-            std::unique_ptr<std::mutex> ck_dispatch_mutex_;
-            // PIMPL for CK implementation (avoids CK headers in this header)
+            // PIMPL for implementation (avoids backend headers in this header)
             struct Impl;
             std::unique_ptr<Impl> impl_;
 
@@ -806,7 +833,7 @@ namespace llaminar2
 } // namespace llaminar2
 
 // =====================================================================
-// Low-level CK GEMM Functions (exposed for benchmarking)
+// Low-level GEMM Functions (exposed for benchmarking)
 // =====================================================================
 //
 // NOTE: These are declared with C linkage to match the existing .cpp/.hip
@@ -816,58 +843,10 @@ namespace llaminar2
 extern "C"
 {
     /**
-     * @brief Pre-initialize all CK GEMM kernels to avoid first-call latency
-     *
-     * CK device objects are expensive to construct (5-10 seconds each on gfx906)
-     * due to template instantiation and GPU ISA checks. Call this function
-     * during backend initialization to avoid blocking on first inference call.
-     *
-     * Pre-initializes:
-     *   - 32x32 kernel (for decode, M <= 32)
-     *   - 64x64 kernel (for small batch, 32 < M < 128)
-     *   - 128x128 kernel (for prefill, M >= 128)
-     */
-    void rocmQuantGemm_warmupKernels();
-
-    /**
-     * @brief Execute Two-Kernel INT8 GEMM (CK NoScale + applyScales_kernel)
-     *
-     * This is the DEFAULT and RECOMMENDED path. It uses:
-     *   1. CK INT8×INT8→INT32 GEMM (executeNoScale)
-     *   2. Custom scale application kernel (applyScales_kernel)
-     *
-     * Achieves ~0.9999 cosine similarity vs reference.
-     */
-    bool rocmQuantGemm_executeTwoKernel(
-        const int8_t *d_A, const int8_t *d_B, float *d_E,
-        const float *d_scaleA, const float *d_scaleB,
-        int M, int N, int K,
-        int rocm_device_id,
-        void *stream,
-        void *kernel_ctx);
-
-    /**
-     * @brief Execute Two-Kernel INT8 GEMM with HIP event timing (for benchmarking)
-     *
-     * Same as executeTwoKernel_cached but uses HIP events to measure ONLY
-     * the GPU kernel execution time, excluding PCIe transfers.
-     *
-     * @param kernel_time_ms OUTPUT: Kernel execution time in milliseconds
-     */
-    bool rocmQuantGemm_executeTwoKernel_timed(
-        const int8_t *d_A, const int8_t *d_B, float *d_E,
-        const float *d_scaleA, const float *d_scaleB,
-        int32_t *d_C_int32,
-        int M, int N, int K,
-        int rocm_device_id,
-        float *kernel_time_ms, void *stream,
-        void *kernel_ctx);
-
-    /**
      * @brief Execute hipBLAS INT8 GEMM fallback
      *
      * Uses hipBLAS INT8 GEMM with FP32 accumulation. Useful as fallback
-     * for dimensions CK doesn't support.
+     * for unsupported dimensions.
      */
     bool rocmQuantGemm_executeHipBLAS(
         const int8_t *d_A, const int8_t *d_B, float *d_E,

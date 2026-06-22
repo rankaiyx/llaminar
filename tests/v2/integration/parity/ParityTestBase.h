@@ -73,7 +73,7 @@
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/debug/TPSnapshot.h"
-#include "execution/local_execution/orchestrators/MultiDeviceOrchestrator.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 
 // Pipeline parallelism support
@@ -87,10 +87,12 @@
 #include "kernels/KernelFactory.h"
 #include "backends/BackendManager.h"
 #include "backends/GlobalDeviceAddress.h"
+#include "utils/DebugEnv.h"
 #ifdef HAVE_CUDA
 #include "kernels/cuda/ops/CUDAEmbeddingKernelT.h"
 #include <cuda_runtime.h>
-// Deterministic mode: disables FP32 atomicAdd in split-K/stream-K GEMM
+// Parity should exercise the production CUDA prefill path unless a test opts in
+// to a deterministic-mode regression explicitly.
 extern "C" void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
 #endif
 #ifdef HAVE_ROCM
@@ -156,6 +158,12 @@ namespace llaminar2::test::parity
         /// Used for GLOBAL scope TP where column-parallel stages (Q/K/V projections)
         /// produce partial outputs that can't be directly compared to full PyTorch outputs.
         std::vector<std::string> excluded_stages;
+
+        /// Stages whose snapshots should be allreduced (SUM) across MPI ranks before
+        /// comparing to PyTorch reference. Used for EP/TP partial sums (e.g., MoE expert
+        /// output, shared expert output) where each rank holds a partial contribution.
+        /// Requires mpi_ctx_ to be set. Stages listed here should NOT also be excluded.
+        std::vector<std::string> allreduce_stages;
     };
 
     // =============================================================================
@@ -202,6 +210,12 @@ namespace llaminar2::test::parity
         size_t total_elements = 0;
         TensorDistributionStats llaminar_stats;
         TensorDistributionStats pytorch_stats;
+
+        // --- MoE routing-specific metrics (NaN for non-routing stages) ---
+        bool is_routing_stage = false;                                      ///< True for MOE_ROUTING_INDICES / MOE_ROUTING_WEIGHTS
+        float routing_overlap = std::numeric_limits<float>::quiet_NaN();    ///< Set overlap (Jaccard) for indices, sparse-vector cosine for weights
+        float routing_top1_match = std::numeric_limits<float>::quiet_NaN(); ///< Fraction of tokens where top-1 expert matches (indices only)
+        float routing_weight_l1 = std::numeric_limits<float>::quiet_NaN();  ///< Mean L1 distance of sparse weight vectors (weights only)
     };
 
     /**
@@ -394,6 +408,7 @@ namespace llaminar2::test::parity
         LocalTP,     ///< Local Tensor Parallelism (multi-device, single process)
         LocalPP,     ///< Local Pipeline Parallelism (multi-device, single process)
         NodeLocalTP, ///< Node-Local Tensor Parallelism (multi-rank MPI, same node)
+        NodeLocalPP, ///< Node-Local Pipeline Parallelism (multi-rank MPI, same node)
         GlobalTP,    ///< Global Tensor Parallelism (multi-rank MPI, cross-node)
     };
 
@@ -488,6 +503,8 @@ namespace llaminar2::test::parity
             return "LocalPP";
         case Parallelism::NodeLocalTP:
             return "NodeLocalTP";
+        case Parallelism::NodeLocalPP:
+            return "NodeLocalPP";
         case Parallelism::GlobalTP:
             return "GlobalTP";
         }
@@ -555,16 +572,17 @@ namespace llaminar2::test::parity
      */
     struct BackendThresholds
     {
-        float cosine_threshold = 0.999f;               ///< Min avg cosine for layer pass
-        float decode_cosine_threshold = 0.99f;         ///< Threshold for decode parity
-        int early_layers_count = 4;                    ///< Number of early layers to check
-        int min_early_layers_passed = 4;               ///< Min early layers that must pass
-        float kl_threshold = 0.05f;                    ///< Max KL divergence for logits
-        std::vector<std::string> excluded_stages = {}; ///< Stages to exclude from parity comparison
-        float min_top1_accuracy = 80.0f;               ///< Min Top-1 accuracy %
-        float min_top5_accuracy = 80.0f;               ///< Min Top-5 accuracy %
-        float min_decode_pass_rate = 0.8f;             ///< Min fraction of decode steps passing
-        int pytorch_top1_in_topk = 3;                  ///< PyTorch's top-1 must be in llaminar's top-K (0=disabled)
+        float cosine_threshold = 0.999f;                ///< Min avg cosine for layer pass
+        float decode_cosine_threshold = 0.99f;          ///< Threshold for decode parity
+        int early_layers_count = 4;                     ///< Number of early layers to check
+        int min_early_layers_passed = 4;                ///< Min early layers that must pass
+        float kl_threshold = 0.05f;                     ///< Max KL divergence for logits
+        std::vector<std::string> excluded_stages = {};  ///< Stages to exclude from parity comparison
+        std::vector<std::string> allreduce_stages = {}; ///< Stages to allreduce across MPI ranks before comparison
+        float min_top1_accuracy = 80.0f;                ///< Min Top-1 accuracy %
+        float min_top5_accuracy = 80.0f;                ///< Min Top-5 accuracy %
+        float min_decode_pass_rate = 0.8f;              ///< Min fraction of decode steps passing
+        int pytorch_top1_in_topk = 3;                   ///< PyTorch's top-1 must be in llaminar's top-K (0=disabled)
     };
 
     // =============================================================================
@@ -602,10 +620,24 @@ namespace llaminar2::test::parity
         /// Must be unique per model to avoid snapshot collisions between quant formats.
         std::string snapshot_dir;
 
+        /// Prompt override. If non-empty, overrides ParityConfig::prompt for
+        /// PyTorch snapshot generation.
+        std::string prompt;
+
+        /// Token ID override. If non-empty, overrides ParityConfig::token_ids
+        /// for Llaminar execution. This is useful for chat-template prompts
+        /// where the rendered text contains special tokens.
+        std::vector<int> token_ids;
+
         /// PP stage device sizes for hybrid PP+TP configurations
         /// Example: {2, 1} means stage 0 has 2 devices (TP domain), stage 1 has 1 device
         /// Empty means one device per stage (pure PP) or all devices in one domain (pure TP)
         std::vector<int> pp_stage_sizes;
+
+        /// Proportional layer split weights for PP stages.
+        /// Example: {0.31, 0.69} gives stage 0 ~31% of layers and stage 1 ~69%.
+        /// Empty means equal split. Must match num_pp_stages() if set.
+        std::vector<float> pp_weights;
 
         /// TP backend for stages that are TP domains (only used when pp_stage_sizes has entries > 1)
         Collective tp_collective = Collective::None;
@@ -623,9 +655,14 @@ namespace llaminar2::test::parity
         bool is_local_tp() const { return parallelism == Parallelism::LocalTP; }
         bool is_local_pp() const { return parallelism == Parallelism::LocalPP; }
         bool is_node_local_tp() const { return parallelism == Parallelism::NodeLocalTP; }
+        bool is_node_local_pp() const { return parallelism == Parallelism::NodeLocalPP; }
         bool is_global_tp() const { return parallelism == Parallelism::GlobalTP; }
         /// Returns true for any cross-rank TP (NodeLocal or Global)
         bool is_cross_rank_tp() const { return is_node_local_tp() || is_global_tp(); }
+        /// Returns true for any cross-rank PP
+        bool is_cross_rank_pp() const { return is_node_local_pp(); }
+        /// Returns true for any cross-rank parallelism (TP or PP)
+        bool is_cross_rank() const { return is_cross_rank_tp() || is_cross_rank_pp(); }
         bool is_single_device() const { return parallelism == Parallelism::None && devices.size() == 1; }
         bool should_skip() const { return !skip_reason.empty(); }
 
@@ -662,21 +699,21 @@ namespace llaminar2::test::parity
         if (cfg.should_skip())
             return cfg.skip_reason;
 
-        // Check MPI initialization for LocalTP/LocalPP/NodeLocalTP/GlobalTP tests
-        if (cfg.is_local_tp() || cfg.is_local_pp() || cfg.is_cross_rank_tp())
+        // Check MPI initialization for LocalTP/LocalPP/NodeLocalTP/NodeLocalPP/GlobalTP tests
+        if (cfg.is_local_tp() || cfg.is_local_pp() || cfg.is_cross_rank())
         {
             if (!isMpiInitialized())
                 return "Test requires MPI (run with mpirun)";
         }
 
-        // Check MPI world size for cross-rank TP tests
-        if (cfg.is_cross_rank_tp())
+        // Check MPI world size for cross-rank tests
+        if (cfg.is_cross_rank())
         {
             int world_size = 1;
             MPI_Comm_size(MPI_COMM_WORLD, &world_size);
             if (world_size < cfg.mpi_ranks)
             {
-                return "Cross-rank TP test requires " + std::to_string(cfg.mpi_ranks) +
+                return "Cross-rank test requires " + std::to_string(cfg.mpi_ranks) +
                        " MPI ranks (got " + std::to_string(world_size) + ")";
             }
         }
@@ -1594,6 +1631,44 @@ namespace llaminar2::test::parity
         }
 
     protected:
+        /**
+         * @brief Required snapshot version for compatibility.
+         *
+         * Bump this when the snapshot format or V-head reversal semantics change.
+         * Snapshots with a lower version will be automatically regenerated.
+         *   v1: original format (V-head reversal applied to all models)
+         *   v2: MoE-only V-head reversal (dense models skip reversal)
+         *   v3: Qwen3.5 prefill GDN conv and Q/K norm snapshots match C++ layout
+         */
+        static constexpr int kRequiredSnapshotVersion = 3;
+
+        /**
+         * @brief Read snapshot_version from metadata.txt
+         * @return version number, or 0 if not found (pre-versioning snapshots)
+         */
+        static int readSnapshotVersion(const std::filesystem::path &metadata_path)
+        {
+            std::ifstream f(metadata_path);
+            if (!f.is_open())
+                return 0;
+            std::string line;
+            while (std::getline(f, line))
+            {
+                if (line.rfind("snapshot_version:", 0) == 0)
+                {
+                    try
+                    {
+                        return std::stoi(line.substr(17));
+                    }
+                    catch (...)
+                    {
+                        return 0;
+                    }
+                }
+            }
+            return 0; // Pre-versioning snapshot (no version line)
+        }
+
         ParityConfig config_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<IInferenceRunner> runner_;
@@ -1751,14 +1826,12 @@ namespace llaminar2::test::parity
 
         void SetUp() override
         {
-            // Enable deterministic CUDA GEMM for reproducible parity results.
-            // Stream-K is disabled, and BK64 split-K is capped to 1 because
-            // that path's FP32 accumulation-order drift compounds through the
-            // attention stack. BK256 remains enabled for FFN-down shapes where
-            // the current parity diagnostics show split_k>1 is bitwise-stable.
-            setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+            // Model parity is a production-path canary. Do not let an inherited
+            // shell env or a previous test route it through deterministic GEMM.
+            setenv("LLAMINAR_DETERMINISTIC", "0", 1);
+            mutableDebugEnv().reload();
 #ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(true);
+            cudaNativeVNNIPrefill_setDeterministicMode(false);
 #endif
 
             // Start log file capture for this test run (rank 0 only)
@@ -1784,12 +1857,22 @@ namespace llaminar2::test::parity
             // Device-specific setup first (may skip)
             setupDeviceSpecific();
 
+            // Skip cleanly if the model GGUF isn't staged on this runner.
+            // Missing models otherwise produce confusing snapshot-regeneration
+            // failures inside Python rather than a clear "model not found".
+            if (!config_.model_path.empty() && !std::filesystem::exists(config_.model_path))
+            {
+                GTEST_SKIP() << "Model file not found: " << config_.model_path
+                             << " (populate MODELS_DIR on the runner)";
+            }
+
             resolveSnapshotDirIfNeeded();
 
             // Regenerate snapshots only on rank 0 to avoid race conditions
             // and redundant work. All ranks wait at barrier before proceeding.
             // OPTIMIZATION: Skip regeneration if snapshots already exist on disk
-            // (metadata.txt is the marker file written by all Python generators).
+            // (metadata.txt is the marker file written by all Python generators)
+            // AND the snapshot version matches the expected version.
             // This is critical for MPI_PROCS>1 tests where popen()/fork() inside
             // an MPI-managed process can crash the HNP event loop.
             if (isRank0())
@@ -1806,8 +1889,19 @@ namespace llaminar2::test::parity
                     auto metadata_path = std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
                     if (std::filesystem::exists(metadata_path))
                     {
-                        LOG_INFO("[" << getBackendName() << " Parity] Found existing snapshots on disk: " << config_.snapshot_dir);
-                        need_regen = false;
+                        int disk_version = readSnapshotVersion(metadata_path);
+                        if (disk_version >= kRequiredSnapshotVersion)
+                        {
+                            LOG_INFO("[" << getBackendName() << " Parity] Found existing v" << disk_version
+                                         << " snapshots on disk: " << config_.snapshot_dir);
+                            need_regen = false;
+                        }
+                        else
+                        {
+                            LOG_WARN("[" << getBackendName() << " Parity] Stale snapshots (v"
+                                         << disk_version << " < required v" << kRequiredSnapshotVersion
+                                         << ") — regenerating: " << config_.snapshot_dir);
+                        }
                     }
                 }
 
@@ -1837,9 +1931,37 @@ namespace llaminar2::test::parity
             // Barrier before teardown to ensure all ranks are done
             mpiBarrier();
 
+            // Ensure all GPU work that may reference graph stages or cached
+            // prepared weights has completed before any owner is destroyed.
+#ifdef HAVE_CUDA
+            if (auto *cuda_backend = llaminar2::getCUDABackend())
+            {
+                for (int d = 0; d < cuda_backend->deviceCount(); ++d)
+                {
+                    cuda_backend->synchronize(d);
+                }
+                cudaGetLastError();
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (auto *rocm_backend = llaminar2::getROCmBackend())
+            {
+                for (int d = 0; d < rocm_backend->deviceCount(); ++d)
+                {
+                    rocm_backend->synchronize(d);
+                }
+            }
+#endif
+
+            // Destroy graph/stage owners before clearing global kernel caches.
+            // The model context remains alive until after clearCache(), so tensor
+            // cache cleanup can still access tensor-owned packed caches safely.
+            runner_.reset();
+            orch_runner_.reset();
+
             // CRITICAL: Clear kernel cache BEFORE destroying model context!
-            // KernelFactory::clearCache() accesses tensor->rocm_cache_ and tensor->cuda_cache_
-            // to free device memory. If we destroy the tensors first (via model_ctx_.reset()),
+            // KernelFactory::clearCache() accesses tensor->cache_ (CPU packed weights)
+            // to free resources. If we destroy the tensors first (via model_ctx_.reset()),
             // clearCache() would be accessing freed memory (use-after-free).
             llaminar::v2::kernels::KernelFactory::clearCache();
 
@@ -1851,8 +1973,6 @@ namespace llaminar2::test::parity
 #endif
 
             model_ctx_.reset();
-            runner_.reset();
-            orch_runner_.reset(); // Clean up modern orchestration runner
             pytorch_snapshots_.clear();
 
             // CRITICAL: Synchronize and clear error state on all GPU devices!
@@ -1898,7 +2018,17 @@ namespace llaminar2::test::parity
             LOG_INFO("[" << getBackendName() << " Parity] Regenerating PyTorch snapshots from GGUF: " << config_.model_path);
 
             std::ostringstream cmd;
-            cmd << "bash -c 'source /workspaces/llaminar/.venv/bin/activate && python3"
+            // Source devcontainer venv if present, else fall back to system
+            // python3 (which is what the CI builder image uses, where Python
+            // deps were installed via `pip install --break-system-packages`).
+            //
+            // IMPORTANT: CTest sets OMP_NUM_THREADS=1 and MKL_NUM_THREADS=1 for the
+            // Llaminar test process (intentional: mpirun -np 1 handles affinity itself).
+            // Those env vars are inherited by this python3 subprocess, which would pin
+            // PyTorch's CPU forward pass to a single thread — catastrophic for large
+            // models. We unset them and let PyTorch/OpenMP/MKL use all available cores.
+            cmd << "bash -c 'unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
+                << "[ -f /workspaces/llaminar/.venv/bin/activate ] && source /workspaces/llaminar/.venv/bin/activate; python3"
                 << " python/reference/generate_qwen_pipeline_snapshots.py"
                 << " --model " << config_.model_path
                 << " --prompt \"" << config_.prompt << "\""
@@ -1977,6 +2107,220 @@ namespace llaminar2::test::parity
                 LOG_ERROR("[Parity] Failed to load snapshot '" << name << "': " << e.what());
                 return {};
             }
+        }
+
+        // =================================================================
+        // GDN V-head permutation for parity comparison
+        // =================================================================
+        //
+        // V-head ordering context:
+        //
+        // GGUF stores V-heads in tiled order for efficient ggml broadcast.
+        // For **dense** Qwen3.5 models, both Llaminar and PyTorch use
+        // GGUF tiled V-head order (the Python GGUF loader skips reversal
+        // for dense models). No comparison-time permutation is needed.
+        //
+        // For **MoE** Qwen3.5 models, the Python GGUF loader reverses
+        // V-head tiling to HF grouped order (the MoE Llaminar GDN
+        // implementation expects grouped V-head order). Comparison-time
+        // permutation maps Llaminar's output (grouped) to PyTorch's
+        // output (also grouped after reversal) — which are already
+        // aligned. However, the QKV_PROJECTION snapshot captures the
+        // raw projection output before GDN processes it, so V-heads
+        // appear in different order between Llaminar (tiled) and
+        // PyTorch (grouped after weight reversal). The permutation
+        // fixes this for comparison.
+        //
+
+        /**
+         * @brief GDN head configuration with MoE detection for V-head permutation
+         *
+         * V-head permutation is only needed for MoE models where the Python
+         * GGUF loader applies V-head reversal (tiled→grouped). Dense models
+         * skip reversal, so both sides use tiled order and no permutation
+         * is needed at comparison time.
+         */
+        struct GDNHeadConfig
+        {
+            int n_k_heads = 0;
+            int n_v_heads = 0;
+            int d_state = 0;
+            bool is_moe = false;
+
+            bool needsPermutation() const
+            {
+                // Only MoE models need comparison-time permutation because
+                // the Python GGUF loader reverses V-head tiling for MoE only.
+                // Dense models skip reversal, so both sides match already.
+                return is_moe && n_k_heads > 0 && n_v_heads > 0 && n_k_heads != n_v_heads;
+            }
+
+            int headsPerGroup() const
+            {
+                return n_k_heads > 0 ? n_v_heads / n_k_heads : 1;
+            }
+        };
+
+        GDNHeadConfig getGDNHeadConfig() const
+        {
+            if (!model_ctx_)
+                return {};
+
+            const auto &arch = model_ctx_->architecture();
+            const auto &meta = model_ctx_->model().metadata;
+
+            auto getMetaInt = [&](const std::string &suffix) -> int
+            {
+                auto it = meta.find(arch + "." + suffix);
+                if (it == meta.end())
+                    return 0;
+                const auto &val = it->second;
+                if (val.type == GGUFValueType::UINT32)
+                    return static_cast<int>(val.asUInt32());
+                if (val.type == GGUFValueType::UINT64)
+                    return static_cast<int>(val.asUInt64());
+                return 0;
+            };
+
+            GDNHeadConfig cfg;
+            cfg.n_k_heads = getMetaInt("ssm.group_count");
+            cfg.n_v_heads = getMetaInt("ssm.time_step_rank");
+            cfg.d_state = getMetaInt("ssm.state_size");
+            cfg.is_moe = (getMetaInt("expert_count") > 0);
+            return cfg;
+        }
+
+        /**
+         * @brief Read MoE configuration from GGUF metadata
+         */
+        struct MoEConfig
+        {
+            int num_experts = 0;
+            int top_k = 0;
+        };
+
+        MoEConfig getMoEConfig() const
+        {
+            if (!model_ctx_)
+                return {};
+
+            const auto &arch = model_ctx_->architecture();
+            const auto &meta = model_ctx_->model().metadata;
+
+            auto getMetaInt = [&](const std::string &suffix) -> int
+            {
+                auto it = meta.find(arch + "." + suffix);
+                if (it == meta.end())
+                    return 0;
+                const auto &val = it->second;
+                if (val.type == GGUFValueType::UINT32)
+                    return static_cast<int>(val.asUInt32());
+                if (val.type == GGUFValueType::UINT64)
+                    return static_cast<int>(val.asUInt64());
+                return 0;
+            };
+
+            MoEConfig cfg;
+            cfg.num_experts = getMetaInt("expert_count");
+            cfg.top_k = getMetaInt("expert_used_count");
+            return cfg;
+        }
+
+        /**
+         * @brief Apply GDN V-head permutation to Llaminar data for comparison.
+         *
+         * For stages that contain V-head-ordered data (Z projection, delta rule,
+         * norm gate), permutes from Llaminar's ratio-grouped order to PyTorch's
+         * interleaved order. For QKV_PROJECTION, only the V portion is permuted.
+         *
+         * @return Permuted copy if permutation was applied, empty vector otherwise.
+         *         When non-empty, use permuted.data() instead of llaminar_data.
+         */
+        std::vector<float> applyGDNHeadPermutation(
+            const float *llaminar_data,
+            size_t size,
+            const std::string &stage,
+            const GDNHeadConfig &gdn) const
+        {
+            if (!gdn.needsPermutation())
+                return {};
+
+            const int n_k = gdn.n_k_heads;
+            const int n_v = gdn.n_v_heads;
+            const int d = gdn.d_state;
+            const int hpg = gdn.headsPerGroup(); // heads per group (n_v / n_k)
+
+            // Build inverse permutation: inv[pt_head] = ll_head
+            std::vector<int> inv_perm(static_cast<size_t>(n_v));
+            for (int pt_h = 0; pt_h < n_v; ++pt_h)
+            {
+                int ratio = pt_h % hpg;
+                int group = pt_h / hpg;
+                inv_perm[static_cast<size_t>(pt_h)] = ratio * n_k + group;
+            }
+
+            auto permuteHeads = [&](const float *src, size_t total_elements) -> std::vector<float>
+            {
+                const size_t head_dim = static_cast<size_t>(d);
+                const size_t n_heads = static_cast<size_t>(n_v);
+                const size_t tokens = total_elements / (n_heads * head_dim);
+                if (tokens * n_heads * head_dim != total_elements)
+                    return {}; // Size doesn't match expected layout
+
+                std::vector<float> out(total_elements);
+                for (size_t t = 0; t < tokens; ++t)
+                {
+                    for (size_t pt_h = 0; pt_h < n_heads; ++pt_h)
+                    {
+                        size_t ll_h = static_cast<size_t>(inv_perm[pt_h]);
+                        std::memcpy(
+                            &out[(t * n_heads + pt_h) * head_dim],
+                            &src[(t * n_heads + ll_h) * head_dim],
+                            head_dim * sizeof(float));
+                    }
+                }
+                return out;
+            };
+
+            if (stage == "GDN_Z_PROJECTION" ||
+                stage == "GDN_DELTA_RULE_OUTPUT" ||
+                stage == "GDN_NORM_GATE_OUTPUT")
+            {
+                return permuteHeads(llaminar_data, size);
+            }
+
+            if (stage == "QKV_PROJECTION" || stage == "GDN_CONV1D_OUTPUT")
+            {
+                // QKV-like layout: [seq, Q(n_k*d) | K(n_k*d) | V(n_v*d)]
+                // Short-conv preserves this packed layout, so it needs the
+                // same V-head-only permutation as the raw projection snapshot.
+                const size_t q_dim = static_cast<size_t>(n_k * d);
+                const size_t k_dim = static_cast<size_t>(n_k * d);
+                const size_t v_dim = static_cast<size_t>(n_v * d);
+                const size_t qkv_dim = q_dim + k_dim + v_dim;
+                const size_t tokens = size / qkv_dim;
+                if (tokens * qkv_dim != size)
+                    return {}; // Size doesn't match
+
+                // Permute only the V portion
+                std::vector<float> out(llaminar_data, llaminar_data + size); // copy all
+                for (size_t t = 0; t < tokens; ++t)
+                {
+                    const float *v_src = llaminar_data + t * qkv_dim + q_dim + k_dim;
+                    float *v_dst = out.data() + t * qkv_dim + q_dim + k_dim;
+                    for (size_t pt_h = 0; pt_h < static_cast<size_t>(n_v); ++pt_h)
+                    {
+                        size_t ll_h = static_cast<size_t>(inv_perm[pt_h]);
+                        std::memcpy(
+                            &v_dst[pt_h * static_cast<size_t>(d)],
+                            &v_src[ll_h * static_cast<size_t>(d)],
+                            static_cast<size_t>(d) * sizeof(float));
+                    }
+                }
+                return out;
+            }
+
+            return {}; // Not a GDN stage
         }
 
         /**
@@ -2089,6 +2433,162 @@ namespace llaminar2::test::parity
         }
 
         /**
+         * @brief Compare MoE routing indices (expert selection).
+         *
+         * For each token, computes the set overlap between selected expert IDs
+         * (Jaccard-like: |intersection| / top_k). Stores mean overlap in
+         * cosine_similarity for consistent table rendering.
+         *
+         * @param actual    Llaminar routing indices [seq_len * top_k] (int cast to float)
+         * @param expected  PyTorch routing indices [seq_len * top_k] (int cast to float)
+         * @param size      Total elements (seq_len * top_k)
+         * @param top_k     Number of experts selected per token
+         */
+        StageComparisonResult compareRoutingIndices(
+            const float *actual,
+            const std::vector<float> &expected,
+            size_t size,
+            int top_k,
+            const std::string &stage_name = "MOE_ROUTING_INDICES")
+        {
+            StageComparisonResult result;
+            result.stage_name = stage_name;
+            result.total_elements = size;
+
+            if (expected.empty() || expected.size() != size || top_k <= 0)
+                return result;
+
+            const size_t seq_len = size / static_cast<size_t>(top_k);
+            double total_overlap = 0.0;
+            double total_rank_corr = 0.0;
+            int position_0_match = 0; // How often the top-1 expert matches
+
+            for (size_t t = 0; t < seq_len; ++t)
+            {
+                const float *ll_row = actual + t * top_k;
+                const float *pt_row = expected.data() + t * top_k;
+
+                // Build sets for intersection
+                std::set<int> ll_set, pt_set;
+                for (int k = 0; k < top_k; ++k)
+                {
+                    ll_set.insert(static_cast<int>(ll_row[k]));
+                    pt_set.insert(static_cast<int>(pt_row[k]));
+                }
+
+                // Set intersection size
+                int overlap = 0;
+                for (int id : ll_set)
+                    if (pt_set.count(id))
+                        overlap++;
+
+                total_overlap += static_cast<double>(overlap) / top_k;
+
+                // Top-1 match (most-weighted expert)
+                if (static_cast<int>(ll_row[0]) == static_cast<int>(pt_row[0]))
+                    position_0_match++;
+            }
+
+            result.is_routing_stage = true;
+            result.routing_overlap = static_cast<float>(total_overlap / seq_len);
+            result.routing_top1_match = static_cast<float>(position_0_match) / static_cast<float>(seq_len);
+            result.cosine_similarity = result.routing_overlap;   // Keep for backward compat (layer log)
+            result.max_abs_diff = 1.0f - result.routing_overlap; // "distance" from perfect
+            result.passed = (result.routing_overlap >= config_.cosine_threshold);
+            return result;
+        }
+
+        /**
+         * @brief Compare MoE routing weights (expert contributions).
+         *
+         * For each token, creates a sparse [num_experts]-dim vector where
+         * vec[expert_id] = routing_weight, then computes cosine similarity
+         * between the two sparse vectors. This naturally handles different
+         * expert orderings and partial set overlaps.
+         *
+         * @param actual_weights   Llaminar routing weights [seq_len * top_k]
+         * @param expected_weights PyTorch routing weights [seq_len * top_k]
+         * @param actual_indices   Llaminar routing indices [seq_len * top_k]
+         * @param expected_indices PyTorch routing indices [seq_len * top_k]
+         * @param size             Elements in weight arrays (seq_len * top_k)
+         * @param top_k            Experts per token
+         * @param num_experts      Total expert count (for sparse vector dim)
+         */
+        StageComparisonResult compareRoutingWeights(
+            const float *actual_weights,
+            const std::vector<float> &expected_weights,
+            const float *actual_indices,
+            const std::vector<float> &expected_indices,
+            size_t size,
+            int top_k,
+            int num_experts,
+            const std::string &stage_name = "MOE_ROUTING_WEIGHTS")
+        {
+            StageComparisonResult result;
+            result.stage_name = stage_name;
+            result.total_elements = size;
+
+            if (expected_weights.empty() || expected_weights.size() != size || top_k <= 0)
+                return result;
+
+            const size_t seq_len = size / static_cast<size_t>(top_k);
+            double total_cosine = 0.0;
+            double total_l1 = 0.0;
+            float max_weight_diff = 0.0f;
+
+            for (size_t t = 0; t < seq_len; ++t)
+            {
+                // Build sparse weight vectors indexed by expert ID
+                std::vector<float> ll_sparse(num_experts, 0.0f);
+                std::vector<float> pt_sparse(num_experts, 0.0f);
+
+                for (int k = 0; k < top_k; ++k)
+                {
+                    int ll_id = static_cast<int>(actual_indices[t * top_k + k]);
+                    int pt_id = static_cast<int>(expected_indices[t * top_k + k]);
+                    if (ll_id >= 0 && ll_id < num_experts)
+                        ll_sparse[ll_id] = actual_weights[t * top_k + k];
+                    if (pt_id >= 0 && pt_id < num_experts)
+                        pt_sparse[pt_id] = expected_weights[t * top_k + k];
+                }
+
+                // Cosine similarity of sparse weight vectors
+                double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
+                double l1 = 0.0;
+                for (int e = 0; e < num_experts; ++e)
+                {
+                    dot += ll_sparse[e] * pt_sparse[e];
+                    norm_a += ll_sparse[e] * ll_sparse[e];
+                    norm_b += pt_sparse[e] * pt_sparse[e];
+                    float diff = std::abs(ll_sparse[e] - pt_sparse[e]);
+                    l1 += diff;
+                    if (diff > max_weight_diff)
+                        max_weight_diff = diff;
+                }
+
+                double denom = std::sqrt(norm_a) * std::sqrt(norm_b);
+                total_cosine += (denom > 1e-30) ? (dot / denom) : 0.0;
+                total_l1 += l1;
+            }
+
+            result.is_routing_stage = true;
+            result.routing_overlap = static_cast<float>(total_cosine / seq_len); // sparse-vector cosine
+            result.routing_weight_l1 = static_cast<float>(total_l1 / seq_len);
+            result.cosine_similarity = result.routing_overlap; // Keep for backward compat (layer log)
+            result.max_abs_diff = max_weight_diff;
+            result.passed = (result.routing_overlap >= config_.cosine_threshold);
+            return result;
+        }
+
+        /**
+         * @brief Check if a stage name is a MoE routing stage needing special comparison
+         */
+        static bool isRoutingStage(const std::string &stage)
+        {
+            return stage == "MOE_ROUTING_INDICES" || stage == "MOE_ROUTING_WEIGHTS";
+        }
+
+        /**
          * @brief Compare TP snapshot against PyTorch reference with sharding awareness
          *
          * For column-parallel stages:
@@ -2099,7 +2599,7 @@ namespace llaminar2::test::parity
          * 1. Verify all devices have consistent data
          * 2. Compare combined output against full PyTorch
          *
-         * @param tp_snapshot The TPSnapshot from MultiDeviceOrchestrator::getTPSnapshot()
+         * @param tp_snapshot The TPSnapshot from RankOrchestrator::getTPSnapshot()
          * @param pytorch_data Full PyTorch reference data
          * @param pytorch_rows Number of rows in PyTorch data (seq_len)
          * @param pytorch_cols Number of columns in PyTorch data (feature_dim)
@@ -2367,7 +2867,7 @@ namespace llaminar2::test::parity
          * @brief Setup pipeline for LocalPP (Pipeline Parallelism) tests
          *
          * Creates a pipeline parallel configuration where layers are split across
-         * multiple devices. Uses MultiDeviceOrchestrator with PP mode which:
+         * multiple devices. Uses RankOrchestrator with PP mode which:
          * - Creates per-stage DeviceGraphOrchestrator instances
          * - Handles sequential forward execution through stages
          * - Manages activation transfer via LocalPPContext
@@ -2447,11 +2947,11 @@ namespace llaminar2::test::parity
                                                             << n_layers << " layers");
             }
 
-            // Create MultiDeviceOrchestrator::Config with PP mode (or TP_PP for hybrid)
-            MultiDeviceOrchestrator::Config mdo_config;
+            // Create RankOrchestrator::Config with PP mode (or TP_PP for hybrid)
+            RankOrchestrator::Config mdo_config;
             mdo_config.mode = cfg().is_hybrid_pp_tp()
-                                  ? MultiDeviceOrchestrator::ParallelismMode::TP_PP
-                                  : MultiDeviceOrchestrator::ParallelismMode::PP;
+                                  ? RankOrchestrator::ParallelismMode::TP_PP
+                                  : RankOrchestrator::ParallelismMode::PP;
             mdo_config.max_seq_len = 4096;
             mdo_config.batch_size = 1;
             mdo_config.activation_precision = ActivationPrecision::FP32;
@@ -2473,7 +2973,7 @@ namespace llaminar2::test::parity
 
             for (int s = 0; s < num_stages; ++s)
             {
-                MultiDeviceOrchestrator::PPStageConfig stage_config;
+                RankOrchestrator::PPStageConfig stage_config;
                 stage_config.first_layer = s * layers_per_stage;
                 stage_config.last_layer = (s == num_stages - 1) ? n_layers : (s + 1) * layers_per_stage;
                 stage_config.has_embedding = (s == 0);
@@ -2525,24 +3025,24 @@ namespace llaminar2::test::parity
             // Validate PP config
             if (!mdo_config.validate())
             {
-                LOG_ERROR("[Parity] Invalid MultiDeviceOrchestrator PP config");
+                LOG_ERROR("[Parity] Invalid RankOrchestrator PP config");
                 return false;
             }
 
-            // Create MultiDeviceOrchestrator with PP mode
-            auto multi_orch = std::make_unique<MultiDeviceOrchestrator>(model_ctx_, mdo_config);
+            // Create RankOrchestrator with PP mode
+            auto multi_orch = std::make_unique<RankOrchestrator>(model_ctx_, mdo_config);
 
             if (!multi_orch)
             {
-                LOG_ERROR("[Parity] Failed to create MultiDeviceOrchestrator for PP");
+                LOG_ERROR("[Parity] Failed to create RankOrchestrator for PP");
                 return false;
             }
 
             // Enable snapshot capture for parity testing
             multi_orch->enableSnapshotCapture();
 
-            LOG_INFO("[Parity] MultiDeviceOrchestrator " << (cfg().is_hybrid_pp_tp() ? "TP_PP" : "PP")
-                                                         << " created with " << num_stages << " stages");
+            LOG_INFO("[Parity] RankOrchestrator " << (cfg().is_hybrid_pp_tp() ? "TP_PP" : "PP")
+                                                  << " created with " << num_stages << " stages");
 
             // Transfer ownership to base class runner_
             runner_ = std::move(multi_orch);
@@ -2950,13 +3450,20 @@ namespace llaminar2::test::parity
             std::vector<std::string> per_layer_stages = {
                 "ATTENTION_NORM",
                 // GDN sub-stages (skipped for FA layers where they don't exist)
-                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
+                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_CONV1D_OUTPUT", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
                 // Standard attention sub-stages (skipped for GDN layers)
                 "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
+                "FA_GATE",
                 "Q_NORM", "K_NORM", // Qwen3 per-head QK RMSNorm (skipped if not available)
                 "Q_ROPE", "K_ROPE",
-                "ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
-                "FFN_NORM", "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN", "FFN_RESIDUAL"};
+                "ATTENTION_CONTEXT", "ATTENTION_CONTEXT_GATED", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
+                "FFN_NORM",
+                // Dense FFN sub-stages (skipped for MoE layers)
+                "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN",
+                // MoE sub-stages (skipped for dense FFN layers)
+                "MOE_ROUTER_OUTPUT", "MOE_ROUTING_INDICES", "MOE_ROUTING_WEIGHTS",
+                "MOE_EXPERT_OUTPUT", "MOE_SHARED_EXPERT_OUTPUT", "MOE_SHARED_GATE_OUTPUT", "MOE_COMBINED_OUTPUT",
+                "FFN_RESIDUAL"};
             auto snapshot_keys = runner_->getSnapshotKeys();
             std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
 
@@ -2999,6 +3506,17 @@ namespace llaminar2::test::parity
             }
             summary.embedding_passed = (summary.embedding_cosine >= config_.cosine_threshold);
 
+            // Pre-compute GDN head config for V-head permutation
+            const auto gdn_cfg = getGDNHeadConfig();
+            const auto moe_cfg = getMoEConfig();
+            if (gdn_cfg.needsPermutation())
+            {
+                LOG_INFO("[Parity] GDN V-head permutation active: n_k=" << gdn_cfg.n_k_heads
+                                                                        << " n_v=" << gdn_cfg.n_v_heads
+                                                                        << " d=" << gdn_cfg.d_state
+                                                                        << " heads_per_group=" << gdn_cfg.headsPerGroup());
+            }
+
             // Compare each layer
             for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
             {
@@ -3022,11 +3540,24 @@ namespace llaminar2::test::parity
                     std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage;
                     std::string pytorch_key = llaminar_key;
 
-                    if (!available_snapshots.count(llaminar_key))
-                        continue;
-
                     auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
                     if (pytorch_data.empty())
+                        continue;
+
+                    const bool is_allreduce_stage =
+                        mpi_ctx_ && !config_.allreduce_stages.empty() &&
+                        std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
+                            config_.allreduce_stages.end();
+
+                    const bool has_local_snapshot = available_snapshots.count(llaminar_key) > 0;
+                    float ranks_with_snapshot = has_local_snapshot ? 1.0f : 0.0f;
+                    if (is_allreduce_stage)
+                    {
+                        float local_has_snapshot = ranks_with_snapshot;
+                        mpi_ctx_->allreduce_sum(&local_has_snapshot, &ranks_with_snapshot, 1);
+                    }
+
+                    if (!has_local_snapshot)
                         continue;
 
                     size_t llaminar_size;
@@ -3034,15 +3565,70 @@ namespace llaminar2::test::parity
                     if (!llaminar_data)
                         continue;
 
-                    auto result = compareTensors(llaminar_data, pytorch_data, llaminar_size, stage);
-                    stats.stages_compared++;
-                    sum_cosine += result.cosine_similarity;
+                    // Apply GDN V-head permutation if needed (Llaminar ratio-grouped → PyTorch interleaved)
+                    auto permuted = applyGDNHeadPermutation(llaminar_data, llaminar_size, stage, gdn_cfg);
+                    const float *compare_data = permuted.empty() ? llaminar_data : permuted.data();
+
+                    StageComparisonResult result;
+                    // EP/TP allreduce: reconstruct full output from partial sums across ranks
+                    bool did_allreduce = false;
+                    std::vector<float> allreduced_buf;
+                    if (is_allreduce_stage &&
+                        static_cast<int>(ranks_with_snapshot + 0.5f) == mpiWorldSize())
+                    {
+                        allreduced_buf.resize(llaminar_size);
+                        mpi_ctx_->allreduce_sum(compare_data, allreduced_buf.data(), llaminar_size);
+                        compare_data = allreduced_buf.data();
+                        did_allreduce = true;
+                    }
+                    if (stage == "MOE_ROUTING_INDICES")
+                    {
+                        result = compareRoutingIndices(compare_data, pytorch_data, llaminar_size,
+                                                       moe_cfg.top_k, stage);
+                    }
+                    else if (stage == "MOE_ROUTING_WEIGHTS")
+                    {
+                        std::string idx_key = "layer" + std::to_string(layer_idx) + "_MOE_ROUTING_INDICES";
+                        size_t ll_idx_size;
+                        const float *ll_idx = runner_->getSnapshot(idx_key, ll_idx_size);
+                        auto pt_idx = loadPyTorchSnapshot(idx_key);
+                        if (ll_idx && !pt_idx.empty())
+                            result = compareRoutingWeights(compare_data, pytorch_data, ll_idx, pt_idx,
+                                                           llaminar_size, moe_cfg.top_k, moe_cfg.num_experts, stage);
+                        else
+                            result = compareTensors(compare_data, pytorch_data, llaminar_size, stage);
+                    }
+                    else
+                    {
+                        result = compareTensors(compare_data, pytorch_data, llaminar_size, stage);
+                    }
                     stats.stage_results.push_back(result);
 
-                    // Per-stage cosine logging for diagnostics
-                    LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
-                                               << " cosine=" << std::fixed << std::setprecision(6) << result.cosine_similarity
-                                               << " size=" << llaminar_size);
+                    // Routing stages use set-overlap (Jaccard), not cosine similarity.
+                    // Include them in stage_results for logging/CSV but exclude from
+                    // layer-level min/avg aggregation to avoid metric contamination.
+                    if (!isRoutingStage(stage))
+                    {
+                        stats.stages_compared++;
+                        sum_cosine += result.cosine_similarity;
+                    }
+
+                    // Per-stage logging for diagnostics
+                    if (result.is_routing_stage)
+                    {
+                        LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
+                                                   << " routing_overlap=" << std::fixed << std::setprecision(6) << result.routing_overlap
+                                                   << (!std::isnan(result.routing_top1_match) ? " top1_match=" + std::to_string(result.routing_top1_match) : "")
+                                                   << (!std::isnan(result.routing_weight_l1) ? " weight_l1=" + std::to_string(result.routing_weight_l1) : "")
+                                                   << " size=" << llaminar_size);
+                    }
+                    else
+                    {
+                        LOG_INFO("[Parity] Layer " << layer_idx << " " << stage
+                                                   << (did_allreduce ? " (allreduced)" : "")
+                                                   << " cosine=" << std::fixed << std::setprecision(6) << result.cosine_similarity
+                                                   << " size=" << llaminar_size);
+                    }
 
                     // Per-row cosine diagnostic for ATTENTION_CONTEXT (layer 0 only)
                     if (stage == "ATTENTION_CONTEXT" && layer_idx == 0)
@@ -3089,7 +3675,7 @@ namespace llaminar2::test::parity
                         stats.max_kurtosis_stage = stage;
                     }
 
-                    if (result.cosine_similarity < stats.min_cosine_sim)
+                    if (!isRoutingStage(stage) && result.cosine_similarity < stats.min_cosine_sim)
                     {
                         stats.min_cosine_sim = result.cosine_similarity;
                         stats.worst_stage = stage;
@@ -3097,10 +3683,16 @@ namespace llaminar2::test::parity
                 }
 
                 // Compute per-stage cosine drops (error introduced by each stage)
+                // Skip transitions involving routing stages (different metric scale)
                 if (stats.stage_results.size() >= 2)
                 {
                     for (size_t s = 1; s < stats.stage_results.size(); ++s)
                     {
+                        bool curr_routing = isRoutingStage(stats.stage_results[s].stage_name);
+                        bool prev_routing = isRoutingStage(stats.stage_results[s - 1].stage_name);
+                        if (curr_routing || prev_routing)
+                            continue; // Skip drops involving routing stages
+
                         float drop = stats.stage_results[s - 1].cosine_similarity -
                                      stats.stage_results[s].cosine_similarity;
                         stats.stage_results[s].cosine_drop = drop;
@@ -3218,7 +3810,7 @@ namespace llaminar2::test::parity
          * 1. Per-device partial outputs against corresponding PyTorch slices
          * 2. Combined (concatenated) outputs against full PyTorch reference
          *
-         * Requires runner_ to be a MultiDeviceOrchestrator (will cast and check).
+         * Requires runner_ to be a RankOrchestrator (will cast and check).
          *
          * @return TPParityTestSummary with per-device and combined metrics
          */
@@ -3235,11 +3827,11 @@ namespace llaminar2::test::parity
                     return summary;
             }
 
-            // Try to cast to MultiDeviceOrchestrator for TP snapshot access
-            auto *multi_device = dynamic_cast<MultiDeviceOrchestrator *>(runner_.get());
+            // Try to cast to RankOrchestrator for TP snapshot access
+            auto *multi_device = dynamic_cast<RankOrchestrator *>(runner_.get());
             if (!multi_device)
             {
-                LOG_ERROR("[TP Parity] runner_ is not a MultiDeviceOrchestrator - "
+                LOG_ERROR("[TP Parity] runner_ is not a RankOrchestrator - "
                           "ensure test calls setupLocalTPPipeline() or similar before runTPPrefillParity()");
                 return summary;
             }
@@ -3251,7 +3843,7 @@ namespace llaminar2::test::parity
                 if (dev_runner)
                 {
                     // Use index-based name for simplicity
-                    // MultiDeviceOrchestrator stores device info in config
+                    // RankOrchestrator stores device info in config
                     summary.device_names.push_back("TP_rank_" + std::to_string(i));
                 }
             }
@@ -3602,10 +4194,10 @@ namespace llaminar2::test::parity
             }
 
             // Verify we have a multi-device orchestrator
-            auto *multi_device = dynamic_cast<MultiDeviceOrchestrator *>(runner_.get());
+            auto *multi_device = dynamic_cast<RankOrchestrator *>(runner_.get());
             if (!multi_device)
             {
-                LOG_ERROR("[TP Decode Parity] runner_ is not a MultiDeviceOrchestrator - "
+                LOG_ERROR("[TP Decode Parity] runner_ is not a RankOrchestrator - "
                           "ensure test calls setupLocalTPPipeline() or similar before runTPDecodeParity()");
                 return summary;
             }
@@ -3667,7 +4259,7 @@ namespace llaminar2::test::parity
                 if (!success)
                     continue;
 
-                // Get Llaminar's logits (MultiDeviceOrchestrator gathers from all devices)
+                // Get Llaminar's logits (RankOrchestrator gathers from all devices)
                 const float *llaminar_logits = runner_->logits();
                 if (!llaminar_logits)
                 {
@@ -3842,28 +4434,43 @@ namespace llaminar2::test::parity
             // Export CSV results
             exportPrefillCSV(summary);
 
-            // Assertions (all ranks - GTest will aggregate failures)
-            EXPECT_GE(summary.early_layers_passed, config_.min_early_layers_passed)
-                << "At least " << config_.min_early_layers_passed << " of the first "
-                << config_.early_layers_count << " layers should pass parity (cosine >= "
-                << config_.cosine_threshold << ")";
+            // For cross-rank PP, each rank only validates assertions relevant to its stage:
+            // - Head rank: has early layers and embedding, validates early_layers_passed
+            // - Tail rank: has LM_HEAD logits, validates logit metrics
+            // Detection: if LM_HEAD summary is all-zero and we have a multi-rank MPI context,
+            // this rank likely lacks the LM head. Similarly for early layers.
+            const bool has_lm_head_data = (summary.lm_head_cosine > 0.0f || summary.lm_head_top1 > 0.0f);
+            const bool has_early_layer_data = (summary.early_layers_passed > 0 || summary.embedding_passed);
 
-            EXPECT_LT(summary.lm_head_kl, config_.kl_threshold)
-                << "LM_HEAD KL divergence too high: " << summary.lm_head_kl
-                << " (threshold: " << config_.kl_threshold << ")";
-
-            EXPECT_GE(summary.lm_head_top1 * 100.0f, config_.min_top1_accuracy)
-                << "LM_HEAD Top-1 accuracy too low: " << (summary.lm_head_top1 * 100.0f)
-                << "% (required: " << config_.min_top1_accuracy << "%)";
-
-            EXPECT_GE(summary.lm_head_top5 * 100.0f, config_.min_top5_accuracy)
-                << "LM_HEAD Top-5 accuracy too low: " << (summary.lm_head_top5 * 100.0f)
-                << "% (required: " << config_.min_top5_accuracy << "%)";
-
-            if (config_.pytorch_top1_in_topk > 0)
+            // Early layer assertions (skip if this rank has no early layer data, e.g. PP tail)
+            if (has_early_layer_data)
             {
-                EXPECT_TRUE(summary.lm_head_pytorch_top1_in_top3)
-                    << "PyTorch's top-1 token must appear in llaminar's top-" << config_.pytorch_top1_in_topk << " for LM_HEAD";
+                EXPECT_GE(summary.early_layers_passed, config_.min_early_layers_passed)
+                    << "At least " << config_.min_early_layers_passed << " of the first "
+                    << config_.early_layers_count << " layers should pass parity (cosine >= "
+                    << config_.cosine_threshold << ")";
+            }
+
+            // LM_HEAD assertions (skip if this rank has no LM_HEAD data, e.g. PP head)
+            if (has_lm_head_data)
+            {
+                EXPECT_LT(summary.lm_head_kl, config_.kl_threshold)
+                    << "LM_HEAD KL divergence too high: " << summary.lm_head_kl
+                    << " (threshold: " << config_.kl_threshold << ")";
+
+                EXPECT_GE(summary.lm_head_top1 * 100.0f, config_.min_top1_accuracy)
+                    << "LM_HEAD Top-1 accuracy too low: " << (summary.lm_head_top1 * 100.0f)
+                    << "% (required: " << config_.min_top1_accuracy << "%)";
+
+                EXPECT_GE(summary.lm_head_top5 * 100.0f, config_.min_top5_accuracy)
+                    << "LM_HEAD Top-5 accuracy too low: " << (summary.lm_head_top5 * 100.0f)
+                    << "% (required: " << config_.min_top5_accuracy << "%)";
+
+                if (config_.pytorch_top1_in_topk > 0)
+                {
+                    EXPECT_TRUE(summary.lm_head_pytorch_top1_in_top3)
+                        << "PyTorch's top-1 token must appear in llaminar's top-" << config_.pytorch_top1_in_topk << " for LM_HEAD";
+                }
             }
         }
 
@@ -3912,12 +4519,17 @@ namespace llaminar2::test::parity
             // Stages to compare per layer during decode (same as prefill)
             const std::vector<std::string> decode_per_layer_stages = {
                 "ATTENTION_NORM",
-                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
+                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_CONV1D_OUTPUT", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
                 "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
+                "FA_GATE",
                 "Q_NORM", "K_NORM",
                 "Q_ROPE", "K_ROPE",
-                "ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
-                "FFN_NORM", "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN", "FFN_RESIDUAL"};
+                "ATTENTION_CONTEXT", "ATTENTION_CONTEXT_GATED", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
+                "FFN_NORM",
+                "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN",
+                "MOE_ROUTER_OUTPUT", "MOE_ROUTING_INDICES", "MOE_ROUTING_WEIGHTS",
+                "MOE_EXPERT_OUTPUT", "MOE_SHARED_EXPERT_OUTPUT", "MOE_SHARED_GATE_OUTPUT", "MOE_COMBINED_OUTPUT",
+                "FFN_RESIDUAL"};
 
             // Check if decode snapshots exist
             auto decode_step0 = loadPyTorchSnapshot("decode_step0_LM_HEAD");
@@ -4017,6 +4629,8 @@ namespace llaminar2::test::parity
                     int n_layers = static_cast<int>(model_ctx_->model().block_count);
                     auto snapshot_keys = runner_->getSnapshotKeys();
                     std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
+                    const auto gdn_cfg_decode = getGDNHeadConfig();
+                    const auto moe_cfg_decode = getMoEConfig();
 
                     for (int layer_idx = 0; layer_idx < n_layers; ++layer_idx)
                     {
@@ -4039,13 +4653,27 @@ namespace llaminar2::test::parity
 
                             // Llaminar snapshot key: layer{N}_{STAGE}
                             std::string llaminar_key = "layer" + std::to_string(layer_idx) + "_" + stage;
-                            if (!available_snapshots.count(llaminar_key))
-                                continue;
 
                             // PyTorch snapshot key: decode_step{N}_layer{L}_{STAGE}
                             std::string pytorch_key = step_prefix + "_layer" + std::to_string(layer_idx) + "_" + stage;
                             auto pytorch_data = loadPyTorchSnapshot(pytorch_key);
                             if (pytorch_data.empty())
+                                continue;
+
+                            const bool is_allreduce_stage =
+                                mpi_ctx_ && !config_.allreduce_stages.empty() &&
+                                std::find(config_.allreduce_stages.begin(), config_.allreduce_stages.end(), stage) !=
+                                    config_.allreduce_stages.end();
+
+                            const bool has_local_snapshot = available_snapshots.count(llaminar_key) > 0;
+                            float ranks_with_snapshot = has_local_snapshot ? 1.0f : 0.0f;
+                            if (is_allreduce_stage)
+                            {
+                                float local_has_snapshot = ranks_with_snapshot;
+                                mpi_ctx_->allreduce_sum(&local_has_snapshot, &ranks_with_snapshot, 1);
+                            }
+
+                            if (!has_local_snapshot)
                                 continue;
 
                             size_t llaminar_size;
@@ -4070,12 +4698,55 @@ namespace llaminar2::test::parity
                                 continue; // Size mismatch, skip
                             }
 
-                            auto result = compareTensors(llaminar_data, pytorch_data, llaminar_size, stage);
-                            stats.stages_compared++;
-                            sum_cosine += result.cosine_similarity;
+                            // Apply GDN V-head permutation if needed
+                            auto permuted_decode = applyGDNHeadPermutation(
+                                llaminar_data, llaminar_size, stage, gdn_cfg_decode);
+                            const float *decode_compare = permuted_decode.empty() ? llaminar_data : permuted_decode.data();
+
+                            StageComparisonResult result;
+                            // EP/TP allreduce: reconstruct full output from partial sums across ranks
+                            bool did_allreduce_decode = false;
+                            std::vector<float> allreduced_decode_buf;
+                            if (is_allreduce_stage &&
+                                static_cast<int>(ranks_with_snapshot + 0.5f) == mpiWorldSize())
+                            {
+                                allreduced_decode_buf.resize(llaminar_size);
+                                mpi_ctx_->allreduce_sum(decode_compare, allreduced_decode_buf.data(), llaminar_size);
+                                decode_compare = allreduced_decode_buf.data();
+                                did_allreduce_decode = true;
+                            }
+                            if (stage == "MOE_ROUTING_INDICES")
+                            {
+                                result = compareRoutingIndices(decode_compare, pytorch_data, llaminar_size,
+                                                               moe_cfg_decode.top_k, stage);
+                            }
+                            else if (stage == "MOE_ROUTING_WEIGHTS")
+                            {
+                                std::string idx_key = "decode_step" + std::to_string(step) + "_layer" + std::to_string(layer_idx) + "_MOE_ROUTING_INDICES";
+                                size_t ll_idx_size;
+                                const float *ll_idx = runner_->getSnapshot(idx_key, ll_idx_size);
+                                auto pt_idx = loadPyTorchSnapshot(idx_key);
+                                if (ll_idx && !pt_idx.empty())
+                                    result = compareRoutingWeights(decode_compare, pytorch_data, ll_idx, pt_idx,
+                                                                   llaminar_size, moe_cfg_decode.top_k,
+                                                                   moe_cfg_decode.num_experts, stage);
+                                else
+                                    result = compareTensors(decode_compare, pytorch_data, llaminar_size, stage);
+                            }
+                            else
+                            {
+                                result = compareTensors(decode_compare, pytorch_data, llaminar_size, stage);
+                            }
                             stats.stage_results.push_back(result);
 
-                            if (result.cosine_similarity < stats.min_cosine_sim)
+                            // Routing stages use set-overlap, not cosine — exclude from aggregation
+                            if (!isRoutingStage(stage))
+                            {
+                                stats.stages_compared++;
+                                sum_cosine += result.cosine_similarity;
+                            }
+
+                            if (!isRoutingStage(stage) && result.cosine_similarity < stats.min_cosine_sim)
                             {
                                 stats.min_cosine_sim = result.cosine_similarity;
                                 stats.worst_stage = stage;
@@ -4083,10 +4754,16 @@ namespace llaminar2::test::parity
                         }
 
                         // Compute per-stage cosine drops (error introduced by each stage)
+                        // Skip transitions involving routing stages (different metric scale)
                         if (stats.stage_results.size() >= 2)
                         {
                             for (size_t s = 1; s < stats.stage_results.size(); ++s)
                             {
+                                bool curr_routing = isRoutingStage(stats.stage_results[s].stage_name);
+                                bool prev_routing = isRoutingStage(stats.stage_results[s - 1].stage_name);
+                                if (curr_routing || prev_routing)
+                                    continue;
+
                                 float drop = stats.stage_results[s - 1].cosine_similarity -
                                              stats.stage_results[s].cosine_similarity;
                                 stats.stage_results[s].cosine_drop = drop;
@@ -4443,6 +5120,10 @@ namespace llaminar2::test::parity
                 GTEST_SKIP() << "No decode snapshots found - skipping decode parity assertions";
             }
 
+            // For cross-rank PP, only the tail rank has valid logits for decode comparison.
+            // Detect by checking if any decode step actually produced metrics (not whether they're good).
+            const bool has_logit_data = !summary.step_stats.empty();
+
             // Render table first (rank 0 only)
             if (isRank0())
             {
@@ -4460,7 +5141,39 @@ namespace llaminar2::test::parity
             // Export CSV results
             exportDecodeCSV(summary);
 
-            // Assertions (all ranks - GTest will aggregate failures)
+            // Assertions — skip on ranks that lack logit data (PP non-tail ranks)
+            if (!has_logit_data)
+                return;
+
+            // Decode also captures per-layer snapshots when the runner exposes
+            // them. Enforce the same early-layer gate used by prefill whenever a
+            // full early-layer window is present on this rank; PP tail ranks may
+            // only own later layers and should still rely on logit assertions.
+            for (const auto &step_stats : summary.step_stats)
+            {
+                int compared_early_layers = 0;
+                int passed_early_layers = 0;
+                for (const auto &layer_stats : step_stats.layer_stats)
+                {
+                    if (layer_stats.layer_idx >= config_.early_layers_count)
+                        continue;
+                    if (layer_stats.stages_compared == 0)
+                        continue;
+
+                    compared_early_layers++;
+                    if (layer_stats.passed)
+                        passed_early_layers++;
+                }
+
+                if (compared_early_layers >= config_.early_layers_count)
+                {
+                    EXPECT_GE(passed_early_layers, config_.min_early_layers_passed)
+                        << "At least " << config_.min_early_layers_passed << " of the first "
+                        << config_.early_layers_count << " layers should pass decode parity at step "
+                        << step_stats.step_idx << " (cosine >= " << config_.decode_cosine_threshold << ")";
+                }
+            }
+
             int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
             EXPECT_GE(summary.steps_passed, min_steps_required)
                 << "Not enough decode steps passed: " << summary.steps_passed << "/" << summary.steps_total
@@ -4800,7 +5513,8 @@ namespace llaminar2::test::parity
                 return;
             }
 
-            f << "backend,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
+            f << "backend,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,"
+                 "is_routing,routing_overlap,routing_top1_match,routing_weight_l1,";
             writeDistributionStatsHeader(f, "llaminar_");
             f << ",";
             writeDistributionStatsHeader(f, "pytorch_");
@@ -4813,13 +5527,17 @@ namespace llaminar2::test::parity
                     f << backend << ","
                       << ls.layer_idx << ","
                       << sr.stage_name << ","
-                      << sr.cosine_similarity << ","
-                      << sr.cosine_drop << ","
-                      << sr.rel_l2_norm << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_similarity)) << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_drop)) << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.rel_l2_norm)) << ","
                       << sr.max_abs_diff << ","
-                      << sr.snr_db << ","
-                      << sr.rmse << ","
-                      << sr.error_entropy << ",";
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.snr_db)) << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.rmse)) << ","
+                      << (sr.is_routing_stage ? "" : std::to_string(sr.error_entropy)) << ","
+                      << (sr.is_routing_stage ? "1" : "0") << ","
+                      << (sr.is_routing_stage ? std::to_string(sr.routing_overlap) : "") << ","
+                      << (std::isnan(sr.routing_top1_match) ? "" : std::to_string(sr.routing_top1_match)) << ","
+                      << (std::isnan(sr.routing_weight_l1) ? "" : std::to_string(sr.routing_weight_l1)) << ",";
                     writeDistributionStatsData(f, sr.llaminar_stats);
                     f << ",";
                     writeDistributionStatsData(f, sr.pytorch_stats);
@@ -4869,7 +5587,8 @@ namespace llaminar2::test::parity
                 return;
             }
 
-            f << "backend,step,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,";
+            f << "backend,step,layer,stage,cosine,cosine_drop,rel_l2,max_abs_diff,snr_db,rmse,error_entropy,"
+                 "is_routing,routing_overlap,routing_top1_match,routing_weight_l1,";
             writeDistributionStatsHeader(f, "llaminar_");
             f << ",";
             writeDistributionStatsHeader(f, "pytorch_");
@@ -4885,13 +5604,17 @@ namespace llaminar2::test::parity
                           << ss.step_idx << ","
                           << ls.layer_idx << ","
                           << sr.stage_name << ","
-                          << sr.cosine_similarity << ","
-                          << sr.cosine_drop << ","
-                          << sr.rel_l2_norm << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_similarity)) << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.cosine_drop)) << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.rel_l2_norm)) << ","
                           << sr.max_abs_diff << ","
-                          << sr.snr_db << ","
-                          << sr.rmse << ","
-                          << sr.error_entropy << ",";
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.snr_db)) << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.rmse)) << ","
+                          << (sr.is_routing_stage ? "" : std::to_string(sr.error_entropy)) << ","
+                          << (sr.is_routing_stage ? "1" : "0") << ","
+                          << (sr.is_routing_stage ? std::to_string(sr.routing_overlap) : "") << ","
+                          << (std::isnan(sr.routing_top1_match) ? "" : std::to_string(sr.routing_top1_match)) << ","
+                          << (std::isnan(sr.routing_weight_l1) ? "" : std::to_string(sr.routing_weight_l1)) << ",";
                         writeDistributionStatsData(f, sr.llaminar_stats);
                         f << ",";
                         writeDistributionStatsData(f, sr.pytorch_stats);

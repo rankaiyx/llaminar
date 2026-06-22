@@ -18,6 +18,7 @@
 #pragma once
 
 #include "../../backends/GlobalDeviceAddress.h"
+#include "../../config/CollectiveBackendType.h"
 #include <string>
 #include <vector>
 
@@ -57,6 +58,48 @@ namespace llaminar2
     }
 
     // =========================================================================
+    // Rank Locality
+    // =========================================================================
+
+    /**
+     * @brief Physical location of an MPI rank
+     *
+     * Populated from MPI_Get_processor_name() during topology construction.
+     * Used by strategy selectors (backend routing, auto TP/PP placement)
+     * to make topology-aware decisions.
+     */
+    struct RankLocality
+    {
+        int rank = -1;              ///< MPI rank index
+        std::string hostname;       ///< Hostname from MPI_Get_processor_name()
+        int node_id = -1;           ///< Derived: ranks with same hostname get same node_id
+    };
+
+    /**
+     * @brief Locality of an inter-stage transfer
+     */
+    enum class TransferLocality
+    {
+        INTRA_NODE,  ///< Both sender and receiver are on the same physical node
+        INTER_NODE,  ///< Sender and receiver are on different physical nodes
+        UNKNOWN,     ///< Locality not yet determined (no rank localities provided)
+    };
+
+    /**
+     * @brief Convert TransferLocality to string
+     */
+    inline const char *transferLocalityName(TransferLocality loc)
+    {
+        switch (loc)
+        {
+        case TransferLocality::INTRA_NODE: return "INTRA_NODE";
+        case TransferLocality::INTER_NODE: return "INTER_NODE";
+        case TransferLocality::UNKNOWN:    return "UNKNOWN";
+        default:                           return "UNKNOWN";
+        }
+    }
+
+    // =========================================================================
     // GlobalPPStageSpec
     // =========================================================================
 
@@ -70,6 +113,7 @@ namespace llaminar2
     struct GlobalPPStageSpec
     {
         int stage_id = -1; ///< 0-indexed stage number in the pipeline
+        std::string domain_name; ///< Optional named execution domain for this stage
 
         // =====================================================================
         // Layer assignment
@@ -91,12 +135,14 @@ namespace llaminar2
         InnerParallelism inner_mode = InnerParallelism::SINGLE_DEVICE;
         std::vector<GlobalDeviceAddress> devices; ///< Devices for this stage
         std::vector<float> tp_weights;            ///< Proportional weights (heterogeneous LocalTP)
+        CollectiveBackendType backend = CollectiveBackendType::AUTO; ///< Domain-preferred collective backend
 
         // =====================================================================
         // Global TP config (multi-rank stages only)
         // =====================================================================
         std::vector<int> participating_ranks;     ///< Which MPI ranks participate (sorted)
         GlobalDeviceAddress per_rank_device;       ///< Device to use on each rank (e.g., cpu:0)
+        std::vector<GlobalDeviceAddress> per_rank_devices; ///< Optional device per participating_ranks entry
 
         // =====================================================================
         // Helpers
@@ -132,6 +178,29 @@ namespace llaminar2
         std::vector<std::string> validate() const;
     };
 
+    /**
+     * @brief Kind of transfer between adjacent Global PP stages
+     */
+    enum class GlobalPPTransferKind
+    {
+        MPI,           ///< Activation moves between MPI ranks
+        LOCAL_HANDOFF, ///< Activation is handed off between local stage/domain runners
+    };
+
+    /** @brief Convert GlobalPPTransferKind to string */
+    inline const char *globalPPTransferKindName(GlobalPPTransferKind kind)
+    {
+        switch (kind)
+        {
+        case GlobalPPTransferKind::MPI:
+            return "MPI";
+        case GlobalPPTransferKind::LOCAL_HANDOFF:
+            return "LOCAL_HANDOFF";
+        default:
+            return "UNKNOWN";
+        }
+    }
+
     // =========================================================================
     // GlobalPPTransfer
     // =========================================================================
@@ -139,19 +208,25 @@ namespace llaminar2
     /**
      * @brief Describes a transfer of activations between two adjacent Global PP stages
      *
-     * Derived automatically from the stage specifications. Each transfer has a
-     * unique sender rank and receiver rank, identified by MPI tag.
+     * Derived automatically from the stage specifications. MPI transfers have
+     * distinct sender/receiver ranks; local handoffs explicitly represent a
+     * same-rank activation handoff between adjacent stage/domain runners.
      */
     struct GlobalPPTransfer
     {
+        GlobalPPTransferKind kind = GlobalPPTransferKind::MPI; ///< Transfer mechanism
         int from_stage = -1;     ///< Source stage ID
         int to_stage = -1;       ///< Destination stage ID
-        int sender_rank = -1;    ///< MPI rank that sends
-        int receiver_rank = -1;  ///< MPI rank that receives (-1 if global TP → same set)
+        int sender_rank = -1;    ///< MPI rank that sends, or local handoff rank
+        int receiver_rank = -1;  ///< MPI rank that receives, or local handoff rank
         int mpi_tag = 0;         ///< Unique MPI tag for this transfer
+        TransferLocality locality = TransferLocality::UNKNOWN; ///< Physical locality of this transfer
 
-        /** @brief Check if this transfer is a no-op (both ranks are the same) */
-        bool isNoop() const { return sender_rank == receiver_rank; }
+        /** @brief Check if this transfer is a legacy MPI no-op */
+        bool isNoop() const { return kind == GlobalPPTransferKind::MPI && sender_rank == receiver_rank; }
+
+        /** @brief Check if this transfer is a local handoff */
+        bool isLocalHandoff() const { return kind == GlobalPPTransferKind::LOCAL_HANDOFF; }
     };
 
     // =========================================================================
@@ -178,6 +253,7 @@ namespace llaminar2
         std::vector<GlobalPPTransfer> transfers;     ///< Inter-stage transfers (derived)
         int total_layers = 0;                        ///< Total transformer layers in model
         int world_size = 0;                          ///< Number of MPI ranks
+        std::vector<RankLocality> rank_localities;    ///< Physical location of each rank (optional)
 
         // =====================================================================
         // Factory
@@ -197,6 +273,16 @@ namespace llaminar2
         static GlobalPPTopology build(std::vector<GlobalPPStageSpec> specs,
                                       int total_layers, int world_size);
 
+        /**
+         * @brief Build topology with rank locality information
+         *
+         * Same as build() but also populates TransferLocality on each transfer
+         * based on whether sender and receiver are co-located.
+         */
+        static GlobalPPTopology build(std::vector<GlobalPPStageSpec> specs,
+                                      int total_layers, int world_size,
+                                      std::vector<RankLocality> localities);
+
         // =====================================================================
         // Queries
         // =====================================================================
@@ -212,6 +298,15 @@ namespace llaminar2
 
         /** @brief Get transfer record between two adjacent stages (nullptr if not found) */
         const GlobalPPTransfer *transferBetween(int from_stage, int to_stage) const;
+
+        /** @brief Check if two ranks are on the same physical node */
+        bool areColocated(int rank_a, int rank_b) const;
+
+        /** @brief Get all ranks on a given node */
+        std::vector<int> ranksOnNode(int node_id) const;
+
+        /** @brief Number of distinct physical nodes */
+        int nodeCount() const;
 
         /** @brief Number of stages */
         int numStages() const { return static_cast<int>(stages.size()); }
@@ -230,6 +325,14 @@ namespace llaminar2
          * @brief Human-readable summary for logging
          */
         std::string toString() const;
+
+        /**
+         * @brief Formatted ASCII table for --show-topology output
+         *
+         * Produces a libfort-formatted table showing PP stages, layer ranges,
+         * rank assignments, devices, and transfer paths.
+         */
+        std::string toTable() const;
     };
 
 } // namespace llaminar2

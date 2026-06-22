@@ -33,6 +33,10 @@ if(CCACHE_PROGRAM)
     message(STATUS "V2: Found ccache: ${CCACHE_PROGRAM}")
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    # Also cache nvcc and hipcc TUs — these are the slowest in the build
+    # (multi-arch fatbin + ROCm headers). Ccache 4.0+ supports both.
+    set(CMAKE_CUDA_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_HIP_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
 else()
     message(STATUS "V2: ccache not found - using direct compilation")
 endif()
@@ -60,6 +64,19 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
 option(HAVE_CUDA "Enable CUDA backend" ON)
 option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
+option(LLAMINAR_BUILD_TESTS "Configure and build Llaminar V2 tests" ON)
+
+set(LLAMINAR_SHARED_CORE_DEFAULT OFF)
+if(HAVE_CUDA OR HAVE_ROCM)
+    set(LLAMINAR_SHARED_CORE_DEFAULT ON)
+endif()
+option(LLAMINAR_SHARED_CORE
+    "Build llaminar2_core as a shared library so GPU device links are paid once and tests link the core DSO"
+    ${LLAMINAR_SHARED_CORE_DEFAULT})
+if(LLAMINAR_SHARED_CORE)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    message(STATUS "V2: Shared llaminar2_core enabled; GPU backend archives will be folded into the core link once")
+endif()
 
 # ML Heuristic auto-retraining option
 # When enabled, automatically checks CSV hash and retrains ML model on every build
@@ -76,6 +93,43 @@ option(USE_ONEDNN "Enable OneDNN for INT8 GEMM acceleration" ON)
 # Attention input dumping (for debugging JIT kernel issues)
 # When enabled, dumps Q/K/V/mask inputs to disk for each JIT attention invocation
 option(DUMP_ATTENTION_INPUTS "Dump attention kernel inputs to disk for debugging" OFF)
+
+# =============================================================================
+# Required Platform Dependencies
+# =============================================================================
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+if(NOT MPIEXEC_EXECUTABLE)
+    message(FATAL_ERROR "Llaminar requires OpenMPI, but CMake did not find an MPI launcher")
+endif()
+
+execute_process(
+    COMMAND "${MPIEXEC_EXECUTABLE}" --version
+    RESULT_VARIABLE LLAMINAR_MPIEXEC_VERSION_RESULT
+    OUTPUT_VARIABLE LLAMINAR_MPIEXEC_VERSION_OUTPUT
+    ERROR_VARIABLE LLAMINAR_MPIEXEC_VERSION_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_STRIP_TRAILING_WHITESPACE)
+set(LLAMINAR_MPIEXEC_VERSION_TEXT "${LLAMINAR_MPIEXEC_VERSION_OUTPUT}\n${LLAMINAR_MPIEXEC_VERSION_ERROR}")
+if(NOT LLAMINAR_MPIEXEC_VERSION_RESULT EQUAL 0 OR
+   NOT LLAMINAR_MPIEXEC_VERSION_TEXT MATCHES "Open MPI|OpenRTE")
+    message(FATAL_ERROR
+        "Llaminar requires OpenMPI. Found MPI launcher '${MPIEXEC_EXECUTABLE}', "
+        "but '${MPIEXEC_EXECUTABLE} --version' did not report Open MPI.\n"
+        "Output:\n${LLAMINAR_MPIEXEC_VERSION_TEXT}")
+endif()
+string(REGEX MATCH "^[^\n]+" LLAMINAR_OPENMPI_VERSION_LINE "${LLAMINAR_MPIEXEC_VERSION_TEXT}")
+message(STATUS "V2: ${LLAMINAR_OPENMPI_VERSION_LINE}")
+
+find_path(NUMA_INCLUDE_DIR NAMES numa.h)
+find_library(NUMA_LIBRARY NAMES numa)
+if(NOT NUMA_INCLUDE_DIR OR NOT NUMA_LIBRARY)
+    message(FATAL_ERROR
+        "Llaminar requires libnuma headers and library. Install libnuma-dev/numactl-devel.")
+endif()
+message(STATUS "V2: Found libnuma include: ${NUMA_INCLUDE_DIR}")
+message(STATUS "V2: Found libnuma library: ${NUMA_LIBRARY}")
 
 # =============================================================================
 # GPU Backend Configuration (Phase 6: Multi-GPU)
@@ -125,14 +179,35 @@ if(HAVE_CUDA)
         endif()
     endif()
     
-    # CUDA compile flags (CUDA 13.0+ dropped sm_70 Volta support)
-    # RTX 3090 = sm_86 (Ampere)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_75")  # Base: Turing
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_75,code=sm_75")  # Turing (RTX 20xx)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_80,code=sm_80")  # Ampere (A100)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_86,code=sm_86")  # Ampere (RTX 30xx)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_89,code=sm_89")  # Ada (RTX 40xx)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_90,code=sm_90")  # Hopper (H100)
+    # CUDA compile flags. NativeVNNI prefill uses Ampere+ ldmatrix/mma.sync
+    # instructions guarded by __CUDA_ARCH__ >= 800, so a CUDA build must include
+    # at least one SM80+ target. A stale pre-Ampere-only cache compiles the kernel
+    # body to no-ops and returns all-zero GEMM outputs.
+    # Honor CMAKE_CUDA_ARCHITECTURES so release images can be built for a
+    # specific fleet or a local smoke-test GPU without forcing a broad fatbin.
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90)
+    endif()
+    set(LLAMINAR_HAS_AMPERE_CUDA_ARCH OFF)
+    foreach(LLAMINAR_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        string(TOLOWER "${LLAMINAR_CUDA_ARCH}" LLAMINAR_CUDA_ARCH_LOWER)
+        if(LLAMINAR_CUDA_ARCH_LOWER MATCHES "^(all|all-major|native)$")
+            set(LLAMINAR_HAS_AMPERE_CUDA_ARCH ON)
+        else()
+            string(REGEX REPLACE "-.*$" "" LLAMINAR_CUDA_ARCH_NUMBER "${LLAMINAR_CUDA_ARCH_LOWER}")
+            if(LLAMINAR_CUDA_ARCH_NUMBER MATCHES "^[0-9]+$" AND LLAMINAR_CUDA_ARCH_NUMBER GREATER_EQUAL 80)
+                set(LLAMINAR_HAS_AMPERE_CUDA_ARCH ON)
+            endif()
+        endif()
+    endforeach()
+    if(NOT LLAMINAR_HAS_AMPERE_CUDA_ARCH)
+        message(FATAL_ERROR
+            "V2: CUDA NativeVNNI requires compiling at least one SM80+ architecture. "
+            "Current CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}'. "
+            "Reconfigure with -DCMAKE_CUDA_ARCHITECTURES='80;86;89;90' or a local "
+            "SM80+ value such as 86.")
+    endif()
+    message(STATUS "V2: CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
     
     # Enable nvcc multi-threaded compilation (auto-detect optimal thread count)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -t 0")
@@ -155,6 +230,11 @@ if(HAVE_CUDA)
     # executable device links), but we keep a small pool as a safety net.
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS nvlink_pool=8)
+        # Limit concurrent host linking — each ld.lld uses 1-2 GB RSS.
+        # Without this, 500+ test executables link simultaneously causing
+        # severe I/O wait and memory pressure.
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS link_pool=24)
+        set(CMAKE_JOB_POOL_LINK link_pool)
     endif()
 endif()
 
@@ -213,10 +293,8 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu  # CUTLASS INT8 GEMM + TC weight repacking
         kernels/cuda/gemm/CUDANativeVNNIIQTables.cu    # shared IQ lookup table symbol definitions for native-vnni decode
         kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu  # tuned shape-specific native-vnni GEMV (Wide/KPar/Direct)
+        kernels/cuda/gemm/CUDATinyFP32ProjectionKernels.cu  # deterministic tiny FP32 M<=4 verifier projections
         kernels/cuda/gemm/CUDANativeVNNIPrefillKernels.cu  # custom native-vnni prefill GEMM family (Q4_0 first)
-        kernels/cuda/gemm/CUDAFusedTCGemm_Turing.cu       # fused tensor-core GEMM: single-launch WMMA over full K (sm_75+)
-        kernels/cuda/gemm/CUDAFusedTCGemm_Ampere.cu        # fused TC GEMM: mma.sync m16n8k32 (sm_80+ Ampere)
-        kernels/cuda/gemm/CUDADecomposedTCGemm.cu         # decomposed tensor-core GEMM fallback (SmallM, WideN, Balanced)
         kernels/cuda/gemm/CUDAcuBLASQuantGemm.cu          # cuBLAS FP16 GEMM path for quantized weights (env: LLAMINAR_CUBLAS_GEMM=1)
         # Ops kernels (split from monolithic CUDAOpsKernels.cu)
         kernels/cuda/ops/CUDARMSNormKernels.cu        # RMSNorm kernels (FP32, BF16, FP16)
@@ -225,6 +303,7 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDAFusedOpsKernels.cu       # Fused ops: SwiGLU+Quant, ResidualAdd+RMSNorm
         kernels/cuda/ops/CUDARoPEKernels.cu           # RoPE kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAEmbeddingKernels.cu      # Embedding lookup kernel
+        kernels/cuda/ops/CUDARowSelectKernels.cu      # Graph-capturable one-row hidden-state selection
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
         kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K kernels for GPU-side sampling
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
@@ -234,6 +313,11 @@ if(HAVE_CUDA)
         kernels/cuda/kvcache/CUDARingKVCacheTQ.cu     # TurboQuant KV cache (TQ8-K/TQ4-V split)
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        # MoE (Mixture of Experts) kernels
+        kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
+        # GPU repack kernels (GGUF → VNNI layout on device)
+        kernels/cuda/repack/CUDAVnniRepackKernels.cu   # VNNI repack for all 18 quantization formats
+        kernels/cuda/repack/CUDAVnniUnpackKernels.cu   # VNNI reverse repack (GPU separated → raw GGUF)
         # Profiling utilities
         utils/CUDAKernelProfiler.cu                   # CUDA event-based kernel profiling
     )
@@ -275,6 +359,7 @@ if(HAVE_CUDA)
     set_target_properties(cuda_backend PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK nvlink_pool)
@@ -297,14 +382,10 @@ if(HAVE_CUDA)
     
     # Link CUDA libraries:
     # - cudart: CUDA Runtime API (for memory management, streams, etc.)
-    # - nvrtc: NVRTC runtime compiler (for JIT kernel compilation)
-    # - cuda: CUDA Driver API (for cuLaunchKernel, cuModuleLoad, etc.)
     # - cublas: cuBLAS library for dense GEMM (FP32/FP16/BF16)
     # - cublasLt: cuBLAS Light for fused GEMM+bias operations
     target_link_libraries(cuda_backend PUBLIC 
         CUDA::cudart
-        CUDA::nvrtc
-        CUDA::cuda_driver
         CUDA::cublas
         CUDA::cublasLt
     )
@@ -351,19 +432,12 @@ if(HAVE_CUDA)
     
     if(EXISTS "${CUTLASS_DIR}/include")
         message(STATUS "V2: Found CUTLASS at ${CUTLASS_DIR}")
+        set(LLAMINAR_HAVE_CUTLASS ON)
         target_include_directories(cuda_backend PUBLIC "${CUTLASS_DIR}/include")
         target_compile_definitions(cuda_backend PUBLIC HAVE_CUTLASS)
         
         # CUTLASS requires C++17 minimum, we use C++23 for stacktrace
         target_compile_features(cuda_backend PUBLIC cxx_std_23)
-        
-        # Add CUTLASS NVCC flags for Tensor Cores
-        # SM 86 = RTX 3090 (Ampere), SM 80 = A100, SM 75 = Turing
-        target_compile_options(cuda_backend PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_75,code=sm_75>  # Turing
-            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_80,code=sm_80>  # Ampere A100
-            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_86,code=sm_86>  # Ampere RTX 3090
-        )
         
         message(STATUS "V2: CUTLASS Tensor Core support enabled (Phase 2)")
     else()
@@ -431,127 +505,26 @@ if(HAVE_CUDA)
     endif()
 endif()
 
+# amdgpu DKMS Auto-Clone for P2P Fix — REMOVED
 # =============================================================================
-# ComposableKernel (CK) Auto-Clone for ROCm INT8 GEMM
-# =============================================================================
-# CK is AMD's template-based GPU kernel library. We use a fork that includes
-# fixes for gfx906 (MI50/MI60) GPUs which don't have MFMA instructions.
-# See: https://github.com/ROCm/composable_kernel/pull/3593
-if(HAVE_ROCM)
-    find_package(Git REQUIRED)
-
-    # Ensure CK exists in external/ and is on our fix branch
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-    set(CK_EXTERNAL_DIR "${REPO_ROOT}/external/composable_kernel")
-    set(CK_GIT_URL "https://github.com/dbsanfte/composable_kernel.git")
-    # Track our fork's fix branch for gfx906 issues (OOB buffer loads, etc.)
-    set(CK_GIT_REF "gfx-906-issues")
-
-    if(NOT EXISTS "${REPO_ROOT}/external")
-        file(MAKE_DIRECTORY ${REPO_ROOT}/external)
-    endif()
-
-    if(NOT EXISTS "${CK_EXTERNAL_DIR}")
-        message(STATUS "V2: ComposableKernel not found in external/, cloning ${CK_GIT_URL} (${CK_GIT_REF})...")
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${CK_GIT_REF}
-                ${CK_GIT_URL}
-                composable_kernel
-            WORKING_DIRECTORY ${REPO_ROOT}/external
-            RESULT_VARIABLE GIT_CLONE_RESULT
-            OUTPUT_VARIABLE GIT_CLONE_OUTPUT
-            ERROR_VARIABLE GIT_CLONE_ERROR
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_STRIP_TRAILING_WHITESPACE
-        )
-
-        if(NOT GIT_CLONE_RESULT EQUAL 0)
-            message(FATAL_ERROR "V2: Failed to clone ComposableKernel: ${GIT_CLONE_ERROR}")
-        endif()
-
-        message(STATUS "V2: ComposableKernel ${CK_GIT_REF} cloned successfully")
-    else()
-        # Verify CK is on the expected branch (don't force-checkout, just warn if different)
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
-            WORKING_DIRECTORY ${CK_EXTERNAL_DIR}
-            RESULT_VARIABLE CK_BRANCH_RESULT
-            OUTPUT_VARIABLE CK_CURRENT_BRANCH
-            ERROR_VARIABLE CK_BRANCH_ERROR
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-        if(CK_BRANCH_RESULT EQUAL 0)
-            if(NOT CK_CURRENT_BRANCH STREQUAL CK_GIT_REF)
-                message(WARNING "V2: ComposableKernel is on branch '${CK_CURRENT_BRANCH}', expected '${CK_GIT_REF}'. "
-                                "INT8 GEMM may not work correctly without the fix branch.")
-            else()
-                message(STATUS "V2: ComposableKernel already present at ${CK_EXTERNAL_DIR} on branch ${CK_GIT_REF}")
-            endif()
-        else()
-            message(STATUS "V2: ComposableKernel already present at ${CK_EXTERNAL_DIR}; leaving existing checkout untouched")
-        endif()
-    endif()
-endif()
-
-# amdgpu DKMS Auto-Clone for P2P Fix
-# =============================================================================
-# The upstream amdgpu DKMS (ROCm/amdgpu) gates CONFIG_HSA_AMD_P2P on
-# CONFIG_DMABUF_MOVENOTIFY, an AMD out-of-tree Kconfig that doesn't exist in
-# mainline kernels >= 5.12. This silently disables GPU-to-GPU P2P through
-# PCIe switches (e.g., Broadcom PEX88096). Our fork removes this gate.
-# See: https://github.com/dbsanfte/amdgpu/tree/fix/pex-pcie-switch-p2p-enable
-if(HAVE_ROCM)
-    find_package(Git REQUIRED)
-
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-    set(AMDGPU_EXTERNAL_DIR "${REPO_ROOT}/external/amdgpu")
-    set(AMDGPU_GIT_URL "https://github.com/dbsanfte/amdgpu.git")
-    set(AMDGPU_GIT_REF "fix/pex-pcie-switch-p2p-enable")
-
-    if(NOT EXISTS "${REPO_ROOT}/external")
-        file(MAKE_DIRECTORY ${REPO_ROOT}/external)
-    endif()
-
-    if(NOT EXISTS "${AMDGPU_EXTERNAL_DIR}")
-        message(STATUS "V2: amdgpu DKMS not found in external/, cloning ${AMDGPU_GIT_URL} (${AMDGPU_GIT_REF})...")
-        execute_process(
-            COMMAND ${GIT_EXECUTABLE} clone --depth 1 --branch ${AMDGPU_GIT_REF}
-                ${AMDGPU_GIT_URL}
-                amdgpu
-            WORKING_DIRECTORY ${REPO_ROOT}/external
-            RESULT_VARIABLE GIT_CLONE_RESULT
-            OUTPUT_VARIABLE GIT_CLONE_OUTPUT
-            ERROR_VARIABLE GIT_CLONE_ERROR
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_STRIP_TRAILING_WHITESPACE
-        )
-
-        if(NOT GIT_CLONE_RESULT EQUAL 0)
-            message(WARNING "V2: Failed to clone amdgpu DKMS fork: ${GIT_CLONE_ERROR}\n"
-                            "P2P through PCIe switches may not work with the stock amdgpu DKMS on mainline kernels.")
-        else()
-            message(STATUS "V2: amdgpu DKMS fork (${AMDGPU_GIT_REF}) cloned successfully")
-        endif()
-    else()
-        message(STATUS "V2: amdgpu DKMS already present at ${AMDGPU_EXTERNAL_DIR}")
-    endif()
-endif()
+# Previously cloned dbsanfte/amdgpu@fix/pex-pcie-switch-p2p-enable into
+# external/amdgpu so the host driver could be rebuilt with a P2P-through-
+# PCIe-switch patch. The build never compiled or linked anything from that
+# tree — kernel-driver rebuild is a host-side concern. The clone added
+# ~1 minute and ~80 MB to every fresh build for no in-tree benefit.
 
 # ROCm backend (separate .cpp compilation unit with HIP)
 if(HAVE_ROCM)
-    # Find ComposableKernel library (AMD's template-based GPU kernel library)
-    list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
-    find_package(ComposableKernel QUIET)
-    
     # ROCm kernels compiled with hipcc
     set(ROCM_KERNEL_SOURCES
         kernels/rocm/gemm/ROCmQuantisedGemmKernel.hip           # Common INT8 GEMM utilities (quantization, scaling, memory)
-        kernels/rocm/gemm/ROCmQuantisedGemmKernel_CK.hip        # ComposableKernel INT8×INT8→INT32 GEMM dispatch
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_INT8_VNNI.hip # INT8 VNNI wide-tile V3+V7 kernels (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel.hip               # GEMV kernel suite documentation index (split into files below)
         kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMM kernels for M>1 prefill (gfx906)
+        kernels/rocm/gemm/ROCmTinyFP32ProjectionKernels.hip # Tiny graph-capturable FP32 small-M projection kernels
+        kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
         kernels/rocm/kvcache/ROCmTurboQuantKernels.hip        # TurboQuant quantize/dequant/RoPE GPU kernels
@@ -560,6 +533,7 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmRoPEKernels.hip                 # RoPE kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmRMSNormKernels.hip              # RMSNorm kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmEmbeddingKernels.hip            # Embedding kernels (FP32, BF16, FP16, Q8_1)
+        kernels/rocm/ops/ROCmRowSelectKernels.hip            # Graph-capturable one-row hidden-state selection
         kernels/rocm/ops/ROCmResidualAddKernels.hip          # Residual Add kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmArgmaxKernels.hip               # Argmax kernel for GPU-side greedy sampling
         kernels/rocm/ops/ROCmSamplingKernels.hip              # Top-K kernel for GPU-side top-k/top-p sampling
@@ -567,6 +541,11 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmCastKernels.hip                  # FP32↔FP16 cast kernels for mixed-precision allreduce
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip        # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        # MoE (Mixture of Experts) kernels
+        kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
+        # GPU weight loading pipeline repack kernels
+        kernels/rocm/repack/VnniRepackKernels.hip            # VNNI repack: Q4_0, IQ4_NL, Q4_K on-device
+        kernels/rocm/repack/VnniUnpackKernels.hip            # VNNI reverse repack (GPU separated → raw GGUF)
         # Profiling utilities
         utils/ROCmKernelProfiler.hip                         # ROCm/HIP event-based kernel profiling
     )
@@ -634,15 +613,6 @@ if(HAVE_ROCM)
         message(STATUS "V2: RCCL will be loaded dynamically (dlopen) from rocm_backend for symbol isolation")
     endif()
     
-    # Link ComposableKernel if found
-    if(ComposableKernel_FOUND)
-        target_link_libraries(rocm_backend PUBLIC ComposableKernel::ComposableKernel)
-        target_compile_definitions(rocm_backend PUBLIC HAVE_COMPOSABLE_KERNEL)
-        message(STATUS "V2: ROCm backend using ComposableKernel for INT8 GEMM")
-    else()
-        message(WARNING "V2: ComposableKernel not found - ROCm INT8 GEMM will be disabled")
-    endif()
-    
     # Set HIP compiler for ROCm source files
     # NOTE: RCCLBackend.cpp, RCCLDynamicLoader.cpp, and RCCLBackendHIP.cpp are NOT
     # compiled with HIP because:
@@ -708,14 +678,29 @@ if(HAVE_ROCM)
     # Workaround: Build RCCL from source with explicit GPU_TARGETS for gfx906.
     # See: https://github.com/ROCm/rocm-systems/issues/2805
     #
-    # Like oneDNN and ComposableKernel, we clone to external/rccl if not present
-    # and build locally. The build is cached based on git commit hash.
-    find_package(Git REQUIRED)
+    # This is OPT-IN for local source builds because building RCCL from source
+    # takes 30-60+ minutes and requires hipcc (so it can't share the C++23
+    # compiler we use for llaminar). The Docker release image enables it by
+    # default so releasable ROCm multi-GPU containers do not fall back to the
+    # broken packaged gfx906 binaries.
+    option(LLAMINAR_BUILD_RCCL_FROM_SOURCE
+           "Clone and build RCCL from source (workaround for broken gfx906 binaries in packaged RCCL)"
+           OFF)
+
+    if(LLAMINAR_BUILD_RCCL_FROM_SOURCE)
+        find_package(Git REQUIRED)
     
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
+    set(RCCL_SOURCE_REF_FILE "${RCCL_EXTERNAL_DIR}/.llaminar-rccl-source-ref")
     set(RCCL_GIT_URL "https://github.com/ROCm/rccl.git")
     set(RCCL_GIT_REF "rocm-7.1.1")  # Match our ROCm version
+    set(RCCL_C_COMPILER "${ROCM_PATH}/bin/amdclang" CACHE FILEPATH
+        "C compiler used for the nested RCCL source build")
+    set(RCCL_CXX_COMPILER "${ROCM_PATH}/bin/hipcc" CACHE FILEPATH
+        "C++ compiler used for the nested RCCL source build")
+    set(RCCL_ONLY_FUNCS "" CACHE STRING
+        "Optional RCCL ONLY_FUNCS generator pattern for nested source builds")
     
     # Auto-detect GPU architecture for RCCL build
     # Default to gfx906 (MI50/MI60) which is known to be broken in packaged RCCL
@@ -763,18 +748,28 @@ if(HAVE_ROCM)
         message(STATUS "V2: RCCL already present at ${RCCL_EXTERNAL_DIR}; leaving existing checkout untouched")
     endif()
     
-    # Get current commit hash for cache validation
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
-        WORKING_DIRECTORY "${RCCL_EXTERNAL_DIR}"
-        RESULT_VARIABLE RCCL_REV_PARSE_RESULT
-        OUTPUT_VARIABLE RCCL_COMMIT
-        ERROR_VARIABLE RCCL_REV_PARSE_ERROR
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_STRIP_TRAILING_WHITESPACE
-    )
-    if(NOT RCCL_REV_PARSE_RESULT EQUAL 0)
-        message(FATAL_ERROR "V2: Failed to determine RCCL commit: ${RCCL_REV_PARSE_ERROR}")
+    # Get current source identity for cache validation. Docker release builds
+    # unpack GitHub source archives instead of cloning, so they carry an
+    # explicit ref marker rather than a .git directory.
+    if(EXISTS "${RCCL_EXTERNAL_DIR}/.git")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+            WORKING_DIRECTORY "${RCCL_EXTERNAL_DIR}"
+            RESULT_VARIABLE RCCL_REV_PARSE_RESULT
+            OUTPUT_VARIABLE RCCL_COMMIT
+            ERROR_VARIABLE RCCL_REV_PARSE_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_STRIP_TRAILING_WHITESPACE
+        )
+        if(NOT RCCL_REV_PARSE_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to determine RCCL commit: ${RCCL_REV_PARSE_ERROR}")
+        endif()
+    elseif(EXISTS "${RCCL_SOURCE_REF_FILE}")
+        file(READ "${RCCL_SOURCE_REF_FILE}" RCCL_COMMIT_RAW)
+        string(STRIP "${RCCL_COMMIT_RAW}" RCCL_COMMIT)
+    else()
+        set(RCCL_COMMIT "${RCCL_GIT_REF}")
+        message(STATUS "V2: RCCL source is not a git checkout and has no ref marker; using ${RCCL_COMMIT} for cache validation")
     endif()
     
     # Check if RCCL build is up-to-date
@@ -796,22 +791,36 @@ if(HAVE_ROCM)
     if(NOT EXISTS "${RCCL_BUILD_DIR}/librccl.so")
         message(STATUS "V2: Building RCCL (${RCCL_GIT_URL}@${RCCL_GIT_REF} @ ${RCCL_COMMIT}) from source...")
         message(STATUS "V2: RCCL GPU targets: ${RCCL_GPU_TARGETS}")
+        if(RCCL_ONLY_FUNCS)
+            message(STATUS "V2: RCCL ONLY_FUNCS: ${RCCL_ONLY_FUNCS}")
+        endif()
         message(STATUS "V2: NOTE: This may take 30-60+ minutes on first build")
+
+        set(RCCL_CONFIG_ARGS
+            -B "${RCCL_BUILD_DIR}"
+            -S "${RCCL_EXTERNAL_DIR}"
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_C_COMPILER=${RCCL_C_COMPILER}
+            -DCMAKE_CXX_COMPILER=${RCCL_CXX_COMPILER}
+            -DCMAKE_PREFIX_PATH=/opt/rocm
+            -DROCM_PATH=${ROCM_PATH}
+            -DGPU_TARGETS=${RCCL_GPU_TARGETS}
+            -DBUILD_TESTS=OFF
+        )
+        if(RCCL_ONLY_FUNCS)
+            list(APPEND RCCL_CONFIG_ARGS "-DONLY_FUNCS=${RCCL_ONLY_FUNCS}")
+        endif()
         
         # Configure RCCL
         execute_process(
-            COMMAND ${CMAKE_COMMAND} -B "${RCCL_BUILD_DIR}" -S "${RCCL_EXTERNAL_DIR}"
-                    -DCMAKE_BUILD_TYPE=Release
-                    -DCMAKE_PREFIX_PATH=/opt/rocm
-                    -DGPU_TARGETS=${RCCL_GPU_TARGETS}
-                    -DBUILD_TESTS=OFF
+            COMMAND ${CMAKE_COMMAND} ${RCCL_CONFIG_ARGS}
             RESULT_VARIABLE RCCL_CONFIG_RESULT
             OUTPUT_VARIABLE RCCL_CONFIG_OUTPUT
             ERROR_VARIABLE RCCL_CONFIG_ERROR
         )
         
         if(NOT RCCL_CONFIG_RESULT EQUAL 0)
-            message(FATAL_ERROR "V2: Failed to configure RCCL: ${RCCL_CONFIG_ERROR}")
+            message(FATAL_ERROR "V2: Failed to configure RCCL:\n${RCCL_CONFIG_OUTPUT}\n${RCCL_CONFIG_ERROR}")
         endif()
         
         # Build RCCL
@@ -823,7 +832,7 @@ if(HAVE_ROCM)
         )
         
         if(NOT RCCL_BUILD_RESULT EQUAL 0)
-            message(FATAL_ERROR "V2: Failed to build RCCL: ${RCCL_BUILD_ERROR}")
+            message(FATAL_ERROR "V2: Failed to build RCCL:\n${RCCL_BUILD_OUTPUT}\n${RCCL_BUILD_ERROR}")
         endif()
         
         # Write version file for cache validation
@@ -833,6 +842,7 @@ if(HAVE_ROCM)
     else()
         message(STATUS "V2: RCCL already built in ${RCCL_BUILD_DIR}")
     endif()
+    endif() # LLAMINAR_BUILD_RCCL_FROM_SOURCE
     
     # =========================================================================
     # RCCL Detection (ROCm Collective Communications Library)
@@ -927,6 +937,7 @@ if(HAVE_CUDA)
     set_target_properties(device_benchmarks PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(TARGET device_benchmarks PROPERTY JOB_POOL_LINK nvlink_pool)
@@ -941,7 +952,7 @@ target_include_directories(device_benchmarks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(device_benchmarks PRIVATE OpenMP::OpenMP_CXX)
 
 if(HAVE_CUDA)
-    target_link_libraries(device_benchmarks PRIVATE CUDA::cudart CUDA::cuda_driver)
+    target_link_libraries(device_benchmarks PRIVATE CUDA::cudart)
     target_compile_definitions(device_benchmarks PRIVATE HAVE_CUDA=1)
 endif()
 
@@ -977,12 +988,32 @@ if(USE_ONEDNN)
     # Note: Repository root is two levels up from src/v2
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(ONEDNN_EXTERNAL_DIR "${REPO_ROOT}/external/onednn")
-    set(ONEDNN_GIT_URL "https://github.com/dbsanfte/oneDNN.git")
-    # Track dbsanfte fork main branch so fused softmax patches are always available
-    set(ONEDNN_GIT_REF "main")
+    set(ONEDNN_SOURCE_REF_FILE "${ONEDNN_EXTERNAL_DIR}/.llaminar-onednn-source-ref")
+    set(ONEDNN_GIT_URL "https://github.com/uxlfoundation/oneDNN.git")
+    # Pinned to an upstream SemVer release tag for reproducible builds.
+    # We previously tracked dbsanfte/oneDNN@main for "fused softmax matmul"
+    # APIs, but that codepath is no longer used in llaminar. Bump this tag
+    # when picking up new upstream features. Latest releases:
+    # https://github.com/uxlfoundation/oneDNN/releases
+    set(ONEDNN_GIT_REF "v3.11.3")
 
     if(NOT EXISTS "${REPO_ROOT}/external")
         file(MAKE_DIRECTORY ${REPO_ROOT}/external)
+    endif()
+
+    # If an existing checkout points at the wrong remote (e.g. the old
+    # dbsanfte/oneDNN fork), wipe it so we re-clone the pinned upstream tag.
+    if(EXISTS "${ONEDNN_EXTERNAL_DIR}/.git")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} -C ${ONEDNN_EXTERNAL_DIR} remote get-url origin
+            OUTPUT_VARIABLE _ONEDNN_EXISTING_URL
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(NOT _ONEDNN_EXISTING_URL STREQUAL ONEDNN_GIT_URL)
+            message(STATUS "V2: OneDNN at ${ONEDNN_EXTERNAL_DIR} points at '${_ONEDNN_EXISTING_URL}', expected '${ONEDNN_GIT_URL}'; re-cloning")
+            file(REMOVE_RECURSE "${ONEDNN_EXTERNAL_DIR}")
+        endif()
     endif()
 
     if(NOT EXISTS "${ONEDNN_EXTERNAL_DIR}")
@@ -1008,17 +1039,27 @@ if(USE_ONEDNN)
         message(STATUS "V2: OneDNN already present at ${ONEDNN_EXTERNAL_DIR}; leaving existing checkout untouched")
     endif()
 
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
-        WORKING_DIRECTORY ${ONEDNN_EXTERNAL_DIR}
-        RESULT_VARIABLE ONEDNN_REV_PARSE_RESULT
-        OUTPUT_VARIABLE ONEDNN_COMMIT
-        ERROR_VARIABLE ONEDNN_REV_PARSE_ERROR
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_STRIP_TRAILING_WHITESPACE
-    )
-    if(NOT ONEDNN_REV_PARSE_RESULT EQUAL 0)
-        message(FATAL_ERROR "V2: Failed to determine OneDNN commit: ${ONEDNN_REV_PARSE_ERROR}")
+    # Docker release builds unpack GitHub source archives before CMake runs, so
+    # archive trees are identified by an explicit ref marker instead of .git.
+    if(EXISTS "${ONEDNN_EXTERNAL_DIR}/.git")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+            WORKING_DIRECTORY ${ONEDNN_EXTERNAL_DIR}
+            RESULT_VARIABLE ONEDNN_REV_PARSE_RESULT
+            OUTPUT_VARIABLE ONEDNN_COMMIT
+            ERROR_VARIABLE ONEDNN_REV_PARSE_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_STRIP_TRAILING_WHITESPACE
+        )
+        if(NOT ONEDNN_REV_PARSE_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to determine OneDNN commit: ${ONEDNN_REV_PARSE_ERROR}")
+        endif()
+    elseif(EXISTS "${ONEDNN_SOURCE_REF_FILE}")
+        file(READ "${ONEDNN_SOURCE_REF_FILE}" ONEDNN_COMMIT_RAW)
+        string(STRIP "${ONEDNN_COMMIT_RAW}" ONEDNN_COMMIT)
+    else()
+        set(ONEDNN_COMMIT "${ONEDNN_GIT_REF}")
+        message(STATUS "V2: OneDNN source is not a git checkout and has no ref marker; using ${ONEDNN_COMMIT} for cache validation")
     endif()
 
     # Now check if OneDNN is built for the requested commit
@@ -1190,7 +1231,11 @@ endif()
 # Typed Register Enforcement (JIT Code Quality)
 # =============================================================================
 # V2 Core Library
-add_library(llaminar2_core STATIC
+set(LLAMINAR2_CORE_LIBRARY_TYPE STATIC)
+if(LLAMINAR_SHARED_CORE)
+    set(LLAMINAR2_CORE_LIBRARY_TYPE SHARED)
+endif()
+add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Interfaces
     interfaces/IMPIContext.cpp
     backends/ComputeBackend.cpp
@@ -1218,18 +1263,26 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/RoPEStage.cpp
     execution/compute_stages/stages/ResidualAddStage.cpp
     execution/compute_stages/stages/FusedResidualNormStage.cpp
+    execution/compute_stages/stages/FusedAddAllreduceStage.cpp
     execution/compute_stages/stages/AllreduceStage.cpp
     execution/compute_stages/stages/AllGatherStage.cpp
     execution/compute_stages/stages/AllGatherVStage.cpp
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
-    execution/compute_stages/stages/MoEStages.cpp
+    execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoEExpertDispatchStage.cpp
+    execution/compute_stages/stages/MoEExpertParallelReduceStage.cpp
+    execution/compute_stages/stages/MoELocalExpertStage.cpp
+    execution/compute_stages/stages/MoESparseDispatchStage.cpp
+    execution/compute_stages/stages/MoESparseReturnReduceStage.cpp
+    execution/compute_stages/stages/MoERoutingStage.cpp
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
     execution/compute_stages/stages/GDNProjectionStage.cpp
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp
+    execution/compute_stages/stages/MTPConcatStage.cpp
     execution/moe/IMoERouter.cpp
     execution/moe/IMoEDispatcher.cpp
     execution/moe/IMoEExpertExecutor.cpp
@@ -1237,13 +1290,57 @@ add_library(llaminar2_core STATIC
     execution/moe/ExpertPlacementMap.cpp
     execution/moe/ExpertWeightCache.cpp
     execution/moe/ExpertRebalancer.cpp
+    execution/moe/DecodeExpertHistogram.cpp
+    execution/moe/MoEExpertParallelPlanner.cpp
+    execution/moe/MoEExpertOwnerMap.cpp
+    execution/moe/MoEExpertTokenRowTransfer.cpp
+    execution/moe/MoEExpertOverlayDenseReduce.cpp
+    execution/moe/MoEExpertOverlayExecutionPlan.cpp
+    execution/moe/MoEGraphRoleRunner.cpp
+    execution/moe/MoEExpertOverlayPreparationPlan.cpp
+    execution/moe/MoEExpertOverlayProfiler.cpp
+    execution/moe/MoEExpertOverlayRuntimePlan.cpp
+    execution/moe/MoEOverlaySparseCollective.cpp
+    execution/moe/SocketAwareRebalancer.cpp
+    execution/moe/MoERebalanceController.cpp
+    execution/moe/MoERuntimeTable.cpp
+    execution/moe/MoEExpertWeightService.cpp
+    execution/moe/ExpertWeightPayloadProvider.cpp
+    execution/moe/GPUExpertTransfer.cpp
     execution/moe/MoEPipeline.cpp
+    execution/prefix_cache/BlockHash.cpp
+    execution/prefix_cache/DeviceHotPrefixStorageBackend.cpp
+    execution/prefix_cache/DiskPrefixStorageBackend.cpp
+    execution/prefix_cache/PrefixCacheCoordinator.cpp
+    execution/prefix_cache/PrefixCacheFingerprint.cpp
+    execution/prefix_cache/PrefixCacheKey.cpp
+    execution/prefix_cache/PrefixPayloadLayout.cpp
+    execution/prefix_cache/PrefixCacheStateProbe.cpp
+    execution/prefix_cache/PrefixStateSnapshot.cpp
+    execution/prefix_cache/PrefixStateCache.cpp
+    execution/prefix_cache/PrefixStorageBackend.cpp
+    execution/prefix_cache/RamPrefixStorageBackend.cpp
+    execution/mtp/MTPDecodeCatchup.cpp
+    execution/mtp/MTPDepthController.cpp
+    execution/mtp/MTPStateTransaction.cpp
+    execution/mtp/MTPSpecRequestBatchOwner.cpp
+    execution/mtp/MTPSpecRequestBatchScheduler.cpp
+    execution/mtp/MTPSpecDecodeMetadata.cpp
+    execution/mtp/MTPSpecKVPublisher.cpp
+    execution/mtp/MTPSpecStateContract.cpp
+    execution/mtp/MTPSpecStatePublisher.cpp
+    execution/mtp/MTPSpecTransactionDriver.cpp
+    execution/mtp/MTPSpecDecodeTransaction.cpp
+    execution/mtp/MTPRejectionSampler.cpp
+    execution/mtp/MTPWeightManifest.cpp
+    execution/runner/MTPVerifierForwardExecutor.cpp
     execution/cache/HybridCacheManager.cpp
-    execution/compute_stages/stages/AttentionWithKVCacheStage.cpp
     execution/compute_stages/stages/KVCacheAppendStage.cpp
     execution/compute_stages/stages/KVCacheGatherStage.cpp
     execution/compute_stages/stages/AttentionComputeStage.cpp
     execution/compute_stages/stages/EmbeddingStage.cpp
+    execution/compute_stages/stages/HiddenStateRowSelectStage.cpp
+    execution/compute_stages/stages/HiddenStateRowsSelectStage.cpp
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
     execution/local_execution/graph/ComputeGraph.cpp
@@ -1261,7 +1358,7 @@ add_library(llaminar2_core STATIC
     execution/local_execution/orchestrators/MultiDomainOrchestrator.cpp
     execution/local_execution/orchestrators/LogitsGatherer.cpp
     execution/local_execution/orchestrators/DeviceSampler.cpp
-    execution/local_execution/orchestrators/MultiDeviceOrchestrator.cpp
+    execution/local_execution/orchestrators/RankOrchestrator.cpp
     execution/local_execution/model/HeterogeneousLayerExecutor.cpp
     execution/local_execution/coherence/CrossDomainTransfer.cpp
     execution/config/HybridPrecisionConfig.cpp
@@ -1287,6 +1384,8 @@ add_library(llaminar2_core STATIC
     config/PipelineConfig.cpp
     # Collective backend type (extracted to avoid circular dependency)
     config/CollectiveBackendType.cpp
+    # Canonical execution-domain contract shared by named domains and MoE overlay domains
+    config/ExecutionDomainDefinition.cpp
     # Orchestration configuration (Phase 0 - CLI/Config architecture for heterogeneous orchestration)
     config/OrchestrationConfig.cpp
     config/OrchestrationConfigParser.cpp
@@ -1307,6 +1406,14 @@ add_library(llaminar2_core STATIC
     execution/mpi_orchestration/PlacementPlan.cpp
     execution/mpi_orchestration/PlacementStrategy.cpp
     execution/mpi_orchestration/placement/HeterogeneousMultiDomainStrategy.cpp
+    # Memory planning (pre-flight VRAM/RAM budget estimation)
+    planning/ClusterInventoryGatherer.cpp
+    planning/ModelMemoryProfile.cpp
+    planning/WeightMemoryEstimator.cpp
+    planning/KVCacheMemoryEstimator.cpp
+    planning/ActivationMemoryEstimator.cpp
+    planning/WorkspaceMemoryEstimator.cpp
+    planning/MemoryPlanner.cpp
     # Execution plan builder (Phase 1 - Plan-to-Graph translation)
     execution/mpi_orchestration/ExecutionPlanBuilder.cpp
     # Pipeline parallel graph builder (Phase 3 - PP stage insertion)
@@ -1315,10 +1422,23 @@ add_library(llaminar2_core STATIC
     execution/factory/InferenceRunnerFactory.cpp
     # App-level components (extracted from Main.cpp)
     app/AppLifecycle.cpp
+    app/SubcommandRouter.cpp
+    app/Splash.cpp
+    app/StartupBanner.cpp
     app/InferenceRunnerAdapter.cpp
     app/ChatTemplateResolver.cpp
     app/MPIBootstrapPhase.cpp
+    app/MPIShutdown.cpp
     app/RuntimeInitPhase.cpp
+    # Subcommands
+    app/commands/CommandMPI.cpp
+    app/commands/BenchmarkCommand.cpp
+    app/commands/LegacyCommand.cpp
+    app/commands/DescribeCommand.cpp
+    app/commands/OneshotCommand.cpp
+    app/commands/ServeCommand.cpp
+    app/commands/PlanCommand.cpp
+    # Execution modes (used by LegacyCommand)
     app/modes/InteractiveChatMode.cpp
     app/modes/SingleShotChatMode.cpp
     app/modes/BenchmarkMode.cpp
@@ -1334,19 +1454,34 @@ add_library(llaminar2_core STATIC
     loaders/DeviceOrchestrator.cpp
     loaders/LayerWeightStreamer.cpp
     loaders/WeightStreamerFactory.cpp
+    loaders/PreparedWeightStore.cpp
+    loaders/WeightLoadProgressAggregator.cpp
+    loaders/WeightLifecycleTrace.cpp
+    loaders/WeightPlan.cpp
+    loaders/WeightIdentity.cpp
+    loaders/WeightMetadataRegistry.cpp
+    loaders/ExpertGemmRegistry.cpp
     # Partial weight loader (Phase 3 - PP partial weight loading)
     loaders/PartialWeightLoader.cpp
+    # GPU weight loading pipeline (Phase 1 - Foundation)
+    loaders/gpu_pipeline/WeightVRAMPool.cpp
+    loaders/gpu_pipeline/PinnedRingBuffer.cpp
+    loaders/gpu_pipeline/LoadOrchestrator.cpp
+    loaders/gpu_pipeline/DeviceLoadPipeline.cpp
     # Layer device placement (Phase 2 - multi-device graph building)
     execution/local_execution/device/LayerDevicePlacement.cpp
     # Qwen2 model and graph configuration
     models/ModelRegistrations.cpp
     models/qwen/QwenGraphBase.cpp
-    models/qwen/Qwen2Graph.cpp
-    models/qwen/Qwen2GraphConfigBuilder.cpp
+    models/qwen/QwenStandardGraph.cpp
+    models/qwen/QwenStandardGraphConfigBuilder.cpp
     models/qwen/Qwen2BufferSpec.cpp
     # Qwen3.5 Dense (hybrid GDN + Full Attention)
     models/qwen35/Qwen35Graph.cpp
     models/qwen35/Qwen35GraphConfigBuilder.cpp
+    # Qwen3.5 MoE (hybrid GDN + Full Attention + Mixture of Experts)
+    models/qwen35moe/Qwen35MoEGraph.cpp
+    models/qwen35moe/Qwen35MoEGraphConfigBuilder.cpp
     tensors/TensorBase.cpp
     tensors/FP32Tensor.cpp
     tensors/FP16Tensor.cpp
@@ -1388,9 +1523,10 @@ add_library(llaminar2_core STATIC
     # Vectorized primitives (ported from V1)
     kernels/cpu/primitives/RoPEPrimitives.cpp
     kernels/cpu/primitives/RMSNormPrimitives.cpp
-    kernels/cpu/primitives/SoftmaxPrimitives.cpp
     kernels/cpu/primitives/SwiGLUPrimitives.cpp
+    kernels/cpu/primitives/VectorPrimitives.cpp
     kernels/cpu/primitives/Q16HeadNormalization.cpp
+    kernels/cpu/sampling/CPUSamplerPrimitives.cpp
     # CPU GEMM kernels and auto-tuning infrastructure
     # NOTE: Legacy GEMM implementations (v1/v2/v3) removed - only gemm (OneDNN) remains
     # All old GEMM kernels removed: GemmAutoTuner, SmartGemmSearch, QuantizedGemm,
@@ -1404,6 +1540,9 @@ add_library(llaminar2_core STATIC
     # GDN kernel implementations (Gated Delta Net)
     kernels/cpu/gdn/CPUShortConvolution.cpp
     kernels/cpu/gdn/CPUGatedDeltaNet.cpp
+    # MoE kernel implementations (routing, gather/scatter, SwiGLU fallback)
+    kernels/IMoEKernel.cpp
+    kernels/cpu/moe/CPUMoEKernel.cpp
     # Kernel dispatch factory (centralized device-aware kernel creation)
     kernels/KernelFactory.cpp
     kernels/HybridKVCacheConfig.cpp
@@ -1423,6 +1562,8 @@ add_library(llaminar2_core STATIC
     utils/Sampler.cpp
     utils/ChatTemplate.cpp
     utils/ChatUI.cpp
+    utils/ToolCallParser.cpp
+    utils/PerfStatsCollector.cpp
     utils/BenchmarkRunner.cpp
     # Collective communication infrastructure
     collective/DeviceGroup.cpp
@@ -1435,6 +1576,7 @@ add_library(llaminar2_core STATIC
     # NOTE: RCCLBackend.cpp is NOT here - it's in rocm_backend to isolate RCCL symbols
     # from NCCL. Both export the same symbols (ncclCommInitRank, etc.) and would conflict.
     collective/backends/UPIBackend.cpp
+    collective/backends/ShmemSpinBackend.cpp
     execution/local_execution/collective/CollectiveContext.cpp
     # NUMA-aware memory allocation
     memory/NUMAAllocator.cpp
@@ -1452,13 +1594,19 @@ add_library(llaminar2_core STATIC
     loaders/LocalTPWeightSharder.cpp
     # TP allreduce stage (Phase 4: supports both LOCAL and GLOBAL TP)
     execution/compute_stages/stages/TPAllreduceStage.cpp
-    # Legacy LOCAL TP allreduce stage (deprecated, use TPAllreduceStage)
-    execution/compute_stages/stages/LocalTPAllreduceStage.cpp
     execution/compute_stages/stages/LocalPPTransferStage.cpp
     execution/compute_stages/stages/GlobalPPTransferStage.cpp
     # Global Pipeline Parallelism topology and planning
     execution/global_pp/GlobalPPTopology.cpp
     execution/global_pp/GlobalPPRankPlanBuilder.cpp
+    # GlobalOrchestrator (Phase 1: cross-machine MPI cluster inference)
+    execution/global/GlobalOrchestrator.cpp
+    # DomainCommunicatorRegistry (Phase 3: per-domain MPI communicator creation)
+    execution/global/DomainCommunicatorRegistry.cpp
+    # StageRunnerFactory (Phase 3: per-domain stage runner construction)
+    execution/global/StageRunnerFactory.cpp
+    # GlobalOrchestratorRunner (Phase 4: IOrchestrationRunner adapter)
+    execution/global/GlobalOrchestratorRunner.cpp
     # Parallelism tree (recursive PP/TP composition)
     execution/parallelism_tree/ParallelismTree.cpp
     execution/parallelism_tree/TransferSpec.cpp
@@ -1469,10 +1617,14 @@ add_library(llaminar2_core STATIC
     # Orchestration runner (Phase 5: end-to-end integration)
     execution/runner/OrchestrationRunner.cpp
     execution/runner/OrchestrationRunnerFactory.cpp
+    execution/runner/NamedDomainGlobalRunner.cpp
     # Snapshot capture (Phase 2: extracted from DeviceGraphOrchestrator)
     snapshots/SnapshotCapture.cpp
     # Forward execution engine (Phase 3: extracted from DeviceGraphOrchestrator)
     execution/local_execution/engine/ForwardExecutionEngine.cpp
+    execution/local_execution/engine/PrefillBucketUtils.cpp
+    # Prefill graph cache (Phase 4: persistent prefill graph capture/replay)
+    execution/local_execution/engine/PrefillGraphCache.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
     # Vendored jinja template engine (from llama.cpp, MIT license)
@@ -1483,6 +1635,60 @@ add_library(llaminar2_core STATIC
     vendor/jinja/string.cpp
     vendor/jinja/value.cpp
 )
+
+# ---------------------------------------------------------------------------
+# Embed model-specific Jinja chat templates
+#
+# Each (jinja file -> generated header) pair lives under jinja/<family>/<ver>/.
+# The generator script `cmake/EmbedJinjaTemplate.cmake` reads the .jinja file
+# and wraps its contents in a C++ raw-string literal. Generated headers land
+# in ${CMAKE_CURRENT_BINARY_DIR}/generated/jinja_templates/ so we add that to
+# the include path.
+# ---------------------------------------------------------------------------
+set(LLAMINAR2_JINJA_EMBED_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/EmbedJinjaTemplate.cmake")
+set(LLAMINAR2_JINJA_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/jinja_templates")
+file(MAKE_DIRECTORY "${LLAMINAR2_JINJA_GEN_DIR}")
+
+function(llaminar2_embed_jinja_template)
+    cmake_parse_arguments(ARG "" "INPUT;OUTPUT;NAMESPACE;SYMBOL;SOURCE_URL;LICENSE" "" ${ARGN})
+    if(NOT ARG_INPUT OR NOT ARG_OUTPUT OR NOT ARG_NAMESPACE OR NOT ARG_SYMBOL)
+        message(FATAL_ERROR "llaminar2_embed_jinja_template: INPUT, OUTPUT, NAMESPACE, SYMBOL required")
+    endif()
+    if(NOT ARG_SOURCE_URL)
+        set(ARG_SOURCE_URL "(not provided)")
+    endif()
+    if(NOT ARG_LICENSE)
+        set(ARG_LICENSE "(not provided)")
+    endif()
+    add_custom_command(
+        OUTPUT "${ARG_OUTPUT}"
+        COMMAND ${CMAKE_COMMAND}
+            -DJINJA_INPUT=${ARG_INPUT}
+            -DHEADER_OUTPUT=${ARG_OUTPUT}
+            -DNAMESPACE=${ARG_NAMESPACE}
+            -DSYMBOL=${ARG_SYMBOL}
+            -DSOURCE_URL=${ARG_SOURCE_URL}
+            -DLICENSE=${ARG_LICENSE}
+            -P "${LLAMINAR2_JINJA_EMBED_SCRIPT}"
+        DEPENDS "${ARG_INPUT}" "${LLAMINAR2_JINJA_EMBED_SCRIPT}"
+        COMMENT "Embedding Jinja template: ${ARG_INPUT}"
+        VERBATIM
+    )
+endfunction()
+
+# --- Qwen 3.5 community chat template (MIT) --------------------------------
+set(QWEN35_JINJA_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../../jinja/qwen/qwen35/template.jinja")
+set(QWEN35_JINJA_HDR "${LLAMINAR2_JINJA_GEN_DIR}/qwen/qwen35/Qwen35ChatTemplate.generated.h")
+llaminar2_embed_jinja_template(
+    INPUT       "${QWEN35_JINJA_SRC}"
+    OUTPUT      "${QWEN35_JINJA_HDR}"
+    NAMESPACE   "llaminar2::qwen35"
+    SYMBOL      "kCommunityChatTemplate"
+    SOURCE_URL  "https://huggingface.co/froggeric/Qwen3.5-35B-A3B-Uncensored-FernflowerAI-MLX-8bit/resolve/main/chat_template.jinja"
+    LICENSE     "MIT"
+)
+target_sources(llaminar2_core PRIVATE "${QWEN35_JINJA_HDR}")
+target_include_directories(llaminar2_core PRIVATE "${LLAMINAR2_JINJA_GEN_DIR}")
 
 target_include_directories(llaminar2_core PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}
@@ -1550,24 +1756,13 @@ else()
     target_compile_definitions(llaminar2_core PUBLIC LLAMINAR_DISABLE_STACKTRACE)
 endif()
 
-# Dependencies
-find_package(MPI REQUIRED)
-find_package(OpenMP REQUIRED COMPONENTS CXX)
-message(STATUS "V2: MPI enabled (required dependency)")
-
-# Generate microkernel instantiations (auto-run Python script at configure time)
-find_library(NUMA_LIBRARY NAMES numa)
-if(NUMA_LIBRARY)
-    message(STATUS "Found libnuma: ${NUMA_LIBRARY}")
-    target_compile_definitions(llaminar2_core PUBLIC HAVE_NUMA)
-    target_link_libraries(llaminar2_core PUBLIC ${NUMA_LIBRARY})
-else()
-    message(STATUS "libnuma not found - NUMA-aware allocation disabled")
-endif()
+# Required dependencies
+target_include_directories(llaminar2_core PUBLIC ${NUMA_INCLUDE_DIR})
 
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
+    ${NUMA_LIBRARY}
     ftxui::screen
     ftxui::dom
     ftxui::component
@@ -1587,7 +1782,13 @@ endif()
 # Link GPU Backend Libraries (Phase 3)
 # =============================================================================
 if(HAVE_CUDA)
-    target_link_libraries(llaminar2_core PUBLIC cuda_backend)
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(llaminar2_core PRIVATE
+            -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive
+        )
+    else()
+        target_link_libraries(llaminar2_core PUBLIC cuda_backend)
+    endif()
     
     # Add CUDA kernel C++ adapter files (compiled with C++ compiler, NOT nvcc)
     # These implement ITensorGemm interface and can include MPI headers
@@ -1599,13 +1800,20 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp
         kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE, Embedding ITensor implementations
         kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
+        kernels/cuda/moe/CUDAMoEKernel.cpp            # MoE kernel adapter (routing, gather, scatter, gate, swiglu)
     )
     
     message(STATUS "V2: Linked CUDA backend library")
 endif()
 
 if(HAVE_ROCM)
-    target_link_libraries(llaminar2_core PUBLIC rocm_backend)
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(llaminar2_core PRIVATE
+            -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive
+        )
+    else()
+        target_link_libraries(llaminar2_core PUBLIC rocm_backend)
+    endif()
     
     # Add ROCm kernel C++ adapter files (compiled with C++ compiler, NOT hipcc)
     # These implement ITensorGemm interface and can include MPI headers
@@ -1623,25 +1831,44 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmRoPEKernelT.cpp                  # RoPE ITensor implementation
         kernels/rocm/ops/ROCmRMSNormKernelT.cpp               # RMSNorm ITensor implementation
         kernels/rocm/ops/ROCmEmbeddingKernelT.cpp             # Embedding ITensor implementation
+        kernels/rocm/moe/ROCmMoEKernel.cpp                    # MoE kernel (routing, gather, scatter, gate, swiglu)
     )
+
+    if(LLAMINAR_SHARED_CORE)
+        target_include_directories(llaminar2_core PUBLIC
+            ${ROCM_PATH}/include
+            ${ROCM_PATH}/hip/include
+            ${ROCM_PATH}/hipblas/include
+            ${ROCM_PATH}/hipblaslt/include
+        )
+    endif()
     
     message(STATUS "V2: Linked ROCm backend library with hipBLAS GEMM")
 endif()
 
 # Link device benchmarks library
-target_link_libraries(llaminar2_core PUBLIC device_benchmarks)
+if(LLAMINAR_SHARED_CORE)
+    target_link_libraries(llaminar2_core PRIVATE
+        -Wl,--whole-archive device_benchmarks -Wl,--no-whole-archive
+    )
+else()
+    target_link_libraries(llaminar2_core PUBLIC device_benchmarks)
+endif()
 message(STATUS "V2: Linked device benchmarks library")
 
 if(HAVE_CUDA)
     target_compile_definitions(llaminar2_core PUBLIC HAVE_CUDA)
+    if(LLAMINAR_HAVE_CUTLASS)
+        target_compile_definitions(llaminar2_core PUBLIC HAVE_CUTLASS)
+        target_include_directories(llaminar2_core PUBLIC "${CUTLASS_DIR}/include")
+    endif()
     target_include_directories(llaminar2_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
     target_link_libraries(llaminar2_core PUBLIC 
         CUDA::cudart 
         CUDA::cublas
         CUDA::cublasLt  # For fused GEMM+bias operations
-        CUDA::nvml  # For GPU NUMA node detection
     )
-    message(STATUS "V2: Linked CUDA runtime, cuBLAS, cuBLASLt, and NVML")
+    message(STATUS "V2: Linked CUDA runtime, cuBLAS, and cuBLASLt")
     
     # NOTE: NCCL is linked to cuda_backend (not llaminar2_core) to isolate symbols
     # from RCCL. Both export identical symbols and would conflict if in same library.
@@ -1658,12 +1885,13 @@ endif()
 # Link ROCm backend if enabled
 # =============================================================================
 if(HAVE_ROCM)
-    target_compile_definitions(llaminar2_core PUBLIC HAVE_ROCM)
-    # NOTE: HIP runtime, hipBLAS, hipBLASLt, and ROCm include directories are
-    # linked to rocm_backend (not llaminar2_core) to consolidate all HIP
-    # dependencies in one place. They flow transitively via the PUBLIC link
-    # from rocm_backend → llaminar2_core → executables.
-    message(STATUS "V2: ROCm libraries available via rocm_backend (hip::host, hipBLAS, hipBLASLt)")
+    target_compile_definitions(llaminar2_core PUBLIC HAVE_ROCM __HIP_PLATFORM_AMD__=1)
+    # Expose the cheap HIP host-runtime contract for consumers that include HIP
+    # headers or call hipGetDeviceCount()/hipMemcpy() directly. The expensive
+    # ROCm backend archive and device-symbol link remain consolidated in
+    # rocm_backend and are folded into shared llaminar2_core once.
+    target_link_libraries(llaminar2_core PUBLIC hip::host)
+    message(STATUS "V2: ROCm host runtime exposed via llaminar2_core; backend archives remain folded once")
     
     # NOTE: RCCL is linked to rocm_backend (not llaminar2_core) to isolate symbols
     # from NCCL. Both libraries export the same symbols (ncclCommInitRank, etc.)
@@ -1715,20 +1943,32 @@ if(HAVE_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../benchmarks/v2/gemm_sw
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
-# Enable testing for V2
-enable_testing()
+# Enable testing for V2.
+if(LLAMINAR_BUILD_TESTS)
+    # Release builds only include performance tests; all other builds include everything.
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        set(V2_PERF_TESTS_ONLY ON)
+    else()
+        set(V2_PERF_TESTS_ONLY OFF)
+    endif()
 
-# V2 Tests
-# Include test subdirectory (unit, integration, e2e, pytorch_parity)
-# Note: The source tree is at ../../tests/v2 relative to src/v2
-add_subdirectory(../../tests/v2 ${CMAKE_BINARY_DIR}/tests/v2)
+    enable_testing()
+
+    # V2 Tests
+    # Include test subdirectory (unit, integration, e2e, pytorch_parity, performance)
+    # Note: The source tree is at ../../tests/v2 relative to src/v2
+    # In Release mode, V2_PERF_TESTS_ONLY=ON skips non-perf targets.
+    add_subdirectory(../../tests/v2 ${CMAKE_BINARY_DIR}/tests/v2)
+endif()
 
 # TODO: GPU backends (CUDA, ROCm, Vulkan) - not yet implemented
 # TODO: Intel MKL backend - not yet implemented
 
 # Install targets
-install(TARGETS llaminar2
+install(TARGETS llaminar2 llaminar2_core
     RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
 )
 
 install(FILES

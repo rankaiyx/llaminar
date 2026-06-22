@@ -36,8 +36,9 @@ namespace llaminar2
     /**
      * @brief CPU/NUMA backend implementing IBackend interface
      *
-     * Provides rank-local memory management for CPU execution, with NUMA-aware
-     * allocation when libnuma is available.
+     * Provides rank-local memory management for CPU execution. libnuma is a
+     * build-time requirement; requested NUMA allocation must bind successfully
+     * or allocation fails.
      */
     class CPUBackend : public IBackend
     {
@@ -46,7 +47,8 @@ namespace llaminar2
          * @brief Construct CPUBackend for this rank's NUMA node
          * @param local_numa_node NUMA node for this MPI rank (from MPITopology::placement().numa_node)
          *
-         * If local_numa_node is -1 or invalid, uses system-wide memory (no NUMA binding).
+         * If local_numa_node is -1, uses system-wide memory (no NUMA binding).
+         * Invalid requested NUMA nodes throw.
          */
         explicit CPUBackend(int local_numa_node);
         ~CPUBackend() override;
@@ -102,8 +104,8 @@ namespace llaminar2
          * @param device_id Must be 0
          * @return Pointer to allocated memory, or nullptr on failure
          *
-         * Uses numa_alloc_onnode() if libnuma is available, otherwise falls back
-         * to aligned_alloc() with parallel first-touch initialization for NUMA locality.
+         * Uses aligned_alloc(), mbind(), and parallel first-touch initialization
+         * for NUMA locality. A failed mbind returns nullptr.
          */
         void *allocate(size_t bytes, int device_id) override;
 
@@ -231,6 +233,13 @@ namespace llaminar2
         void *createEvent(int device_id) override;
 
         /**
+         * @brief Create timing event (same dummy pointer as createEvent())
+         * @param device_id Must be 0
+         * @return Non-null dummy pointer (CPU is always synchronous)
+         */
+        void *createTimingEvent(int device_id) override;
+
+        /**
          * @brief Destroy event (no-op for CPU)
          * @param event Event handle (ignored)
          * @param device_id Must be 0
@@ -252,6 +261,15 @@ namespace llaminar2
          * @return true
          */
         bool waitForEvent(void *event, int device_id) override;
+
+        /**
+         * @brief CPU elapsed event timing is always zero.
+         */
+        bool eventElapsedTimeMs(
+            void *start_event,
+            void *stop_event,
+            int device_id,
+            float *out_ms) override;
 
         // ====================================================================
         // Capability Queries

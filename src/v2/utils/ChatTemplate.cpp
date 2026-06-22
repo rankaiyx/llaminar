@@ -170,7 +170,8 @@ namespace llaminar2
 
     std::string ChatTemplate::renderJinja(const std::vector<ChatMessage> &messages,
                                           bool add_generation_prompt,
-                                          bool enable_thinking) const
+                                          bool enable_thinking,
+                                          const std::string &tools_json) const
     {
         if (!jinja_state_)
             return {};
@@ -186,13 +187,45 @@ namespace llaminar2
 
             jinja::context ctx(jinja_state_->source);
 
-            // Build the messages array as ordered JSON
+            // Build the messages array as ordered JSON, including tool-calling fields
             nlohmann::ordered_json msg_array = nlohmann::ordered_json::array();
             for (const auto &msg : messages)
             {
                 nlohmann::ordered_json jmsg;
                 jmsg["role"] = msg.role;
-                jmsg["content"] = msg.content;
+
+                // content can be null for assistant messages with tool_calls
+                if (msg.hasToolCalls() && msg.content.empty())
+                    jmsg["content"] = nullptr;
+                else
+                    jmsg["content"] = msg.content;
+
+                // Include tool_calls for assistant messages (parse from JSON strings)
+                if (!msg.tool_calls.empty())
+                {
+                    jmsg["tool_calls"] = nlohmann::ordered_json::array();
+                    for (const auto &tc_str : msg.tool_calls)
+                    {
+                        try
+                        {
+                            jmsg["tool_calls"].push_back(
+                                nlohmann::ordered_json::parse(tc_str));
+                        }
+                        catch (const nlohmann::ordered_json::parse_error &)
+                        {
+                            // Skip malformed tool call entries
+                        }
+                    }
+                }
+
+                // Include tool_call_id for tool result messages
+                if (!msg.tool_call_id.empty())
+                    jmsg["tool_call_id"] = msg.tool_call_id;
+
+                // Include name for tool result messages
+                if (!msg.name.empty())
+                    jmsg["name"] = msg.name;
+
                 msg_array.push_back(jmsg);
             }
 
@@ -206,6 +239,19 @@ namespace llaminar2
                 inp["add_generation_prompt"] = true;
             }
             inp["enable_thinking"] = enable_thinking;
+
+            // Pass tools array to Jinja context if provided
+            if (!tools_json.empty())
+            {
+                try
+                {
+                    inp["tools"] = nlohmann::ordered_json::parse(tools_json);
+                }
+                catch (const nlohmann::ordered_json::parse_error &)
+                {
+                    // Invalid tools JSON — skip
+                }
+            }
 
             // Load context into jinja runtime
             jinja::global_from_json(ctx, inp, false);
@@ -278,44 +324,71 @@ namespace llaminar2
 
     void ChatTemplate::detectThinkingTags()
     {
-        // Differential rendering approach (like llama.cpp):
-        // Compare enable_thinking=true vs NOT passing enable_thinking at all
-        // This makes `enable_thinking is defined` differ between the two.
+        // Differential rendering approach (inspired by llama.cpp):
+        // Render the generation prompt three ways and compare.
+        //
+        //   A) enable_thinking=true   (thinking active)
+        //   B) enable_thinking=false  (thinking suppressed — templates often
+        //                              emit an empty `<think></think>` block
+        //                              here, which exposes both tags)
+        //   C) enable_thinking unset  (pre-2025 Qwen / non-thinking templates
+        //                              behave as if thinking were off)
+        //
+        // Historically we only compared (A) vs (C). That works for templates
+        // whose internal default is "off when unset", but fails silently when
+        // a template defaults `enable_thinking=true` in its own namespace
+        // (e.g. the community Qwen 3.5 Jinja) — (A) and (C) render identically
+        // and the detector incorrectly concludes the template is not a
+        // thinking model. Adding the (A) vs (B) comparison fixes that class.
         std::vector<ChatMessage> test_messages = {
             {"user", "Hello"}};
 
         std::string with_thinking = renderJinja(test_messages, true, true);
+        std::string no_thinking = renderJinja(test_messages, true, false);
         std::string without_thinking = renderJinjaWithoutThinkingVar(test_messages, true);
 
         LOG_DEBUG("[ChatTemplate] detectThinkingTags: with_thinking (" << with_thinking.size()
-                                                                        << " chars), without_thinking ("
-                                                                        << without_thinking.size() << " chars)");
+                                                                       << " chars), no_thinking ("
+                                                                       << no_thinking.size()
+                                                                       << " chars), without_thinking ("
+                                                                       << without_thinking.size() << " chars)");
 
-        if (with_thinking.empty() || without_thinking.empty())
+        if (with_thinking.empty())
         {
             return;
         }
 
-        // Find the suffix difference: what's appended when thinking is enabled
-        // Both should share the same prefix up to the generation prompt
-        if (with_thinking == without_thinking)
+        // Prefer whichever non-thinking rendering actually differs from the
+        // thinking one. For modern Qwen 3.x templates this will be
+        // no_thinking; for legacy ones it will be without_thinking.
+        std::string reference;
+        if (!no_thinking.empty() && no_thinking != with_thinking)
         {
-            // No difference — not a thinking model
+            reference = no_thinking;
+        }
+        else if (!without_thinking.empty() && without_thinking != with_thinking)
+        {
+            reference = without_thinking;
+        }
+        else
+        {
+            // All three renderings are identical — template does not branch on
+            // enable_thinking, so it is not a thinking model.
             is_thinking_model_ = false;
             return;
         }
 
         // Find the common prefix
         size_t common = 0;
-        size_t min_len = std::min(with_thinking.size(), without_thinking.size());
-        while (common < min_len && with_thinking[common] == without_thinking[common])
+        size_t min_len = std::min(with_thinking.size(), reference.size());
+        while (common < min_len && with_thinking[common] == reference[common])
         {
             common++;
         }
 
         // The difference at the end tells us the thinking tags
         std::string thinking_suffix = with_thinking.substr(common);
-        std::string non_thinking_suffix = without_thinking.substr(common);
+        std::string non_thinking_suffix = reference.substr(common);
 
         // Helper: find a closing tag like </think> in a string
         auto find_close_tag = [](const std::string &s) -> std::string
@@ -423,9 +496,9 @@ namespace llaminar2
         if (is_thinking_model_)
         {
 
-            LOG_INFO("[ChatTemplate] Thinking model detected via Jinja differential rendering"
-                     << "\n  start_tag: \"" << thinking_start_tag_ << "\""
-                     << "\n  end_tag: \"" << thinking_end_tag_ << "\"");
+            LOG_DEBUG("[ChatTemplate] Thinking model detected via Jinja differential rendering"
+                      << "\n  start_tag: \"" << thinking_start_tag_ << "\""
+                      << "\n  end_tag: \"" << thinking_end_tag_ << "\"");
         }
     }
 
@@ -527,12 +600,13 @@ namespace llaminar2
 
     std::string ChatTemplate::apply(const std::vector<ChatMessage> &messages,
                                     bool add_generation_prompt,
-                                    bool enable_thinking) const
+                                    bool enable_thinking,
+                                    const std::string &tools_json) const
     {
         // Primary path: Jinja2 rendering
         if (jinja_available_)
         {
-            std::string result = renderJinja(messages, add_generation_prompt, enable_thinking);
+            std::string result = renderJinja(messages, add_generation_prompt, enable_thinking, tools_json);
             if (!result.empty())
             {
                 return result;
@@ -540,7 +614,7 @@ namespace llaminar2
             LOG_WARN("[ChatTemplate] Jinja2 render returned empty, falling back to hardcoded format");
         }
 
-        // Fallback path: hardcoded format implementations
+        // Fallback path: hardcoded format implementations (no tools support)
         return applyFallback(messages, add_generation_prompt);
     }
 
@@ -1110,9 +1184,12 @@ namespace llaminar2
         }
         else
         {
-            // No end tag found — entire output is reasoning (model still thinking)
-            // or non-thinking model output. Treat as content.
-            result.content = text;
+            // No end tag found — model produced thinking but never closed it
+            // (e.g. hit max_tokens while still in <think> block).
+            // Since the generation prompt ends with the start tag, everything
+            // the model wrote is reasoning content, not final content.
+            result.has_reasoning = true;
+            result.reasoning_content = text;
         }
 
         return result;

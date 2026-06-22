@@ -5,8 +5,10 @@
 # container; the kernel driver is expected on the host and passed through
 # via /dev/kfd + /dev/dri + the render/video groups.
 #
-# MODE=full     (default) — rocm usecase (HIP compiler, rocBLAS dev, RCCL).
-# MODE=runtime             — rocm-hip-runtime usecase + rocBLAS + RCCL runtime.
+# MODE=full     (default) — AMD's full `rocm` usecase.
+# MODE=build              — minimal compiler/dev package set for building
+#                           Llaminar's ROCm backend and optional RCCL source.
+# MODE=runtime            — minimal runtime package set.
 #
 # gfx906 (MI50) was dropped from ROCm 7.x. We restore support by grafting the
 # gfx906 Tensile library files from Arch Linux's rocBLAS package, which
@@ -24,29 +26,128 @@ APT_OPTS=(
     -o Acquire::https::Timeout=30
 )
 
+curl_download() {
+    local url="$1"
+    local output="$2"
+
+    curl -fsSL \
+        --connect-timeout 30 \
+        --max-time 300 \
+        --retry 8 \
+        --retry-all-errors \
+        --retry-delay 5 \
+        --retry-max-time 900 \
+        -o "${output}" \
+        "${url}"
+}
+
+download_arch_rocblas() {
+    local output="$1"
+    local package_url="${ROCBLAS_ARCH_PACKAGE_URL:-}"
+    local package_file=""
+    local urls=()
+
+    if [[ -n "${package_url}" ]]; then
+        urls+=("${package_url}")
+    else
+        if ! package_url="$(
+            curl -fsSLI \
+                --connect-timeout 30 \
+                --max-time 60 \
+                --retry 3 \
+                --retry-all-errors \
+                "https://archlinux.org/packages/extra/x86_64/rocblas/download" \
+            | awk 'tolower($1) == "location:" { loc=$2 } END { gsub(/\r/, "", loc); print loc }'
+        )"; then
+            package_url=""
+        fi
+        package_file="${package_url##*/}"
+
+        if [[ "${package_file}" == rocblas-*.pkg.tar.zst ]]; then
+            urls+=(
+                "https://geo.mirror.pkgbuild.com/extra/os/x86_64/${package_file}"
+                "https://mirror.rackspace.com/archlinux/extra/os/x86_64/${package_file}"
+                "https://arch.mirror.constant.com/extra/os/x86_64/${package_file}"
+                "https://mirrors.edge.kernel.org/archlinux/extra/os/x86_64/${package_file}"
+            )
+        fi
+        urls+=("https://archlinux.org/packages/extra/x86_64/rocblas/download")
+    fi
+
+    for package_url in "${urls[@]}"; do
+        echo "==> [rocm] downloading rocBLAS Arch package from ${package_url}"
+        if curl -fsSL \
+            --connect-timeout 30 \
+            --max-time 300 \
+            --speed-limit 262144 \
+            --speed-time 60 \
+            --retry 2 \
+            --retry-all-errors \
+            --retry-delay 5 \
+            -o "${output}" \
+            "${package_url}"; then
+            return 0
+        fi
+        rm -f "${output}"
+    done
+
+    echo "Failed to download Arch rocBLAS package from all mirrors" >&2
+    return 1
+}
+
 # amdgpu-install is the canonical installer for ROCm on Ubuntu.
-curl -fsSL --retry 5 --retry-delay 5 -o /tmp/amdgpu-install.deb \
-    "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/noble/amdgpu-install_${ROCM_DEB_VERSION}_all.deb"
+curl_download \
+    "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/noble/amdgpu-install_${ROCM_DEB_VERSION}_all.deb" \
+    /tmp/amdgpu-install.deb
 apt-get "${APT_OPTS[@]}" update
-apt-get "${APT_OPTS[@]}" install -y /tmp/amdgpu-install.deb
+apt-get "${APT_OPTS[@]}" install -y --allow-change-held-packages /tmp/amdgpu-install.deb
 rm /tmp/amdgpu-install.deb
 
-if [[ "${MODE}" == "full" ]]; then
-    USECASE="rocm"
-else
-    USECASE="rocm"   # ROCm doesn't ship a split runtime usecase we can rely
-                     # on; the "rocm" usecase installs both compiler and
-                     # runtime. We trim at image-flatten time, not here.
-fi
-
-# --no-dkms: the kernel driver comes from the host; don't rebuild it inside
-# the container.
-amdgpu-install --usecase="${USECASE}" --no-dkms -y
+case "${MODE}" in
+    full)
+        # --no-dkms: the kernel driver comes from the host; don't rebuild it
+        # inside the container.
+        amdgpu-install --usecase=rocm --no-dkms -y
+        ;;
+    build)
+        # Direct package closure needed by CMake:
+        # - hipcc/amdclang + HIP headers/runtime
+        # - hipBLAS/hipBLASLt headers and shared libraries
+        # - ROCm CMake/device libs for HIP and RCCL source builds
+        # - RCCL dev package for headers/system fallback when source build is off
+        apt-get "${APT_OPTS[@]}" update
+        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
+            rocm-llvm \
+            rocm-cmake \
+            rocm-device-libs \
+            hipcc \
+            hipify-clang \
+            hip-dev \
+            hsa-rocr-dev \
+            libdrm-dev \
+            hipblas-dev \
+            hipblaslt-dev \
+            rocblas-dev \
+            rccl-dev \
+            rocminfo \
+            rocm-smi-lib
+        ;;
+    runtime)
+        apt-get "${APT_OPTS[@]}" update
+        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
+            hipblas \
+            rocminfo \
+            rocm-smi-lib
+        ;;
+    *)
+        echo "Unknown MODE='${MODE}' (expected full, build, or runtime)" >&2
+        exit 2
+        ;;
+esac
 
 # Restore gfx906 (MI50 / Vega 20) Tensile kernels removed in ROCm 7.x.
-apt-get "${APT_OPTS[@]}" install -y --no-install-recommends zstd
-curl -fsSL --retry 5 --retry-delay 5 -o /tmp/rocblas-arch.pkg.tar.zst \
-    "https://archlinux.org/packages/extra/x86_64/rocblas/download"
+apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages zstd
+download_arch_rocblas /tmp/rocblas-arch.pkg.tar.zst
 mkdir -p /tmp/rocblas-arch
 tar -I zstd -xf /tmp/rocblas-arch.pkg.tar.zst -C /tmp/rocblas-arch
 if compgen -G "/tmp/rocblas-arch/opt/rocm/lib/rocblas/library/*gfx906*" >/dev/null; then

@@ -22,7 +22,6 @@ import mmap
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional, Union
 from enum import IntEnum
-import numpy as np
 
 
 class GGUFValueType(IntEnum):
@@ -69,6 +68,7 @@ class GGUFTensorType(IntEnum):
     IQ2_S = 22
     IQ4_XS = 23
     IQ1_M = 29
+    BF16 = 30
 
 
 class GGUFTensorInfo:
@@ -96,7 +96,7 @@ class GGUFTensorInfo:
     @property
     def is_quantized(self) -> bool:
         """Check if tensor uses quantized format"""
-        return self.type not in (GGUFTensorType.F32, GGUFTensorType.F16)
+        return self.type not in (GGUFTensorType.F32, GGUFTensorType.F16, GGUFTensorType.BF16)
     
     def __repr__(self) -> str:
         return f"GGUFTensorInfo(name={self.name}, shape={self.shape}, type={self.type.name})"
@@ -329,27 +329,38 @@ class GGUFParser:
             
         print(f"Tensor data starts at offset: {self.data_offset}")
         
-    def read_tensor_data(self, tensor_info: GGUFTensorInfo) -> bytes:
+    def read_tensor_data(self, tensor_info: GGUFTensorInfo) -> memoryview:
         """
         Read raw tensor data from file.
-        
+
+        Returns a zero-copy ``memoryview`` over the memory-mapped region.
+        Downstream consumers feed this into ``np.frombuffer(...)`` which
+        accepts any buffer-protocol object and itself does not copy.
+
+        PERF: Previously this returned ``bytes(self.mmap[a:b])`` which forces
+        the kernel to copy the entire slice (28+ GB on 27B Q8_0 models)
+        out of the page cache into a Python bytes object before the
+        dequant kernel even runs. The memoryview alternative defers all
+        page faulting to the actual numpy reads, which then happen in
+        parallel from worker threads.
+
         Args:
             tensor_info: Tensor information
-            
+
         Returns:
-            Raw tensor data as bytes
+            Read-only memoryview of the raw tensor data.
         """
         if self.data_offset is None:
             raise ValueError("Must call parse() before reading tensor data")
-        
+
         # Calculate actual file offset
         file_offset = self.data_offset + tensor_info.offset
-        
+
         # Calculate data size based on tensor type and dimensions
         data_size = self._calculate_tensor_size(tensor_info)
-        
-        # Read data from memory-mapped file
-        return bytes(self.mmap[file_offset:file_offset + data_size])
+
+        # Zero-copy view into the mmap. mmap is thread-safe for reads.
+        return memoryview(self.mmap)[file_offset:file_offset + data_size]
     
     def _calculate_tensor_size(self, tensor_info: GGUFTensorInfo) -> int:
         """Calculate size in bytes of tensor data"""
@@ -359,13 +370,20 @@ class GGUFParser:
         # Type size lookup table (bytes per element or block)
         if tensor_type == GGUFTensorType.F32:
             return n_elements * 4
-        elif tensor_type == GGUFTensorType.F16:
+        elif tensor_type in (GGUFTensorType.F16, GGUFTensorType.BF16):
             return n_elements * 2
         elif tensor_type == GGUFTensorType.Q4_0:
             # Q4_0: 32 elements per block, 18 bytes per block (2 scale + 16 data)
             block_size = 32
             n_blocks = (n_elements + block_size - 1) // block_size
             return n_blocks * 18
+        elif tensor_type == GGUFTensorType.Q2_K:
+            # Q2_K: 256 elements per row super-block, 84 bytes per block.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 84
         elif tensor_type == GGUFTensorType.Q8_0:
             # Q8_0: 32 elements per block, 34 bytes per block (2 scale + 32 data)
             block_size = 32
@@ -381,6 +399,11 @@ class GGUFParser:
             block_size = 256
             n_blocks = (n_elements + block_size - 1) // block_size
             return n_blocks * 176
+        elif tensor_type == GGUFTensorType.Q4_K:
+            # Q4_K: 256 elements per block, 144 bytes per block (2d+2dmin+12scales+128qs)
+            block_size = 256
+            n_blocks = (n_elements + block_size - 1) // block_size
+            return n_blocks * 144
         elif tensor_type == GGUFTensorType.Q4_1:
             # Q4_1: 32 elements per block, 20 bytes per block (2 scale + 2 min + 16 data)
             block_size = 32
@@ -391,6 +414,36 @@ class GGUFParser:
             block_size = 32
             n_blocks = (n_elements + block_size - 1) // block_size
             return n_blocks * 22
+        elif tensor_type == GGUFTensorType.IQ3_S:
+            # IQ3_S: 256 elements per row super-block, 110 bytes per block.
+            # Use the fastest-varying dimension so row padding is accounted for.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 110
+        elif tensor_type == GGUFTensorType.IQ2_S:
+            # IQ2_S: 256 elements per row super-block, 82 bytes per block.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 82
+        elif tensor_type == GGUFTensorType.IQ3_XXS:
+            # IQ3_XXS: 256 elements per row super-block, 98 bytes per block.
+            # Use the fastest-varying dimension so row padding is accounted for.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 98
+        elif tensor_type == GGUFTensorType.IQ4_XS:
+            # IQ4_XS: 256 elements per row super-block, 136 bytes per block.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 136
         else:
             # For other types, estimate conservatively
             # Most quantized types use 2-8 bits per value
@@ -441,6 +494,20 @@ class GGUFParser:
             full_key = prefix + gguf_key
             if full_key in self.metadata:
                 config[hf_key] = self.metadata[full_key]
+
+        # Some Qwen3.6 GGUFs are encoded as qwen35 and include trailing
+        # next-token-prediction sidecar block(s) in block_count. Those blocks
+        # remain in the tensor inventory for MTP, but the main PyTorch
+        # reference graph must not instantiate them as ordinary decoder layers.
+        nextn_depth_key = prefix + 'nextn_predict_layers'
+        nextn_depth = int(self.metadata.get(nextn_depth_key, 0) or 0)
+        raw_layers = int(config.get('num_hidden_layers', 0) or 0)
+        if model_type in ('qwen35', 'qwen35moe') and nextn_depth > 0 and raw_layers >= nextn_depth:
+            source_layer = raw_layers - nextn_depth
+            nextn_tensor_name = f'blk.{source_layer}.nextn.eh_proj.weight'
+            tensor_names = {getattr(t, 'name', t) for t in getattr(self, 'tensors', [])}
+            if nextn_tensor_name in tensor_names:
+                config['num_hidden_layers'] = source_layer
         
         # Vocab size (may be in tokenizer metadata)
         vocab_size_keys = [
@@ -457,7 +524,7 @@ class GGUFParser:
                 break
         
         # Qwen 3.5 Gated Delta Net specific metadata
-        if model_type == 'qwen35':
+        if model_type in ('qwen35', 'qwen35moe'):
             qwen35_keys = {
                 'attention.head_count_kv': 'num_key_value_heads',
                 'attention.key_length': 'head_dim',
@@ -479,6 +546,19 @@ class GGUFParser:
             dim_sections_key = prefix + 'rope.dimension_sections'
             if dim_sections_key in self.metadata:
                 config['rope_dimension_sections'] = self.metadata[dim_sections_key]
+
+        # Qwen 3.5 MoE specific metadata
+        if model_type == 'qwen35moe':
+            moe_keys = {
+                'expert_count': 'num_experts',
+                'expert_used_count': 'num_experts_per_tok',
+                'expert_feed_forward_length': 'moe_intermediate_size',
+                'expert_shared_feed_forward_length': 'shared_expert_intermediate_size',
+            }
+            for gguf_key, hf_key in moe_keys.items():
+                full_key = prefix + gguf_key
+                if full_key in self.metadata:
+                    config[hf_key] = self.metadata[full_key]
         
         return config
     

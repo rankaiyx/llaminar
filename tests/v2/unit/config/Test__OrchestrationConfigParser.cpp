@@ -73,6 +73,12 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.tp_degree, 1);
     EXPECT_EQ(config.pp_degree, 1);
     EXPECT_FALSE(config.dry_run);
+    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ExpertParallel);
+    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
+    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
+    EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
+    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+    EXPECT_EQ(config.moe_rebalance.window_size, 256);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_DryRun)
@@ -397,6 +403,101 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithWeightsAndBacke
     EXPECT_EQ(domain.backend, CollectiveBackendType::HETEROGENEOUS);
 }
 
+TEST(Test__OrchestrationConfigParser, ParseArgs_DefineDomain_WithScopeOwnerRanksBackend)
+{
+    ArgvHelper args{"llaminar2",
+                    "--define-domain", "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0",
+                    "--define-domain", "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    ASSERT_EQ(config.domain_definitions.size(), 2u);
+    EXPECT_EQ(config.domain_definitions[0].scope, TPScope::LOCAL);
+    ASSERT_TRUE(config.domain_definitions[0].owner_rank.has_value());
+    EXPECT_EQ(*config.domain_definitions[0].owner_rank, 0);
+    EXPECT_EQ(config.domain_definitions[0].backend, CollectiveBackendType::RCCL);
+
+    EXPECT_EQ(config.domain_definitions[1].scope, TPScope::NODE_LOCAL);
+    EXPECT_EQ(config.domain_definitions[1].backend, CollectiveBackendType::UPI);
+    ASSERT_EQ(config.domain_definitions[1].explicit_ranks.size(), 2u);
+    EXPECT_EQ(config.domain_definitions[1].explicit_ranks[0], 0);
+    EXPECT_EQ(config.domain_definitions[1].explicit_ranks[1], 1);
+}
+
+TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonicalNormalization)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper named_args{"llaminar2",
+                          "--define-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;owner=0"};
+    ArgvHelper overlay_args{"llaminar2",
+                            "--moe-expert-overlay", "tiered",
+                            "--moe-expert-overlay-continuation", "rocm_hot",
+                            "--moe-expert-overlay-shared-domain", "rocm_hot",
+                            "--moe-expert-overlay-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;compute=expert_id_sharded;owner=0",
+                            "--moe-expert-overlay-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=expert_id_sharded;ranks=0,1",
+                            "--moe-expert-overlay-tier", "hot@rocm_hot;priority=0",
+                            "--moe-expert-overlay-tier", "cold@cpu_cold;priority=1;fallback=true"};
+
+    const auto named_config = parser.parseArgs(named_args.argc(), named_args.argv());
+    const auto overlay_config = parser.parseArgs(overlay_args.argc(), overlay_args.argv());
+
+    ASSERT_EQ(named_config.domain_definitions.size(), 1u);
+    ASSERT_NE(overlay_config.moe_expert_parallel_plan, nullptr);
+    ASSERT_EQ(overlay_config.moe_expert_parallel_plan->domains.size(), 2u);
+
+    const auto named_domain = named_config.domain_definitions[0].toExecutionDomainDefinition();
+    const auto overlay_domain = overlay_config.moe_expert_parallel_plan->domains[0].toExecutionDomainDefinition();
+
+    EXPECT_EQ(named_domain.name, overlay_domain.name);
+    EXPECT_EQ(named_domain.participants, overlay_domain.participants);
+    EXPECT_EQ(named_domain.weights, overlay_domain.weights);
+    EXPECT_EQ(named_domain.scope, overlay_domain.scope);
+    EXPECT_EQ(named_domain.backend, overlay_domain.backend);
+    EXPECT_EQ(named_domain.owner_rank, overlay_domain.owner_rank);
+    EXPECT_EQ(named_domain.ranks, overlay_domain.ranks);
+    EXPECT_EQ(named_domain.compute_kind, ExecutionDomainComputeKind::UNSPECIFIED);
+    EXPECT_EQ(overlay_domain.compute_kind, ExecutionDomainComputeKind::EXPERT_ID_SHARDED);
+
+    const auto inventory = overlay_config.executionDomainDefinitions();
+    ASSERT_EQ(inventory.size(), 2u);
+    EXPECT_EQ(inventory[0].logicalIdentity(), "rocm_hot");
+    EXPECT_EQ(inventory[1].logicalIdentity(), "cpu_cold");
+}
+
+TEST(Test__OrchestrationConfigParser, Phase9B_DomainIdentityIsNameScopedForSharedParticipants)
+{
+    const auto first = ExecutionDomainDefinition::parse(
+        "continuation=0:cuda:0;scope=single;backend=auto;compute=replicated_experts");
+    const auto second = ExecutionDomainDefinition::parse(
+        "shared_experts=0:cuda:0;scope=single;backend=auto;compute=replicated_experts");
+
+    EXPECT_TRUE(first.samePhysicalParticipants(second));
+    EXPECT_NE(first.logicalIdentity(), second.logicalIdentity());
+}
+
+TEST(Test__OrchestrationConfigParser, Phase9B_PPStageRemainsLayerPlacementNotMoEOverlay)
+{
+    ArgvHelper args{"llaminar2",
+                    "--define-domain", "gpu_tp=0:cuda:0,0:cuda:1;scope=local;backend=nccl;owner=0",
+                    "--pp-stage", "0=gpu_tp:0-3"};
+    OrchestrationConfigParser parser;
+
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+
+    ASSERT_EQ(config.domain_definitions.size(), 1u);
+    ASSERT_EQ(config.pp_stage_definitions.size(), 1u);
+    EXPECT_EQ(config.pp_stage_definitions[0].domain_name, "gpu_tp");
+    EXPECT_EQ(config.pp_stage_definitions[0].first_layer, 0);
+    EXPECT_EQ(config.pp_stage_definitions[0].last_layer, 3);
+    EXPECT_EQ(config.moe_expert_parallel_plan, nullptr);
+
+    const auto inventory = config.executionDomainDefinitions();
+    ASSERT_EQ(inventory.size(), 1u);
+    EXPECT_EQ(inventory[0].logicalIdentity(), "gpu_tp");
+    EXPECT_EQ(inventory[0].compute_kind, ExecutionDomainComputeKind::UNSPECIFIED);
+}
+
 TEST(Test__OrchestrationConfigParser, ParseArgs_PPStage)
 {
     ArgvHelper args{"llaminar2", "--pp-stage", "0=gpu_tp:0-13"};
@@ -591,6 +692,38 @@ tp_weights: [0.73, 0.27]
     EXPECT_EQ(config.tp_weights.size(), 2);
 }
 
+TEST(Test__OrchestrationConfigParser, ParseYamlString_NamedDomainLists)
+{
+    OrchestrationConfigParser parser;
+
+    std::string yaml = R"(
+domains:
+    - "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"
+    - "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1"
+pp_stages:
+    - "0=rocm_socket0:0-13"
+    - "1=cpu_sockets:14-27"
+)";
+
+    auto config = parser.parseYamlString(yaml);
+
+    ASSERT_EQ(config.domain_definitions.size(), 2u);
+    EXPECT_EQ(config.domain_definitions[0].name, "rocm_socket0");
+    EXPECT_EQ(config.domain_definitions[0].scope, TPScope::LOCAL);
+    ASSERT_TRUE(config.domain_definitions[0].owner_rank.has_value());
+    EXPECT_EQ(*config.domain_definitions[0].owner_rank, 0);
+    EXPECT_EQ(config.domain_definitions[0].backend, CollectiveBackendType::RCCL);
+    EXPECT_EQ(config.domain_definitions[1].scope, TPScope::NODE_LOCAL);
+    ASSERT_EQ(config.domain_definitions[1].explicit_ranks.size(), 2u);
+    EXPECT_EQ(config.domain_definitions[1].explicit_ranks[1], 1);
+
+    ASSERT_EQ(config.pp_stage_definitions.size(), 2u);
+    EXPECT_EQ(config.pp_stage_definitions[0].domain_name, "rocm_socket0");
+    EXPECT_EQ(config.pp_stage_definitions[1].domain_name, "cpu_sockets");
+    EXPECT_EQ(config.pp_stage_definitions[1].first_layer, 14);
+    EXPECT_EQ(config.pp_stage_definitions[1].last_layer, 27);
+}
+
 TEST(Test__OrchestrationConfigParser, ParseYamlString_AllIntrospectionFlags)
 {
     OrchestrationConfigParser parser;
@@ -681,6 +814,64 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_EmptyString_ReturnsDefault
 
     EXPECT_EQ(config.tp_degree, 1);
     EXPECT_EQ(config.pp_degree, 1);
+    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ExpertParallel);
+    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
+    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseYamlString_MoENestedBlock)
+{
+    OrchestrationConfigParser parser;
+
+    std::string yaml = R"(
+moe:
+    expert_mode: replicated
+    hot_expert_cache: 12
+    rebalance: observe
+    rebalance_window: 64
+    rebalance_max_window: 512
+    rebalance_window_growth: 2.5
+    release_raw_expert_weights: true
+    )";
+
+    auto config = parser.parseYamlString(yaml);
+
+    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::Replicated);
+    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Count);
+    EXPECT_EQ(config.moe_hot_expert_cache.count, 12);
+    EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 12);
+    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Observe);
+    EXPECT_EQ(config.moe_rebalance.window_size, 64);
+    EXPECT_EQ(config.moe_rebalance.max_window_size, 512);
+    EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.5f);
+    EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseYamlString_MoEFlatKeys)
+{
+    OrchestrationConfigParser parser;
+
+    std::string yaml = R"(
+moe_expert_mode: expert-parallel
+moe_hot_expert_cache: 25%
+moe_rebalance: off
+moe_rebalance_window: 128
+moe_rebalance_max_window: 1024
+moe_rebalance_window_growth: 1.25
+moe_release_raw_expert_weights: false
+    )";
+
+    auto config = parser.parseYamlString(yaml);
+
+    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ExpertParallel);
+    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
+    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 25.0f);
+    EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 64);
+    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Off);
+    EXPECT_EQ(config.moe_rebalance.window_size, 128);
+    EXPECT_EQ(config.moe_rebalance.max_window_size, 1024);
+    EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 1.25f);
+    EXPECT_FALSE(config.moe_rebalance.release_raw_expert_weights);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseYamlString_QuotedValues)
@@ -721,6 +912,8 @@ TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsKeyOptions)
     EXPECT_TRUE(help.find("--pp-stage") != std::string::npos);
     EXPECT_TRUE(help.find("--backend") != std::string::npos);
     EXPECT_TRUE(help.find("--config") != std::string::npos);
+    EXPECT_TRUE(help.find("--moe-expert-mode") != std::string::npos);
+    EXPECT_TRUE(help.find("--moe-hot-expert-cache") != std::string::npos);
 }
 // ============================================================================
 // CLI Parsing - Model Configuration
@@ -962,6 +1155,17 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_BenchmarkMode)
     EXPECT_TRUE(config.benchmark_mode);
 }
 
+TEST(Test__OrchestrationConfigParser, ParseArgs_BenchmarkJsonOutput)
+{
+    ArgvHelper args{"llaminar2", "--benchmark", "--benchmark-json-output", "/tmp/llaminar-benchmark.json"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.benchmark_mode);
+    EXPECT_EQ(config.benchmark_json_output_path, "/tmp/llaminar-benchmark.json");
+}
+
 // ============================================================================
 // CLI Parsing - Fused Attention
 // ============================================================================
@@ -1162,6 +1366,102 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoESparseCPU)
     auto config = parser.parseArgs(args.argc(), args.argv());
 
     EXPECT_TRUE(config.moe_sparse_experts_cpu);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoEExpertMode)
+{
+    {
+        ArgvHelper args{"llaminar2", "--moe-expert-mode", "replicated"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::Replicated);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-expert-mode", "tensor-parallel"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::TensorParallel);
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoEHotExpertCache)
+{
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "10%"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
+        EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
+        EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "24"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Count);
+        EXPECT_EQ(config.moe_hot_expert_cache.count, 24);
+        EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 24);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "off"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Off);
+        EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 0);
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
+{
+    ArgvHelper args{"llaminar2",
+                    "--moe-rebalance", "observe",
+                    "--moe-rebalance-window", "128",
+                    "--moe-rebalance-max-window", "2048",
+                    "--moe-rebalance-window-growth", "2.0",
+                    "--moe-release-raw-expert-weights"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Observe);
+    EXPECT_EQ(config.moe_rebalance.window_size, 128);
+    EXPECT_EQ(config.moe_rebalance.max_window_size, 2048);
+    EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.0f);
+    EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidMoEConfig_Throws)
+{
+    {
+        ArgvHelper args{"llaminar2", "--moe-expert-mode", "mystery"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "101%"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "-1"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-rebalance", "mystery"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
 }
 
 // ============================================================================
@@ -1385,4 +1685,326 @@ TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsExamples)
 
     EXPECT_TRUE(help.find("Examples:") != std::string::npos);
     EXPECT_TRUE(help.find("llaminar2") != std::string::npos);
+}
+
+// ============================================================================
+// Precision Tests (activation + kv-cache, with all short aliases)
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_KvCachePrecision_LongForm)
+{
+    ArgvHelper args({"llaminar2", "--kv-cache-precision", "q16_1"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.kv_cache_precision, "q16_1");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_KvCachePrecision_ShortAliasFlag)
+{
+    ArgvHelper args({"llaminar2", "--kv-prec", "fp16"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.kv_cache_precision, "fp16");
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_KvCachePrecision_AcceptsShortValueAliases)
+{
+    // The kv-cache parser normalises to lowercase and accepts short value
+    // aliases (f32, f16, q8, q16, i16) in addition to canonical forms.
+    for (const auto &alias : {"f32", "f16", "q8", "q16", "i16", "tq4", "tq"})
+    {
+        ArgvHelper args({"llaminar2", "--kv-cache-precision", alias});
+        auto parser = createOrchestrationConfigParser();
+        auto config = parser->parseArgs(args.argc(), args.argv());
+        EXPECT_EQ(config.kv_cache_precision, alias) << "alias=" << alias;
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_KvCachePrecision_InvalidThrows)
+{
+    ArgvHelper args({"llaminar2", "--kv-cache-precision", "nonsense"});
+    auto parser = createOrchestrationConfigParser();
+    EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_InvalidThrowsViaValidValues)
+{
+    // --activation-precision uses CliSpec's valid_values whitelist, so an
+    // unknown value must be rejected with a listing of the accepted set.
+    ArgvHelper args({"llaminar2", "--activation-precision", "int4"});
+    auto parser = createOrchestrationConfigParser();
+    try
+    {
+        parser->parseArgs(args.argc(), args.argv());
+        FAIL() << "expected throw";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("fp32"), std::string::npos);
+        EXPECT_NE(msg.find("bf16"), std::string::npos);
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_ActivationPrecision_AllThreeAliases)
+{
+    for (const auto &flag : {"--activation-precision", "--activation-prec", "--act-prec"})
+    {
+        ArgvHelper args({"llaminar2", flag, "bf16"});
+        auto parser = createOrchestrationConfigParser();
+        auto config = parser->parseArgs(args.argc(), args.argv());
+        EXPECT_EQ(config.activation_precision, "bf16") << "flag=" << flag;
+    }
+}
+
+// ============================================================================
+// MPI profile (enum) + backend / scope / split enum coverage
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MPIProfile_Tuned)
+{
+    ArgvHelper args({"llaminar2", "--mpi-profile", "tuned"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.mpi_profile, MPIProfile::TUNED);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MPIProfile_InvalidThrows)
+{
+    ArgvHelper args({"llaminar2", "--mpi-profile", "turbo"});
+    auto parser = createOrchestrationConfigParser();
+    try
+    {
+        parser->parseArgs(args.argc(), args.argv());
+        FAIL() << "expected throw";
+    }
+    catch (const std::invalid_argument &e)
+    {
+        std::string msg = e.what();
+        EXPECT_NE(msg.find("--mpi-profile"), std::string::npos);
+        // valid_values whitelist should mention both accepted values.
+        EXPECT_NE(msg.find("auto"), std::string::npos);
+        EXPECT_NE(msg.find("tuned"), std::string::npos);
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_TpScope_NodeLocal)
+{
+    ArgvHelper args({"llaminar2", "--tp-scope", "node_local"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.tp_scope, TPScope::NODE_LOCAL);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Backend_Heterogeneous)
+{
+    ArgvHelper args({"llaminar2", "--backend", "heterogeneous"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.default_backend, CollectiveBackendType::HETEROGENEOUS);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_PpSplit_InvalidThrows)
+{
+    ArgvHelper args({"llaminar2", "--pp-split", "lopsided"});
+    auto parser = createOrchestrationConfigParser();
+    EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+// ============================================================================
+// Device shorthand semantics
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Device_CpuMarksAllLocal)
+{
+    // Bare `-d cpu` should set cpu_global_tp_all_local=true and leave
+    // numa_explicit=false (the orchestrator will fan out across NUMA nodes).
+    ArgvHelper args({"llaminar2", "-d", "cpu"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_TRUE(config.cpu_global_tp_all_local);
+    EXPECT_FALSE(config.device_for_this_rank_numa_explicit);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Device_InvalidCpuNumaThrows)
+{
+    ArgvHelper args({"llaminar2", "-d", "cpu:abc"});
+    auto parser = createOrchestrationConfigParser();
+    EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+// ============================================================================
+// Verbosity: -v / -vv / -vvv / repeated -v
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Verbose_Triple)
+{
+    ArgvHelper args({"llaminar2", "-vvv"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.verbose_level, 3);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Verbose_RepeatedIncrements)
+{
+    ArgvHelper args({"llaminar2", "-v", "-v", "-v"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.verbose_level, 3);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Verbose_RepeatedIncrementsClampAt3)
+{
+    ArgvHelper args({"llaminar2", "-v", "-v", "-v", "-v", "-v"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.verbose_level, 3);
+}
+
+// ============================================================================
+// Deterministic: temperature forcing + env var side effect
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Deterministic_ForcesTemperatureZero)
+{
+    // Even when --temperature is supplied non-zero before --deterministic,
+    // the deterministic flag must zero it out.
+    ArgvHelper args({"llaminar2", "--temperature", "0.8", "--deterministic"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_TRUE(config.deterministic);
+    EXPECT_FLOAT_EQ(config.temperature, 0.0f);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Deterministic_SetsEnvVar)
+{
+    unsetenv("LLAMINAR_DETERMINISTIC");
+    ArgvHelper args({"llaminar2", "--deterministic"});
+    auto parser = createOrchestrationConfigParser();
+    (void)parser->parseArgs(args.argc(), args.argv());
+    const char *env = std::getenv("LLAMINAR_DETERMINISTIC");
+    ASSERT_NE(env, nullptr);
+    EXPECT_STREQ(env, "1");
+    unsetenv("LLAMINAR_DETERMINISTIC");
+}
+
+// ============================================================================
+// Server mode flags
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Serve_WithHostAndPort)
+{
+    ArgvHelper args({"llaminar2", "--serve", "--host", "0.0.0.0", "--port", "9000"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_TRUE(config.serve_mode);
+    EXPECT_EQ(config.serve_host, "0.0.0.0");
+    EXPECT_EQ(config.serve_port, 9000);
+}
+
+// ============================================================================
+// MPI bootstrap flags
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MpiHostfile)
+{
+    ArgvHelper args({"llaminar2", "--mpi-hostfile", "/etc/hosts.txt"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.hostfile, "/etc/hosts.txt");
+}
+
+// ============================================================================
+// NYI flags still parse (back-compat)
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NYIFlags_StillAccepted)
+{
+    // All NYI flags must still be parseable so existing scripts don't break.
+    ArgvHelper args({
+        "llaminar2",
+        "--topology",
+        "PP(a)",
+        "--topology-file",
+        "topo.yaml",
+        "--max-gpu-memory",
+        "8192",
+        "--max-cpu-memory",
+        "16384",
+        "--cpu-layers",
+        "4",
+        "--cpu-layers-first",
+    });
+    auto parser = createOrchestrationConfigParser();
+    OrchestrationConfig config;
+    EXPECT_NO_THROW(config = parser->parseArgs(args.argc(), args.argv()));
+    EXPECT_EQ(config.topology_string, "PP(a)");
+    EXPECT_EQ(config.topology_file_path, "topo.yaml");
+    EXPECT_EQ(config.max_gpu_memory_mb, 8192u);
+    EXPECT_EQ(config.max_cpu_memory_mb, 16384u);
+    EXPECT_EQ(config.cpu_layers, 4);
+    EXPECT_TRUE(config.cpu_layers_first);
+}
+
+// ============================================================================
+// Cross-flag validation
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_Heterogeneous_NoGpuTp_NoCpuTp_Throws)
+{
+    ArgvHelper args({"llaminar2", "--heterogeneous", "--no-gpu-tp", "--no-cpu-tp"});
+    auto parser = createOrchestrationConfigParser();
+    EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+// ============================================================================
+// Negative-number value support for int options (regression guard)
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NegativeSeedSpaceForm)
+{
+    ArgvHelper args({"llaminar2", "--seed", "-1"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.seed, -1);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_NegativeNPredictSpaceForm)
+{
+    ArgvHelper args({"llaminar2", "-n", "-1"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.n_predict, -1);
+}
+
+// ============================================================================
+// Equals-form coverage for assorted option types
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_EqualsForm_OnEnum)
+{
+    ArgvHelper args({"llaminar2", "--tp-scope=local"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.tp_scope, TPScope::LOCAL);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_EqualsForm_OnString)
+{
+    ArgvHelper args({"llaminar2", "--model=/tmp/model.gguf"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_EQ(config.model_path, "/tmp/model.gguf");
+}
+
+// ============================================================================
+// Last-write-wins for repeated value flags
+// ============================================================================
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_RepeatedFlag_LastWriteWins)
+{
+    ArgvHelper args({"llaminar2", "--temperature", "0.5", "--temperature", "0.9"});
+    auto parser = createOrchestrationConfigParser();
+    auto config = parser->parseArgs(args.argc(), args.argv());
+    EXPECT_FLOAT_EQ(config.temperature, 0.9f);
 }

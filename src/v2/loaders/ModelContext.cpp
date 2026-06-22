@@ -6,6 +6,7 @@
 
 #include "ModelContext.h"
 #include "../utils/Logger.h"
+#include <exception>
 #include <iostream>
 #include <limits>
 
@@ -50,6 +51,15 @@ namespace llaminar2
             WeightPrecision weight_precision) override
         {
             return loader_.loadTensorColumnSlice(name, col_start, col_end, device, weight_precision);
+        }
+
+        std::shared_ptr<TensorBase> loadTensorExpertSlice(
+            const std::string &name,
+            size_t expert_start, size_t expert_end,
+            DeviceId device,
+            WeightPrecision weight_precision) override
+        {
+            return loader_.loadTensorExpertSlice(name, expert_start, expert_end, device, weight_precision);
         }
 
         bool hasTensor(const std::string &name) const override { return loader_.hasTensor(name); }
@@ -134,9 +144,13 @@ namespace llaminar2
         }
 
         // Load model metadata
-        if (!ctx->loader_.loadModel(model_path))
+        try
         {
-            LOG_ERROR("[ModelContext] Failed to load model: " << model_path);
+            ctx->loader_.loadModel(model_path);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[ModelContext] Failed to load model: " << model_path << " (" << e.what() << ")");
             return nullptr;
         }
 
@@ -193,11 +207,17 @@ namespace llaminar2
 
         // Configure mmap before loading (must precede loadModel)
         ctx->loader_.setUseMmap(config.use_mmap);
+        ctx->loader_.setSkipMmapCacheEviction(config.skip_mmap_cache_eviction);
+        ctx->loader_.setTargetIsGpu(config.target_is_gpu);
 
         // Load model metadata
-        if (!ctx->loader_.loadModel(model_path))
+        try
         {
-            LOG_ERROR("[ModelContext] Failed to load model: " << model_path);
+            ctx->loader_.loadModel(model_path);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[ModelContext] Failed to load model: " << model_path << " (" << e.what() << ")");
             return nullptr;
         }
 
@@ -251,9 +271,13 @@ namespace llaminar2
             new ModelContext(model_path, mpi_ctx, nullptr, nullptr, WeightDistributionStrategy::LAYER_PARTITIONED));
 
         // Load model metadata
-        if (!ctx->loader_.loadModel(model_path))
+        try
         {
-            LOG_ERROR("[ModelContext] Failed to load model: " << model_path);
+            ctx->loader_.loadModel(model_path);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[ModelContext] Failed to load model: " << model_path << " (" << e.what() << ")");
             return nullptr;
         }
 
@@ -271,9 +295,9 @@ namespace llaminar2
         // This ensures nested MDO (TP within PP) builds graphs with correct layer count
         ctx->pp_block_count_override_ = last_layer - first_layer;
 
-        LOG_INFO("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
-                                                                        << "), embedding=" << (has_embedding ? "yes" : "no")
-                                                                        << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+        LOG_DEBUG("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
+                                                                         << "), embedding=" << (has_embedding ? "yes" : "no")
+                                                                         << ", lm_head=" << (has_lm_head ? "yes" : "no"));
 
         return ctx;
     }
