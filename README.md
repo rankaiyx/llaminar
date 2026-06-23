@@ -225,11 +225,11 @@ The result is one execution model that scales down to a single CPU socket and
 up to heterogeneous multi-GPU, multi-socket, and multi-rank deployments while
 keeping placement, collectives, and graph replay explicit.
 
-## Running Llaminar
+## Running Llaminar (longer)
 
-### Ubuntu 24.04 Mixed-GPU Host
+### Ubuntu 24.04 Mixed-GPU Host (full-fat)
 
-The release container is built for machines that may use NVIDIA CUDA and AMD
+The full release container is built for machines that may use NVIDIA CUDA and AMD
 ROCm in the same process. It ships the Llaminar binary plus CUDA 13.0
 user-space libraries, NCCL for CUDA 13.0, and ROCm 7.1.1 user-space libraries.
 It does not ship kernel drivers.
